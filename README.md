@@ -46,7 +46,11 @@ on flaky networks, no scratch space gymnastics.
 
 ## Status
 
-Pre-MVP. See [`docs/PLAN.md`](docs/PLAN.md) for the implementation plan.
+MVP complete (2026-04-29). All ten phases of the original plan have
+landed; active work has moved to optimizations and post-MVP scope. See
+[`docs/PLAN.md`](docs/PLAN.md) for the historical MVP plan and
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) for the current
+backlog.
 
 ## For contributors and AI agents
 
@@ -55,13 +59,15 @@ point at the same docs). The full doc set:
 
 - [`CLAUDE.md`](CLAUDE.md) — entry point, house rules summary
 - [`AGENTS.md`](AGENTS.md) — workflow rules for coding agents
-- [`docs/PLAN.md`](docs/PLAN.md) — sequenced MVP plan
+- [`docs/PLAN.md`](docs/PLAN.md) — sequenced MVP plan (complete; kept as
+  historical record)
 - [`docs/ENGINEERING_STANDARDS.md`](docs/ENGINEERING_STANDARDS.md) —
   non-negotiable rules
 - [`docs/ENGINEERING_BEST_PRACTICES.md`](docs/ENGINEERING_BEST_PRACTICES.md)
   — idiomatic patterns
-- [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) — explicitly deferred,
-  do not implement during MVP
+- [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) — post-MVP backlog;
+  items still require deliberate review and a successor plan before
+  implementation
 
 ## License
 

@@ -1,5 +1,12 @@
 # Plan: peel MVP
 
+> **Status: MVP complete (2026-04-29).** All ten sequenced phases below have
+> landed (see `git log` — `phase 1` through `phase 10`). Active work has
+> moved to `OPTIMIZATIONS.md`; this document is retained as the historical
+> record of how the MVP was scoped and built. Do not start new MVP work from
+> this file — promote items from `OPTIMIZATIONS.md` into a successor plan
+> instead (see "When to revisit this list" in that doc).
+
 This is the **MVP**. Things explicitly *out* of scope for the MVP are listed
 in `OPTIMIZATIONS.md`. Don't pull from that list during MVP work.
 
@@ -357,7 +364,8 @@ All of the following are true:
    complete usage example and a section explaining the architecture
    linked to `PLAN.md`.
 
-After MVP, work moves to `OPTIMIZATIONS.md`.
+After MVP, work moves to `OPTIMIZATIONS.md`. **As of 2026-04-29, the MVP
+criteria above are satisfied and that transition is now in effect.**
 
 ## Schedule guidance
 

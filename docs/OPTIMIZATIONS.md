@@ -1,15 +1,22 @@
 # Optimizations & Future Work
 
-This file is a **wishlist of things explicitly deferred** until after the
-MVP in `PLAN.md` is complete and stable. Nothing here is approved for
-implementation. Items move from this file to `PLAN.md` (or its successor)
-through deliberate human review, not by an agent deciding "while I'm here…"
+> **Status: post-MVP work is now active (2026-04-29).** The MVP in `PLAN.md`
+> has shipped (phases 1–10 complete). Items in this file are now eligible
+> for prioritization, but the rule still stands: **promotion from this file
+> to active work happens through deliberate human review**, not by an agent
+> deciding "while I'm here…" When an item is selected, it should be lifted
+> into a successor plan (a new sequenced doc, same discipline as the
+> original `PLAN.md`) before implementation begins.
+
+This file started as a **wishlist of things explicitly deferred** during
+MVP. Now that the MVP is complete, it serves as the input queue for the
+next planning round.
 
 The point of having this file is twofold:
 
 1. To capture good ideas so they're not lost.
-2. To give agents an explicit "do not do this yet" list so MVP work
-   stays scoped.
+2. To give agents an explicit "not until it's been planned" list so
+   post-MVP work stays scoped to what was actually agreed.
 
 Each item below has: what it is, why we deferred it, and a sketch of how
 it would be approached if/when prioritized.
@@ -347,7 +354,8 @@ attack vector).
 
 ## When to revisit this list
 
-After the MVP ships and is stable, look at this list and ask:
+**This is the moment.** The MVP shipped on 2026-04-29 and we're now in the
+post-MVP phase. Look at this list and ask:
 
 1. What did real users actually need that we deferred?
 2. What did we discover during MVP work that changed our priors?
