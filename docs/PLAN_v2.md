@@ -358,12 +358,20 @@ sensible number, the non-TTY fallback logs every 2 s.
 
 ---
 
-### §7. io_uring backend (`O.2`)
+### §7. io_uring backend — file IO (`O.2`, file-IO half)
 
-**What**: replace blocking `read`/`write_all_at` in the download
-workers and sparse file with `io_uring` submission queues on Linux
-when the kernel supports it, with a safe automatic fallback to the
-existing blocking path when it doesn't.
+**What**: replace blocking `pwrite_at` / `pread_at` on the sparse
+file with `io_uring` submission queues on Linux when the kernel
+supports it, with a safe automatic fallback to the existing blocking
+path when it doesn't.
+
+**Scope split (added 2026-04-29).** §7 covers *file IO only*
+(`pwrite_at` / `pread_at`). The download path's TCP `connect` /
+`send` / `recv` are the subject of §7b, which builds on §7's trait,
+IO thread, and capability probe. Splitting the work keeps each diff
+focused and lets the file-IO half land and bake before we touch the
+hand-rolled HTTP client + rustls byte transport. Together §7 and §7b
+deliver `O.2` from `OPTIMIZATIONS.md`.
 
 **Why now**: it sits behind §8 (adaptive chunk size — adaptive sizing
 makes more sense once IO concurrency can actually scale) and §9 (mmap
@@ -381,11 +389,12 @@ Anything that asks us to add `tokio` is rejected.
 
 **Sketch**:
 
-1. New `IoBackend` trait wrapping the operations workers and the
-   sparse file currently call directly: `pwrite_at`, `pread_at`,
-   `connect`, `send`, `recv`. Default implementation is the existing
-   blocking path; `IoUringBackend` is a Linux-only implementation
-   gated on `#[cfg(target_os = "linux")]`.
+1. New `IoBackend` trait wrapping the file-IO operations the sparse
+   file currently calls directly: `pwrite_at`, `pread_at`, plus
+   `sync_all`. Default implementation is the existing blocking path;
+   `UringBackend` is a Linux-only implementation gated on
+   `#[cfg(target_os = "linux")]`. The trait is shaped to grow the
+   socket operations §7b introduces without breaking either backend.
 2. Capability probe at startup: open a ring with
    `IoUring::new(MIN_DEPTH)`. If construction fails (kernel too old,
    container without uring, seccomp blocking), log a `warn!` to
@@ -395,7 +404,7 @@ Anything that asks us to add `tokio` is rejected.
    uring, just smaller).
 3. ulimit checks: `RLIMIT_NOFILE` should be ≥ workers × 2; below
    that, log a `warn!` with the recommended `ulimit -n` value.
-4. Submission strategy: workers post `read` SQEs into a per-worker
+4. Submission strategy: workers post `write` SQEs into a per-worker
    ring slot, then drain CQEs in batches. The IO thread owns the
    ring; workers communicate with it via a bounded channel of
    submission requests.
@@ -408,6 +417,86 @@ throughput improvement on a localhost mock under high parallelism
 (N=64 workers). Flag `--io-backend blocking` forces the old path for
 A/B comparison. Falls back cleanly on a kernel < 5.6 and prints the
 expected stderr warning.
+
+---
+
+### §7b. io_uring backend — network IO (`O.2`, network-IO half)
+
+> **Status: drafted 2026-04-29, not yet started.** Added to the plan
+> after §7 was scoped down to file IO. §7b assumes §7's trait, IO
+> thread, capability probe, and `--io-backend` CLI flag are already
+> in tree.
+
+**What**: extend the [`IoBackend`] trait from §7 to cover the
+download workers' network IO — TCP `connect`, `send`, `recv` — via
+`io_uring`, sharing the dedicated IO thread and capability probe with
+the file-IO path. `rustls` continues to drive the TLS state machine;
+the uring path swaps the byte transport beneath it.
+
+**Why now**: §7 establishes the trait, the IO thread, the bounded
+submission channel, and the capability probe. Doing the network half
+in a separate phase keeps each diff focused, lets the file-IO half
+ship and bake before we touch the wire path, and lets us A/B the two
+halves independently against the same demo (the §7 demo runs with
+network blocking; this phase's demo runs with both halves on uring).
+
+**Dependency**: no new crate. Uses the same `io-uring` dependency
+approved in §7.
+
+**Hard rule for this phase: still no async runtime.** Each socket
+operation submits an SQE on the per-process IO thread and the calling
+worker thread blocks on a per-op completion notifier. The ring
+batches across workers — one ring, N workers — but each individual
+`Read::read` / `Write::write` call is synchronous from the worker's
+point of view, so `rustls` and the hand-rolled HTTP client work
+unchanged.
+
+**Sketch**:
+
+1. `IoBackend` (introduced in §7) gains three methods: `connect(addr:
+   SocketAddr) -> io::Result<UringSocket>`, plus `send` and `recv`
+   operating on a backend-owned socket handle. Returning a typed
+   handle (rather than a raw `RawFd`) keeps the ownership story
+   crisp: the backend owns the socket lifecycle, the caller borrows a
+   `Read + Write` adapter.
+2. `UringSocket` is a thin wrapper around the kernel-side socket plus
+   a back-reference to the `IoBackend`. It implements `std::io::Read`
+   and `std::io::Write` by submitting `recv` / `send` SQEs and waiting
+   on the per-op completion. This is the surface
+   `rustls::StreamOwned` plugs into in place of `TcpStream`.
+3. `http::client::Client` gains a backend handle (`Arc<dyn
+   IoBackend>`), defaulting to the blocking backend it has today.
+   Connect / send / recv go through the backend; the rest of the
+   client (request framing, response parsing, redirects, pool) is
+   unchanged.
+4. TLS: `rustls::StreamOwned<ClientConnection, UringSocket>` Just
+   Works because `UringSocket: Read + Write`. We do not interpose
+   below the TLS state machine — the rustls / `webpki-roots` exception
+   in `ENGINEERING_STANDARDS.md` §2.4 covers the unchanged bits.
+5. Worker `cancel` flag: a worker that's blocked inside a uring `recv`
+   completion wait must respond to cancellation. Either (a) submit the
+   `recv` SQE with a linked timeout SQE and re-check `cancel` on
+   timeout, or (b) submit a uring `cancel` SQE from the scheduler when
+   it flips the flag. (a) is simpler; pick that and document the
+   worst-case latency (1× timeout) in the trait's contract.
+6. Capability is shared with §7's probe. A `--io-backend uring`
+   selection that hits a kernel without ring support falls back to
+   *both* halves blocking, with the same `warn!` line. There is no
+   "uring file IO + blocking sockets" mixed mode — the trait stays
+   coherent across halves.
+7. Tests: a localhost mock server (reusing the existing test harness)
+   plus the same crash-test path with the uring backend forced. Run
+   the property-style "identical extraction output across backends
+   for a fixed seed" test from §7 against the network half too.
+
+**Demo**: the §7 demo, repeated under simulated network latency
+(`tc qdisc add dev lo root netem delay 50ms` on Linux runners). At
+N=64 workers and 50 ms RTT, the blocking-sockets variant pays a
+context switch per recv; the uring variant batches recvs across
+workers and finishes faster. The exact speedup is hardware- and
+kernel-dependent; the demo bar is "uring is not slower than blocking
+on the same workload, and is meaningfully faster at high parallelism
++ high RTT."
 
 ---
 
@@ -719,10 +808,10 @@ All of the following are true:
 3. CI gates listed in `ENGINEERING_STANDARDS.md` §CI remain green;
    coverage thresholds (80 % overall, 95 % on critical paths)
    continue to hold across the new modules.
-4. `OPTIMIZATIONS.md` has been amended to mark items `O.1`, `O.2`,
-   `O.3`, `O.6`, `O.7`, `O.8`, `O.10`, `O.11`, `O.13`, `O.14`,
-   `O.19` as "delivered in PLAN_v2 §<phase>"; the rest stay deferred
-   for a future round.
+4. `OPTIMIZATIONS.md` has been amended to mark items `O.1`, `O.2`
+   (delivered jointly by §7 + §7b), `O.3`, `O.6`, `O.7`, `O.8`,
+   `O.10`, `O.11`, `O.13`, `O.14`, `O.19` as "delivered in PLAN_v2
+   §<phase>"; the rest stay deferred for a future round.
 5. README has been updated with the new format coverage matrix and
    the new flags.
 
@@ -730,9 +819,10 @@ All of the following are true:
 
 There is still no schedule. The plan is sequenced; do it in order, do
 each phase completely. Phase A's five phases are gating dependencies
-for one another (§1 first; §5 last). Phase B's nine phases are
-loosely dependent in the order written and should not be parallelized
-across sessions.
+for one another (§1 first; §5 last). Phase B's ten phases (§6, §7,
+§7b, §8–§14) are loosely dependent in the order written and should
+not be parallelized across sessions; in particular §7b builds on §7
+and must not start until §7 has landed and demoed.
 
 ## Decisions resolved before §1 begins
 
