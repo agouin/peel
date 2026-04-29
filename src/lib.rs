@@ -18,8 +18,8 @@
 //!
 //! - [`bitmap`] — lock-free chunk completion bitmap shared across the
 //!   download workers, scheduler, and decoder.
-//! - [`download`] (Unix only) — the sparse output file workers write
-//!   into; eventually also the scheduler and worker pool.
+//! - [`download`] (Unix only) — the sparse output file, the chunk
+//!   scheduler, and the per-chunk worker that issues ranged GETs.
 //! - [`http`] — hand-rolled HTTP/1.1 client with connection pooling and
 //!   TLS via `rustls`, plus the typed [`http::request`] /
 //!   [`http::response`] / [`http::range`] / [`http::url`] support
