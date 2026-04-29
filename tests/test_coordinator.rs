@@ -38,7 +38,7 @@ use peel::types::ByteOffset;
 mod support;
 
 use support::mock_server::{MockRequest, MockResponse, MockServer};
-use support::tar_fixtures::build_simple_archive;
+use support::tar_fixtures::{build_header, build_pax_body, build_simple_archive, end_of_archive};
 
 // ---- helpers -----------------------------------------------------------
 
@@ -523,6 +523,173 @@ fn url_change_on_resume_aborts_cleanly() {
     );
     let err = run(args).expect_err("url change must abort");
     assert!(matches!(err, CoordinatorError::SourceChanged { .. }));
+}
+
+// ---- uncompressed `.tar` (PLAN_v2 §2) ---------------------------------
+
+/// North-star happy path against an uncompressed `.tar`: the identity
+/// decoder hands bytes straight through to `TarSink` and the on-disk
+/// extracted tree matches the archive contents.
+#[test]
+fn happy_path_plain_tar_to_dir_extracts_archive() {
+    let archive = build_simple_archive(&[
+        ("dir/a.txt", b"hello-uncompressed-tar"),
+        ("dir/sub/b.bin", &[7u8; 1024]),
+        ("dir/c.empty", b""),
+    ]);
+    let server = MockServer::start(ok_handler(archive, Some("\"v-plain-tar\"")));
+
+    let work = unique_dir("happy_plain_tar");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let args = make_args(
+        &server,
+        "x.tar",
+        OutputTarget::Dir(out_dir.clone()),
+        coord_config_for_test(4096),
+    );
+    let stats = run(args).expect("plain-tar happy run");
+    assert!(!stats.resumed);
+
+    let entries = read_dir_recursive(&out_dir);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"dir/a.txt"));
+    assert!(names.contains(&"dir/sub/b.bin"));
+    assert!(names.contains(&"dir/c.empty"));
+    assert_eq!(
+        fs::read(out_dir.join("dir/a.txt")).unwrap(),
+        b"hello-uncompressed-tar"
+    );
+    assert_eq!(
+        fs::read(out_dir.join("dir/sub/b.bin")).unwrap(),
+        vec![7u8; 1024]
+    );
+
+    // Sidecars cleaned up.
+    assert!(!work.join("out.peel.part").exists());
+    assert!(!work.join("out.peel.ckpt").exists());
+}
+
+/// A URL with no recognized suffix still routes to the tar identity
+/// decoder via the magic-byte path: `ustar\0` at offset 257 is the
+/// only registered tar signature and the only registered signature
+/// that doesn't live at offset 0, so this exercises the offset-aware
+/// branch of [`peel::decode::DecoderRegistry::factory_for_prefix`].
+#[test]
+fn tar_magic_only_path_extracts_when_url_has_no_suffix() {
+    let archive = build_simple_archive(&[("a.txt", b"magic-detected-tar"), ("b.bin", &[3u8; 33])]);
+    let server = MockServer::start(ok_handler(archive, Some("\"v-magic-tar\"")));
+
+    let work = unique_dir("tar_magic_only");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    // The URL ends in a generic, unrecognized suffix; only the magic
+    // byte detection can pick the tar factory.
+    let args = make_args(
+        &server,
+        "download.bin",
+        OutputTarget::Dir(out_dir.clone()),
+        coord_config_for_test(4096),
+    );
+    let stats = run(args).expect("tar magic run");
+    assert!(!stats.resumed);
+
+    assert_eq!(
+        fs::read(out_dir.join("a.txt")).unwrap(),
+        b"magic-detected-tar"
+    );
+    assert_eq!(fs::read(out_dir.join("b.bin")).unwrap(), vec![3u8; 33]);
+}
+
+/// Empty archive (just the two-zero-block end-of-archive marker) is
+/// 1024 bytes of zeros — there is *no* `ustar` magic to detect, so
+/// magic-byte detection misses entirely. The suffix-only path must
+/// still route the run to the identity decoder; the tar sink validates
+/// the marker and `close()` succeeds.
+#[test]
+fn empty_tar_archive_resolves_via_suffix_only() {
+    let body = end_of_archive();
+    let server = MockServer::start(ok_handler(body, Some("\"v-empty-tar\"")));
+
+    let work = unique_dir("empty_tar");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let args = make_args(
+        &server,
+        "empty.tar",
+        OutputTarget::Dir(out_dir.clone()),
+        coord_config_for_test(4096),
+    );
+    let stats = run(args).expect("empty tar run");
+    assert!(!stats.resumed);
+    assert!(read_dir_recursive(&out_dir).is_empty());
+}
+
+/// PAX-prefixed entry: the first 512-byte block in the archive is a
+/// PAX 'x' extended header (typeflag `x`, magic still `ustar\0` at
+/// offset 257) overriding the next member's path. Magic-byte
+/// detection must accept this — offset 257 in the *first* block
+/// satisfies the registered tar magic — and the parser must traverse
+/// the PAX record to extract the long-named member that follows.
+#[test]
+fn pax_prefixed_tar_extracts_via_magic_detection() {
+    // A "long" path that requires PAX overriding, since USTAR caps
+    // the name at 100 bytes (with optional 155-byte prefix). We pick
+    // a path comfortably above 100 bytes so the override is the only
+    // viable encoding.
+    let long_path = format!("dir/{}/leaf.txt", "a".repeat(120));
+    let payload: &[u8] = b"pax-overridden-payload";
+
+    let pax_body = build_pax_body(&[("path", &long_path)]);
+    let pax_padded = {
+        // pad PAX body to a 512-byte block.
+        let mut v = pax_body.clone();
+        let rem = v.len() % 512;
+        if rem != 0 {
+            v.resize(v.len() + (512 - rem), 0);
+        }
+        v
+    };
+
+    let mut archive: Vec<u8> = Vec::new();
+    // PAX 'x' header — first 512 bytes carry the ustar magic at 257.
+    archive.extend_from_slice(&build_header(
+        "PaxHeaders/leaf.txt",
+        pax_body.len() as u64,
+        b'x',
+    ));
+    archive.extend_from_slice(&pax_padded);
+    // Followed by the regular file whose path PAX overrides.
+    archive.extend_from_slice(&build_header("ignored", payload.len() as u64, b'0'));
+    archive.extend_from_slice(payload);
+    let pad = (512 - payload.len() % 512) % 512;
+    archive.extend(std::iter::repeat_n(0u8, pad));
+    archive.extend_from_slice(&end_of_archive());
+
+    let server = MockServer::start(ok_handler(archive, Some("\"v-pax-tar\"")));
+
+    let work = unique_dir("pax_tar");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    // Generic suffix forces the magic-byte path. The PAX block leads
+    // and still carries the registered ustar magic at offset 257.
+    let args = make_args(
+        &server,
+        "data.bin",
+        OutputTarget::Dir(out_dir.clone()),
+        coord_config_for_test(4096),
+    );
+    run(args).expect("pax tar run");
+    let extracted = fs::read(out_dir.join(&long_path)).expect("pax-overridden file present");
+    assert_eq!(extracted, payload);
 }
 
 // ---- no decoder for filename ----------------------------------------

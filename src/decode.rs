@@ -24,6 +24,8 @@
 //!
 //! - [`zstd`] — wraps the upstream `zstd` crate's streaming reader and
 //!   detects frame boundaries by single-frame stepping.
+//! - [`identity`] — passthrough decoder for archive formats that have
+//!   no compression layer (uncompressed `.tar`).
 //!
 //! Future formats (`gzip`, anything that fits the protocol) are added
 //! here following the same shape.
@@ -57,6 +59,7 @@ use thiserror::Error;
 
 use crate::types::ByteOffset;
 
+pub mod identity;
 pub mod zstd;
 
 /// Status returned by [`StreamingDecoder::decode_step`].
@@ -238,9 +241,15 @@ impl DecoderRegistry {
     /// Create a registry populated with every decoder shipped by this
     /// crate.
     ///
-    /// Currently registers `.zst` / `.zstd` (suffixes), the four-byte
-    /// zstd magic at offset 0 (`28 B5 2F FD`), and the format name
-    /// `"zstd"`.
+    /// Currently registers:
+    ///
+    /// - `"zstd"` — `.zst` / `.zstd` suffixes; magic `28 B5 2F FD` at
+    ///   offset 0.
+    /// - `"tar"` — `.tar` suffix; POSIX ustar magic `"ustar\0"` and
+    ///   legacy old-GNU magic `"ustar  \0"`, both at offset 257
+    ///   (inside the first 512-byte tar header block). The decoder is
+    ///   the identity passthrough — uncompressed tar streams hand
+    ///   their bytes straight through to [`crate::sink::TarSink`].
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
@@ -252,6 +261,21 @@ impl DecoderRegistry {
                 bytes: &[0x28, 0xB5, 0x2F, 0xFD],
             }],
             zstd::factory,
+        );
+        r.register_format(
+            "tar",
+            &[".tar"],
+            &[
+                MagicSignature {
+                    offset: 257,
+                    bytes: b"ustar\0",
+                },
+                MagicSignature {
+                    offset: 257,
+                    bytes: b"ustar  \0",
+                },
+            ],
+            identity::factory,
         );
         r
     }
@@ -459,7 +483,10 @@ mod tests {
         assert!(!r.is_empty());
         assert!(r.factory_for_name("dataset.zst").is_some());
         assert!(r.factory_for_name("dataset.zstd").is_some());
-        assert!(r.factory_for_name("dataset.tar").is_none());
+        // `.tar` is also registered now (PLAN_v2 §2). A suffix that no
+        // shipping decoder owns still misses.
+        assert!(r.factory_for_name("dataset.tar").is_some());
+        assert!(r.factory_for_name("dataset.lz4").is_none());
     }
 
     #[test]
@@ -671,5 +698,44 @@ mod tests {
         let r = DecoderRegistry::with_defaults();
         let names = r.format_names();
         assert!(names.contains(&"zstd"));
+        assert!(names.contains(&"tar"));
+    }
+
+    #[test]
+    fn registry_with_defaults_registers_tar_suffix_and_magics() {
+        let r = DecoderRegistry::with_defaults();
+
+        // Suffix lookup.
+        assert!(r.factory_for_name("archive.tar").is_some());
+
+        // POSIX ustar magic at offset 257 inside a 512-byte header.
+        let mut posix = vec![0u8; 512];
+        posix[257..263].copy_from_slice(b"ustar\0");
+        posix[263..265].copy_from_slice(b"00");
+        let posix_factory = r.factory_for_prefix(&posix).expect("posix matches");
+        assert_eq!(r.name_for_factory(posix_factory), Some("tar"));
+
+        // Legacy old-GNU magic at offset 257 — the registry recognizes
+        // it as tar even though the parser ultimately rejects it; the
+        // user should see a sink-level "malformed header" rather than
+        // a registry-level "no decoder".
+        let mut old_gnu = vec![0u8; 512];
+        old_gnu[257..265].copy_from_slice(b"ustar  \0");
+        let old_gnu_factory = r.factory_for_prefix(&old_gnu).expect("old gnu matches");
+        assert_eq!(r.name_for_factory(old_gnu_factory), Some("tar"));
+
+        // The format-name lookup picks up the same factory.
+        assert!(r.factory_for_format_name("tar").is_some());
+
+        // Magic-window must be ≥ 265 bytes to cover both signatures.
+        assert!(r.max_magic_window() >= 265);
+    }
+
+    #[test]
+    fn registry_with_defaults_tar_does_not_match_random_bytes() {
+        // A 512-byte block with no tar magic at 257 should miss.
+        let r = DecoderRegistry::with_defaults();
+        let buf = vec![0u8; 512];
+        assert!(r.factory_for_prefix(&buf).is_none());
     }
 }

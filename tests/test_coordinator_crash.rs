@@ -523,3 +523,119 @@ fn random_kill_points_resume_to_identical_tar_output() {
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
 }
+
+// ---- harness: uncompressed `.tar` (PLAN_v2 §2) ------------------------
+
+#[test]
+fn random_kill_points_resume_to_identical_plain_tar_output() {
+    // Same shape as the zstd-tar harness above but the body is the
+    // uncompressed archive — exercises the identity decoder's
+    // resume contract directly. The identity decoder reports a frame
+    // boundary on every step, so the sink's between-member quiescence
+    // is what gates the checkpoint cadence.
+    let mut members: Vec<(&str, Vec<u8>)> = Vec::new();
+    for i in 0..12 {
+        let name = Box::leak(format!("dir/plain_{i:02}.bin").into_boxed_str());
+        let payload: Vec<u8> = (0..(384 + i * 73))
+            .map(|j| (i as u8).wrapping_mul(11).wrapping_add(j as u8))
+            .collect();
+        members.push((name, payload));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    for (name, payload) in &members {
+        body.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    body.extend_from_slice(&end_of_archive_block());
+
+    let server = MockServer::start(ok_handler(body, "\"v-plain-tar\""));
+
+    // Reference run.
+    let golden_dir = unique_dir("golden_plain_tar");
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_out = golden_dir.join("out");
+    fs::create_dir_all(&golden_out).expect("golden out dir");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let args = make_args(
+        &server,
+        "x.tar",
+        OutputTarget::Dir(golden_out.clone()),
+        coord_config(4096),
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden plain-tar run");
+    let golden_entries = read_dir_recursive(&golden_out);
+    assert!(
+        !golden_entries.is_empty(),
+        "golden plain-tar run produced no files",
+    );
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    if total_checkpoints < 2 {
+        return;
+    }
+
+    let trial_count = 10u64;
+    let mut rng = Lcg::seeded(0x1357_2468_BD9A_CE13);
+    let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, total_checkpoints);
+        let work = unique_dir(&format!("plain_tar_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_dir = work.join("out");
+        fs::create_dir_all(&out_dir).expect("trial out dir");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let args = make_args(
+            &server,
+            "x.tar",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                let got = read_dir_recursive(&out_dir);
+                assert_eq!(got, golden_entries, "trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("trial {trial}: unexpected error {other:?}"),
+        }
+
+        let resume_args = make_args(
+            &server,
+            "x.tar",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume ok");
+        assert!(
+            stats.resumed,
+            "trial {trial}: resume did not flag itself as resumed"
+        );
+
+        let got = read_dir_recursive(&out_dir);
+        if got != golden_entries {
+            captured_failures.lock().unwrap().push(format!(
+                "trial {trial}: plain-tar resume diverges from golden \
+                 (abort_after={abort_after})",
+            ));
+        }
+    }
+
+    let failures = captured_failures.lock().unwrap();
+    assert!(failures.is_empty(), "{:?}", *failures);
+}
