@@ -24,11 +24,13 @@
 //!   TLS via `rustls`, plus the typed [`http::request`] /
 //!   [`http::response`] / [`http::range`] / [`http::url`] support
 //!   modules.
+//! - [`decode`] — the [`decode::StreamingDecoder`] protocol every
+//!   format-specific decoder honors, plus the in-tree zstd
+//!   implementation and a suffix-keyed [`decode::DecoderRegistry`].
 //!
-//! Future modules (`checkpoint`, `decode`, `sink`, `extractor`,
-//! `coordinator`) are introduced one plan section at a time. Until
-//! they exist, the binary in [`main.rs`](../src/main.rs) is
-//! intentionally a stub.
+//! Future modules (`checkpoint`, `sink`, `extractor`, `coordinator`)
+//! are introduced one plan section at a time. Until they exist, the
+//! binary in [`main.rs`](../src/main.rs) is intentionally a stub.
 //!
 //! [`docs/PLAN.md`]: https://github.com/ondofinance/pux/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/ondofinance/pux/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -37,6 +39,7 @@
 #![warn(unused, clippy::all)]
 
 pub mod bitmap;
+pub mod decode;
 #[cfg(unix)]
 pub mod download;
 pub mod error;

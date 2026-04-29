@@ -22,6 +22,11 @@ thiserror = "2"
 # from `http::client`.
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
+# Compression backends, pre-approved per docs/ENGINEERING_STANDARDS.md §2.2.
+# We use only the streaming reader API plus `encode_all` for tests; the
+# default features (legacy decoders, dictionary builder, etc.) are not
+# needed and would expand the audit surface for no gain.
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 
