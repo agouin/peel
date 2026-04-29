@@ -212,6 +212,15 @@ impl TarSink {
                                 source,
                             })?;
                         *remaining -= want as u64;
+                        // Transition immediately when both data and
+                        // padding are exhausted. Without this guard,
+                        // a file whose size is an exact multiple of
+                        // 512 (so `padding == 0`) would loop into the
+                        // "both zero" arm below, return 0 consumed,
+                        // and trip the outer no-progress check.
+                        if *remaining == 0 && *padding == 0 {
+                            self.finish_file_state();
+                        }
                         want
                     } else if *padding > 0 {
                         let want = usize::from(*padding).min(input.len());
@@ -243,6 +252,12 @@ impl TarSink {
                             .min(input.len());
                         buf.extend_from_slice(&input[..want]);
                         *remaining -= want as u64;
+                        // Same alignment-fix rationale as the File
+                        // arm: a PAX header whose size is a multiple
+                        // of 512 would otherwise stall the parser.
+                        if *remaining == 0 && *padding == 0 {
+                            self.finish_pax_state()?;
+                        }
                         want
                     } else if *padding > 0 {
                         let want = usize::from(*padding).min(input.len());

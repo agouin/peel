@@ -90,6 +90,12 @@ pub enum ExtractorError {
     /// future refactor breaks the invariant.
     #[error("sink reported failure but the typed error was lost (internal invariant)")]
     SinkErrorLost,
+
+    /// The checkpoint observer registered via
+    /// [`Extractor::extract_with_callback`] returned an error. The
+    /// underlying cause is preserved for the coordinator to surface.
+    #[error("checkpoint observer aborted extraction")]
+    Observer(#[source] std::io::Error),
 }
 
 /// Tunables for [`Extractor::extract`].
@@ -108,6 +114,27 @@ impl Default for ExtractorConfig {
             punch_threshold: DEFAULT_PUNCH_THRESHOLD,
         }
     }
+}
+
+/// Snapshot passed to the [`Extractor::extract_with_callback`]
+/// observer on every quiescent advance.
+///
+/// The observer is the §10 coordinator's hook for writing a checkpoint
+/// at exactly the right moment: the decoder has just completed a frame
+/// **and** the sink reports it is at a member boundary, so the source
+/// position recorded here is a restart-safe point for resume.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointInfo {
+    /// Source byte offset immediately past the most recently completed
+    /// frame. Resume seeks the decoder back to this offset.
+    pub source_position: u64,
+    /// Total bytes consumed from the source by the decoder so far.
+    pub bytes_in: u64,
+    /// Total bytes the sink has accepted so far.
+    pub bytes_out: u64,
+    /// Running count of quiescent checkpoints observed in this run,
+    /// inclusive of this one. Useful for throttling cadence.
+    pub quiescent_index: u64,
 }
 
 /// Wall-clock and byte-volume statistics for one extraction.
@@ -207,10 +234,44 @@ impl Extractor {
         &self,
         source_fd: BorrowedFd<'_>,
         decoder: &mut dyn StreamingDecoder,
-        mut sink: S,
+        sink: S,
         puncher: &dyn PunchHole,
     ) -> Result<ExtractionStats, ExtractorError> {
-        let stats = self.run_loop(source_fd, decoder, &mut sink, puncher)?;
+        self.extract_with_callback(source_fd, decoder, sink, puncher, |_| Ok(()))
+    }
+
+    /// Like [`Self::extract`] but invokes `on_checkpoint` whenever the
+    /// extractor advances its quiescent-checkpoint position.
+    ///
+    /// The callback fires *before* the in-loop punch for that
+    /// position, so a coordinator using it to write a durable
+    /// checkpoint sees the discipline:
+    ///
+    /// 1. Decoder + sink report a quiescent boundary.
+    /// 2. Coordinator writes its checkpoint.
+    /// 3. Extractor punches the source up to the boundary.
+    ///
+    /// If the callback returns `Err`, the extractor stops and surfaces
+    /// the failure as [`ExtractorError::Observer`]; no further bytes
+    /// are written and no further punches issued.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::extract`], plus [`ExtractorError::Observer`] if
+    /// `on_checkpoint` returns `Err`.
+    pub fn extract_with_callback<S, F>(
+        &self,
+        source_fd: BorrowedFd<'_>,
+        decoder: &mut dyn StreamingDecoder,
+        mut sink: S,
+        puncher: &dyn PunchHole,
+        on_checkpoint: F,
+    ) -> Result<ExtractionStats, ExtractorError>
+    where
+        S: Sink,
+        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
+    {
+        let stats = self.run_loop(source_fd, decoder, &mut sink, puncher, on_checkpoint)?;
         sink.close().map_err(ExtractorError::Sink)?;
         Ok(stats)
     }
@@ -218,13 +279,18 @@ impl Extractor {
     /// Inner loop. Borrowing `&mut sink` here (rather than moving) is
     /// what lets [`Self::extract`] call `sink.close()` once the loop
     /// returns and the borrow is released.
-    fn run_loop<S: Sink>(
+    fn run_loop<S, F>(
         &self,
         source_fd: BorrowedFd<'_>,
         decoder: &mut dyn StreamingDecoder,
         sink: &mut S,
         puncher: &dyn PunchHole,
-    ) -> Result<ExtractionStats, ExtractorError> {
+        mut on_checkpoint: F,
+    ) -> Result<ExtractionStats, ExtractorError>
+    where
+        S: Sink,
+        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
+    {
         // Align to the puncher's preferred block boundary or 4 KiB,
         // whichever is larger. Misaligned tails are silently retained
         // by the kernel rather than treated as an error; aligning here
@@ -274,19 +340,32 @@ impl Extractor {
 
             stats.bytes_in = decoder.bytes_consumed().get();
 
-            // Update the checkpoint position when both the decoder
-            // reports a frame boundary and the sink is quiescent. The
-            // boundary value monotonically increases, so we only ever
-            // advance.
+            // Checkpoint discipline: only fire when the boundary
+            // *just* advanced AND the sink is quiescent in the same
+            // step. If we instead allowed firing on a later iteration
+            // (after the boundary changed), the sink might have
+            // already consumed bytes from frame N+1 — pairing an old
+            // `source_position` with a newer `bytes_out` and breaking
+            // resume's byte-identical guarantee.
             let boundary = decoder.frame_boundary().map(ByteOffset::get);
-            if boundary != last_observed_boundary && boundary.is_some() {
+            let boundary_advanced = boundary != last_observed_boundary && boundary.is_some();
+            if boundary_advanced {
                 stats.frame_boundaries_observed = stats.frame_boundaries_observed.saturating_add(1);
                 last_observed_boundary = boundary;
             }
-            if let Some(b) = boundary {
-                if adapter.sink.is_quiescent() && b > last_quiescent_at {
-                    last_quiescent_at = b;
-                    stats.quiescent_checkpoints = stats.quiescent_checkpoints.saturating_add(1);
+            if boundary_advanced {
+                if let Some(b) = boundary {
+                    if adapter.sink.is_quiescent() && b > last_quiescent_at {
+                        last_quiescent_at = b;
+                        stats.quiescent_checkpoints = stats.quiescent_checkpoints.saturating_add(1);
+                        let info = CheckpointInfo {
+                            source_position: b,
+                            bytes_in: stats.bytes_in,
+                            bytes_out: adapter.bytes_out,
+                            quiescent_index: stats.quiescent_checkpoints,
+                        };
+                        on_checkpoint(info).map_err(ExtractorError::Observer)?;
+                    }
                 }
             }
 

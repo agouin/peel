@@ -27,6 +27,12 @@ webpki-roots = "0.26"
 # default features (legacy decoders, dictionary builder, etc.) are not
 # needed and would expand the audit surface for no gain.
 zstd = { version = "0.13", default-features = false }
+# CLI argument parsing for the `peel` binary boundary; pre-approved per
+# docs/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
+clap = { version = "4", features = ["derive"] }
+# Application-level error reporting at the binary boundary, pre-approved
+# per docs/ENGINEERING_STANDARDS.md §2.2 / §3.2.
+anyhow = "1"
 
 [dev-dependencies]
 

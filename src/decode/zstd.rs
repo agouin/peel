@@ -210,11 +210,16 @@ impl StreamingDecoder for ZstdDecoder {
                         let boundary = count.saturating_sub(buffered);
                         self.last_frame_boundary = Some(ByteOffset::new(boundary));
                         self.state = State::BetweenFrames(buf_reader);
-                        // Fall through to BetweenFrames in the next
-                        // iteration so the caller observes either a
-                        // `MoreData` (next frame began) or `Eof`
-                        // (clean stream end) without having to call
-                        // again.
+                        // Return immediately so the caller can observe
+                        // the new frame_boundary and (if it owns a
+                        // checkpoint discipline) snapshot a `bytes_out`
+                        // that is paired exactly with this source
+                        // offset. Falling through to spin up the next
+                        // frame in the same call would let bytes_out
+                        // race past the boundary, which §10's resume
+                        // contract relies on.
+                        self.refresh_consumed_snapshot();
+                        return Ok(DecodeStatus::MoreData);
                     }
                     Ok(n) => {
                         sink.write_all(&self.output_buf[..n])
@@ -385,6 +390,49 @@ mod tests {
         assert_eq!(boundaries[0], frame_a.len() as u64, "frame A end");
         assert_eq!(boundaries[1], combined.len() as u64, "frame B end");
         assert_eq!(decoder.bytes_consumed().get(), combined.len() as u64);
+    }
+
+    /// Regression: when a frame's footer is reached, the decoder must
+    /// surface the new boundary *before* spinning up the next frame's
+    /// decoder in the same call. Otherwise §10's checkpoint discipline
+    /// records a `bytes_out` that includes bytes already produced from
+    /// the next frame, breaking byte-identical resume.
+    #[test]
+    fn frame_boundary_advance_pairs_with_unchanged_output() {
+        let payload_a = b"a".repeat(2048);
+        let payload_b = b"b".repeat(4096);
+        let frame_a = ::zstd::encode_all(&payload_a[..], 1).expect("encode A");
+        let frame_b = ::zstd::encode_all(&payload_b[..], 1).expect("encode B");
+        let mut combined = frame_a.clone();
+        combined.extend_from_slice(&frame_b);
+
+        let mut decoder =
+            ZstdDecoder::new(Box::new(Cursor::new(combined.clone()))).expect("construct");
+
+        let mut sink = Vec::new();
+        let mut prior_boundary = decoder.frame_boundary();
+        loop {
+            let bytes_before = sink.len() as u64;
+            let status = decoder.decode_step(&mut sink).expect("decode_step");
+            let next_boundary = decoder.frame_boundary();
+            if next_boundary != prior_boundary {
+                let bytes_after = sink.len() as u64;
+                assert_eq!(
+                    bytes_after, bytes_before,
+                    "frame-boundary-advance step must not produce output: \
+                     before={bytes_before} after={bytes_after}",
+                );
+                prior_boundary = next_boundary;
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+
+        // Sanity: decoded output is the concatenation of payload A and B.
+        let mut expected = payload_a;
+        expected.extend_from_slice(&payload_b);
+        assert_eq!(sink, expected);
     }
 
     /// `bytes_consumed` is monotonically non-decreasing across every

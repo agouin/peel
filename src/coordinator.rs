@@ -1,0 +1,1277 @@
+//! The §10 coordinator: ties the download scheduler, the extractor, and
+//! the checkpoint module together into one resumable pipeline.
+//!
+//! [`run`] is the single public entry point. It opens (or reuses) the
+//! sparse `<output>.peel.part` and `<output>.peel.ckpt` files alongside
+//! the user's chosen output, issues a `HEAD` to discover the source's
+//! size and identity, and either starts a fresh extraction or resumes an
+//! existing one off the on-disk checkpoint.
+//!
+//! # Threading
+//!
+//! The download scheduler runs on a background thread. The extractor
+//! runs on the calling thread. They communicate through three pieces of
+//! shared state:
+//!
+//! - the [`SparseFile`] — workers write chunks at offset, the extractor
+//!   reads sequentially from the front;
+//! - the [`ChunkBitmap`] — workers mark complete chunks, the extractor
+//!   blocks on the bit for the chunk it needs next;
+//! - the cursor [`AtomicU64`] — the extractor advances it as it reads,
+//!   the scheduler biases dispatch toward chunks at or past the cursor.
+//!
+//! When the download thread exits (success or error) it sets a shared
+//! `download_done` flag and stashes its result in a mutex; the extractor's
+//! [`BlockingSparseReader`] checks both whenever it is about to block on
+//! a missing chunk.
+//!
+//! # Checkpoint cadence
+//!
+//! Quiescent advances fire many times a second on a fast pipeline.
+//! Writing a checkpoint on every one would be wasteful. The coordinator
+//! throttles: it writes a new checkpoint when *either* (a) at least
+//! [`CoordinatorConfig::checkpoint_min_bytes`] bytes of source progress
+//! have been made since the last write, or (b) at least
+//! [`CoordinatorConfig::checkpoint_min_interval`] of wall-clock time has
+//! elapsed since the last write. Either floor catches the slow case
+//! (small archive, fast network) and the fast case (large archive,
+//! slow disk).
+//!
+//! # Cleanup on success
+//!
+//! On a clean run the coordinator deletes `.peel.part` and
+//! `.peel.ckpt`. Failures leave them in place so the next invocation
+//! resumes. The output (the extracted directory or the raw output file)
+//! is never deleted on failure — partial extraction state is the user's
+//! to inspect.
+
+#![cfg(unix)]
+
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
+
+use thiserror::Error;
+
+use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
+use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
+use crate::decode::{DecodeError, DecoderRegistry, StreamingDecoder};
+use crate::download::{
+    chunk_count, discover, run as run_scheduler, DownloadInfo, DownloadStats, RetryConfig,
+    SchedulerConfig, SchedulerError, SourceFingerprint, SparseFile, SparseFileError,
+    DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
+};
+use crate::extractor::{
+    CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
+    DEFAULT_PUNCH_THRESHOLD,
+};
+use crate::http::{Client, ClientError, Url, UrlError};
+use crate::punch::{default_puncher, NoopPuncher, PunchHole};
+use crate::sink::{RawSink, Sink, SinkError, TarSink};
+use crate::types::{ByteOffset, ChunkIndex};
+
+/// What kind of output the coordinator should produce.
+#[derive(Debug, Clone)]
+pub enum OutputTarget {
+    /// Stream the decoded bytes verbatim into a single file.
+    File(PathBuf),
+    /// Extract the decoded archive (tar) into the given directory.
+    /// The directory must exist (the coordinator will create it if
+    /// missing).
+    Dir(PathBuf),
+}
+
+impl OutputTarget {
+    /// Path the .peel.part / .peel.ckpt sidecars are placed alongside.
+    fn anchor(&self) -> &Path {
+        match self {
+            Self::File(p) | Self::Dir(p) => p.as_path(),
+        }
+    }
+
+    /// `true` when this target is a tar extraction directory.
+    fn is_dir(&self) -> bool {
+        matches!(self, Self::Dir(_))
+    }
+}
+
+/// Tunable knobs for [`run`].
+#[derive(Debug, Clone)]
+pub struct CoordinatorConfig {
+    /// HTTP-side: chunk size used when slicing the source for parallel
+    /// ranged downloads.
+    pub chunk_size: u64,
+    /// HTTP-side: number of parallel download workers.
+    pub workers: u32,
+    /// Per-chunk retry policy (forwarded to the scheduler).
+    pub retry: RetryConfig,
+    /// Extractor-side: minimum gap between in-loop punch syscalls.
+    pub punch_threshold: u64,
+    /// Minimum source-byte progress between checkpoint writes.
+    pub checkpoint_min_bytes: u64,
+    /// Minimum wall-clock time between checkpoint writes.
+    pub checkpoint_min_interval: Duration,
+    /// Override the .peel.part / .peel.ckpt anchor (defaults to the
+    /// output path itself). Set this for tests that point inputs and
+    /// outputs at different temp directories.
+    pub workdir: Option<PathBuf>,
+    /// Sleep between polls when the [`BlockingSparseReader`] is waiting
+    /// on a chunk that hasn't been downloaded yet. Tests use a small
+    /// value; production is fine with the default.
+    pub reader_poll_interval: Duration,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            workers: DEFAULT_WORKERS,
+            retry: RetryConfig::default(),
+            punch_threshold: DEFAULT_PUNCH_THRESHOLD,
+            checkpoint_min_bytes: 8 * 1024 * 1024,
+            checkpoint_min_interval: Duration::from_secs(2),
+            workdir: None,
+            reader_poll_interval: Duration::from_millis(5),
+        }
+    }
+}
+
+/// Caller-supplied progress callback fired periodically while [`run`]
+/// is running. Errors returned here surface as
+/// [`CoordinatorError::Progress`] and abort the run.
+pub type ProgressFn = Box<dyn FnMut(ProgressEvent<'_>) + Send>;
+
+/// Diagnostic events the coordinator emits during a run.
+///
+/// The trait-object indirection keeps the public API ergonomic for
+/// callers that just want to print progress; tests pass a counting
+/// closure to verify cadence.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent<'a> {
+    /// Discovery completed; the run is starting.
+    Started {
+        /// The source URL after redirects.
+        url: &'a Url,
+        /// Total source size in bytes.
+        total_size: u64,
+        /// True if a prior checkpoint was found and is being resumed.
+        resuming: bool,
+        /// Total chunks the source was sliced into.
+        total_chunks: u32,
+        /// Chunks already complete on entry (resume case).
+        chunks_resumed: u32,
+    },
+    /// A checkpoint was written.
+    CheckpointWritten {
+        /// Source byte offset the checkpoint refers to.
+        source_position: u64,
+        /// Bytes the decoder has consumed so far.
+        bytes_in: u64,
+        /// Bytes the sink has accepted so far.
+        bytes_out: u64,
+    },
+    /// The run finished cleanly.
+    Finished {
+        /// Aggregated download statistics.
+        download: DownloadStats,
+        /// Aggregated extraction statistics.
+        extraction: ExtractionStats,
+    },
+}
+
+/// Knobs the [`run`] entry point asks the caller to supply.
+pub struct RunArgs {
+    /// Source URL (the `peel` CLI's positional argument).
+    pub url: String,
+    /// Where extracted output goes.
+    pub output: OutputTarget,
+    /// Tunables. Pass [`CoordinatorConfig::default`] for production.
+    pub config: CoordinatorConfig,
+    /// HTTP client. Tests inject one configured against the mock
+    /// server; the default binary just calls [`Client::new`].
+    pub client: Client,
+    /// Decoder registry. The default is
+    /// [`DecoderRegistry::with_defaults`].
+    pub registry: DecoderRegistry,
+    /// Optional progress callback.
+    pub progress: Option<ProgressFn>,
+    /// Optional shared atomic flag. When the flag transitions to
+    /// `true` between checkpoint writes, the coordinator aborts with
+    /// [`CoordinatorError::Aborted`], leaving the most recently
+    /// written `.peel.part` and `.peel.ckpt` durable on disk so the
+    /// next invocation can resume.
+    ///
+    /// This is the test-side hook the §10.3 crash-test harness uses
+    /// to simulate `kill -9` at random points; production callers
+    /// leave it `None`.
+    pub kill_switch: Option<Arc<AtomicBool>>,
+}
+
+/// Aggregate result of a successful [`run`].
+#[derive(Debug, Clone)]
+pub struct RunStats {
+    /// Source URL after redirects.
+    pub final_url: Url,
+    /// Total source size in bytes.
+    pub total_size: u64,
+    /// Whether the run resumed an existing checkpoint.
+    pub resumed: bool,
+    /// Aggregated download statistics.
+    pub download: DownloadStats,
+    /// Aggregated extraction statistics.
+    pub extraction: ExtractionStats,
+    /// Wall-clock time spent inside [`run`].
+    pub elapsed: Duration,
+}
+
+/// Errors produced by [`run`].
+#[derive(Debug, Error)]
+pub enum CoordinatorError {
+    /// The user-supplied URL did not parse.
+    #[error("invalid URL {url:?}")]
+    InvalidUrl {
+        /// The URL the user passed.
+        url: String,
+        /// Underlying parse error.
+        #[source]
+        source: UrlError,
+    },
+
+    /// Building the HTTP client failed.
+    #[error("HTTP client setup failed")]
+    Client(#[source] ClientError),
+
+    /// The download scheduler failed.
+    #[error("download failed")]
+    Scheduler(#[source] SchedulerError),
+
+    /// The extractor failed.
+    #[error("extraction failed")]
+    Extractor(#[source] ExtractorError),
+
+    /// A sink error surfaced before extraction started (e.g. building
+    /// the resume sink failed).
+    #[error("sink setup failed")]
+    Sink(#[source] SinkError),
+
+    /// Decoder factory rejected the source on construction.
+    #[error("decoder construction failed")]
+    Decode(#[source] DecodeError),
+
+    /// No decoder is registered for the resolved URL's filename.
+    #[error("no decoder registered for {filename:?}")]
+    NoDecoder {
+        /// Filename component the registry was looked up against.
+        filename: String,
+    },
+
+    /// The output URL has no usable filename component to look up a
+    /// decoder by suffix.
+    #[error("URL {url:?} has no filename to derive a decoder from")]
+    NoFilename {
+        /// The URL being inspected.
+        url: String,
+    },
+
+    /// IO setting up or tearing down a coordinator-owned file.
+    #[error("io error operating on {path}")]
+    Io {
+        /// File involved.
+        path: PathBuf,
+        /// Underlying OS error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The sparse output file failed an operation.
+    #[error("sparse file operation failed")]
+    SparseFile(#[source] SparseFileError),
+
+    /// Reading or writing a checkpoint failed.
+    #[error("checkpoint operation failed")]
+    Checkpoint(#[source] CheckpointError),
+
+    /// A checkpoint exists but its bitmap could not be deserialized.
+    #[error("checkpoint bitmap is corrupt")]
+    CheckpointBitmap(#[source] BitmapDecodeError),
+
+    /// The recorded checkpoint refers to a different source than the
+    /// one the user asked us to fetch — either the URL changed, the
+    /// total size changed, or the ETag/Last-Modified moved.
+    #[error("source identity changed since the prior checkpoint: {reason}")]
+    SourceChanged {
+        /// Human-readable summary of the discrepancy.
+        reason: String,
+    },
+
+    /// The configured chunk count overflowed `u32`.
+    #[error("source too large for the configured chunk size: {chunks} chunks")]
+    TooManyChunks {
+        /// How many chunks the source would need.
+        chunks: u64,
+    },
+
+    /// The download thread panicked.
+    #[error("download thread panicked")]
+    DownloadPanicked,
+
+    /// The caller's [`RunArgs::kill_switch`] flipped to `true`
+    /// between checkpoint writes. The .peel.part / .peel.ckpt
+    /// sidecars are intentionally left on disk so the next call
+    /// resumes.
+    #[error("aborted by kill switch after {checkpoints_written} checkpoints")]
+    Aborted {
+        /// How many checkpoint writes had already completed at the
+        /// moment of the abort.
+        checkpoints_written: u64,
+    },
+}
+
+/// Run the full pipeline.
+///
+/// # Errors
+///
+/// Any of the [`CoordinatorError`] variants. On error the `.peel.part`
+/// and `.peel.ckpt` sidecars are left on disk so the next invocation
+/// resumes.
+pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
+    let started = Instant::now();
+    let RunArgs {
+        url,
+        output,
+        config,
+        client,
+        registry,
+        mut progress,
+        kill_switch,
+    } = args;
+
+    let parsed_url = Url::parse(&url).map_err(|source| CoordinatorError::InvalidUrl {
+        url: url.clone(),
+        source,
+    })?;
+
+    let info = discover(&client, &parsed_url).map_err(CoordinatorError::Scheduler)?;
+
+    let part_path = sidecar_path(&output, &config, ".peel.part");
+    let ckpt_path = sidecar_path(&output, &config, ".peel.ckpt");
+
+    ensure_parent_dir(&part_path)?;
+    ensure_parent_dir(&ckpt_path)?;
+    if let OutputTarget::Dir(d) = &output {
+        fs::create_dir_all(d).map_err(|source| CoordinatorError::Io {
+            path: d.clone(),
+            source,
+        })?;
+    }
+
+    let prior = Checkpoint::read(&ckpt_path).map_err(CoordinatorError::Checkpoint)?;
+    let resume_plan = build_resume_plan(prior.as_ref(), &info, &url, &config, &output)?;
+    let resuming = matches!(resume_plan, ResumePlan::Resume { .. });
+
+    let total_chunks = chunk_count(info.total_size, config.chunk_size).map_err(|e| match e {
+        SchedulerError::TooManyChunks { chunks, .. } => CoordinatorError::TooManyChunks { chunks },
+        other => CoordinatorError::Scheduler(other),
+    })?;
+
+    // Build the bitmap. If we're resuming, repopulate it from the
+    // checkpoint's serialized form; otherwise start empty.
+    let bitmap = match &resume_plan {
+        ResumePlan::Fresh => Arc::new(ChunkBitmap::new(total_chunks)),
+        ResumePlan::Resume { bitmap_bytes, .. } => Arc::new(
+            ChunkBitmap::from_bytes(total_chunks, bitmap_bytes)
+                .map_err(CoordinatorError::CheckpointBitmap)?,
+        ),
+    };
+
+    let chunks_resumed = u32::try_from(bitmap.count_complete()).unwrap_or(u32::MAX);
+
+    let sparse = Arc::new(
+        SparseFile::open_or_create(&part_path, info.total_size)
+            .map_err(CoordinatorError::SparseFile)?,
+    );
+
+    let cursor = Arc::new(AtomicU64::new(match &resume_plan {
+        ResumePlan::Fresh => 0,
+        ResumePlan::Resume {
+            decoder_position, ..
+        } => *decoder_position,
+    }));
+
+    if let Some(cb) = progress.as_mut() {
+        cb(ProgressEvent::Started {
+            url: &info.url,
+            total_size: info.total_size,
+            resuming,
+            total_chunks,
+            chunks_resumed,
+        });
+    }
+
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size: config.chunk_size,
+        workers: config.workers,
+        retry: config.retry.clone(),
+    };
+
+    let download_done = Arc::new(AtomicBool::new(false));
+    let download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>> =
+        Arc::new(Mutex::new(None));
+
+    let total_size = info.total_size;
+    let chunk_size = config.chunk_size;
+
+    let extraction_outcome =
+        thread::scope(|scope| -> Result<ExtractionOutcome, CoordinatorError> {
+            // Spawn the download thread.
+            let dl_done = Arc::clone(&download_done);
+            let dl_outcome = Arc::clone(&download_outcome);
+            let dl_sparse = Arc::clone(&sparse);
+            let dl_bitmap = Arc::clone(&bitmap);
+            let dl_cursor = Arc::clone(&cursor);
+            let dl_info = info.clone();
+            let dl_client = client.clone();
+            let dl_cfg = scheduler_cfg.clone();
+            let dl_handle = thread::Builder::new()
+                .name("peel-download-scheduler".into())
+                .spawn_scoped(scope, move || {
+                    let result = run_scheduler(
+                        &dl_client, &dl_info, &dl_sparse, &dl_bitmap, &dl_cursor, &dl_cfg,
+                    );
+                    if let Ok(mut slot) = dl_outcome.lock() {
+                        *slot = Some(result);
+                    }
+                    dl_done.store(true, Ordering::Release);
+                })
+                .map_err(|source| CoordinatorError::Io {
+                    path: PathBuf::from("<spawn-download>"),
+                    source,
+                })?;
+
+            // Build the blocking reader that feeds the decoder. It starts
+            // at `decoder_position` for resume, or 0 for fresh runs.
+            let reader_start = cursor.load(Ordering::Acquire);
+            let reader = BlockingSparseReader::new(
+                Arc::clone(&sparse),
+                Arc::clone(&bitmap),
+                chunk_size,
+                total_size,
+                reader_start,
+                Arc::clone(&download_done),
+                Arc::clone(&download_outcome),
+                config.reader_poll_interval,
+            );
+
+            // Pick the decoder factory off the URL's filename.
+            let factory = registry
+                .factory_for_path(Path::new(info.url.path()))
+                .or_else(|| {
+                    filename_from_url(&info.url).and_then(|n| registry.factory_for_name(&n))
+                })
+                .ok_or_else(|| {
+                    let filename =
+                        filename_from_url(&info.url).unwrap_or_else(|| info.url.path().to_string());
+                    CoordinatorError::NoDecoder { filename }
+                })?;
+
+            let mut decoder = factory(Box::new(reader)).map_err(CoordinatorError::Decode)?;
+
+            // Run the extractor with a checkpoint observer that writes a
+            // durable checkpoint every time the cadence floor fires.
+            let extractor = Extractor::new(ExtractorConfig {
+                punch_threshold: config.punch_threshold,
+            });
+            let puncher: Box<dyn PunchHole> = default_puncher();
+
+            let extraction_stats = match &output {
+                OutputTarget::File(path) => {
+                    let sink = build_raw_sink(path, &resume_plan)?;
+                    run_one(
+                        &extractor,
+                        &sparse,
+                        &mut *decoder,
+                        sink,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &part_path,
+                        &info,
+                        &url,
+                        &bitmap,
+                        chunk_size,
+                        &output,
+                        &config,
+                        progress.as_mut(),
+                        kill_switch.as_ref(),
+                    )?
+                }
+                OutputTarget::Dir(path) => {
+                    let sink = build_tar_sink(path, &resume_plan)?;
+                    run_one(
+                        &extractor,
+                        &sparse,
+                        &mut *decoder,
+                        sink,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &part_path,
+                        &info,
+                        &url,
+                        &bitmap,
+                        chunk_size,
+                        &output,
+                        &config,
+                        progress.as_mut(),
+                        kill_switch.as_ref(),
+                    )?
+                }
+            };
+
+            // Wait for the download thread to drain. By the time the
+            // extractor reaches EOF, the bitmap is fully populated and
+            // workers are exiting.
+            dl_handle
+                .join()
+                .map_err(|_| CoordinatorError::DownloadPanicked)?;
+            let download_stats = match download_outcome.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => None,
+            };
+            let download_stats = match download_stats {
+                Some(Ok(s)) => s,
+                Some(Err(e)) => return Err(CoordinatorError::Scheduler(e)),
+                None => DownloadStats::default(),
+            };
+
+            Ok(ExtractionOutcome {
+                extraction: extraction_stats,
+                download: download_stats,
+            })
+        })?;
+
+    // Drop the sparse file so the puncher's borrowed fd is no longer
+    // alive, then delete the sidecars.
+    drop(sparse);
+    fs::remove_file(&part_path).ok();
+    fs::remove_file(&ckpt_path).ok();
+    fs::remove_file(crate::checkpoint::tmp_path_for(&ckpt_path)).ok();
+
+    let outcome = RunStats {
+        final_url: info.url,
+        total_size: info.total_size,
+        resumed: resuming,
+        download: extraction_outcome.download.clone(),
+        extraction: extraction_outcome.extraction,
+        elapsed: started.elapsed(),
+    };
+
+    if let Some(cb) = progress.as_mut() {
+        cb(ProgressEvent::Finished {
+            download: outcome.download.clone(),
+            extraction: outcome.extraction,
+        });
+    }
+
+    Ok(outcome)
+}
+
+/// Internal: ferry the two stats blobs out of the scoped thread block.
+struct ExtractionOutcome {
+    extraction: ExtractionStats,
+    download: DownloadStats,
+}
+
+/// What [`build_resume_plan`] decides to do with a prior checkpoint.
+#[derive(Debug)]
+enum ResumePlan {
+    Fresh,
+    Resume {
+        decoder_position: u64,
+        bitmap_bytes: Vec<u8>,
+        sink_state: SinkState,
+    },
+}
+
+/// Decide whether to resume off `prior` or start fresh.
+fn build_resume_plan(
+    prior: Option<&Checkpoint>,
+    info: &DownloadInfo,
+    requested_url: &str,
+    config: &CoordinatorConfig,
+    output: &OutputTarget,
+) -> Result<ResumePlan, CoordinatorError> {
+    let Some(prior) = prior else {
+        return Ok(ResumePlan::Fresh);
+    };
+
+    if prior.url != requested_url && prior.url != info.url.to_string() {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint URL was {:?}, current request is {:?}",
+                prior.url, requested_url
+            ),
+        });
+    }
+    if prior.total_size != info.total_size {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint total_size was {}, current source is {}",
+                prior.total_size, info.total_size
+            ),
+        });
+    }
+    if prior.chunk_size != config.chunk_size {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint chunk_size was {}, current chunk_size is {}",
+                prior.chunk_size, config.chunk_size
+            ),
+        });
+    }
+    if !fingerprint_matches(prior, &info.fingerprint) {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "ETag/Last-Modified changed (was etag={:?} last_modified={:?}, \
+                 now etag={:?} last_modified={:?})",
+                prior.etag,
+                prior.last_modified,
+                info.fingerprint.etag,
+                info.fingerprint.last_modified,
+            ),
+        });
+    }
+    let sink_compat = matches!(
+        (output, &prior.sink_state),
+        (OutputTarget::File(_), SinkState::Raw { .. })
+            | (OutputTarget::Dir(_), SinkState::Tar { .. })
+    );
+    if !sink_compat {
+        return Err(CoordinatorError::SourceChanged {
+            reason: "checkpoint sink type does not match the requested output".into(),
+        });
+    }
+    Ok(ResumePlan::Resume {
+        decoder_position: prior.decoder_position.get(),
+        bitmap_bytes: prior.bitmap_completed.clone(),
+        sink_state: prior.sink_state.clone(),
+    })
+}
+
+fn fingerprint_matches(prior: &Checkpoint, fingerprint: &SourceFingerprint) -> bool {
+    if let (Some(a), Some(b)) = (&prior.etag, &fingerprint.etag) {
+        if a != b {
+            return false;
+        }
+    }
+    if let (Some(a), Some(b)) = (&prior.last_modified, &fingerprint.last_modified) {
+        if a != b {
+            return false;
+        }
+    }
+    // If neither side carries an identifier we fall through and accept
+    // the resume; we cannot prove the source unchanged but neither can
+    // a fresh `HEAD`, so the only honest move is to take the user's
+    // request at face value.
+    true
+}
+
+/// Internal: build the RawSink for either fresh or resumed mode.
+fn build_raw_sink(path: &Path, plan: &ResumePlan) -> Result<RawSink, CoordinatorError> {
+    let sink = match plan {
+        ResumePlan::Fresh => RawSink::create(path).map_err(CoordinatorError::Sink)?,
+        ResumePlan::Resume { sink_state, .. } => {
+            let SinkState::Raw { bytes_written } = sink_state else {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is Tar but output is a File".into(),
+                });
+            };
+            RawSink::resume(path, *bytes_written).map_err(CoordinatorError::Sink)?
+        }
+    };
+    Ok(sink)
+}
+
+/// Internal: build the TarSink for either fresh or resumed mode.
+///
+/// On resume we just construct a fresh sink: the decoded byte stream
+/// picks up at a member boundary (the checkpoint discipline guarantees
+/// that), so the sink starts processing the next member's header
+/// immediately. Already-extracted members on disk are left alone.
+fn build_tar_sink(path: &Path, _plan: &ResumePlan) -> Result<TarSink, CoordinatorError> {
+    TarSink::new(path).map_err(CoordinatorError::Sink)
+}
+
+/// Internal: drive the extractor with a checkpoint-writing observer.
+#[allow(clippy::too_many_arguments)]
+fn run_one<S: Sink>(
+    extractor: &Extractor,
+    sparse: &SparseFile,
+    decoder: &mut dyn StreamingDecoder,
+    sink: S,
+    puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    part_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
+    bitmap: &ChunkBitmap,
+    chunk_size: u64,
+    output: &OutputTarget,
+    config: &CoordinatorConfig,
+    progress: Option<&mut ProgressFn>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+) -> Result<ExtractionStats, CoordinatorError> {
+    let mut last_write_at = Instant::now()
+        .checked_sub(config.checkpoint_min_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_position: u64 = 0;
+    let mut progress_inner = progress;
+    let mut checkpoints_written: u64 = 0;
+    // Sentinel io::Error message used when the kill switch fires; the
+    // caller pattern-matches on this to surface a typed
+    // `CoordinatorError::Aborted` rather than a generic Extractor
+    // failure.
+    const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
+
+    let result = extractor.extract_with_callback(
+        sparse.as_fd(),
+        decoder,
+        sink,
+        puncher,
+        |info_cb: CheckpointInfo| -> io::Result<()> {
+            // Throttle: write at most once per cadence floor.
+            let elapsed = last_write_at.elapsed();
+            let progressed = info_cb.source_position.saturating_sub(last_position);
+            if progressed < config.checkpoint_min_bytes && elapsed < config.checkpoint_min_interval
+            {
+                return Ok(());
+            }
+
+            // Crash-test hook. We test the kill switch *before*
+            // writing so the count of durable checkpoints exactly
+            // matches the value the caller observed.
+            if let Some(flag) = kill_switch {
+                if flag.load(Ordering::Acquire) {
+                    return Err(io::Error::other(KILL_SENTINEL));
+                }
+            }
+
+            // Flush the sparse file's pending writes so the bitmap's
+            // claim of "this chunk is durable" is honest. This is
+            // best-effort; a failure here surfaces to the extractor as
+            // an Observer error.
+            sparse
+                .sync_all()
+                .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
+
+            let sink_state = sink_state_for(output, info_cb.bytes_out);
+            let ckpt = Checkpoint {
+                url: requested_url.to_string(),
+                etag: info.fingerprint.etag.clone(),
+                last_modified: info.fingerprint.last_modified.clone(),
+                total_size: info.total_size,
+                chunk_size,
+                decoder_position: ByteOffset::new(info_cb.source_position),
+                bitmap_completed: bitmap.to_bytes(),
+                created_at: SystemTime::now(),
+                sink_state,
+            };
+            ckpt.write(ckpt_path)
+                .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+
+            last_write_at = Instant::now();
+            last_position = info_cb.source_position;
+            checkpoints_written = checkpoints_written.saturating_add(1);
+            if let Some(cb) = progress_inner.as_deref_mut() {
+                cb(ProgressEvent::CheckpointWritten {
+                    source_position: info_cb.source_position,
+                    bytes_in: info_cb.bytes_in,
+                    bytes_out: info_cb.bytes_out,
+                });
+            }
+            Ok(())
+        },
+    );
+
+    // Avoid unused-variable warnings even when no `Err` path runs.
+    let _ = part_path;
+    match result {
+        Ok(stats) => Ok(stats),
+        Err(ExtractorError::Observer(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Extractor(other)),
+    }
+}
+
+/// Compute the appropriate [`SinkState`] for the configured output and
+/// the current sink-byte counter. Tar's `members_completed` is left
+/// empty here; we don't track member names through the extractor's
+/// callback in the MVP. The on-disk artifacts are what carry the
+/// resume signal for tar.
+fn sink_state_for(output: &OutputTarget, bytes_out: u64) -> SinkState {
+    if output.is_dir() {
+        SinkState::Tar {
+            members_completed: Vec::new(),
+        }
+    } else {
+        SinkState::Raw {
+            bytes_written: bytes_out,
+        }
+    }
+}
+
+/// Compute `<anchor> + suffix` for the .peel.part / .peel.ckpt
+/// sidecars, optionally redirected to `config.workdir`.
+fn sidecar_path(output: &OutputTarget, config: &CoordinatorConfig, suffix: &str) -> PathBuf {
+    let anchor = output.anchor();
+    let basename = anchor
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("output"));
+    let parent = config
+        .workdir
+        .clone()
+        .or_else(|| anchor.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut name = basename.into_os_string();
+    name.push(suffix);
+    parent.join(PathBuf::from(name))
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), CoordinatorError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|source| CoordinatorError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn filename_from_url(url: &Url) -> Option<String> {
+    let path = url.path().split('?').next()?;
+    let last = path.rsplit('/').next()?;
+    if last.is_empty() {
+        None
+    } else {
+        Some(last.to_string())
+    }
+}
+
+/// `Read` adapter that feeds the decoder from the sparse file,
+/// blocking when the chunk it needs hasn't been downloaded yet.
+///
+/// Construct via [`Self::new`]; the type owns its own cursor. The
+/// scheduler reads `cursor` to bias dispatch toward the chunk the
+/// decoder is about to need.
+pub struct BlockingSparseReader {
+    sparse: Arc<SparseFile>,
+    bitmap: Arc<ChunkBitmap>,
+    chunk_size: u64,
+    total_size: u64,
+    cursor: Arc<AtomicU64>,
+    download_done: Arc<AtomicBool>,
+    download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    poll_interval: Duration,
+}
+
+impl BlockingSparseReader {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        sparse: Arc<SparseFile>,
+        bitmap: Arc<ChunkBitmap>,
+        chunk_size: u64,
+        total_size: u64,
+        start_offset: u64,
+        download_done: Arc<AtomicBool>,
+        download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+        poll_interval: Duration,
+    ) -> Self {
+        // Coordinator-level invariant: the cursor was set to
+        // start_offset before construction; we don't reset it here so
+        // the scheduler can't observe a transient regression.
+        let cursor = Arc::new(AtomicU64::new(start_offset));
+        Self {
+            sparse,
+            bitmap,
+            chunk_size,
+            total_size,
+            cursor,
+            download_done,
+            download_outcome,
+            poll_interval,
+        }
+    }
+}
+
+impl Read for BlockingSparseReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let pos = self.cursor.load(Ordering::Acquire);
+            if pos >= self.total_size {
+                return Ok(0);
+            }
+
+            // Identify the chunk this position lives in. If chunk_size
+            // is somehow zero we already rejected at config time, but
+            // we still saturate to avoid div-by-zero.
+            if self.chunk_size == 0 {
+                return Err(io::Error::other("zero chunk_size"));
+            }
+            let chunk_idx = (pos / self.chunk_size) as u32;
+            if !self.bitmap.is_complete(ChunkIndex::new(chunk_idx)) {
+                if self.download_done.load(Ordering::Acquire) {
+                    if let Ok(mut slot) = self.download_outcome.lock() {
+                        if let Some(Err(e)) = slot.take() {
+                            return Err(io::Error::other(format!("download failed: {e}")));
+                        }
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "download finished but chunk {chunk_idx} (cursor {pos}) is not \
+                             complete"
+                        ),
+                    ));
+                }
+                thread::sleep(self.poll_interval);
+                continue;
+            }
+
+            let want = self.total_size.saturating_sub(pos).min(buf.len() as u64) as usize;
+            // Also stop at the end of the current chunk so we don't
+            // accidentally read into a chunk that hasn't been claimed
+            // yet.
+            let chunk_end = u64::from(chunk_idx)
+                .saturating_add(1)
+                .saturating_mul(self.chunk_size)
+                .min(self.total_size);
+            let chunk_remaining = chunk_end.saturating_sub(pos) as usize;
+            let want = want.min(chunk_remaining);
+            if want == 0 {
+                return Ok(0);
+            }
+            let n = self
+                .sparse
+                .read_at(ByteOffset::new(pos), &mut buf[..want])
+                .map_err(|e| io::Error::other(format!("sparse read: {e}")))?;
+            if n == 0 {
+                // Defensive: the sparse file is sized to total_size, so
+                // a short read of zero here is unexpected. Surface as
+                // an io error rather than spinning.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("short read from sparse file at offset {pos}"),
+                ));
+            }
+            self.cursor.fetch_add(n as u64, Ordering::Release);
+            return Ok(n);
+        }
+    }
+}
+
+// Marker re-export so the unused-import warning doesn't fire when the
+// `Read` import is only used through trait dispatch.
+#[allow(dead_code)]
+const _: fn() = || {
+    let _ = NoopPuncher::new();
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicU64;
+
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("peel_coord_unit_{label}_{pid}_{nanos}_{n}"))
+    }
+
+    fn sample_info(total_size: u64) -> DownloadInfo {
+        DownloadInfo {
+            url: Url::parse("https://example.com/x.tar.zst").expect("parse"),
+            total_size,
+            fingerprint: SourceFingerprint {
+                etag: Some("\"abc\"".into()),
+                last_modified: None,
+            },
+            accept_ranges: true,
+        }
+    }
+
+    fn sample_checkpoint(url: &str, total_size: u64, chunk_size: u64) -> Checkpoint {
+        Checkpoint {
+            url: url.into(),
+            etag: Some("\"abc\"".into()),
+            last_modified: None,
+            total_size,
+            chunk_size,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![],
+            created_at: SystemTime::now(),
+            sink_state: SinkState::Tar {
+                members_completed: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn build_resume_plan_returns_fresh_when_no_checkpoint() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let plan = build_resume_plan(None, &info, "https://example.com/x.tar.zst", &cfg, &output)
+            .expect("plan");
+        assert!(matches!(plan, ResumePlan::Fresh));
+    }
+
+    #[test]
+    fn build_resume_plan_resumes_when_everything_matches() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let plan = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect("plan");
+        assert!(matches!(plan, ResumePlan::Resume { .. }));
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_etag_change() {
+        let mut info = sample_info(1024);
+        info.fingerprint.etag = Some("\"changed\"".into());
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        match err {
+            CoordinatorError::SourceChanged { reason } => {
+                assert!(reason.contains("ETag") || reason.contains("etag"));
+            }
+            other => panic!("expected SourceChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_size_change() {
+        let info = sample_info(2048);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        match err {
+            CoordinatorError::SourceChanged { reason } => {
+                assert!(reason.contains("total_size"));
+            }
+            other => panic!("expected SourceChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_url_mismatch() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://other.example/y.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        match err {
+            CoordinatorError::SourceChanged { reason } => {
+                assert!(reason.contains("URL"));
+            }
+            other => panic!("expected SourceChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_sink_kind_mismatch() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        // Prior was Tar, request is File.
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::File(PathBuf::from("/tmp/y.bin"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        assert!(matches!(err, CoordinatorError::SourceChanged { .. }));
+    }
+
+    #[test]
+    fn sidecar_paths_alongside_output_by_default() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let part = sidecar_path(&output, &cfg, ".peel.part");
+        let ckpt = sidecar_path(&output, &cfg, ".peel.ckpt");
+        assert_eq!(part, PathBuf::from("/tmp/peel_test/out.bin.peel.part"));
+        assert_eq!(ckpt, PathBuf::from("/tmp/peel_test/out.bin.peel.ckpt"));
+    }
+
+    #[test]
+    fn sidecar_paths_redirected_to_workdir_when_set() {
+        let cfg = CoordinatorConfig {
+            workdir: Some(PathBuf::from("/var/peel/work")),
+            ..CoordinatorConfig::default()
+        };
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let part = sidecar_path(&output, &cfg, ".peel.part");
+        assert_eq!(part, PathBuf::from("/var/peel/work/out.bin.peel.part"));
+    }
+
+    #[test]
+    fn filename_from_url_extracts_basename() {
+        let u = Url::parse("https://host.example/path/to/file.tar.zst?cache=1").expect("parse");
+        assert_eq!(filename_from_url(&u).as_deref(), Some("file.tar.zst"));
+    }
+
+    #[test]
+    fn filename_from_url_returns_none_for_root() {
+        let u = Url::parse("https://host.example/").expect("parse");
+        assert!(filename_from_url(&u).is_none());
+    }
+
+    #[test]
+    fn blocking_reader_returns_zero_at_eof() {
+        // Build a tiny sparse file and matching bitmap; reader at the
+        // end of the file must return Ok(0) immediately without
+        // touching the bitmap.
+        let path = unique_temp("eof");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(SparseFile::open_or_create(&path, 64).expect("sparse"));
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        let download_done = Arc::new(AtomicBool::new(true));
+        let outcome = Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            64,
+            64,
+            64,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        );
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).expect("read");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn blocking_reader_reads_complete_chunk() {
+        let path = unique_temp("ready");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(SparseFile::open_or_create(&path, 16).expect("sparse"));
+        sparse
+            .pwrite_at(ByteOffset::ZERO, b"abcdefghijklmnop")
+            .expect("write");
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        bitmap.mark_complete(ChunkIndex::new(0));
+        let download_done = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            16,
+            16,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        );
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).expect("read");
+        assert_eq!(n, 16);
+        assert_eq!(&buf[..n], b"abcdefghijklmnop");
+    }
+
+    #[test]
+    fn blocking_reader_errors_when_download_completes_with_missing_chunk() {
+        let path = unique_temp("missing");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(SparseFile::open_or_create(&path, 32).expect("sparse"));
+        let bitmap = Arc::new(ChunkBitmap::new(2));
+        // Chunk 0 incomplete; download_done set means we should error.
+        let download_done = Arc::new(AtomicBool::new(true));
+        let outcome = Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            16,
+            32,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        );
+        let mut buf = [0u8; 32];
+        let err = reader.read(&mut buf).expect_err("must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    struct TmpFile(PathBuf);
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+}

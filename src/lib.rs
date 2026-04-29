@@ -37,10 +37,10 @@
 //!   extraction in progress: the [`checkpoint::Checkpoint`] struct,
 //!   its tiny custom binary format, and the atomic
 //!   write-to-temp-then-rename dance that makes resume safe.
-//!
-//! Future modules (`coordinator`) are introduced one plan section at
-//! a time. Until they exist, the binary in [`main.rs`](../src/main.rs)
-//! is intentionally a stub.
+//! - [`coordinator`] (Unix only) — the §10 entry point that wires
+//!   download + extractor + checkpoint into a single resumable
+//!   pipeline. The `peel` binary calls into [`coordinator::run`]
+//!   after parsing CLI flags.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -50,6 +50,10 @@
 
 pub mod bitmap;
 pub mod checkpoint;
+#[cfg(unix)]
+pub mod cli;
+#[cfg(unix)]
+pub mod coordinator;
 pub mod decode;
 #[cfg(unix)]
 pub mod download;

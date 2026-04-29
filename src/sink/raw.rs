@@ -14,7 +14,7 @@
 //! sink imposes no extra constraint.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::sink::{Sink, SinkError};
@@ -67,6 +67,49 @@ impl RawSink {
             path,
             file: Some(file),
         }
+    }
+
+    /// Open `path` without truncation, seek to `bytes_written`, and
+    /// wrap the file in a [`RawSink`] ready to append from there.
+    ///
+    /// This is the resume entry point used by the §10 coordinator
+    /// after a crash: the prior run wrote `bytes_written` decoded
+    /// bytes into the file before exiting, the new run constructs a
+    /// decoder positioned at the matching frame boundary in the
+    /// source, and the two streams meet exactly at `bytes_written`.
+    ///
+    /// The file is truncated to `bytes_written` so any partial write
+    /// past that point (uncommon but possible if the kernel flushed
+    /// non-frame-aligned data after the most recent checkpoint) is
+    /// discarded before the resumed extraction continues.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Io`] if the file cannot be opened, the
+    /// seek fails, or the truncation fails.
+    pub fn resume<P: AsRef<Path>>(path: P, bytes_written: u64) -> Result<Self, SinkError> {
+        let path = path.as_ref().to_path_buf();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| SinkError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.set_len(bytes_written)
+            .map_err(|source| SinkError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.seek(SeekFrom::Start(bytes_written))
+            .map_err(|source| SinkError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self::wrap(path, file))
     }
 
     /// Return a borrow of the underlying file. Useful for tests that
@@ -210,6 +253,63 @@ mod tests {
             other => panic!("expected SinkError::Io, got {other:?}"),
         }
 
+        fs::remove_file(&tmp).ok();
+    }
+
+    /// `RawSink::resume` opens an existing file at the recorded
+    /// position and continues writing without truncating earlier bytes.
+    #[test]
+    fn raw_sink_resume_preserves_prior_bytes_and_appends() {
+        let tmp = std::env::temp_dir().join(format!(
+            "peel-raw-sink-resume-{}-{}.bin",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = fs::remove_file(&tmp);
+
+        let mut first = RawSink::create(&tmp).expect("create");
+        first.write(b"first half;").expect("first write");
+        first.close().expect("close first");
+
+        let written = b"first half;".len() as u64;
+        let mut second = RawSink::resume(&tmp, written).expect("resume");
+        second.write(b"second half").expect("second write");
+        second.close().expect("close second");
+
+        let mut got = Vec::new();
+        File::open(&tmp)
+            .expect("reopen")
+            .read_to_end(&mut got)
+            .expect("read");
+        assert_eq!(got, b"first half;second half");
+
+        fs::remove_file(&tmp).ok();
+    }
+
+    /// Resume truncates any post-checkpoint debris that survived a
+    /// crash, then continues at the new position.
+    #[test]
+    fn raw_sink_resume_truncates_past_recorded_position() {
+        let tmp = std::env::temp_dir().join(format!(
+            "peel-raw-sink-resume-truncate-{}-{}.bin",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = fs::remove_file(&tmp);
+
+        // Simulate a prior run that wrote 20 bytes, of which only
+        // the first 10 were checkpoint-durable.
+        fs::write(&tmp, b"AAAAAAAAAA0123456789").expect("write");
+        let mut sink = RawSink::resume(&tmp, 10).expect("resume");
+        sink.write(b"BBBBB").expect("append");
+        sink.close().expect("close");
+
+        let mut got = Vec::new();
+        File::open(&tmp)
+            .expect("reopen")
+            .read_to_end(&mut got)
+            .expect("read");
+        assert_eq!(got, b"AAAAAAAAAABBBBB");
         fs::remove_file(&tmp).ok();
     }
 

@@ -259,6 +259,102 @@ impl ChunkBitmap {
             .map(|w| u64::from(w.load(Ordering::Relaxed).count_ones()))
             .sum()
     }
+
+    /// Serialize the bitmap to a byte vector.
+    ///
+    /// The encoding is the little-endian byte representation of every
+    /// underlying word concatenated in order, truncated so that exactly
+    /// `ceil(len() / 8)` bytes are returned. Bits beyond `len()` are
+    /// invariantly zero so they never appear in the output.
+    ///
+    /// Pair with [`Self::from_bytes`] to reconstruct.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let total_bits = self.num_chunks as usize;
+        let total_bytes = total_bits.div_ceil(8);
+        let mut out = Vec::with_capacity(total_bytes);
+        for w in self.words.iter() {
+            out.extend_from_slice(&w.load(Ordering::Acquire).to_le_bytes());
+        }
+        out.truncate(total_bytes);
+        out
+    }
+
+    /// Reconstruct a bitmap from `bytes` written by [`Self::to_bytes`].
+    ///
+    /// The caller must already know `num_chunks`; the byte length of
+    /// the input alone is ambiguous because the trailing word can be
+    /// partially filled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BitmapDecodeError::LengthMismatch`] if `bytes.len()`
+    /// does not equal `ceil(num_chunks / 8)`. Bits beyond `num_chunks`
+    /// in the trailing byte must be zero on input; non-zero trailing
+    /// bits return [`BitmapDecodeError::TrailingBitsSet`].
+    pub fn from_bytes(num_chunks: u32, bytes: &[u8]) -> Result<Self, BitmapDecodeError> {
+        let expected = (num_chunks as usize).div_ceil(8);
+        if bytes.len() != expected {
+            return Err(BitmapDecodeError::LengthMismatch {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        let bitmap = Self::new(num_chunks);
+        if bytes.is_empty() {
+            return Ok(bitmap);
+        }
+
+        // Reject trailing bits set in the last byte; this catches
+        // tampered checkpoints early rather than silently expanding
+        // them on a future re-encode.
+        let bits_in_last = num_chunks % 8;
+        if bits_in_last != 0 {
+            let last = bytes[bytes.len() - 1];
+            let mask = (1u8 << bits_in_last) - 1;
+            if last & !mask != 0 {
+                return Err(BitmapDecodeError::TrailingBitsSet {
+                    last_byte: last,
+                    valid_mask: mask,
+                });
+            }
+        }
+
+        let words = bitmap.words.len();
+        for w in 0..words {
+            let start = w * 8;
+            let end = (start + 8).min(bytes.len());
+            if start >= bytes.len() {
+                break;
+            }
+            let mut buf = [0u8; 8];
+            buf[..end - start].copy_from_slice(&bytes[start..end]);
+            bitmap.words[w].store(u64::from_le_bytes(buf), Ordering::Release);
+        }
+        Ok(bitmap)
+    }
+}
+
+/// Errors returned by [`ChunkBitmap::from_bytes`].
+#[derive(Debug, thiserror::Error)]
+pub enum BitmapDecodeError {
+    /// Input byte length did not match `ceil(num_chunks / 8)`.
+    #[error("bitmap byte length {actual} does not match expected {expected}")]
+    LengthMismatch {
+        /// Expected length (`ceil(num_chunks / 8)`).
+        expected: usize,
+        /// Actual length of the input slice.
+        actual: usize,
+    },
+    /// Bits beyond the declared `num_chunks` were set in the trailing
+    /// byte.
+    #[error("bitmap trailing byte {last_byte:#04x} has bits beyond mask {valid_mask:#04x} set")]
+    TrailingBitsSet {
+        /// The trailing byte as it appeared in input.
+        last_byte: u8,
+        /// The valid-bit mask that should have been respected.
+        valid_mask: u8,
+    },
 }
 
 /// Number of `AtomicU64` words required to back `num_chunks` bits.
@@ -735,5 +831,109 @@ mod tests {
         });
 
         assert_eq!(bitmap.count_complete(), u64::from(N));
+    }
+
+    // ---- to_bytes / from_bytes --------------------------------------
+
+    #[test]
+    fn to_bytes_round_trips_empty_bitmap() {
+        let b = ChunkBitmap::new(0);
+        let bytes = b.to_bytes();
+        assert!(bytes.is_empty());
+        let restored = ChunkBitmap::from_bytes(0, &bytes).expect("decode");
+        assert_eq!(restored.len(), 0);
+    }
+
+    #[test]
+    fn to_bytes_truncates_to_ceil_bits_div_eight() {
+        // Five chunks → one byte; bit 0 and bit 3 set → 0b00001001 = 9.
+        let b = ChunkBitmap::new(5);
+        b.mark_complete(ChunkIndex::new(0));
+        b.mark_complete(ChunkIndex::new(3));
+        assert_eq!(b.to_bytes(), vec![0b0000_1001]);
+    }
+
+    #[test]
+    fn to_bytes_round_trips_at_word_boundary() {
+        let b = ChunkBitmap::new(64);
+        for i in (0..64).step_by(2) {
+            b.mark_complete(ChunkIndex::new(i));
+        }
+        let bytes = b.to_bytes();
+        assert_eq!(bytes.len(), 8);
+        let restored = ChunkBitmap::from_bytes(64, &bytes).expect("decode");
+        assert_eq!(restored.count_complete(), 32);
+        for i in 0..64u32 {
+            assert_eq!(restored.is_complete(ChunkIndex::new(i)), i % 2 == 0);
+        }
+    }
+
+    #[test]
+    fn to_bytes_round_trips_partial_trailing_word() {
+        // 100 chunks spans 2 words but only 13 bytes of output.
+        let b = ChunkBitmap::new(100);
+        for i in [0u32, 1, 7, 8, 63, 64, 99] {
+            b.mark_complete(ChunkIndex::new(i));
+        }
+        let bytes = b.to_bytes();
+        assert_eq!(bytes.len(), 100usize.div_ceil(8));
+        let restored = ChunkBitmap::from_bytes(100, &bytes).expect("decode");
+        for i in 0..100u32 {
+            let want = matches!(i, 0 | 1 | 7 | 8 | 63 | 64 | 99);
+            assert_eq!(restored.is_complete(ChunkIndex::new(i)), want);
+        }
+    }
+
+    #[test]
+    fn from_bytes_rejects_wrong_length() {
+        match ChunkBitmap::from_bytes(64, &[0u8; 7]) {
+            Err(BitmapDecodeError::LengthMismatch { expected, actual }) => {
+                assert_eq!(expected, 8);
+                assert_eq!(actual, 7);
+            }
+            other => panic!("expected LengthMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_bytes_rejects_bits_set_beyond_num_chunks() {
+        // num_chunks = 5 → valid mask is 0b0001_1111. A trailing byte
+        // with bit 7 set is invalid.
+        let bytes = vec![0b1000_0001u8];
+        match ChunkBitmap::from_bytes(5, &bytes) {
+            Err(BitmapDecodeError::TrailingBitsSet {
+                last_byte,
+                valid_mask,
+            }) => {
+                assert_eq!(last_byte, 0b1000_0001);
+                assert_eq!(valid_mask, 0b0001_1111);
+            }
+            other => panic!("expected TrailingBitsSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_to_from_bytes_round_trip_random() {
+        let mut rng = Lcg::seeded(0xB17_B17_B17);
+        for _ in 0..64 {
+            let n = rng.next_u32() % 1024;
+            let b = ChunkBitmap::new(n);
+            for _ in 0..(n / 3 + 1) {
+                let idx = rng.next_u32() % n.max(1);
+                if n > 0 {
+                    b.mark_complete(ChunkIndex::new(idx));
+                }
+            }
+            let bytes = b.to_bytes();
+            let restored = ChunkBitmap::from_bytes(n, &bytes).expect("decode");
+            assert_eq!(restored.len(), n);
+            for i in 0..n {
+                assert_eq!(
+                    restored.is_complete(ChunkIndex::new(i)),
+                    b.is_complete(ChunkIndex::new(i)),
+                    "bit {i} differs"
+                );
+            }
+        }
     }
 }

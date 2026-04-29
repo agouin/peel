@@ -100,6 +100,34 @@ fn tar_sink_extracts_multiple_files_bulk() {
     assert_eq!(gamma, b"gamma".repeat(513));
 }
 
+/// Regression: a member whose payload size is an exact multiple of
+/// the 512-byte block must transition the parser to the next header
+/// in the same `write` call. The previous bug parked the parser in
+/// `State::File { remaining: 0, padding: 0 }` and tripped the
+/// "parser made no progress" guard on the next byte.
+#[test]
+fn tar_sink_handles_block_aligned_member() {
+    let dir = fresh_dir("tar_block_aligned");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let archive = build_simple_archive(&[
+        ("aligned.bin", &b"a".repeat(512)),
+        ("after.txt", b"the next member after a 512-aligned one\n"),
+    ]);
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    // Feed the whole archive in one buffer — the previous bug
+    // surfaced precisely when the same write spanned the 512-aligned
+    // member's body and the next header.
+    sink.write(&archive).expect("bulk write");
+    sink.close().expect("close");
+
+    let aligned = fs::read(dir.join("aligned.bin")).expect("aligned");
+    assert_eq!(aligned, b"a".repeat(512));
+    let after = fs::read(dir.join("after.txt")).expect("after");
+    assert_eq!(after, b"the next member after a 512-aligned one\n");
+}
+
 /// PLAN §7.4: feed the archive a byte at a time and verify identical
 /// output to the bulk-feed case. This is the single test that proves
 /// the parser is genuinely streaming — every internal state arm has
