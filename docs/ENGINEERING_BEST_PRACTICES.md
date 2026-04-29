@@ -324,7 +324,7 @@ All without network flakiness. The mock server is its own module under
 ///
 /// # Examples
 /// ```
-/// # use pux::ChunkBitmap;
+/// # use peel::ChunkBitmap;
 /// let mut b = ChunkBitmap::new(10);
 /// b.mark_complete(ChunkIndex(3));
 /// assert!(b.is_complete(ChunkIndex(3)));

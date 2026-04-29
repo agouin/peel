@@ -1,6 +1,6 @@
 //! Hand-rolled HTTP/1.1 client used by the download scheduler.
 //!
-//! `pux` deliberately avoids `reqwest`/`hyper`/`ureq`. The wire-level
+//! `peel` deliberately avoids `reqwest`/`hyper`/`ureq`. The wire-level
 //! behaviour we depend on (HEAD, ranged GET, basic redirects, ETag and
 //! `Content-Range` round-tripping) is small enough to write ourselves on
 //! top of [`std::net::TcpStream`] and `rustls`. See

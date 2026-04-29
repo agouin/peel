@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn raw_sink_writes_and_closes() {
         let tmp = std::env::temp_dir().join(format!(
-            "pux-raw-sink-{}-{}.bin",
+            "peel-raw-sink-{}-{}.bin",
             std::process::id(),
             line!(),
         ));
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn raw_sink_is_always_quiescent() {
         let tmp = std::env::temp_dir().join(format!(
-            "pux-raw-sink-quiescent-{}-{}.bin",
+            "peel-raw-sink-quiescent-{}-{}.bin",
             std::process::id(),
             line!(),
         ));
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn raw_sink_write_after_close_errors() {
         let tmp = std::env::temp_dir().join(format!(
-            "pux-raw-sink-after-close-{}-{}.bin",
+            "peel-raw-sink-after-close-{}-{}.bin",
             std::process::id(),
             line!(),
         ));
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn raw_sink_streams_arbitrary_chunk_boundaries() {
         let tmp = std::env::temp_dir().join(format!(
-            "pux-raw-sink-stream-{}-{}.bin",
+            "peel-raw-sink-stream-{}-{}.bin",
             std::process::id(),
             line!(),
         ));

@@ -1,4 +1,4 @@
-//! `pux` — streaming, resumable, space-efficient extraction of compressed
+//! `peel` — streaming, resumable, space-efficient extraction of compressed
 //! archives downloaded over HTTP.
 //!
 //! See [`docs/PLAN.md`] in the repository for the implementation plan and
@@ -35,8 +35,8 @@
 //! introduced one plan section at a time. Until they exist, the
 //! binary in [`main.rs`](../src/main.rs) is intentionally a stub.
 //!
-//! [`docs/PLAN.md`]: https://github.com/ondofinance/pux/blob/main/docs/PLAN.md
-//! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/ondofinance/pux/blob/main/docs/ENGINEERING_STANDARDS.md
+//! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
+//! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
 
 #![deny(missing_docs)]
 #![warn(unused, clippy::all)]

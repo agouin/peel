@@ -1,11 +1,11 @@
-//! End-to-end integration test for [`pux::types`].
+//! End-to-end integration test for [`peel::types`].
 //!
 //! The unit tests in `src/types.rs` cover the algebra of each type in
 //! isolation; this test exercises the *public* surface across types
 //! together — chunk → byte range → offset arithmetic — to catch
 //! regressions where the types compose poorly.
 
-use pux::types::{ByteOffset, ByteRange, ChunkIndex};
+use peel::types::{ByteOffset, ByteRange, ChunkIndex};
 
 #[test]
 fn chunk_iteration_covers_total_size_contiguously() {

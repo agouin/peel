@@ -48,8 +48,8 @@ use crate::types::ChunkIndex;
 /// # Examples
 ///
 /// ```
-/// use pux::bitmap::ChunkBitmap;
-/// use pux::types::ChunkIndex;
+/// use peel::bitmap::ChunkBitmap;
+/// use peel::types::ChunkIndex;
 ///
 /// let bitmap = ChunkBitmap::new(10);
 /// assert_eq!(bitmap.count_complete(), 0);

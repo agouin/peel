@@ -18,7 +18,7 @@ use std::fmt;
 /// # Examples
 ///
 /// ```
-/// use pux::types::ByteOffset;
+/// use peel::types::ByteOffset;
 ///
 /// let a = ByteOffset::new(1024);
 /// let b = a.checked_add(2048).expect("no overflow");
@@ -90,7 +90,7 @@ impl fmt::Display for ByteOffset {
 /// # Examples
 ///
 /// ```
-/// use pux::types::ChunkIndex;
+/// use peel::types::ChunkIndex;
 ///
 /// let idx = ChunkIndex::new(7);
 /// assert_eq!(idx.get(), 7);
@@ -178,7 +178,7 @@ impl fmt::Display for ChunkIndex {
 /// # Examples
 ///
 /// ```
-/// use pux::types::{ByteOffset, ByteRange};
+/// use peel::types::{ByteOffset, ByteRange};
 ///
 /// let r = ByteRange::new(ByteOffset::new(10), ByteOffset::new(30))
 ///     .expect("non-reversed");

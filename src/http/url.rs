@@ -1,6 +1,6 @@
 //! Minimal URL parser for the HTTP client.
 //!
-//! `pux` only needs to understand the URL shapes the download scheduler
+//! `peel` only needs to understand the URL shapes the download scheduler
 //! actually hands the client: an absolute `http`/`https` URL with an
 //! authority, an optional port, an optional path, and an optional query.
 //! Fragments are stripped (servers never see them); userinfo (`user:pass@`)
@@ -97,7 +97,7 @@ impl fmt::Display for Scheme {
 /// # Examples
 ///
 /// ```
-/// use pux::http::{Scheme, Url};
+/// use peel::http::{Scheme, Url};
 ///
 /// let u = Url::parse("https://example.com/foo?x=1#frag").expect("valid");
 /// assert_eq!(u.scheme(), Scheme::Https);

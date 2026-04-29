@@ -2,7 +2,7 @@
 //!
 //! Streams the named file through the registered decoder for its
 //! suffix and writes the decompressed bytes to stdout. Doubles as the
-//! demo for `docs/PLAN.md` §6 — proves the [`pux::decode`] surface
+//! demo for `docs/PLAN.md` §6 — proves the [`peel::decode`] surface
 //! handles multi-frame `.zst` archives end-to-end and reports frame
 //! boundaries.
 //!
@@ -17,7 +17,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use pux::decode::{DecodeStatus, DecoderRegistry};
+use peel::decode::{DecodeStatus, DecoderRegistry};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);

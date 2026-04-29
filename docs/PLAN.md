@@ -1,4 +1,4 @@
-# Plan: pux MVP
+# Plan: peel MVP
 
 This is the **MVP**. Things explicitly *out* of scope for the MVP are listed
 in `OPTIMIZATIONS.md`. Don't pull from that list during MVP work.
@@ -6,7 +6,7 @@ in `OPTIMIZATIONS.md`. Don't pull from that list during MVP work.
 ## North-star use case
 
 ```
-$ pux https://example.com/dataset.tar.zst -C ./out
+$ peel https://example.com/dataset.tar.zst -C ./out
 [downloading] 234.5 MiB / 1.2 GiB  ▓▓▓░░░░░  19.5%  (4 workers, 38 MiB/s)
 [extracting]  119 files, 156.2 MiB written
 [disk]        compressed on-disk: 84 MiB (of 234.5 MiB downloaded)
@@ -191,7 +191,7 @@ Orchestrate workers downloading chunks into the sparse file.
      priority steering. Crash test: kill the scheduler thread mid-flight,
      verify bitmap state is consistent with what's actually on disk.
 
-**Demo**: `pux-download URL output.bin` (a temporary debug binary)
+**Demo**: `peel-download URL output.bin` (a temporary debug binary)
 downloads a multi-hundred-MB file with 4 workers, prints throughput,
 result is byte-identical to the source.
 
@@ -226,7 +226,7 @@ Ports the Python prototype, with the addition of frame-boundary detection.
      that are valid restart points (verified by trying to decode from
      that offset).
 
-**Demo**: `pux-decode foo.zst > foo` works on multi-frame zstd
+**Demo**: `peel-decode foo.zst > foo` works on multi-frame zstd
 files; tests confirm frame boundaries.
 
 ---
@@ -249,7 +249,7 @@ files; tests confirm frame boundaries.
      (`../../etc/passwd` rejected), large-file (>8 GB, ustar size limits)
      handling.
 
-**Demo**: pipe a `.tar` to `pux-extract -C out/`, verify all files
+**Demo**: pipe a `.tar` to `peel-extract -C out/`, verify all files
 extracted with correct contents and modes (modes deferred to
 `OPTIMIZATIONS.md`; MVP just gets contents right).
 
@@ -273,7 +273,7 @@ extracted with correct contents and modes (modes deferred to
      local file (no network yet); verify outputs match reference and
      on-disk source footprint shrinks.
 
-**Demo**: `pux-extract local.tar.zst -C out/` produces correct
+**Demo**: `peel-extract local.tar.zst -C out/` produces correct
 extraction with shrinking source footprint.
 
 ---
@@ -311,8 +311,8 @@ write and rename, and verifies the existing `.ckpt` is intact.
 Wires download + extractor + checkpoint into one resumable pipeline.
 
 10.1. `coordinator.rs`:
-      - Open or create sparse file at `<output>.pux.part`.
-      - Open or create `<output>.pux.ckpt`.
+      - Open or create sparse file at `<output>.peel.part`.
+      - Open or create `<output>.peel.ckpt`.
       - If checkpoint exists and ETag matches server, resume: load
         bitmap, seek decoder to `decoder_position`, restore sink state.
       - Spawn download scheduler thread; spawn extractor thread.

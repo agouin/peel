@@ -138,7 +138,7 @@ pub struct ClientConfig {
     /// [`DEFAULT_READ_BUFFER_BYTES`].
     pub read_buffer_bytes: usize,
     /// Optional `User-Agent` override; if `None`, the default
-    /// `pux/<version>` from [`Request::write_to`] is used.
+    /// `peel/<version>` from [`Request::write_to`] is used.
     pub user_agent: Option<String>,
 }
 

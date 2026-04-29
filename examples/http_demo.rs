@@ -8,7 +8,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use pux::http::{Client, Url};
+use peel::http::{Client, Url};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);

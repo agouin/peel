@@ -1,10 +1,10 @@
-# pux
+# peel
 
 A streaming, resumable, space-efficient extractor for compressed archives
 downloaded over HTTP.
 
 ```
-pux https://example.com/dataset.tar.zst -C ./out
+peel https://example.com/dataset.tar.zst -C ./out
 ```
 
 What it does:

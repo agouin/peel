@@ -3,7 +3,7 @@
 //!
 //! # Why this matters
 //!
-//! `pux` writes the compressed source into a sparse file as it downloads
+//! `peel` writes the compressed source into a sparse file as it downloads
 //! and, in parallel, decodes the prefix of that file into the extracted
 //! output. Once the decoder has consumed bytes `[0, X)` of the source
 //! and we have a durable checkpoint past that point, the underlying
@@ -152,7 +152,7 @@ impl PunchHole for NoopPuncher {
 /// # Examples
 ///
 /// ```
-/// use pux::punch::align_down;
+/// use peel::punch::align_down;
 ///
 /// assert_eq!(align_down(8195, 4096), Some(8192));
 /// assert_eq!(align_down(4096, 4096), Some(4096));

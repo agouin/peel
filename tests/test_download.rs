@@ -1,8 +1,8 @@
-//! Integration tests for `pux::download::scheduler`.
+//! Integration tests for `peel::download::scheduler`.
 //!
 //! Each test starts a fresh [`MockServer`], constructs a sparse file
 //! and a [`ChunkBitmap`] sized to the source, then drives
-//! `pux::download::run` against the mock. Assertions exercise the
+//! `peel::download::run` against the mock. Assertions exercise the
 //! plan §5 acceptance criteria: parallel happy path, retry-on-5xx,
 //! abort on ETag change, single-stream fallback, resume, missing
 //! Content-Length, and cursor-based dispatch priority.
@@ -14,13 +14,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pux::bitmap::ChunkBitmap;
-use pux::download::{
+use peel::bitmap::ChunkBitmap;
+use peel::download::{
     chunk_count, discover, run, DownloadMode, RetryConfig, SchedulerConfig, SchedulerError,
     SparseFile, WorkerError,
 };
-use pux::http::{Client, ClientConfig, Url};
-use pux::types::ChunkIndex;
+use peel::http::{Client, ClientConfig, Url};
+use peel::types::ChunkIndex;
 
 #[path = "support/mod.rs"]
 mod support;
@@ -38,7 +38,7 @@ fn temp_path(label: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let n = UNIQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("pux_test_download_{label}_{pid}_{nanos}_{n}.bin"))
+    std::env::temp_dir().join(format!("peel_test_download_{label}_{pid}_{nanos}_{n}.bin"))
 }
 
 struct CleanupOnDrop(PathBuf);
@@ -531,10 +531,10 @@ fn run_skips_chunks_already_marked_complete() {
     // if a prior run had completed them) and pre-mark them in the
     // bitmap. A correct scheduler must then only fetch chunks 1, 3, 4.
     sparse
-        .pwrite_at(pux::types::ByteOffset::new(0), &body_clone[0..4000])
+        .pwrite_at(peel::types::ByteOffset::new(0), &body_clone[0..4000])
         .expect("pre-write 0");
     sparse
-        .pwrite_at(pux::types::ByteOffset::new(8000), &body_clone[8000..12_000])
+        .pwrite_at(peel::types::ByteOffset::new(8000), &body_clone[8000..12_000])
         .expect("pre-write 2");
     let bitmap = ChunkBitmap::new(total_chunks);
     bitmap.mark_complete(ChunkIndex::new(0));

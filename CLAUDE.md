@@ -5,7 +5,7 @@ This file is read by Claude Code at the start of every session. Its job is to
 
 ## What this project is
 
-`pux` is a Rust CLI utility for **streaming, resumable, space-efficient
+`peel` is a Rust CLI utility for **streaming, resumable, space-efficient
 extraction of compressed archives downloaded over HTTP**. It combines:
 
 - Parallel ranged HTTP downloads (like aria2c)

@@ -1,4 +1,4 @@
-//! Integration tests for [`pux::decode`].
+//! Integration tests for [`peel::decode`].
 //!
 //! These exercise the public API across module boundaries: registry
 //! lookup, factory dispatch, and end-to-end decode of multi-frame
@@ -8,8 +8,8 @@
 
 use std::io::{Cursor, Read, Write};
 
-use pux::decode::{DecodeError, DecodeStatus, DecoderRegistry, StreamingDecoder};
-use pux::types::ByteOffset;
+use peel::decode::{DecodeError, DecodeStatus, DecoderRegistry, StreamingDecoder};
+use peel::types::ByteOffset;
 
 /// A two-frame zstd stream that the registered `.zst` factory should
 /// decode end-to-end with frame boundaries at the expected offsets.

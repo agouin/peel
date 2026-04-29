@@ -122,7 +122,7 @@ entirely. Worth it if the use case demands it; out of scope otherwise.
 
 ---
 
-### O.9 Native pux container format
+### O.9 Native peel container format
 
 **What**: design a new archive format optimized end-to-end for our
 pipeline (per-block compression, embedded sync markers, validated
@@ -224,7 +224,7 @@ semantics, signal handling).
 
 ### O.16 Daemon / library mode
 
-**What**: expose `pux` as a library callable from other Rust
+**What**: expose `peel` as a library callable from other Rust
 binaries, or as a long-running daemon with an IPC interface.
 
 **Why deferred**: the MVP is a CLI. The internal API is shaped to
@@ -299,7 +299,7 @@ synthetic corpus catches most issues.
 
 ### O.22 Differential testing against reference tools
 
-**What**: extract every test archive with both pux and `tar -xzf`
+**What**: extract every test archive with both peel and `tar -xzf`
 (or equivalent), diff the outputs.
 
 **Why deferred**: unit tests already verify content correctness;

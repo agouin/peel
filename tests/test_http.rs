@@ -1,4 +1,4 @@
-//! Integration tests for `pux::http` against the mock server.
+//! Integration tests for `peel::http` against the mock server.
 //!
 //! Every test starts a fresh mock server on `127.0.0.1:<auto>`, points
 //! a fresh `Client` at it, drives one or more requests, and asserts on
@@ -8,10 +8,10 @@
 use std::io::Read;
 use std::time::Duration;
 
-use pux::http::range::{parse_content_range, ContentRange};
-use pux::http::Url;
-use pux::http::{Client, ClientConfig, ClientError};
-use pux::types::{ByteOffset, ByteRange};
+use peel::http::range::{parse_content_range, ContentRange};
+use peel::http::Url;
+use peel::http::{Client, ClientConfig, ClientError};
+use peel::types::{ByteOffset, ByteRange};
 
 #[path = "support/mod.rs"]
 mod support;

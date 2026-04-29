@@ -1,6 +1,6 @@
 //! In-memory builders for USTAR/PAX test fixtures.
 //!
-//! `pux::sink::tar` ships an internal copy of these helpers behind
+//! `peel::sink::tar` ships an internal copy of these helpers behind
 //! `#[cfg(test)]` for its unit tests. Integration tests do not see
 //! `#[cfg(test)]`-only items in the library, so we duplicate the
 //! small fixture builder here. The duplication is intentional —

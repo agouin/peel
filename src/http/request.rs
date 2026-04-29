@@ -1,6 +1,6 @@
 //! Typed HTTP requests and their on-the-wire serialization.
 //!
-//! `pux` only ever sends two kinds of requests: a `HEAD` to discover the
+//! `peel` only ever sends two kinds of requests: a `HEAD` to discover the
 //! source's size and capabilities, and a `GET` (full or ranged) to pull
 //! bytes. Both have empty bodies and a small fixed set of headers we
 //! actually use, so the [`Request`] type is intentionally minimal.
@@ -172,7 +172,7 @@ impl<'u> Request<'u> {
     /// Write the request to `out` in HTTP/1.1 wire format.
     ///
     /// Inserts a default `Host:` header if none was supplied and a
-    /// default `User-Agent: pux/<version>` if none was supplied. Adds
+    /// default `User-Agent: peel/<version>` if none was supplied. Adds
     /// the trailing CRLF that terminates the headers but writes no body.
     ///
     /// # Errors
@@ -194,7 +194,7 @@ impl<'u> Request<'u> {
         }
         let has_ua = self.has_header("user-agent");
         if !has_ua {
-            write!(buf, "User-Agent: pux/{}\r\n", env!("CARGO_PKG_VERSION"))
+            write!(buf, "User-Agent: peel/{}\r\n", env!("CARGO_PKG_VERSION"))
                 .map_err(RequestError::Io)?;
         }
         let has_conn = self.has_header("connection");
@@ -255,7 +255,7 @@ mod tests {
         let wire = String::from_utf8(req.to_wire_bytes()).expect("ascii");
         assert!(wire.starts_with("HEAD /foo HTTP/1.1\r\n"));
         assert!(wire.contains("Host: example.com\r\n"));
-        assert!(wire.contains("User-Agent: pux/"));
+        assert!(wire.contains("User-Agent: peel/"));
         assert!(wire.contains("Connection: keep-alive\r\n"));
         assert!(wire.ends_with("\r\n\r\n"));
     }
@@ -305,7 +305,7 @@ mod tests {
         let wire = String::from_utf8(req.to_wire_bytes()).expect("ascii");
         assert!(wire.contains("User-Agent: test/1\r\n"));
         // The default User-Agent must not also appear.
-        assert!(!wire.contains("pux/"));
+        assert!(!wire.contains("peel/"));
     }
 
     #[test]

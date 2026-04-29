@@ -1,4 +1,4 @@
-//! Mock HTTP/1.1 server for testing the `pux` HTTP client.
+//! Mock HTTP/1.1 server for testing the `peel` HTTP client.
 //!
 //! Spins up a real `TcpListener` on `127.0.0.1` (auto-assigned port),
 //! accepts connections, parses just enough of each request to dispatch
@@ -8,7 +8,7 @@
 //!
 //! This is *not* an HTTP server in any general sense; it's a
 //! deterministic byte fixture that happens to speak enough HTTP for
-//! `pux::http::Client` to drive it.
+//! `peel::http::Client` to drive it.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};

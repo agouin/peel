@@ -368,7 +368,7 @@ fn run_parallel(
             let total_size = info.total_size;
             let retry = config.retry.clone();
             thread::Builder::new()
-                .name(format!("pux-download-worker-{w_id}"))
+                .name(format!("peel-download-worker-{w_id}"))
                 .spawn_scoped(scope, move || {
                     worker_loop(
                         &ctx, chunk_size, total_size, &retry, task_rx, done_tx, cancel,

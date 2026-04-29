@@ -1,6 +1,6 @@
-//! Error-handling conventions for the `pux` library.
+//! Error-handling conventions for the `peel` library.
 //!
-//! `pux` deliberately does **not** define a single crate-wide `Error`
+//! `peel` deliberately does **not** define a single crate-wide `Error`
 //! enum. Each module owns its own typed error built with
 //! [`thiserror::Error`]. Merging a download error and a checkpoint error
 //! into one variant set dilutes the diagnostics and tempts callers into

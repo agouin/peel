@@ -1,7 +1,7 @@
-//! Integration tests for [`pux::sink`].
+//! Integration tests for [`peel::sink`].
 //!
-//! Exercises both the always-quiescent [`pux::sink::RawSink`] and the
-//! streaming [`pux::sink::TarSink`] against in-memory archive fixtures
+//! Exercises both the always-quiescent [`peel::sink::RawSink`] and the
+//! streaming [`peel::sink::TarSink`] against in-memory archive fixtures
 //! built by [`support::tar_fixtures`]. The tests cover the §7 demo
 //! shape: feed an archive byte-by-byte, verify on-disk contents,
 //! verify path-escape rejection, verify large-size handling.
@@ -13,7 +13,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pux::sink::{RawSink, Sink, SinkError, TarSink};
+use peel::sink::{RawSink, Sink, SinkError, TarSink};
 
 #[path = "support/mod.rs"]
 mod support;
@@ -32,7 +32,7 @@ fn fresh_dir(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let p = std::env::temp_dir().join(format!("pux_sink_it_{label}_{pid}_{nanos}_{n}"));
+    let p = std::env::temp_dir().join(format!("peel_sink_it_{label}_{pid}_{nanos}_{n}"));
     fs::create_dir_all(&p).expect("create temp dir");
     p
 }

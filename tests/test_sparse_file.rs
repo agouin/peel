@@ -1,8 +1,8 @@
-//! Integration tests for [`pux::download::SparseFile`].
+//! Integration tests for [`peel::download::SparseFile`].
 //!
 //! The headline test here is the §3 demo from `docs/PLAN.md`: a 1 GiB
 //! sparse file, eight worker threads writing 1 MiB chunks at random
-//! offsets through the `SparseFile` API, with a [`pux::bitmap::ChunkBitmap`]
+//! offsets through the `SparseFile` API, with a [`peel::bitmap::ChunkBitmap`]
 //! tracking completion. We check three properties:
 //!
 //! 1. Every chunk written is later readable with the exact bytes the
@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use pux::bitmap::ChunkBitmap;
-use pux::download::{SparseFile, SparseFileError};
-use pux::types::{ByteOffset, ChunkIndex};
+use peel::bitmap::ChunkBitmap;
+use peel::download::{SparseFile, SparseFileError};
+use peel::types::{ByteOffset, ChunkIndex};
 
 const ONE_MIB: u64 = 1024 * 1024;
 const ONE_GIB: u64 = 1024 * ONE_MIB;
@@ -46,7 +46,7 @@ fn unique_temp_path(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("pux_sparse_it_{label}_{pid}_{nanos}_{n}.bin"))
+    std::env::temp_dir().join(format!("peel_sparse_it_{label}_{pid}_{nanos}_{n}.bin"))
 }
 
 struct CleanupOnDrop(PathBuf);

@@ -1,4 +1,4 @@
-//! Integration tests for [`pux::punch`].
+//! Integration tests for [`peel::punch`].
 //!
 //! On Linux these exercise the real
 //! `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` syscall against
@@ -6,8 +6,8 @@
 //! underlying filesystem doesn't support punching we treat the
 //! [`PunchError::Unsupported`] response as a skip rather than a failure.
 //!
-//! On non-Linux Unix platforms [`pux::punch::default_puncher`] returns a
-//! [`pux::punch::NoopPuncher`] and we run the same end-to-end flow as a
+//! On non-Linux Unix platforms [`peel::punch::default_puncher`] returns a
+//! [`peel::punch::NoopPuncher`] and we run the same end-to-end flow as a
 //! smoke test that proves the trait dispatch works.
 
 #![cfg(unix)]
@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
-use pux::punch::PunchHole;
-use pux::punch::{align_down, default_puncher, PunchError};
-use pux::types::ByteOffset;
+use peel::punch::PunchHole;
+use peel::punch::{align_down, default_puncher, PunchError};
+use peel::types::ByteOffset;
 
 const FOUR_MIB: u64 = 4 * 1024 * 1024;
 
@@ -37,7 +37,7 @@ fn unique_temp_path(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("pux_punch_{label}_{pid}_{nanos}_{n}.bin"))
+    std::env::temp_dir().join(format!("peel_punch_{label}_{pid}_{nanos}_{n}.bin"))
 }
 
 /// Drops cleanly remove the file even when the test panics.
@@ -134,7 +134,7 @@ fn punch_preserves_logical_size_and_never_grows_blocks() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_punch_releases_blocks_when_supported() {
-    use pux::punch::LinuxPuncher;
+    use peel::punch::LinuxPuncher;
 
     let path = unique_temp_path("linux_release");
     let _cleanup = CleanupOnDrop(path.clone());
@@ -173,6 +173,6 @@ fn linux_punch_releases_blocks_when_supported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_puncher_block_size_hint_is_4096() {
-    use pux::punch::LinuxPuncher;
+    use peel::punch::LinuxPuncher;
     assert_eq!(LinuxPuncher::new().block_size_hint(), 4096);
 }

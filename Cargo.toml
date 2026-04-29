@@ -1,5 +1,5 @@
 [package]
-name = "pux"
+name = "peel"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
@@ -7,11 +7,11 @@ publish = false
 description = "Streaming, resumable, space-efficient extractor for compressed archives downloaded over HTTP."
 
 [lib]
-name = "pux"
+name = "peel"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pux"
+name = "peel"
 path = "src/main.rs"
 
 [dependencies]

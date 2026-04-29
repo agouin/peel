@@ -9,7 +9,7 @@
 //! # Inclusive vs. half-open
 //!
 //! HTTP byte ranges are *inclusive on both ends*: `bytes=0-99` requests
-//! the first 100 bytes. Internally `pux` uses [`crate::types::ByteRange`]
+//! the first 100 bytes. Internally `peel` uses [`crate::types::ByteRange`]
 //! which is half-open (`[start, end_exclusive)`). The conversions in
 //! this module are explicit so the two conventions never collide
 //! silently.
@@ -68,8 +68,8 @@ pub enum RangeError {
 /// # Examples
 ///
 /// ```
-/// use pux::http::range::format_range_header;
-/// use pux::types::{ByteOffset, ByteRange};
+/// use peel::http::range::format_range_header;
+/// use peel::types::{ByteOffset, ByteRange};
 ///
 /// let r = ByteRange::new(ByteOffset::new(0), ByteOffset::new(100)).unwrap();
 /// assert_eq!(format_range_header(r).unwrap(), "bytes=0-99");

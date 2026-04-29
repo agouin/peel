@@ -1,4 +1,4 @@
-//! Integration tests for [`pux::bitmap::ChunkBitmap`].
+//! Integration tests for [`peel::bitmap::ChunkBitmap`].
 //!
 //! These exercise the public API across module boundaries and the
 //! producer/consumer synchronization edge that workers rely on. Unit
@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use pux::bitmap::ChunkBitmap;
-use pux::types::ChunkIndex;
+use peel::bitmap::ChunkBitmap;
+use peel::types::ChunkIndex;
 
 #[test]
 fn empty_bitmap_reports_no_completions() {

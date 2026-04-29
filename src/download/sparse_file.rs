@@ -1,6 +1,6 @@
 //! The on-disk landing pad for the compressed source download.
 //!
-//! `pux` writes downloaded chunks straight into a single file at their
+//! `peel` writes downloaded chunks straight into a single file at their
 //! eventual offsets, leaves the gaps as filesystem holes, and lets the
 //! decoder follow the contiguous prefix forward. This module owns that
 //! file: opening / creating it at the right size, performing concurrent
@@ -347,7 +347,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("pux_sparse_{label}_{pid}_{nanos}_{n}.bin"))
+        std::env::temp_dir().join(format!("peel_sparse_{label}_{pid}_{nanos}_{n}.bin"))
     }
 
     struct CleanupOnDrop(PathBuf);

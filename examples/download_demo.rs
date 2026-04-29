@@ -1,6 +1,6 @@
 //! `cargo run --example download_demo -- <URL> <output>`
 //!
-//! Drives `pux::download` end-to-end against a real server: discovery
+//! Drives `peel::download` end-to-end against a real server: discovery
 //! `HEAD`, parallel ranged GETs (or single-stream fallback), sparse-file
 //! reassembly. Prints throughput and chunk stats. Doubles as the demo
 //! for `docs/PLAN.md` §5.
@@ -18,12 +18,12 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
-use pux::bitmap::ChunkBitmap;
-use pux::download::{
+use peel::bitmap::ChunkBitmap;
+use peel::download::{
     chunk_count, discover, run, DownloadInfo, DownloadMode, RetryConfig, SchedulerConfig,
     SparseFile, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
-use pux::http::{Client, Url};
+use peel::http::{Client, Url};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
