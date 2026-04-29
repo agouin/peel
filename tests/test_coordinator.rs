@@ -89,6 +89,8 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         checkpoint_min_interval: Duration::from_millis(0),
         workdir: None,
         reader_poll_interval: Duration::from_millis(2),
+        forced_format: None,
+        force_format_from_magic: false,
     }
 }
 

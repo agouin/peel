@@ -59,7 +59,7 @@ use thiserror::Error;
 
 use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
 use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
-use crate::decode::{DecodeError, DecoderRegistry, StreamingDecoder};
+use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
 use crate::download::{
     chunk_count, discover, run as run_scheduler, DownloadInfo, DownloadStats, RetryConfig,
     SchedulerConfig, SchedulerError, SourceFingerprint, SparseFile, SparseFileError,
@@ -123,6 +123,23 @@ pub struct CoordinatorConfig {
     /// on a chunk that hasn't been downloaded yet. Tests use a small
     /// value; production is fine with the default.
     pub reader_poll_interval: Duration,
+    /// Force a specific decoder, looked up by name in the
+    /// [`DecoderRegistry`], bypassing both suffix and magic-byte
+    /// detection. Mirrors the `--format <name>` CLI flag.
+    ///
+    /// Useful for URLs like
+    /// `https://example.com/download?id=42` where the suffix is
+    /// uninformative.
+    pub forced_format: Option<String>,
+    /// When set, a suffix/magic disagreement is resolved in favor of
+    /// the magic-byte signature (with a warning) instead of returning
+    /// [`CoordinatorError::FormatMismatch`]. Mirrors the
+    /// `--force-format-from-magic` CLI flag.
+    ///
+    /// Mutually exclusive with [`Self::forced_format`] at the CLI
+    /// boundary; left to coexist here so library callers can
+    /// configure either independently.
+    pub force_format_from_magic: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -136,6 +153,8 @@ impl Default for CoordinatorConfig {
             checkpoint_min_interval: Duration::from_secs(2),
             workdir: None,
             reader_poll_interval: Duration::from_millis(5),
+            forced_format: None,
+            force_format_from_magic: false,
         }
     }
 }
@@ -267,6 +286,31 @@ pub enum CoordinatorError {
     NoDecoder {
         /// Filename component the registry was looked up against.
         filename: String,
+    },
+
+    /// The URL's suffix and the source's magic-byte signature point at
+    /// different formats. The user must disambiguate with
+    /// `--format <name>` or `--force-format-from-magic`.
+    #[error(
+        "format detection conflict: URL suffix indicates {suffix_format:?}, magic bytes \
+         indicate {magic_format:?}. Pass --format <name> to force a specific decoder \
+         or --force-format-from-magic to trust the magic"
+    )]
+    FormatMismatch {
+        /// Format name resolved from the URL's filename suffix, if any.
+        suffix_format: Option<String>,
+        /// Format name resolved from the magic-byte signature, if any.
+        magic_format: Option<String>,
+    },
+
+    /// The user passed `--format <name>` but no decoder is registered
+    /// under that name.
+    #[error("unknown format {name:?}; known formats: {available:?}")]
+    UnknownFormatName {
+        /// The name the user passed.
+        name: String,
+        /// Format names the registry knows about, for the error message.
+        available: Vec<String>,
     },
 
     /// The output URL has no usable filename component to look up a
@@ -452,6 +496,21 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     source,
                 })?;
 
+            // Resolve the decoder factory before constructing the
+            // reader. Detection may need to wait for chunk 0 to land
+            // so the magic-byte sniff has bytes to look at; doing it
+            // here keeps the BlockingSparseReader from owning that
+            // wait.
+            let factory = select_decoder_factory(
+                &registry,
+                &info,
+                &config,
+                &sparse,
+                &bitmap,
+                &download_done,
+                &download_outcome,
+            )?;
+
             // Build the blocking reader that feeds the decoder. It starts
             // at `decoder_position` for resume, or 0 for fresh runs.
             let reader_start = cursor.load(Ordering::Acquire);
@@ -465,18 +524,6 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 Arc::clone(&download_outcome),
                 config.reader_poll_interval,
             );
-
-            // Pick the decoder factory off the URL's filename.
-            let factory = registry
-                .factory_for_path(Path::new(info.url.path()))
-                .or_else(|| {
-                    filename_from_url(&info.url).and_then(|n| registry.factory_for_name(&n))
-                })
-                .ok_or_else(|| {
-                    let filename =
-                        filename_from_url(&info.url).unwrap_or_else(|| info.url.path().to_string());
-                    CoordinatorError::NoDecoder { filename }
-                })?;
 
             let mut decoder = factory(Box::new(reader)).map_err(CoordinatorError::Decode)?;
 
@@ -975,6 +1022,166 @@ impl Read for BlockingSparseReader {
             return Ok(n);
         }
     }
+}
+
+/// Pick the decoder factory the run should use, applying (in order):
+///
+/// 1. `config.forced_format` — short-circuit, no sniffing.
+/// 2. URL-suffix lookup against the registry.
+/// 3. Magic-byte lookup against the first
+///    `min(chunk_size, max_magic_window)` bytes of the source. Sniffing
+///    waits for the chunks covering that prefix to be downloaded.
+/// 4. Conflict resolution:
+///    - both lookups agree → use that factory;
+///    - both lookups disagree → return [`CoordinatorError::FormatMismatch`]
+///      unless `config.force_format_from_magic` is set, in which case
+///      the magic wins and a warning is emitted;
+///    - only one lookup matched → use it;
+///    - neither matched → return [`CoordinatorError::NoDecoder`].
+#[allow(clippy::too_many_arguments)]
+fn select_decoder_factory(
+    registry: &DecoderRegistry,
+    info: &DownloadInfo,
+    config: &CoordinatorConfig,
+    sparse: &SparseFile,
+    bitmap: &ChunkBitmap,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+) -> Result<DecoderFactory, CoordinatorError> {
+    if let Some(name) = config.forced_format.as_deref() {
+        return registry.factory_for_format_name(name).ok_or_else(|| {
+            CoordinatorError::UnknownFormatName {
+                name: name.to_string(),
+                available: registry
+                    .format_names()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            }
+        });
+    }
+
+    let suffix_factory = registry
+        .factory_for_path(Path::new(info.url.path()))
+        .or_else(|| filename_from_url(&info.url).and_then(|n| registry.factory_for_name(&n)));
+
+    // The plan calls for sniffing the first
+    // `min(chunk_size, max_magic_window)` bytes — but
+    // `max_magic_window` is small (≤ a few hundred bytes for every
+    // currently-registered format) and chunk_size is megabytes, so
+    // `max_magic_window` always wins. We still cap by `total_size`
+    // for the rare archive shorter than the magic window.
+    let max_window = registry.max_magic_window();
+    let prefix = if max_window == 0 {
+        Vec::new()
+    } else {
+        sniff_prefix(
+            sparse,
+            bitmap,
+            config.chunk_size,
+            info.total_size,
+            max_window,
+            download_done,
+            download_outcome,
+            config.reader_poll_interval,
+        )?
+    };
+    let magic_factory = registry.factory_for_prefix(&prefix);
+
+    match (suffix_factory, magic_factory) {
+        (Some(s), Some(m)) if std::ptr::fn_addr_eq(s, m) => Ok(s),
+        (Some(s), Some(m)) => {
+            let suffix_name = registry.name_for_factory(s).map(String::from);
+            let magic_name = registry.name_for_factory(m).map(String::from);
+            if config.force_format_from_magic {
+                // User-facing notice. We don't pull in `tracing` for
+                // this single call site — the rest of the binary uses
+                // `eprintln!` for user-visible output (see main.rs)
+                // and this is unambiguously user-facing rather than
+                // diagnostic logging.
+                eprintln!(
+                    "[warn] format-detection conflict: URL suffix indicates {} but \
+                     magic bytes indicate {}; using {} per --force-format-from-magic",
+                    suffix_name.as_deref().unwrap_or("?"),
+                    magic_name.as_deref().unwrap_or("?"),
+                    magic_name.as_deref().unwrap_or("?"),
+                );
+                Ok(m)
+            } else {
+                Err(CoordinatorError::FormatMismatch {
+                    suffix_format: suffix_name,
+                    magic_format: magic_name,
+                })
+            }
+        }
+        (Some(s), None) => Ok(s),
+        (None, Some(m)) => Ok(m),
+        (None, None) => {
+            let filename =
+                filename_from_url(&info.url).unwrap_or_else(|| info.url.path().to_string());
+            Err(CoordinatorError::NoDecoder { filename })
+        }
+    }
+}
+
+/// Wait for the chunks covering `[0, min(max_window, total_size))` to
+/// be marked complete in `bitmap`, then read the prefix from `sparse`.
+///
+/// Returns a buffer that may be shorter than `max_window` if the
+/// source itself is smaller. Surfaces a typed
+/// [`CoordinatorError::Scheduler`] / [`CoordinatorError::Io`] if the
+/// download thread finished before chunk 0 became available.
+#[allow(clippy::too_many_arguments)]
+fn sniff_prefix(
+    sparse: &SparseFile,
+    bitmap: &ChunkBitmap,
+    chunk_size: u64,
+    total_size: u64,
+    max_window: usize,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    poll_interval: Duration,
+) -> Result<Vec<u8>, CoordinatorError> {
+    if max_window == 0 || total_size == 0 || chunk_size == 0 {
+        return Ok(Vec::new());
+    }
+    let want = (max_window as u64).min(total_size);
+    // Number of chunks required to cover offset 0..want. For typical
+    // configs this is exactly 1 (chunk_size ≫ max_window).
+    // INVARIANT: chunk_size > 0 (checked above) so div_ceil is sound.
+    let chunks_needed = u32::try_from(want.div_ceil(chunk_size).max(1)).unwrap_or(u32::MAX);
+    for i in 0..chunks_needed {
+        let idx = ChunkIndex::new(i);
+        loop {
+            if bitmap.is_complete(idx) {
+                break;
+            }
+            if download_done.load(Ordering::Acquire) {
+                let detail = match download_outcome.lock() {
+                    Ok(slot) => match &*slot {
+                        Some(Err(e)) => format!("download failed: {e}"),
+                        _ => format!(
+                            "download finished but chunk {i} (needed for format detection) \
+                             is not complete"
+                        ),
+                    },
+                    Err(_) => "download outcome poisoned".to_string(),
+                };
+                return Err(CoordinatorError::Io {
+                    path: PathBuf::from("<sniff-prefix>"),
+                    source: io::Error::new(io::ErrorKind::UnexpectedEof, detail),
+                });
+            }
+            thread::sleep(poll_interval);
+        }
+    }
+    // INVARIANT: want <= usize::MAX because want <= max_window: usize.
+    let mut buf = vec![0u8; want as usize];
+    let n = sparse
+        .read_at(ByteOffset::ZERO, &mut buf)
+        .map_err(CoordinatorError::SparseFile)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 // Marker re-export so the unused-import warning doesn't fire when the

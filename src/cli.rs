@@ -31,6 +31,15 @@ use crate::http::Client;
         .required(true)
         .args(["output_dir", "output_file"]),
 ))]
+#[command(group(
+    // The two format-override flags express *different intents*: one
+    // names a specific decoder, the other says "trust whichever
+    // decoder the magic bytes pick". They cannot both be set at once;
+    // the CLI rejects the combination at parse time per `PLAN_v2.md`
+    // §1 step 5.
+    ArgGroup::new("format-override")
+        .args(["forced_format", "force_format_from_magic"]),
+))]
 pub struct Cli {
     /// Source URL (e.g. https://example.com/dataset.tar.zst).
     pub url: String,
@@ -63,6 +72,19 @@ pub struct Cli {
     /// seconds (fractional).
     #[arg(long = "checkpoint-min-secs", default_value_t = 2.0)]
     pub checkpoint_min_secs: f64,
+
+    /// Force a specific decoder by name, bypassing both URL-suffix
+    /// and magic-byte detection. Use this when the URL has no
+    /// usable suffix (e.g. opaque query-string downloads). Mutually
+    /// exclusive with `--force-format-from-magic`.
+    #[arg(long = "format", value_name = "NAME")]
+    pub forced_format: Option<String>,
+
+    /// When the URL suffix and the source's magic bytes disagree,
+    /// trust the magic instead of returning `FormatMismatch`.
+    /// Mutually exclusive with `--format`.
+    #[arg(long = "force-format-from-magic", default_value_t = false)]
+    pub force_format_from_magic: bool,
 }
 
 impl Cli {
@@ -95,6 +117,8 @@ impl Cli {
                 checkpoint_min_interval: Duration::from_secs_f64(self.checkpoint_min_secs.max(0.0)),
                 workdir: None,
                 reader_poll_interval: Duration::from_millis(5),
+                forced_format: self.forced_format,
+                force_format_from_magic: self.force_format_from_magic,
             },
             client,
             registry: DecoderRegistry::with_defaults(),
@@ -145,6 +169,50 @@ mod tests {
     fn rejects_no_output() {
         let err = Cli::try_parse_from(["peel", "https://example.com/x.tar.zst"])
             .expect_err("must require output");
+        let _ = err;
+    }
+
+    #[test]
+    fn parses_forced_format_flag() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x?id=42",
+            "-o",
+            "/tmp/out.bin",
+            "--format",
+            "zstd",
+        ])
+        .expect("parse");
+        assert_eq!(cli.forced_format.as_deref(), Some("zstd"));
+        assert!(!cli.force_format_from_magic);
+    }
+
+    #[test]
+    fn parses_force_format_from_magic_flag() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.gz",
+            "-o",
+            "/tmp/out.bin",
+            "--force-format-from-magic",
+        ])
+        .expect("parse");
+        assert!(cli.force_format_from_magic);
+        assert!(cli.forced_format.is_none());
+    }
+
+    #[test]
+    fn rejects_format_and_force_from_magic_simultaneously() {
+        let err = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.gz",
+            "-o",
+            "/tmp/out.bin",
+            "--format",
+            "zstd",
+            "--force-format-from-magic",
+        ])
+        .expect_err("must conflict");
         let _ = err;
     }
 }

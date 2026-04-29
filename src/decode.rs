@@ -42,9 +42,12 @@
 //!
 //! # Registry
 //!
-//! [`DecoderRegistry`] maps file-name suffixes to factory functions. The
-//! lookup is longest-suffix-wins so `.tar.zst` shadows `.zst` once a tar
-//! decoder lands. [`DecoderRegistry::with_defaults`] returns a registry
+//! [`DecoderRegistry`] maps formats to factory functions through three
+//! parallel lookups: file-name **suffix**, magic-byte **prefix**, and
+//! human-readable **format name** (used by `--format <name>`). Suffix
+//! and magic lookups both follow a longest-match-wins rule so
+//! `.tar.zst` shadows `.zst` and a more specific magic shadows a less
+//! specific one. [`DecoderRegistry::with_defaults`] returns a registry
 //! pre-populated with every decoder this crate ships.
 
 use std::io::{Read, Write};
@@ -162,22 +165,67 @@ pub trait StreamingDecoder: Send {
 pub type DecoderFactory =
     fn(Box<dyn Read + Send>) -> Result<Box<dyn StreamingDecoder>, DecodeError>;
 
-/// Map from file-name suffixes to [`DecoderFactory`] callbacks.
+/// A fixed byte sequence at a known offset that uniquely identifies a
+/// compressed-archive format.
 ///
-/// Lookup is longest-suffix-wins: when a path matches multiple
-/// registered suffixes, the registry returns the factory whose suffix
-/// is longest. This is what makes `.tar.zst` resolve to a tar-aware
-/// decoder once one lands without having to deregister `.zst` first.
+/// Most container formats begin with a magic at offset 0 (zstd, gzip,
+/// xz, lz4, zip's local file header); tar lives at offset 257 inside
+/// the first 512-byte header block. The registry uses these signatures
+/// to identify a format from a downloaded prefix when the URL's suffix
+/// is unhelpful (e.g. `https://example.com/download?id=42`) or
+/// contradicts the bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct MagicSignature {
+    /// Offset, in bytes, where the signature begins in the source.
+    pub offset: u16,
+    /// The exact bytes that must appear at `offset`.
+    pub bytes: &'static [u8],
+}
+
+impl MagicSignature {
+    /// Smallest prefix length that fully covers this signature.
+    ///
+    /// A caller that has read fewer bytes than this cannot evaluate
+    /// the signature one way or the other.
+    #[must_use]
+    pub fn window_required(&self) -> usize {
+        self.offset as usize + self.bytes.len()
+    }
+
+    /// Whether `prefix` matches this signature.
+    ///
+    /// Returns `false` if `prefix` is shorter than [`Self::window_required`].
+    #[must_use]
+    pub fn matches(&self, prefix: &[u8]) -> bool {
+        let end = self.window_required();
+        prefix.len() >= end && &prefix[self.offset as usize..end] == self.bytes
+    }
+}
+
+/// Three-way lookup from URL suffix, magic-byte prefix, or
+/// human-readable format name to [`DecoderFactory`] callbacks.
 ///
-/// All comparisons are case-insensitive on the file-name portion of the
-/// path.
+/// Suffix and magic lookups both follow a longest-match-wins rule:
+/// when a name matches multiple registered suffixes the longest
+/// suffix wins (so `.tar.zst` shadows `.zst`); when a prefix matches
+/// multiple registered magics the longest magic wins. Format-name
+/// lookups are exact-match.
+///
+/// All string comparisons are case-insensitive on the file-name
+/// portion of the path / on the format name.
 #[derive(Default, Clone)]
 pub struct DecoderRegistry {
     /// Each entry is `(lowercased_suffix, factory)`. Order is the
     /// insertion order; lookup linearly searches for the longest match.
     /// At plan-§6 scale (a handful of suffixes), the linear scan is
     /// faster than any lookup structure that requires hashing.
-    entries: Vec<(String, DecoderFactory)>,
+    suffix_entries: Vec<(String, DecoderFactory)>,
+    /// Each entry is `(magic_signature, factory)`. Same linear-scan
+    /// rationale as `suffix_entries`.
+    magic_entries: Vec<(MagicSignature, DecoderFactory)>,
+    /// Each entry is `(lowercased_name, factory)`. Used by the
+    /// `--format <name>` CLI override path.
+    name_entries: Vec<(String, DecoderFactory)>,
 }
 
 impl DecoderRegistry {
@@ -190,12 +238,21 @@ impl DecoderRegistry {
     /// Create a registry populated with every decoder shipped by this
     /// crate.
     ///
-    /// Currently registers `.zst` and `.zstd`.
+    /// Currently registers `.zst` / `.zstd` (suffixes), the four-byte
+    /// zstd magic at offset 0 (`28 B5 2F FD`), and the format name
+    /// `"zstd"`.
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
-        r.register(".zst", zstd::factory);
-        r.register(".zstd", zstd::factory);
+        r.register_format(
+            "zstd",
+            &[".zst", ".zstd"],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &[0x28, 0xB5, 0x2F, 0xFD],
+            }],
+            zstd::factory,
+        );
         r
     }
 
@@ -205,10 +262,61 @@ impl DecoderRegistry {
     /// Re-registering the same suffix replaces the prior factory.
     pub fn register(&mut self, suffix: &str, factory: DecoderFactory) {
         let key = suffix.to_ascii_lowercase();
-        if let Some(slot) = self.entries.iter_mut().find(|(s, _)| *s == key) {
+        if let Some(slot) = self.suffix_entries.iter_mut().find(|(s, _)| *s == key) {
             slot.1 = factory;
         } else {
-            self.entries.push((key, factory));
+            self.suffix_entries.push((key, factory));
+        }
+    }
+
+    /// Register `factory` to handle sources whose first bytes match
+    /// `magic`.
+    ///
+    /// Re-registering the same magic (same offset and same bytes)
+    /// replaces the prior factory.
+    pub fn register_magic(&mut self, magic: MagicSignature, factory: DecoderFactory) {
+        if let Some(slot) = self
+            .magic_entries
+            .iter_mut()
+            .find(|(m, _)| m.offset == magic.offset && m.bytes == magic.bytes)
+        {
+            slot.1 = factory;
+        } else {
+            self.magic_entries.push((magic, factory));
+        }
+    }
+
+    /// Register `factory` under a human-readable format `name` for
+    /// `--format <name>` lookups.
+    ///
+    /// Re-registering the same name (case-insensitively) replaces the
+    /// prior factory.
+    pub fn register_name(&mut self, name: &str, factory: DecoderFactory) {
+        let key = name.to_ascii_lowercase();
+        if let Some(slot) = self.name_entries.iter_mut().find(|(n, _)| *n == key) {
+            slot.1 = factory;
+        } else {
+            self.name_entries.push((key, factory));
+        }
+    }
+
+    /// Convenience: register `factory` against a format name, a list
+    /// of suffixes, and a list of magic signatures in one call. Each
+    /// individual registration follows the same replacement semantics
+    /// as the targeted single-purpose method.
+    pub fn register_format(
+        &mut self,
+        name: &str,
+        suffixes: &[&str],
+        magics: &[MagicSignature],
+        factory: DecoderFactory,
+    ) {
+        self.register_name(name, factory);
+        for s in suffixes {
+            self.register(s, factory);
+        }
+        for m in magics {
+            self.register_magic(*m, factory);
         }
     }
 
@@ -228,23 +336,84 @@ impl DecoderRegistry {
     #[must_use]
     pub fn factory_for_name(&self, name: &str) -> Option<DecoderFactory> {
         let lower = name.to_ascii_lowercase();
-        self.entries
+        self.suffix_entries
             .iter()
             .filter(|(suffix, _)| lower.ends_with(suffix.as_str()))
             .max_by_key(|(suffix, _)| suffix.len())
             .map(|(_, factory)| *factory)
     }
 
+    /// Return the longest-matching factory for `prefix`, if any of the
+    /// registered magics match.
+    ///
+    /// "Longest" is measured in [`MagicSignature::bytes`] length so
+    /// more specific signatures shadow less specific ones (the same
+    /// rule as suffix lookup, in spirit).
+    #[must_use]
+    pub fn factory_for_prefix(&self, prefix: &[u8]) -> Option<DecoderFactory> {
+        self.magic_entries
+            .iter()
+            .filter(|(magic, _)| magic.matches(prefix))
+            .max_by_key(|(magic, _)| magic.bytes.len())
+            .map(|(_, factory)| *factory)
+    }
+
+    /// Return the factory registered against the given format `name`,
+    /// case-insensitively, if any.
+    ///
+    /// Used by the `--format <name>` CLI override that bypasses both
+    /// suffix and magic detection.
+    #[must_use]
+    pub fn factory_for_format_name(&self, name: &str) -> Option<DecoderFactory> {
+        let lower = name.to_ascii_lowercase();
+        self.name_entries
+            .iter()
+            .find(|(n, _)| n == &lower)
+            .map(|(_, factory)| *factory)
+    }
+
+    /// Largest prefix window any registered magic requires.
+    ///
+    /// The coordinator uses this to decide how many bytes to wait for
+    /// before sniffing — every registered signature can be evaluated
+    /// once a buffer of this length has been read.
+    #[must_use]
+    pub fn max_magic_window(&self) -> usize {
+        self.magic_entries
+            .iter()
+            .map(|(m, _)| m.window_required())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// List of registered format names, in registration order. Used
+    /// by error messages that want to suggest valid `--format` values.
+    #[must_use]
+    pub fn format_names(&self) -> Vec<&str> {
+        self.name_entries.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// Reverse-lookup: the registered name (if any) for a given
+    /// factory, used to render human-readable diagnostics about
+    /// detection mismatches.
+    #[must_use]
+    pub fn name_for_factory(&self, factory: DecoderFactory) -> Option<&str> {
+        self.name_entries
+            .iter()
+            .find(|(_, f)| std::ptr::fn_addr_eq(*f, factory))
+            .map(|(n, _)| n.as_str())
+    }
+
     /// Number of registered suffixes.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.suffix_entries.len()
     }
 
     /// True if the registry has no registered suffixes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.suffix_entries.is_empty()
     }
 }
 
@@ -345,5 +514,162 @@ mod tests {
         // without a file name are not matchable.
         let bare = std::path::Path::new("/");
         assert!(r.factory_for_path(bare).is_none());
+    }
+
+    #[test]
+    fn magic_signature_matches_only_with_full_window() {
+        let zstd_magic = MagicSignature {
+            offset: 0,
+            bytes: &[0x28, 0xB5, 0x2F, 0xFD],
+        };
+        assert_eq!(zstd_magic.window_required(), 4);
+        assert!(!zstd_magic.matches(&[]));
+        assert!(!zstd_magic.matches(&[0x28, 0xB5, 0x2F]));
+        assert!(zstd_magic.matches(&[0x28, 0xB5, 0x2F, 0xFD]));
+        assert!(zstd_magic.matches(&[0x28, 0xB5, 0x2F, 0xFD, 0xAA]));
+        assert!(!zstd_magic.matches(&[0x1F, 0x8B, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn magic_signature_with_offset_skips_leading_bytes() {
+        // Tar's `ustar\0` lives at offset 257 inside the first 512-byte
+        // header block. A short prefix can't satisfy it; a long-enough
+        // prefix with the right pattern can.
+        let tar_magic = MagicSignature {
+            offset: 257,
+            bytes: b"ustar\0",
+        };
+        assert_eq!(tar_magic.window_required(), 263);
+        assert!(!tar_magic.matches(&[0u8; 100]));
+        let mut block = vec![0u8; 512];
+        block[257..263].copy_from_slice(b"ustar\0");
+        assert!(tar_magic.matches(&block));
+    }
+
+    #[test]
+    fn registry_with_defaults_registers_zstd_magic_and_format_name() {
+        let r = DecoderRegistry::with_defaults();
+        let prefix = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+        assert!(r.factory_for_prefix(&prefix).is_some());
+        assert!(r.factory_for_prefix(&[0x1F, 0x8B, 0x00, 0x00]).is_none());
+        assert!(r.factory_for_format_name("zstd").is_some());
+        assert!(r.factory_for_format_name("ZSTD").is_some());
+        assert!(r.factory_for_format_name("gzip").is_none());
+    }
+
+    #[test]
+    fn registry_factory_for_prefix_picks_longest_magic() {
+        // Two stub formats that share the same prefix start; the longer
+        // (more specific) signature should win.
+        let mut r = DecoderRegistry::new();
+        r.register_magic(
+            MagicSignature {
+                offset: 0,
+                bytes: &[0xAA, 0xBB],
+            },
+            stub_factory,
+        );
+        r.register_magic(
+            MagicSignature {
+                offset: 0,
+                bytes: &[0xAA, 0xBB, 0xCC, 0xDD],
+            },
+            other_factory,
+        );
+
+        let chosen = r
+            .factory_for_prefix(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE])
+            .expect("longer matches");
+        assert!(std::ptr::fn_addr_eq(
+            chosen,
+            other_factory as DecoderFactory
+        ));
+
+        // A prefix that only satisfies the shorter signature falls back
+        // to the shorter factory.
+        let chosen = r
+            .factory_for_prefix(&[0xAA, 0xBB, 0x00])
+            .expect("shorter matches");
+        assert!(std::ptr::fn_addr_eq(chosen, stub_factory as DecoderFactory));
+    }
+
+    #[test]
+    fn registry_re_registering_magic_replaces_factory() {
+        let magic = MagicSignature {
+            offset: 0,
+            bytes: &[0x01, 0x02, 0x03],
+        };
+        let mut r = DecoderRegistry::new();
+        r.register_magic(magic, stub_factory);
+        r.register_magic(magic, other_factory);
+        let chosen = r
+            .factory_for_prefix(&[0x01, 0x02, 0x03, 0x04])
+            .expect("registered");
+        assert!(std::ptr::fn_addr_eq(
+            chosen,
+            other_factory as DecoderFactory
+        ));
+        // No accidental duplicate left in the magic vector.
+        assert_eq!(r.magic_entries.len(), 1);
+    }
+
+    #[test]
+    fn registry_max_magic_window_picks_largest_offset_plus_len() {
+        let mut r = DecoderRegistry::new();
+        r.register_magic(
+            MagicSignature {
+                offset: 0,
+                bytes: &[0xAA; 4],
+            },
+            stub_factory,
+        );
+        assert_eq!(r.max_magic_window(), 4);
+        r.register_magic(
+            MagicSignature {
+                offset: 257,
+                bytes: b"ustar\0",
+            },
+            other_factory,
+        );
+        assert_eq!(r.max_magic_window(), 263);
+    }
+
+    #[test]
+    fn registry_max_magic_window_is_zero_when_no_magic_registered() {
+        let r = DecoderRegistry::new();
+        assert_eq!(r.max_magic_window(), 0);
+    }
+
+    #[test]
+    fn registry_register_format_populates_all_three_maps() {
+        let mut r = DecoderRegistry::new();
+        r.register_format(
+            "stub",
+            &[".stub", ".s2"],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &[0xDE, 0xAD],
+            }],
+            stub_factory,
+        );
+        assert!(r.factory_for_format_name("stub").is_some());
+        assert!(r.factory_for_format_name("STUB").is_some());
+        assert!(r.factory_for_name("a.stub").is_some());
+        assert!(r.factory_for_name("a.s2").is_some());
+        assert!(r.factory_for_prefix(&[0xDE, 0xAD, 0x00]).is_some());
+    }
+
+    #[test]
+    fn registry_name_for_factory_round_trips() {
+        let r = DecoderRegistry::with_defaults();
+        let zstd_factory = r.factory_for_format_name("zstd").expect("registered");
+        assert_eq!(r.name_for_factory(zstd_factory), Some("zstd"));
+    }
+
+    #[test]
+    fn registry_format_names_returns_registered_names() {
+        let r = DecoderRegistry::with_defaults();
+        let names = r.format_names();
+        assert!(names.contains(&"zstd"));
     }
 }
