@@ -46,9 +46,11 @@
 //! not 'malformed header'" guideline.
 
 pub mod crc32;
+pub mod decode;
 pub mod format;
 
 pub use crc32::{ieee, Crc32};
+pub use decode::{decompress_entry, EntryDecodeError, COPY_BUFFER_LEN};
 pub use format::{
     find_eocd, parse_central_directory, CentralDirectoryEntry, CompressionMethod,
     EndOfCentralDirectory, GeneralPurposeFlags, LocalFileHeader, MAX_EOCD_TAIL_BYTES,

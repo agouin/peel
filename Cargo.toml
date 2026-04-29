@@ -39,6 +39,12 @@ xz2 = "0.1"
 # need at runtime, so it stays disabled. `safe-decode` keeps malformed
 # input from triggering panics inside the block decompressor.
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
+# DEFLATE backend for ZIP entries (PLAN_v2.md §5 / docs/ENGINEERING_STANDARDS.md §2.2).
+# `rust_backend` selects the pure-Rust miniz_oxide backend per the
+# allowlist note — no C dependency, smaller audit surface than the
+# default zlib-ng backend, throughput well above what the network
+# bottleneck makes us care about.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # docs/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }
