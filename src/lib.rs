@@ -30,10 +30,13 @@
 //! - [`sink`] — the [`sink::Sink`] trait every extraction target
 //!   honors, the always-quiescent [`sink::RawSink`], and the
 //!   member-aligned streaming [`sink::TarSink`].
+//! - [`extractor`] (Unix only) — the [`extractor::Extractor`]
+//!   coordinator that drives a decoder + sink + puncher loop and
+//!   punches the source behind quiescent checkpoints.
 //!
-//! Future modules (`checkpoint`, `extractor`, `coordinator`) are
-//! introduced one plan section at a time. Until they exist, the
-//! binary in [`main.rs`](../src/main.rs) is intentionally a stub.
+//! Future modules (`checkpoint`, `coordinator`) are introduced one
+//! plan section at a time. Until they exist, the binary in
+//! [`main.rs`](../src/main.rs) is intentionally a stub.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -46,6 +49,8 @@ pub mod decode;
 #[cfg(unix)]
 pub mod download;
 pub mod error;
+#[cfg(unix)]
+pub mod extractor;
 pub mod http;
 #[cfg(unix)]
 pub mod punch;

@@ -534,7 +534,10 @@ fn run_skips_chunks_already_marked_complete() {
         .pwrite_at(peel::types::ByteOffset::new(0), &body_clone[0..4000])
         .expect("pre-write 0");
     sparse
-        .pwrite_at(peel::types::ByteOffset::new(8000), &body_clone[8000..12_000])
+        .pwrite_at(
+            peel::types::ByteOffset::new(8000),
+            &body_clone[8000..12_000],
+        )
         .expect("pre-write 2");
     let bitmap = ChunkBitmap::new(total_chunks);
     bitmap.mark_complete(ChunkIndex::new(0));

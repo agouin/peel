@@ -2,7 +2,7 @@
 
 **Sick of downloading an archive just to extract it and delete it?**
 **Tired of provisioning disk for *both* the compressed file and the
-extracted contents — only to throw half of it away?**
+extracted contents — only to throw ~half of it away?**
 
 `peel` downloads, decompresses, and extracts in a single pass. The
 compressed bytes never fully land on disk: as the decoder consumes them,
