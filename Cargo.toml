@@ -16,6 +16,12 @@ path = "src/main.rs"
 
 [dependencies]
 thiserror = "2"
+# TLS dependencies are pre-approved per docs/ENGINEERING_STANDARDS.md §2.4.
+# `ring` is the crypto backend; `tls12` and `tls13` cover the protocol versions
+# we need; `std` enables the blocking-IO `rustls::StreamOwned` adapter we use
+# from `http::client`.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "0.26"
 
 [dev-dependencies]
 

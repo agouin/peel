@@ -16,10 +16,19 @@
 //!   implementations used to release blocks of the compressed source as
 //!   the decoder advances.
 //!
-//! Future modules (`bitmap`, `checkpoint`, `http`, `download`,
-//! `decode`, `sink`, `extractor`, `coordinator`) are introduced one
-//! plan section at a time. Until they exist, the binary in
-//! [`main.rs`](../src/main.rs) is intentionally a stub.
+//! - [`bitmap`] — lock-free chunk completion bitmap shared across the
+//!   download workers, scheduler, and decoder.
+//! - [`download`] (Unix only) — the sparse output file workers write
+//!   into; eventually also the scheduler and worker pool.
+//! - [`http`] — hand-rolled HTTP/1.1 client with connection pooling and
+//!   TLS via `rustls`, plus the typed [`http::request`] /
+//!   [`http::response`] / [`http::range`] / [`http::url`] support
+//!   modules.
+//!
+//! Future modules (`checkpoint`, `decode`, `sink`, `extractor`,
+//! `coordinator`) are introduced one plan section at a time. Until
+//! they exist, the binary in [`main.rs`](../src/main.rs) is
+//! intentionally a stub.
 //!
 //! [`docs/PLAN.md`]: https://github.com/ondofinance/pux/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/ondofinance/pux/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -27,7 +36,11 @@
 #![deny(missing_docs)]
 #![warn(unused, clippy::all)]
 
+pub mod bitmap;
+#[cfg(unix)]
+pub mod download;
 pub mod error;
+pub mod http;
 #[cfg(unix)]
 pub mod punch;
 pub mod types;
