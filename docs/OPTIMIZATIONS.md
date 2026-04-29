@@ -97,14 +97,38 @@ utility for end-user machines first.
 
 ### O.6 xz / LZMA decoder
 
-**What**: support `.tar.xz` archives.
+**Status: delivered in `PLAN_v2.md` §3 (2026-04-29).** Round-one ships
+per-`Stream` frame granularity via `xz2`'s raw `Stream::process` API;
+see [`src/decode/xz.rs`](../src/decode/xz.rs). Default-encoded
+`.tar.xz` files are single-Block (and therefore single-Stream from the
+format's point of view) — no implementation can checkpoint within
+those, because the file itself does not contain a usable restart
+point. Per-Block granularity for multi-Block / multi-Stream files
+(which would help multi-threaded encoder output, `xz --keep` concat
+output, etc.) is filed below as `O.6b`.
 
-**Why deferred**: xz's checkpoint story is awkward — block boundaries
-exist but Rust crate support for surfacing them is poor. Doing it well
-requires either a fork of `xz2` or a hand-rolled block-index parser.
+---
 
-**Sketch**: parse the xz stream/index footer to enumerate block offsets,
-then decode block-by-block with checkpointing at block boundaries.
+### O.6b xz per-Block frame boundaries (round-two follow-on)
+
+**What**: parse xz's Block headers and Stream Index to expose
+per-Block frame boundaries within a single Stream, instead of only
+the per-Stream boundary `PLAN_v2.md` §3 settled for.
+
+**Why deferred**: only matters for multi-Block xz files (multi-threaded
+encoder output via `pixz` / `xz -T`, deliberately split corpora) and
+for multi-Stream files (`xz --keep` concat). The dominant `.tar.xz`
+shape — single-Block, single-Stream — cannot be checkpointed
+within-Block by *any* implementation; the format itself does not
+contain a restart point. Round-one's per-Stream MVP covers the case
+where it matters in practice.
+
+**Sketch**: parse the Stream Index at the tail of each Stream (it
+enumerates Blocks with their compressed/uncompressed sizes). Drive
+`xz2::stream::Stream::new_stream_decoder` per-Block by re-instantiating
+at known Block boundaries. Surface each Block boundary through
+`StreamingDecoder::frame_boundary` exactly the way per-Stream is
+surfaced today. Promote when real users hit the slow-resume cost.
 
 ---
 

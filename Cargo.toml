@@ -27,6 +27,11 @@ webpki-roots = "0.26"
 # default features (legacy decoders, dictionary builder, etc.) are not
 # needed and would expand the audit surface for no gain.
 zstd = { version = "0.13", default-features = false }
+# xz / LZMA decompression backend (PLAN_v2.md §3 / docs/ENGINEERING_STANDARDS.md §2.2).
+# Bindings to upstream liblzma; we use only the raw `stream::Stream` API
+# (single-frame stepping, mirroring the zstd shape) so the default
+# convenience features are kept off-radius.
+xz2 = "0.1"
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # docs/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }

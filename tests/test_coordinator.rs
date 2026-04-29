@@ -109,6 +109,36 @@ fn encode_zstd_frames(payloads: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Encode `payload` as a single-Stream xz blob using liblzma's easy
+/// encoder at preset 6 (matching `xz`'s default).
+fn encode_xz(payload: &[u8]) -> Vec<u8> {
+    use xz2::stream::{Action, Check, Status, Stream};
+
+    let mut encoder = Stream::new_easy_encoder(6, Check::Crc64).expect("encoder");
+    let mut out: Vec<u8> = Vec::with_capacity(payload.len() / 2 + 256);
+    let mut input_pos = 0usize;
+    let mut scratch = vec![0u8; 1 << 14];
+    loop {
+        let action = if input_pos < payload.len() {
+            Action::Run
+        } else {
+            Action::Finish
+        };
+        let prev_in = encoder.total_in();
+        let prev_out = encoder.total_out();
+        let res = encoder
+            .process(&payload[input_pos..], &mut scratch, action)
+            .expect("encode step");
+        input_pos += (encoder.total_in() - prev_in) as usize;
+        let produced = (encoder.total_out() - prev_out) as usize;
+        out.extend_from_slice(&scratch[..produced]);
+        if let Status::StreamEnd = res {
+            break;
+        }
+    }
+    out
+}
+
 /// "Well-behaved" mock handler: HEAD reports size + ETag + Accept-Ranges,
 /// every range request gets a 206 with the matching slice.
 fn ok_handler(
@@ -291,6 +321,55 @@ fn happy_path_tar_zst_to_dir_extracts_archive() {
     );
 
     // Sidecars cleaned up.
+    let sidecar_part = work.join("out.peel.part");
+    let sidecar_ckpt = work.join("out.peel.ckpt");
+    assert!(
+        !sidecar_part.exists(),
+        "expected no .part: {sidecar_part:?}"
+    );
+    assert!(
+        !sidecar_ckpt.exists(),
+        "expected no .ckpt: {sidecar_ckpt:?}"
+    );
+}
+
+// ---- happy path: tar.xz output (PLAN_v2 §3) ---------------------------
+
+#[test]
+fn happy_path_tar_xz_to_dir_extracts_archive() {
+    let archive = build_simple_archive(&[
+        ("dir/a.txt", b"hello-xz-a"),
+        ("dir/sub/b.bin", &[7u8; 1024]),
+        ("dir/c.empty", b""),
+    ]);
+    let body = encode_xz(&archive);
+    let server = MockServer::start(ok_handler(body, Some("\"v-tar-xz\"")));
+
+    let work = unique_dir("happy_tar_xz");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let args = make_args(
+        &server,
+        "x.tar.xz",
+        OutputTarget::Dir(out_dir.clone()),
+        coord_config_for_test(4096),
+    );
+
+    let stats = run(args).expect("tar.xz happy run");
+    assert!(!stats.resumed);
+
+    let entries = read_dir_recursive(&out_dir);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"dir/a.txt"));
+    assert!(names.contains(&"dir/sub/b.bin"));
+    assert_eq!(fs::read(out_dir.join("dir/a.txt")).unwrap(), b"hello-xz-a");
+    assert_eq!(
+        fs::read(out_dir.join("dir/sub/b.bin")).unwrap(),
+        vec![7u8; 1024]
+    );
+
     let sidecar_part = work.join("out.peel.part");
     let sidecar_ckpt = work.join("out.peel.ckpt");
     assert!(

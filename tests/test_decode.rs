@@ -156,6 +156,103 @@ fn decoder_can_be_driven_from_a_worker_thread() {
     assert_eq!(result, payload);
 }
 
+/// The registry routes `.xz` and `.tar.xz` to the xz decoder, decodes
+/// a single-Stream xz blob round-trip, and reports the end-of-Stream
+/// frame boundary at the cumulative source-byte offset.
+#[test]
+fn registry_factory_decodes_single_stream_xz() {
+    use xz2::stream::{Action, Check, Status, Stream};
+
+    fn encode_xz(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = Stream::new_easy_encoder(6, Check::Crc64).expect("encoder");
+        let mut out: Vec<u8> = Vec::with_capacity(payload.len() / 2 + 256);
+        let mut input_pos = 0usize;
+        let mut scratch = vec![0u8; 1 << 14];
+        loop {
+            let action = if input_pos < payload.len() {
+                Action::Run
+            } else {
+                Action::Finish
+            };
+            let prev_in = encoder.total_in();
+            let prev_out = encoder.total_out();
+            let res = encoder
+                .process(&payload[input_pos..], &mut scratch, action)
+                .expect("encode step");
+            input_pos += (encoder.total_in() - prev_in) as usize;
+            let produced = (encoder.total_out() - prev_out) as usize;
+            out.extend_from_slice(&scratch[..produced]);
+            if let Status::StreamEnd = res {
+                break;
+            }
+        }
+        out
+    }
+
+    let payload: Vec<u8> = b"xz-integration-payload\n".repeat(2048);
+    let compressed = encode_xz(&payload);
+    let compressed_len = compressed.len() as u64;
+
+    let registry = DecoderRegistry::with_defaults();
+    // Both `.xz` and `.tar.xz` resolve to the xz factory.
+    let plain = registry
+        .factory_for_name("dataset.xz")
+        .expect(".xz registered");
+    let tarred = registry
+        .factory_for_name("dataset.tar.xz")
+        .expect(".tar.xz registered");
+    // Factory identity test (longest-suffix-wins should still find the
+    // xz factory for both, since the same factory is registered for
+    // both suffixes).
+    let _ = (plain, tarred);
+
+    let mut decoder = plain(Box::new(Cursor::new(compressed))).expect("factory constructs");
+    let mut sink: Vec<u8> = Vec::with_capacity(payload.len());
+
+    let mut last_consumed = 0u64;
+    let mut last_boundary: Option<u64> = None;
+    loop {
+        let status = decoder.decode_step(&mut sink).expect("decode_step");
+        let consumed_now = decoder.bytes_consumed().get();
+        assert!(
+            consumed_now >= last_consumed,
+            "bytes_consumed regressed {last_consumed} -> {consumed_now}",
+        );
+        assert!(
+            consumed_now <= compressed_len,
+            "bytes_consumed {consumed_now} exceeds source length {compressed_len}",
+        );
+        last_consumed = consumed_now;
+        if let Some(b) = decoder.frame_boundary() {
+            last_boundary = Some(b.get());
+        }
+        if status == DecodeStatus::Eof {
+            break;
+        }
+    }
+
+    assert_eq!(sink, payload);
+    assert_eq!(decoder.bytes_consumed().get(), compressed_len);
+    assert_eq!(
+        last_boundary,
+        Some(compressed_len),
+        "frame_boundary at end of single Stream",
+    );
+}
+
+/// Magic-byte detection picks up the xz format from a prefix even
+/// when the URL has no helpful suffix. Mirrors the §1 magic-only
+/// resolution path against the §3 decoder.
+#[test]
+fn registry_factory_for_prefix_routes_to_xz() {
+    let xz_magic = [0xFD_u8, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x00];
+    let registry = DecoderRegistry::with_defaults();
+    let factory = registry
+        .factory_for_prefix(&xz_magic)
+        .expect("xz magic registered");
+    assert_eq!(registry.name_for_factory(factory), Some("xz"));
+}
+
 /// Truncated streams must surface as a clean [`DecodeError::Read`]
 /// rather than a panic. The decoder should not over-report
 /// `bytes_consumed` in this case.

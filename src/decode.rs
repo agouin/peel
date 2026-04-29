@@ -26,6 +26,9 @@
 //!   detects frame boundaries by single-frame stepping.
 //! - [`identity`] — passthrough decoder for archive formats that have
 //!   no compression layer (uncompressed `.tar`).
+//! - [`xz`] — wraps `xz2`'s raw [`xz2::stream::Stream`] in single-Stream
+//!   mode and exposes per-`Stream` boundaries (round-one MVP per
+//!   `docs/PLAN_v2.md` §3; per-Block granularity is filed as `O.6b`).
 //!
 //! Future formats (`gzip`, anything that fits the protocol) are added
 //! here following the same shape.
@@ -60,6 +63,7 @@ use thiserror::Error;
 use crate::types::ByteOffset;
 
 pub mod identity;
+pub mod xz;
 pub mod zstd;
 
 /// Status returned by [`StreamingDecoder::decode_step`].
@@ -250,6 +254,12 @@ impl DecoderRegistry {
     ///   (inside the first 512-byte tar header block). The decoder is
     ///   the identity passthrough — uncompressed tar streams hand
     ///   their bytes straight through to [`crate::sink::TarSink`].
+    /// - `"xz"` — `.xz` / `.tar.xz` suffixes; magic
+    ///   `FD 37 7A 58 5A 00` at offset 0. Round-one frame granularity
+    ///   is per-`Stream` (see `docs/PLAN_v2.md` §3); the resulting
+    ///   decoder hands its bytes straight through to either
+    ///   [`crate::sink::RawSink`] (`.xz`) or [`crate::sink::TarSink`]
+    ///   (`.tar.xz`) like every other compressed format.
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
@@ -276,6 +286,15 @@ impl DecoderRegistry {
                 },
             ],
             identity::factory,
+        );
+        r.register_format(
+            "xz",
+            &[".xz", ".tar.xz"],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00],
+            }],
+            xz::factory,
         );
         r
     }
@@ -486,6 +505,9 @@ mod tests {
         // `.tar` is also registered now (PLAN_v2 §2). A suffix that no
         // shipping decoder owns still misses.
         assert!(r.factory_for_name("dataset.tar").is_some());
+        // `.xz` and `.tar.xz` registered as of PLAN_v2 §3.
+        assert!(r.factory_for_name("dataset.xz").is_some());
+        assert!(r.factory_for_name("dataset.tar.xz").is_some());
         assert!(r.factory_for_name("dataset.lz4").is_none());
     }
 
@@ -699,6 +721,35 @@ mod tests {
         let names = r.format_names();
         assert!(names.contains(&"zstd"));
         assert!(names.contains(&"tar"));
+        assert!(names.contains(&"xz"));
+    }
+
+    #[test]
+    fn registry_with_defaults_registers_xz_suffix_and_magic() {
+        let r = DecoderRegistry::with_defaults();
+
+        // Suffix lookup, including the longer `.tar.xz` shadowing
+        // `.xz`. Both register the same factory, so the assertion is
+        // about hit-vs-miss, not factory identity.
+        let plain = r.factory_for_name("archive.xz").expect(".xz registered");
+        let tarred = r
+            .factory_for_name("archive.tar.xz")
+            .expect(".tar.xz registered");
+        assert!(std::ptr::fn_addr_eq(plain, xz::factory as DecoderFactory));
+        assert!(std::ptr::fn_addr_eq(tarred, xz::factory as DecoderFactory));
+
+        // Magic detection on a real xz prefix.
+        let prefix = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x00];
+        let by_magic = r.factory_for_prefix(&prefix).expect("xz magic registered");
+        assert_eq!(r.name_for_factory(by_magic), Some("xz"));
+
+        // Format-name override path.
+        let by_name = r.factory_for_format_name("xz").expect("name registered");
+        assert!(std::ptr::fn_addr_eq(by_name, xz::factory as DecoderFactory));
+
+        // Window must accommodate the 6-byte xz magic at offset 0
+        // (and the 263-byte tar window already pushed it higher).
+        assert!(r.max_magic_window() >= 6);
     }
 
     #[test]

@@ -197,6 +197,46 @@ fn encode_zstd_frames(payloads: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Encode `payload` as a single-Stream xz blob using liblzma's easy
+/// encoder at preset 6 (matching `xz`'s default).
+fn encode_xz_stream(payload: &[u8]) -> Vec<u8> {
+    use xz2::stream::{Action, Check, Status, Stream};
+
+    let mut encoder = Stream::new_easy_encoder(6, Check::Crc64).expect("encoder");
+    let mut out: Vec<u8> = Vec::with_capacity(payload.len() / 2 + 256);
+    let mut input_pos = 0usize;
+    let mut scratch = vec![0u8; 1 << 14];
+    loop {
+        let action = if input_pos < payload.len() {
+            Action::Run
+        } else {
+            Action::Finish
+        };
+        let prev_in = encoder.total_in();
+        let prev_out = encoder.total_out();
+        let res = encoder
+            .process(&payload[input_pos..], &mut scratch, action)
+            .expect("encode step");
+        input_pos += (encoder.total_in() - prev_in) as usize;
+        let produced = (encoder.total_out() - prev_out) as usize;
+        out.extend_from_slice(&scratch[..produced]);
+        if let Status::StreamEnd = res {
+            break;
+        }
+    }
+    out
+}
+
+/// Concatenate one xz Stream per `payload`. Each Stream-end is a
+/// frame boundary the decoder will surface.
+fn encode_xz_streams(payloads: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in payloads {
+        out.extend_from_slice(&encode_xz_stream(p));
+    }
+    out
+}
+
 /// Header + payload + zero padding for a single tar member (USTAR).
 fn member_archive_bytes(name: &str, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(512 + payload.len() + 511);
@@ -631,6 +671,125 @@ fn random_kill_points_resume_to_identical_plain_tar_output() {
         if got != golden_entries {
             captured_failures.lock().unwrap().push(format!(
                 "trial {trial}: plain-tar resume diverges from golden \
+                 (abort_after={abort_after})",
+            ));
+        }
+    }
+
+    let failures = captured_failures.lock().unwrap();
+    assert!(failures.is_empty(), "{:?}", *failures);
+}
+
+// ---- harness: `.tar.xz` (PLAN_v2 §3, per-Stream frame granularity) ----
+
+#[test]
+fn random_kill_points_resume_to_identical_tar_xz_output() {
+    // Multi-member tar encoded as a *concatenation* of xz Streams,
+    // one Stream per member, so per-Stream frame boundaries surfaced
+    // by `decode/xz.rs` align with tar member boundaries the same
+    // way the tar.zst harness aligns zstd-frame boundaries to member
+    // boundaries. A single-Stream `.tar.xz` would have only one
+    // frame boundary (at end-of-stream), which short-circuits the
+    // per-trial randomization just like a single-frame `.tar.zst`
+    // does on the zstd path.
+    let mut members: Vec<(&str, Vec<u8>)> = Vec::new();
+    for i in 0..10 {
+        let name = Box::leak(format!("dir/xz_{i:02}.bin").into_boxed_str());
+        let payload: Vec<u8> = (0..(384 + i * 73))
+            .map(|j| (i as u8).wrapping_mul(29).wrapping_add(j as u8))
+            .collect();
+        members.push((name, payload));
+    }
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    for (name, payload) in &members {
+        frames.push(member_archive_bytes(name, payload));
+    }
+    frames.push(end_of_archive_block());
+    let frame_refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+    let body = encode_xz_streams(&frame_refs);
+    let server = MockServer::start(ok_handler(body, "\"v-tar-xz\""));
+
+    let golden_dir = unique_dir("golden_tar_xz");
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_out = golden_dir.join("out");
+    fs::create_dir_all(&golden_out).expect("golden out dir");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let args = make_args(
+        &server,
+        "x.tar.xz",
+        OutputTarget::Dir(golden_out.clone()),
+        coord_config(4096),
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden tar.xz run");
+    let golden_entries = read_dir_recursive(&golden_out);
+    assert!(
+        !golden_entries.is_empty(),
+        "golden tar.xz run did not extract any files",
+    );
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    if total_checkpoints < 2 {
+        return;
+    }
+
+    let trial_count = 10u64;
+    let mut rng = Lcg::seeded(0xACE0_F1B7_2486_BD13);
+    let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, total_checkpoints);
+        let work = unique_dir(&format!("tar_xz_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_dir = work.join("out");
+        fs::create_dir_all(&out_dir).expect("trial out dir");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let args = make_args(
+            &server,
+            "x.tar.xz",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                let got = read_dir_recursive(&out_dir);
+                assert_eq!(got, golden_entries, "trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("trial {trial}: unexpected error {other:?}"),
+        }
+
+        let resume_args = make_args(
+            &server,
+            "x.tar.xz",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume ok");
+        assert!(
+            stats.resumed,
+            "trial {trial}: resume did not flag itself as resumed"
+        );
+
+        let got = read_dir_recursive(&out_dir);
+        if got != golden_entries {
+            captured_failures.lock().unwrap().push(format!(
+                "trial {trial}: tar.xz resume diverges from golden \
                  (abort_after={abort_after})",
             ));
         }
