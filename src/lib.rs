@@ -33,10 +33,14 @@
 //! - [`extractor`] (Unix only) — the [`extractor::Extractor`]
 //!   coordinator that drives a decoder + sink + puncher loop and
 //!   punches the source behind quiescent checkpoints.
+//! - [`checkpoint`] — crash-safe persistence of a download +
+//!   extraction in progress: the [`checkpoint::Checkpoint`] struct,
+//!   its tiny custom binary format, and the atomic
+//!   write-to-temp-then-rename dance that makes resume safe.
 //!
-//! Future modules (`checkpoint`, `coordinator`) are introduced one
-//! plan section at a time. Until they exist, the binary in
-//! [`main.rs`](../src/main.rs) is intentionally a stub.
+//! Future modules (`coordinator`) are introduced one plan section at
+//! a time. Until they exist, the binary in [`main.rs`](../src/main.rs)
+//! is intentionally a stub.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -45,6 +49,7 @@
 #![warn(unused, clippy::all)]
 
 pub mod bitmap;
+pub mod checkpoint;
 pub mod decode;
 #[cfg(unix)]
 pub mod download;
