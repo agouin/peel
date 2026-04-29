@@ -125,11 +125,11 @@ const EOCD_FIXED_LEN: usize = 22;
 
 /// Minimum size of a fixed CDE record, before the variable-length
 /// filename / extra / comment fields.
-const CDE_FIXED_LEN: usize = 46;
+pub const CDE_FIXED_LEN: usize = 46;
 
 /// Minimum size of a fixed LFH record, before the variable-length
 /// filename / extra fields.
-const LFH_FIXED_LEN: usize = 30;
+pub const LFH_FIXED_LEN: usize = 30;
 
 /// Compression method recorded in the LFH and CDE.
 ///

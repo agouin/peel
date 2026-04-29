@@ -26,6 +26,7 @@
 pub mod scheduler;
 pub mod sparse_file;
 pub mod worker;
+pub mod zip_pipeline;
 
 pub use scheduler::{
     chunk_count, discover, run, DownloadInfo, DownloadMode, DownloadStats, SchedulerConfig,
@@ -33,3 +34,7 @@ pub use scheduler::{
 };
 pub use sparse_file::{SparseFile, SparseFileError};
 pub use worker::{ChunkOutcome, RetryConfig, SourceFingerprint, WorkerError};
+pub use zip_pipeline::{
+    BoundedSparseReader, ZipExtractionStats, ZipPipeline, ZipPipelineConfig, ZipPipelineError,
+    ZipPipelineEvent, ZipResumeState,
+};
