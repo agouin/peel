@@ -57,7 +57,45 @@ pub use format::{
     SIGNATURE_CDE, SIGNATURE_DATA_DESCRIPTOR, SIGNATURE_EOCD, SIGNATURE_LFH,
 };
 
+use std::io::Read;
+
 use thiserror::Error;
+
+use crate::decode::{DecodeError, StreamingDecoder};
+
+/// Format name [`crate::decode::DecoderRegistry::with_defaults`]
+/// registers ZIP under. The coordinator looks up this exact string
+/// (case-insensitive) when deciding whether to dispatch a run to
+/// [`crate::download::zip_pipeline`] instead of the streaming
+/// decoder loop.
+pub const FORMAT_NAME: &str = "zip";
+
+/// Sentinel [`crate::decode::DecoderFactory`] registered for the
+/// [`FORMAT_NAME`] format.
+///
+/// ZIP archives go through [`crate::download::zip_pipeline`], not
+/// the streaming-decoder loop, so this factory is **never invoked
+/// in normal operation**. It exists so the standard
+/// [`crate::decode::DecoderRegistry`] machinery (suffix matching,
+/// magic-byte sniffing, `--format <name>` override, format-mismatch
+/// detection) resolves `.zip` URLs the same way it resolves any
+/// other format. The coordinator pre-checks the resolved name
+/// against [`FORMAT_NAME`] and dispatches before invoking the
+/// factory; this body is reached only by a programming error
+/// (caller used [`crate::decode::DecoderRegistry`] outside the
+/// coordinator path) and surfaces a clear diagnostic.
+///
+/// # Errors
+///
+/// Always returns [`DecodeError::Construct`] with an explanatory
+/// message.
+pub fn streaming_factory_placeholder(
+    _src: Box<dyn Read + Send>,
+) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+    Err(DecodeError::Construct(std::io::Error::other(
+        "internal error: ZIP factory invoked instead of dispatching to the ZIP pipeline",
+    )))
+}
 
 /// Errors produced while parsing or extracting a ZIP archive.
 ///

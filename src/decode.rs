@@ -313,6 +313,37 @@ impl DecoderRegistry {
             }],
             lz4::factory,
         );
+        // ZIP doesn't use the streaming-decoder loop — see
+        // `docs/PLAN_v2.md` §5 and `crate::zip::streaming_factory_placeholder`.
+        // The registry entry exists so suffix / magic / format-name
+        // detection (and the --format / --force-format-from-magic
+        // CLI overrides) resolve `.zip` archives the same way the
+        // streaming formats do; the coordinator looks up the
+        // resolved factory's name and, when it matches
+        // [`crate::zip::FORMAT_NAME`], dispatches to the ZIP
+        // pipeline instead of invoking the factory.
+        //
+        // Two magic signatures registered: `PK\x03\x04` (the local
+        // file header that begins every non-empty zip) and
+        // `PK\x05\x06` (the EOCD-only encoding of an empty zip).
+        // Zip64-only archives that begin with `PK\x06\x06` are not
+        // auto-detected by magic but still extract via the URL
+        // suffix or `--format zip`.
+        r.register_format(
+            crate::zip::FORMAT_NAME,
+            &[".zip"],
+            &[
+                MagicSignature {
+                    offset: 0,
+                    bytes: &[0x50, 0x4B, 0x03, 0x04],
+                },
+                MagicSignature {
+                    offset: 0,
+                    bytes: &[0x50, 0x4B, 0x05, 0x06],
+                },
+            ],
+            crate::zip::streaming_factory_placeholder,
+        );
         r
     }
 
@@ -528,6 +559,10 @@ mod tests {
         // `.lz4` and `.tar.lz4` registered as of PLAN_v2 §4.
         assert!(r.factory_for_name("dataset.lz4").is_some());
         assert!(r.factory_for_name("dataset.tar.lz4").is_some());
+        // `.zip` registered as of PLAN_v2 §5 (factory is the
+        // sentinel `streaming_factory_placeholder` — the coordinator
+        // dispatches to the ZIP pipeline before invoking it).
+        assert!(r.factory_for_name("release.zip").is_some());
         // A suffix that no shipping decoder owns still misses.
         assert!(r.factory_for_name("dataset.gz").is_none());
     }
@@ -744,6 +779,7 @@ mod tests {
         assert!(names.contains(&"tar"));
         assert!(names.contains(&"xz"));
         assert!(names.contains(&"lz4"));
+        assert!(names.contains(&"zip"));
     }
 
     #[test]

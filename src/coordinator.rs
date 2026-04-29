@@ -62,8 +62,9 @@ use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
 use crate::download::{
     chunk_count, discover, run as run_scheduler, DownloadInfo, DownloadStats, RetryConfig,
-    SchedulerConfig, SchedulerError, SourceFingerprint, SparseFile, SparseFileError,
-    DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
+    SchedulerConfig, SchedulerError, SourceFingerprint, SparseFile, SparseFileError, ZipPipeline,
+    ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE,
+    DEFAULT_WORKERS,
 };
 use crate::extractor::{
     CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
@@ -71,8 +72,9 @@ use crate::extractor::{
 };
 use crate::http::{Client, ClientError, Url, UrlError};
 use crate::punch::{default_puncher, NoopPuncher, PunchHole};
-use crate::sink::{RawSink, Sink, SinkError, TarSink};
+use crate::sink::{RawSink, Sink, SinkError, TarSink, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
+use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
 
 /// What kind of output the coordinator should produce.
 #[derive(Debug, Clone)]
@@ -363,6 +365,18 @@ pub enum CoordinatorError {
     #[error("download thread panicked")]
     DownloadPanicked,
 
+    /// ZIP archives can only extract into a directory; the user
+    /// passed `--output-file`.
+    #[error(
+        "ZIP archives can only be extracted into a directory; \
+         re-run with `-C <DIR>` instead of `-o <FILE>`"
+    )]
+    ZipNeedsDirectory,
+
+    /// The ZIP pipeline failed.
+    #[error("ZIP extraction failed")]
+    Zip(#[source] ZipPipelineError),
+
     /// The caller's [`RunArgs::kill_switch`] flipped to `true`
     /// between checkpoint writes. The .peel.part / .peel.ckpt
     /// sidecars are intentionally left on disk so the next call
@@ -511,69 +525,108 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 &download_outcome,
             )?;
 
-            // Build the blocking reader that feeds the decoder. It starts
-            // at `decoder_position` for resume, or 0 for fresh runs.
-            let reader_start = cursor.load(Ordering::Acquire);
-            let reader = BlockingSparseReader::new(
-                Arc::clone(&sparse),
-                Arc::clone(&bitmap),
-                chunk_size,
-                total_size,
-                reader_start,
-                Arc::clone(&download_done),
-                Arc::clone(&download_outcome),
-                config.reader_poll_interval,
-            );
+            // Look up the resolved factory's name to decide which
+            // pipeline to drive. ZIP archives go through the
+            // per-entry pipeline; everything else goes through the
+            // streaming decoder loop. The name lookup is reverse-
+            // resolved by fn-pointer identity, which works for the
+            // free-function factories every shipping format uses.
+            let format_name = registry.name_for_factory(factory).map(String::from);
+            let is_zip = format_name.as_deref() == Some(ZIP_FORMAT_NAME);
 
-            let mut decoder = factory(Box::new(reader)).map_err(CoordinatorError::Decode)?;
-
-            // Run the extractor with a checkpoint observer that writes a
-            // durable checkpoint every time the cadence floor fires.
-            let extractor = Extractor::new(ExtractorConfig {
-                punch_threshold: config.punch_threshold,
-            });
             let puncher: Box<dyn PunchHole> = default_puncher();
 
-            let extraction_stats = match &output {
-                OutputTarget::File(path) => {
-                    let sink = build_raw_sink(path, &resume_plan)?;
-                    run_one(
-                        &extractor,
-                        &sparse,
-                        &mut *decoder,
-                        sink,
-                        puncher.as_ref(),
-                        &ckpt_path,
-                        &part_path,
-                        &info,
-                        &url,
-                        &bitmap,
-                        chunk_size,
-                        &output,
-                        &config,
-                        progress.as_mut(),
-                        kill_switch.as_ref(),
-                    )?
-                }
-                OutputTarget::Dir(path) => {
-                    let sink = build_tar_sink(path, &resume_plan)?;
-                    run_one(
-                        &extractor,
-                        &sparse,
-                        &mut *decoder,
-                        sink,
-                        puncher.as_ref(),
-                        &ckpt_path,
-                        &part_path,
-                        &info,
-                        &url,
-                        &bitmap,
-                        chunk_size,
-                        &output,
-                        &config,
-                        progress.as_mut(),
-                        kill_switch.as_ref(),
-                    )?
+            let extraction_stats = if is_zip {
+                let dir = match &output {
+                    OutputTarget::Dir(d) => d.clone(),
+                    OutputTarget::File(_) => {
+                        return Err(CoordinatorError::ZipNeedsDirectory);
+                    }
+                };
+                run_zip(
+                    &sparse,
+                    &bitmap,
+                    &cursor,
+                    &download_done,
+                    &download_outcome,
+                    puncher.as_ref(),
+                    &ckpt_path,
+                    &info,
+                    &url,
+                    chunk_size,
+                    total_size,
+                    &dir,
+                    &resume_plan,
+                    &config,
+                    progress.as_mut(),
+                    kill_switch.as_ref(),
+                )?
+            } else {
+                // Build the blocking reader that feeds the decoder.
+                // It starts at `decoder_position` for resume, or 0
+                // for fresh runs.
+                let reader_start = cursor.load(Ordering::Acquire);
+                let reader = BlockingSparseReader::new(
+                    Arc::clone(&sparse),
+                    Arc::clone(&bitmap),
+                    chunk_size,
+                    total_size,
+                    reader_start,
+                    Arc::clone(&download_done),
+                    Arc::clone(&download_outcome),
+                    config.reader_poll_interval,
+                );
+
+                let mut decoder = factory(Box::new(reader)).map_err(CoordinatorError::Decode)?;
+
+                // Run the extractor with a checkpoint observer that
+                // writes a durable checkpoint every time the cadence
+                // floor fires.
+                let extractor = Extractor::new(ExtractorConfig {
+                    punch_threshold: config.punch_threshold,
+                });
+
+                match &output {
+                    OutputTarget::File(path) => {
+                        let sink = build_raw_sink(path, &resume_plan)?;
+                        run_one(
+                            &extractor,
+                            &sparse,
+                            &mut *decoder,
+                            sink,
+                            puncher.as_ref(),
+                            &ckpt_path,
+                            &part_path,
+                            &info,
+                            &url,
+                            &bitmap,
+                            chunk_size,
+                            &output,
+                            &config,
+                            progress.as_mut(),
+                            kill_switch.as_ref(),
+                        )?
+                    }
+                    OutputTarget::Dir(path) => {
+                        let sink = build_tar_sink(path, &resume_plan)?;
+                        run_one(
+                            &extractor,
+                            &sparse,
+                            &mut *decoder,
+                            sink,
+                            puncher.as_ref(),
+                            &ckpt_path,
+                            &part_path,
+                            &info,
+                            &url,
+                            &bitmap,
+                            chunk_size,
+                            &output,
+                            &config,
+                            progress.as_mut(),
+                            kill_switch.as_ref(),
+                        )?
+                    }
                 }
             };
 
@@ -694,6 +747,7 @@ fn build_resume_plan(
         (output, &prior.sink_state),
         (OutputTarget::File(_), SinkState::Raw { .. })
             | (OutputTarget::Dir(_), SinkState::Tar { .. })
+            | (OutputTarget::Dir(_), SinkState::Zip { .. })
     );
     if !sink_compat {
         return Err(CoordinatorError::SourceChanged {
@@ -852,6 +906,193 @@ fn run_one<S: Sink>(
             })
         }
         Err(other) => Err(CoordinatorError::Extractor(other)),
+    }
+}
+
+/// Drive the ZIP per-entry pipeline with a checkpoint-writing
+/// observer.
+///
+/// Mirrors [`run_one`]'s shape: same checkpoint cadence
+/// (`checkpoint_min_bytes` / `checkpoint_min_interval`), same
+/// kill-switch handling, same [`ProgressEvent::CheckpointWritten`]
+/// emission. The differences are mechanical — the pipeline runs
+/// per-entry rather than per-frame, and the checkpoint records
+/// [`SinkState::Zip`] instead of `Tar` / `Raw`.
+#[allow(clippy::too_many_arguments)]
+fn run_zip(
+    sparse: &SparseFile,
+    bitmap: &ChunkBitmap,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
+    chunk_size: u64,
+    total_size: u64,
+    output_dir: &Path,
+    plan: &ResumePlan,
+    config: &CoordinatorConfig,
+    mut progress: Option<&mut ProgressFn>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+) -> Result<ExtractionStats, CoordinatorError> {
+    fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+    let mut sink = ZipSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+
+    // Translate the resume plan into the ZIP-specific shape.
+    let resume = match plan {
+        ResumePlan::Fresh => ZipResumeState::default(),
+        ResumePlan::Resume { sink_state, .. } => match sink_state {
+            SinkState::Zip {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+            } => ZipResumeState {
+                entries_completed: entries_completed.clone(),
+                current_entry: *current_entry,
+                current_entry_offset: *current_entry_offset,
+            },
+            SinkState::Raw { .. } | SinkState::Tar { .. } => {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is not Zip but the resolved format is zip"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    let pipeline_cfg = ZipPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: config.reader_poll_interval,
+        initial_tail_window: crate::zip::MAX_EOCD_TAIL_BYTES.min(total_size),
+    };
+    let pipeline = ZipPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        sparse_fd: sparse.as_fd(),
+    };
+
+    // Checkpoint cadence state, mirroring `run_one`.
+    let mut last_write_at = Instant::now()
+        .checked_sub(config.checkpoint_min_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_progress: u64 = 0;
+    let mut bytes_extracted_total: u64 = 0;
+    let mut bytes_punched_total: u64 = 0;
+    let mut entries_completed: Vec<u32> = resume.entries_completed.clone();
+    let mut entries_extracted_this_run: u64 = 0;
+    let mut checkpoints_written: u64 = 0;
+    const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
+
+    let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
+        // Kill-switch fires before any state mutation so the
+        // user-observable "checkpoint count" matches what's durable
+        // on disk.
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            ZipPipelineEvent::Started { .. } | ZipPipelineEvent::InEntryProgress { .. } => Ok(()),
+            ZipPipelineEvent::EntryFinished {
+                index,
+                bytes_written,
+                bytes_punched,
+                ..
+            } => {
+                entries_completed.push(*index);
+                bytes_extracted_total = bytes_extracted_total.saturating_add(*bytes_written);
+                bytes_punched_total = bytes_punched_total.saturating_add(*bytes_punched);
+                entries_extracted_this_run = entries_extracted_this_run.saturating_add(1);
+
+                // Throttle checkpoint writes. The "progress" we
+                // measure is bytes_extracted_total — an entry-by-entry
+                // proxy for source-byte progress that's monotonic,
+                // bounded by the archive's uncompressed size, and
+                // close to what a user would expect.
+                let elapsed = last_write_at.elapsed();
+                let progressed = bytes_extracted_total.saturating_sub(last_progress);
+                if progressed < config.checkpoint_min_bytes
+                    && elapsed < config.checkpoint_min_interval
+                {
+                    return Ok(());
+                }
+
+                // Flush the sparse file's pending writes so the
+                // bitmap claim of "this chunk is durable" is honest.
+                sparse
+                    .sync_all()
+                    .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
+
+                let ckpt = Checkpoint {
+                    url: requested_url.to_string(),
+                    etag: info.fingerprint.etag.clone(),
+                    last_modified: info.fingerprint.last_modified.clone(),
+                    total_size: info.total_size,
+                    chunk_size,
+                    decoder_position: ByteOffset::new(0),
+                    bitmap_completed: bitmap.to_bytes(),
+                    created_at: SystemTime::now(),
+                    sink_state: SinkState::Zip {
+                        entries_completed: entries_completed.clone(),
+                        current_entry: None,
+                        current_entry_offset: 0,
+                    },
+                };
+                ckpt.write(ckpt_path)
+                    .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+
+                last_write_at = Instant::now();
+                last_progress = bytes_extracted_total;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: bytes_extracted_total,
+                        bytes_out: bytes_extracted_total,
+                    });
+                }
+                Ok(())
+            }
+        }
+    });
+
+    match result {
+        Ok(stats) => {
+            sink.close().map_err(CoordinatorError::Sink)?;
+            // Translate ZipExtractionStats into the
+            // ExtractionStats shape the rest of the coordinator
+            // returns. Some fields don't have a natural ZIP
+            // counterpart and stay zero.
+            Ok(ExtractionStats {
+                bytes_in: total_size,
+                bytes_out: stats.bytes_written,
+                bytes_punched: stats.bytes_punched,
+                punch_calls: u64::from(stats.entries_extracted),
+                punch_unsupported: false,
+                frame_boundaries_observed: u64::from(stats.entries_extracted),
+                quiescent_checkpoints: checkpoints_written,
+                decode_time: Duration::default(),
+                write_time: Duration::default(),
+                punch_time: Duration::default(),
+            })
+        }
+        Err(ZipPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Zip(other)),
     }
 }
 
