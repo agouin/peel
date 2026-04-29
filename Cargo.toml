@@ -32,6 +32,13 @@ zstd = { version = "0.13", default-features = false }
 # (single-frame stepping, mirroring the zstd shape) so the default
 # convenience features are kept off-radius.
 xz2 = "0.1"
+# lz4 frame-format decompression backend (PLAN_v2.md §4 / docs/ENGINEERING_STANDARDS.md §2.2).
+# Pure Rust. We consume only the block-layer API (`block::decompress_into`)
+# and parse the LZ4 Frame Format ourselves to keep the wire-level surface
+# stable; the default `frame` feature pulls a `twox-hash` dep we don't
+# need at runtime, so it stays disabled. `safe-decode` keeps malformed
+# input from triggering panics inside the block decompressor.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # docs/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }

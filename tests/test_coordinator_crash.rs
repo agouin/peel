@@ -227,6 +227,98 @@ fn encode_xz_stream(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encode `payload` as a single-frame, single-block, uncompressed
+/// LZ4 archive. Every block boundary in the resulting frame surfaces
+/// as a frame boundary in `decode/lz4.rs`. Hand-rolled here so the
+/// crash harness does not depend on a runtime lz4 encoder library.
+fn encode_lz4_uncompressed_frame(payload: &[u8]) -> Vec<u8> {
+    const PRIME32_1: u32 = 0x9E37_79B1;
+    const PRIME32_2: u32 = 0x85EB_CA77;
+    const PRIME32_3: u32 = 0xC2B2_AE3D;
+    const PRIME32_4: u32 = 0x27D4_EB2F;
+    const PRIME32_5: u32 = 0x1656_67B1;
+
+    fn read_u32_le(bs: &[u8]) -> u32 {
+        u32::from_le_bytes([bs[0], bs[1], bs[2], bs[3]])
+    }
+    fn round(acc: u32, lane: u32) -> u32 {
+        acc.wrapping_add(lane.wrapping_mul(PRIME32_2))
+            .rotate_left(13)
+            .wrapping_mul(PRIME32_1)
+    }
+    fn xxh32(input: &[u8]) -> u32 {
+        let mut p = 0usize;
+        let len = input.len();
+        let mut h: u32;
+        if len >= 16 {
+            let mut v1 = PRIME32_1.wrapping_add(PRIME32_2);
+            let mut v2 = PRIME32_2;
+            let mut v3 = 0u32;
+            let mut v4 = 0u32.wrapping_sub(PRIME32_1);
+            let limit = len - 16;
+            loop {
+                v1 = round(v1, read_u32_le(&input[p..]));
+                v2 = round(v2, read_u32_le(&input[p + 4..]));
+                v3 = round(v3, read_u32_le(&input[p + 8..]));
+                v4 = round(v4, read_u32_le(&input[p + 12..]));
+                p += 16;
+                if p > limit {
+                    break;
+                }
+            }
+            h = v1
+                .rotate_left(1)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+        } else {
+            h = PRIME32_5;
+        }
+        h = h.wrapping_add(len as u32);
+        while p + 4 <= len {
+            h = h.wrapping_add(read_u32_le(&input[p..]).wrapping_mul(PRIME32_3));
+            h = h.rotate_left(17).wrapping_mul(PRIME32_4);
+            p += 4;
+        }
+        while p < len {
+            h = h.wrapping_add(u32::from(input[p]).wrapping_mul(PRIME32_5));
+            h = h.rotate_left(11).wrapping_mul(PRIME32_1);
+            p += 1;
+        }
+        h ^= h >> 15;
+        h = h.wrapping_mul(PRIME32_2);
+        h ^= h >> 13;
+        h = h.wrapping_mul(PRIME32_3);
+        h ^= h >> 16;
+        h
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x184D_2204u32.to_le_bytes());
+    let flg: u8 = 0b0110_0000;
+    let bd: u8 = 0b0111_0000;
+    out.push(flg);
+    out.push(bd);
+    let hc = ((xxh32(&[flg, bd]) >> 8) & 0xff) as u8;
+    out.push(hc);
+    let header = (payload.len() as u32) | 0x8000_0000;
+    out.extend_from_slice(&header.to_le_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&[0u8; 4]);
+    out
+}
+
+/// Concatenate one lz4 frame per `payload`. Each frame's blocks and
+/// end-of-frame marker surface as frame boundaries the decoder can
+/// land checkpoints on.
+fn encode_lz4_frames(payloads: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in payloads {
+        out.extend_from_slice(&encode_lz4_uncompressed_frame(p));
+    }
+    out
+}
+
 /// Concatenate one xz Stream per `payload`. Each Stream-end is a
 /// frame boundary the decoder will surface.
 fn encode_xz_streams(payloads: &[&[u8]]) -> Vec<u8> {
@@ -790,6 +882,125 @@ fn random_kill_points_resume_to_identical_tar_xz_output() {
         if got != golden_entries {
             captured_failures.lock().unwrap().push(format!(
                 "trial {trial}: tar.xz resume diverges from golden \
+                 (abort_after={abort_after})",
+            ));
+        }
+    }
+
+    let failures = captured_failures.lock().unwrap();
+    assert!(failures.is_empty(), "{:?}", *failures);
+}
+
+// ---- harness: `.tar.lz4` (PLAN_v2 §4) ---------------------------------
+
+#[test]
+fn random_kill_points_resume_to_identical_tar_lz4_output() {
+    // Multi-member tar encoded as a *concatenation* of LZ4 frames,
+    // one frame per member, so per-frame boundaries surfaced by
+    // `decode/lz4.rs` align with tar member boundaries the same way
+    // the tar.zst harness aligns zstd-frame boundaries to member
+    // boundaries. A single-frame `.tar.lz4` would only have block-
+    // and end-of-frame boundaries inside the single frame; using one
+    // frame per member exercises both intra-frame and inter-frame
+    // restart points.
+    let mut members: Vec<(&str, Vec<u8>)> = Vec::new();
+    for i in 0..10 {
+        let name = Box::leak(format!("dir/lz4_{i:02}.bin").into_boxed_str());
+        let payload: Vec<u8> = (0..(384 + i * 73))
+            .map(|j| (i as u8).wrapping_mul(31).wrapping_add(j as u8))
+            .collect();
+        members.push((name, payload));
+    }
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    for (name, payload) in &members {
+        frames.push(member_archive_bytes(name, payload));
+    }
+    frames.push(end_of_archive_block());
+    let frame_refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+    let body = encode_lz4_frames(&frame_refs);
+    let server = MockServer::start(ok_handler(body, "\"v-tar-lz4\""));
+
+    let golden_dir = unique_dir("golden_tar_lz4");
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_out = golden_dir.join("out");
+    fs::create_dir_all(&golden_out).expect("golden out dir");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let args = make_args(
+        &server,
+        "x.tar.lz4",
+        OutputTarget::Dir(golden_out.clone()),
+        coord_config(4096),
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden tar.lz4 run");
+    let golden_entries = read_dir_recursive(&golden_out);
+    assert!(
+        !golden_entries.is_empty(),
+        "golden tar.lz4 run did not extract any files",
+    );
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    if total_checkpoints < 2 {
+        return;
+    }
+
+    let trial_count = 10u64;
+    let mut rng = Lcg::seeded(0x5BEE_F00D_DECA_F2EE);
+    let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, total_checkpoints);
+        let work = unique_dir(&format!("tar_lz4_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_dir = work.join("out");
+        fs::create_dir_all(&out_dir).expect("trial out dir");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let args = make_args(
+            &server,
+            "x.tar.lz4",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                let got = read_dir_recursive(&out_dir);
+                assert_eq!(got, golden_entries, "trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("trial {trial}: unexpected error {other:?}"),
+        }
+
+        let resume_args = make_args(
+            &server,
+            "x.tar.lz4",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume ok");
+        assert!(
+            stats.resumed,
+            "trial {trial}: resume did not flag itself as resumed"
+        );
+
+        let got = read_dir_recursive(&out_dir);
+        if got != golden_entries {
+            captured_failures.lock().unwrap().push(format!(
+                "trial {trial}: tar.lz4 resume diverges from golden \
                  (abort_after={abort_after})",
             ));
         }

@@ -134,10 +134,46 @@ surfaced today. Promote when real users hit the slow-resume cost.
 
 ### O.7 lz4 decoder
 
-**What**: support `.tar.lz4`.
+**Status: delivered in `PLAN_v2.md` §4 (2026-04-29).** Round-one
+parses the [LZ4 Frame Format] header ourselves and feeds individual
+blocks through `lz4_flex::block::decompress_into`; see
+[`src/decode/lz4.rs`](../src/decode/lz4.rs). Frame boundaries are
+surfaced at end-of-frame only — the only positions where a freshly
+constructed decoder can correctly continue, since per-frame state
+(block-max-size, checksum flags, …) is not serialized into the
+checkpoint today. Per-block (within-frame) checkpoint granularity is
+filed below as `O.7b`.
 
-**Why deferred**: lz4 is rare in published archives; not a common
-real-world target.
+[LZ4 Frame Format]: https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
+
+---
+
+### O.7b lz4 per-block frame boundaries (round-two follow-on)
+
+**What**: surface *per-block* frame boundaries inside a single LZ4
+frame, instead of only the end-of-frame boundary `PLAN_v2.md` §4
+settled for. Today a single-frame `.tar.lz4` admits no within-source
+restart point and resumes re-decode the whole frame — for a typical
+single-block-per-tar-member encoding this is fine, but a producer
+that emits one big multi-megablock frame pays the full re-decode cost
+on resume.
+
+**Why deferred**: round-one would need to extend the [`Checkpoint`]
+format with a serialized [`FrameContext`] (`block_max_size`,
+checksum flags, optional content size, the running content hash, …)
+so a freshly constructed decoder restarted at a mid-frame block
+boundary could continue. That's a `format_version` bump and a wider
+diff than the round-one slot wants. Promote when a real corpus
+exists where the slow-resume cost matters.
+
+**Sketch**: extend `checkpoint::SinkState` (or a new sibling) with
+the per-frame parameters captured by `parse_frame_header`. On resume,
+seed the decoder's `State::InFrame { ctx }` from the checkpoint
+instead of starting in `BetweenFrames`. Surface every post-block
+offset through `frame_boundary` once that contract is genuine.
+
+[`Checkpoint`]: ../src/checkpoint.rs
+[`FrameContext`]: ../src/decode/lz4.rs
 
 ---
 

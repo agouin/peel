@@ -223,9 +223,7 @@ impl StreamingDecoder for XzDecoder {
                 self.state = State::Done;
                 Err(DecodeError::Read {
                     consumed: self.consumed_snapshot,
-                    source: io::Error::other(
-                        "xz decoder observed in transient state (poisoned)",
-                    ),
+                    source: io::Error::other("xz decoder observed in transient state (poisoned)"),
                 })
             }
 
@@ -363,9 +361,7 @@ impl StreamingDecoder for XzDecoder {
                                 self.state = State::Done;
                                 Err(DecodeError::Read {
                                     consumed: boundary,
-                                    source: io::Error::other(format!(
-                                        "xz next-stream init: {err}"
-                                    )),
+                                    source: io::Error::other(format!("xz next-stream init: {err}")),
                                 })
                             }
                         }

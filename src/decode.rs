@@ -29,6 +29,9 @@
 //! - [`xz`] — wraps `xz2`'s raw [`xz2::stream::Stream`] in single-Stream
 //!   mode and exposes per-`Stream` boundaries (round-one MVP per
 //!   `docs/PLAN_v2.md` §3; per-Block granularity is filed as `O.6b`).
+//! - [`lz4`] — hand-rolls the LZ4 Frame Format around `lz4_flex`'s
+//!   block-layer API and exposes per-block frame boundaries
+//!   (round-one MVP per `docs/PLAN_v2.md` §4).
 //!
 //! Future formats (`gzip`, anything that fits the protocol) are added
 //! here following the same shape.
@@ -63,6 +66,7 @@ use thiserror::Error;
 use crate::types::ByteOffset;
 
 pub mod identity;
+pub mod lz4;
 pub mod xz;
 pub mod zstd;
 
@@ -260,6 +264,10 @@ impl DecoderRegistry {
     ///   decoder hands its bytes straight through to either
     ///   [`crate::sink::RawSink`] (`.xz`) or [`crate::sink::TarSink`]
     ///   (`.tar.xz`) like every other compressed format.
+    /// - `"lz4"` — `.lz4` / `.tar.lz4` suffixes; magic
+    ///   `04 22 4D 18` at offset 0. Round-one supports
+    ///   block-independent frames only (the lz4 CLI's default); see
+    ///   [`lz4::Lz4Decoder`] for the full feature matrix.
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
@@ -295,6 +303,15 @@ impl DecoderRegistry {
                 bytes: &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00],
             }],
             xz::factory,
+        );
+        r.register_format(
+            "lz4",
+            &[".lz4", ".tar.lz4"],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &[0x04, 0x22, 0x4D, 0x18],
+            }],
+            lz4::factory,
         );
         r
     }
@@ -508,7 +525,11 @@ mod tests {
         // `.xz` and `.tar.xz` registered as of PLAN_v2 §3.
         assert!(r.factory_for_name("dataset.xz").is_some());
         assert!(r.factory_for_name("dataset.tar.xz").is_some());
-        assert!(r.factory_for_name("dataset.lz4").is_none());
+        // `.lz4` and `.tar.lz4` registered as of PLAN_v2 §4.
+        assert!(r.factory_for_name("dataset.lz4").is_some());
+        assert!(r.factory_for_name("dataset.tar.lz4").is_some());
+        // A suffix that no shipping decoder owns still misses.
+        assert!(r.factory_for_name("dataset.gz").is_none());
     }
 
     #[test]
@@ -722,6 +743,29 @@ mod tests {
         assert!(names.contains(&"zstd"));
         assert!(names.contains(&"tar"));
         assert!(names.contains(&"xz"));
+        assert!(names.contains(&"lz4"));
+    }
+
+    #[test]
+    fn registry_with_defaults_registers_lz4_suffix_and_magic() {
+        let r = DecoderRegistry::with_defaults();
+
+        let plain = r.factory_for_name("archive.lz4").expect(".lz4 registered");
+        let tarred = r
+            .factory_for_name("archive.tar.lz4")
+            .expect(".tar.lz4 registered");
+        assert!(std::ptr::fn_addr_eq(plain, lz4::factory as DecoderFactory));
+        assert!(std::ptr::fn_addr_eq(tarred, lz4::factory as DecoderFactory));
+
+        let prefix = [0x04, 0x22, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00];
+        let by_magic = r.factory_for_prefix(&prefix).expect("lz4 magic registered");
+        assert_eq!(r.name_for_factory(by_magic), Some("lz4"));
+
+        let by_name = r.factory_for_format_name("lz4").expect("name registered");
+        assert!(std::ptr::fn_addr_eq(
+            by_name,
+            lz4::factory as DecoderFactory
+        ));
     }
 
     #[test]

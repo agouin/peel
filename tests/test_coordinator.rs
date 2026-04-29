@@ -109,6 +109,88 @@ fn encode_zstd_frames(payloads: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Encode `payload` as a single-frame, single-block, uncompressed
+/// LZ4 archive with no checksums and no content size — the minimum
+/// viable shape `decode/lz4.rs` accepts. Hand-rolled here so the
+/// coordinator integration test stays independent of any specific
+/// lz4 encoder library.
+fn encode_lz4_uncompressed_frame(payload: &[u8]) -> Vec<u8> {
+    const PRIME32_1: u32 = 0x9E37_79B1;
+    const PRIME32_2: u32 = 0x85EB_CA77;
+    const PRIME32_3: u32 = 0xC2B2_AE3D;
+    const PRIME32_4: u32 = 0x27D4_EB2F;
+    const PRIME32_5: u32 = 0x1656_67B1;
+
+    fn read_u32_le(bs: &[u8]) -> u32 {
+        u32::from_le_bytes([bs[0], bs[1], bs[2], bs[3]])
+    }
+    fn round(acc: u32, lane: u32) -> u32 {
+        acc.wrapping_add(lane.wrapping_mul(PRIME32_2))
+            .rotate_left(13)
+            .wrapping_mul(PRIME32_1)
+    }
+    fn xxh32(input: &[u8]) -> u32 {
+        let mut p = 0usize;
+        let len = input.len();
+        let mut h: u32;
+        if len >= 16 {
+            let mut v1 = PRIME32_1.wrapping_add(PRIME32_2);
+            let mut v2 = PRIME32_2;
+            let mut v3 = 0u32;
+            let mut v4 = 0u32.wrapping_sub(PRIME32_1);
+            let limit = len - 16;
+            loop {
+                v1 = round(v1, read_u32_le(&input[p..]));
+                v2 = round(v2, read_u32_le(&input[p + 4..]));
+                v3 = round(v3, read_u32_le(&input[p + 8..]));
+                v4 = round(v4, read_u32_le(&input[p + 12..]));
+                p += 16;
+                if p > limit {
+                    break;
+                }
+            }
+            h = v1
+                .rotate_left(1)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+        } else {
+            h = PRIME32_5;
+        }
+        h = h.wrapping_add(len as u32);
+        while p + 4 <= len {
+            h = h.wrapping_add(read_u32_le(&input[p..]).wrapping_mul(PRIME32_3));
+            h = h.rotate_left(17).wrapping_mul(PRIME32_4);
+            p += 4;
+        }
+        while p < len {
+            h = h.wrapping_add(u32::from(input[p]).wrapping_mul(PRIME32_5));
+            h = h.rotate_left(11).wrapping_mul(PRIME32_1);
+            p += 1;
+        }
+        h ^= h >> 15;
+        h = h.wrapping_mul(PRIME32_2);
+        h ^= h >> 13;
+        h = h.wrapping_mul(PRIME32_3);
+        h ^= h >> 16;
+        h
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x184D_2204u32.to_le_bytes());
+    let flg: u8 = 0b0110_0000;
+    let bd: u8 = 0b0111_0000;
+    out.push(flg);
+    out.push(bd);
+    let hc = ((xxh32(&[flg, bd]) >> 8) & 0xff) as u8;
+    out.push(hc);
+    let header = (payload.len() as u32) | 0x8000_0000;
+    out.extend_from_slice(&header.to_le_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&[0u8; 4]);
+    out
+}
+
 /// Encode `payload` as a single-Stream xz blob using liblzma's easy
 /// encoder at preset 6 (matching `xz`'s default).
 fn encode_xz(payload: &[u8]) -> Vec<u8> {
@@ -368,6 +450,55 @@ fn happy_path_tar_xz_to_dir_extracts_archive() {
     assert_eq!(
         fs::read(out_dir.join("dir/sub/b.bin")).unwrap(),
         vec![7u8; 1024]
+    );
+
+    let sidecar_part = work.join("out.peel.part");
+    let sidecar_ckpt = work.join("out.peel.ckpt");
+    assert!(
+        !sidecar_part.exists(),
+        "expected no .part: {sidecar_part:?}"
+    );
+    assert!(
+        !sidecar_ckpt.exists(),
+        "expected no .ckpt: {sidecar_ckpt:?}"
+    );
+}
+
+// ---- happy path: tar.lz4 output (PLAN_v2 §4) --------------------------
+
+#[test]
+fn happy_path_tar_lz4_to_dir_extracts_archive() {
+    let archive = build_simple_archive(&[
+        ("dir/a.txt", b"hello-lz4-a"),
+        ("dir/sub/b.bin", &[19u8; 1024]),
+        ("dir/c.empty", b""),
+    ]);
+    let body = encode_lz4_uncompressed_frame(&archive);
+    let server = MockServer::start(ok_handler(body, Some("\"v-tar-lz4\"")));
+
+    let work = unique_dir("happy_tar_lz4");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let args = make_args(
+        &server,
+        "x.tar.lz4",
+        OutputTarget::Dir(out_dir.clone()),
+        coord_config_for_test(4096),
+    );
+
+    let stats = run(args).expect("tar.lz4 happy run");
+    assert!(!stats.resumed);
+
+    let entries = read_dir_recursive(&out_dir);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"dir/a.txt"));
+    assert!(names.contains(&"dir/sub/b.bin"));
+    assert_eq!(fs::read(out_dir.join("dir/a.txt")).unwrap(), b"hello-lz4-a");
+    assert_eq!(
+        fs::read(out_dir.join("dir/sub/b.bin")).unwrap(),
+        vec![19u8; 1024]
     );
 
     let sidecar_part = work.join("out.peel.part");
