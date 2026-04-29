@@ -73,6 +73,7 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         chunk_size,
         workers,
         retry: fast_retry(),
+        progress: None,
     }
 }
 
@@ -668,6 +669,7 @@ fn run_rejects_zero_chunk_size() {
         chunk_size: 0,
         workers: 1,
         retry: fast_retry(),
+        progress: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -688,6 +690,7 @@ fn run_rejects_zero_workers() {
         chunk_size: 50,
         workers: 0,
         retry: fast_retry(),
+        progress: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));

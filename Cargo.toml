@@ -51,6 +51,12 @@ clap = { version = "4", features = ["derive"] }
 # Application-level error reporting at the binary boundary, pre-approved
 # per docs/ENGINEERING_STANDARDS.md §2.2 / §3.2.
 anyhow = "1"
+# Structured logging, pre-approved per docs/ENGINEERING_STANDARDS.md §2.2 /
+# §10. The `progress::LogRenderer` (PLAN_v2.md §6) emits non-TTY progress
+# as `tracing::info!` events; the binary boundary configures a subscriber
+# that writes those events to stderr.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 
 [dev-dependencies]
 

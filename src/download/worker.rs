@@ -31,6 +31,7 @@ use thiserror::Error;
 use super::sparse_file::{SparseFile, SparseFileError};
 use crate::http::range::{parse_content_range, RangeError};
 use crate::http::{Client, ClientError, Headers, Url};
+use crate::progress::ProgressState;
 use crate::types::{ByteRange, ChunkIndex};
 
 /// Errors a worker can raise for one chunk attempt.
@@ -254,6 +255,10 @@ pub struct ChunkContext<'a> {
     pub fingerprint: &'a SourceFingerprint,
     /// Sparse file the chunk's bytes are written into.
     pub sparse: &'a SparseFile,
+    /// Optional progress sink the worker `fetch_add`s into after
+    /// each successful `pwrite_at` (PLAN_v2.md §6). `None` keeps the
+    /// worker silent — used by tests that don't drive the renderer.
+    pub progress: Option<&'a ProgressState>,
 }
 
 /// Download a single chunk with retry/backoff.
@@ -359,6 +364,10 @@ fn try_once(
     ctx.sparse
         .pwrite_at(range.start(), &buf)
         .map_err(|source| WorkerError::SparseFile { chunk, source })?;
+
+    if let Some(p) = ctx.progress {
+        p.add_downloaded(range.len());
+    }
 
     if body.is_drained() {
         let reader = body.into_inner();

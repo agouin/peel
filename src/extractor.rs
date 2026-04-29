@@ -34,11 +34,13 @@
 
 use std::io::Write;
 use std::os::fd::BorrowedFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
+use crate::progress::ProgressState;
 use crate::punch::{align_down, PunchError, PunchHole};
 use crate::sink::{Sink, SinkError};
 use crate::types::ByteOffset;
@@ -184,27 +186,45 @@ pub struct ExtractionStats {
 
 /// Coordinator that ties decoder, sink, and puncher into one loop.
 ///
-/// `Extractor` is configuration-only and `Copy`; create it once with
+/// `Extractor` is configuration-only; create it once with
 /// [`Extractor::with_defaults`] (or [`Extractor::new`] for a custom
 /// [`ExtractorConfig`]) and reuse it for as many extractions as the
 /// caller has work for. The state for any single extraction lives
 /// entirely on the call stack of [`Self::extract`].
-#[derive(Debug, Clone, Copy)]
+///
+/// Optionally pairs with a [`ProgressState`] (via
+/// [`Self::with_progress`]) so the per-write byte counter feeds the
+/// `PLAN_v2.md` §6 progress UI.
+#[derive(Debug, Clone)]
 pub struct Extractor {
     config: ExtractorConfig,
+    progress: Option<Arc<ProgressState>>,
 }
 
 impl Extractor {
     /// Create an extractor with the given config.
     #[must_use]
     pub fn new(config: ExtractorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            progress: None,
+        }
     }
 
     /// Create an extractor with [`ExtractorConfig::default`].
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(ExtractorConfig::default())
+    }
+
+    /// Attach a [`ProgressState`] to the extractor. Every successful
+    /// sink write `fetch_add`s its byte length into
+    /// [`ProgressState::add_extracted`]; the renderer thread reads
+    /// from there asynchronously.
+    #[must_use]
+    pub fn with_progress(mut self, progress: Arc<ProgressState>) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     /// Borrow the configured tunables.
@@ -308,6 +328,7 @@ impl Extractor {
             bytes_out: 0,
             write_time: Duration::ZERO,
             captured: None,
+            progress: self.progress.as_deref(),
         };
 
         loop {
@@ -475,6 +496,7 @@ struct SinkAdapter<'a, S: Sink> {
     bytes_out: u64,
     write_time: Duration,
     captured: Option<SinkError>,
+    progress: Option<&'a ProgressState>,
 }
 
 impl<S: Sink> Write for SinkAdapter<'_, S> {
@@ -486,7 +508,11 @@ impl<S: Sink> Write for SinkAdapter<'_, S> {
             Ok(()) => {
                 // u64 can address every byte we'll ever care about; an
                 // `as` cast is fine because `buf.len() <= isize::MAX`.
-                self.bytes_out = self.bytes_out.saturating_add(buf.len() as u64);
+                let n = buf.len() as u64;
+                self.bytes_out = self.bytes_out.saturating_add(n);
+                if let Some(p) = self.progress {
+                    p.add_extracted(n);
+                }
                 Ok(buf.len())
             }
             Err(e) => {

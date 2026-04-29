@@ -45,6 +45,10 @@
 //!   pipeline). ZIP's central-directory-at-the-end design forces a
 //!   different pipeline shape than the streaming decoders in
 //!   [`decode`]; see `docs/PLAN_v2.md` §5.
+//! - [`progress`] — multi-field progress tracking (`PLAN_v2.md` §6):
+//!   shared `ProgressState` updated by writers (workers, extractor,
+//!   ZIP pipeline) plus a TTY / log renderer the binary spawns at
+//!   the boundary.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -65,6 +69,7 @@ pub mod error;
 #[cfg(unix)]
 pub mod extractor;
 pub mod http;
+pub mod progress;
 #[cfg(unix)]
 pub mod punch;
 pub mod sink;

@@ -133,6 +133,7 @@ fn run_demo(args: Args) -> Result<(), String> {
         chunk_size: args.chunk_size,
         workers: args.workers,
         retry: RetryConfig::default(),
+        progress: None,
     };
 
     let started = Instant::now();

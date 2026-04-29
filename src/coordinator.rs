@@ -71,6 +71,7 @@ use crate::extractor::{
     DEFAULT_PUNCH_THRESHOLD,
 };
 use crate::http::{Client, ClientError, Url, UrlError};
+use crate::progress::ProgressState;
 use crate::punch::{default_puncher, NoopPuncher, PunchHole};
 use crate::sink::{RawSink, Sink, SinkError, TarSink, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
@@ -220,6 +221,13 @@ pub struct RunArgs {
     pub registry: DecoderRegistry,
     /// Optional progress callback.
     pub progress: Option<ProgressFn>,
+    /// Optional shared progress state (`PLAN_v2.md` §6). When set, the
+    /// coordinator passes it down to the scheduler (workers) and
+    /// extractor (sink writes) so byte-level counters update
+    /// continuously. The binary's renderer thread reads from this
+    /// state on its own cadence; library callers may construct one
+    /// for tests or programmatic monitoring.
+    pub progress_state: Option<Arc<ProgressState>>,
     /// Optional shared atomic flag. When the flag transitions to
     /// `true` between checkpoint writes, the coordinator aborts with
     /// [`CoordinatorError::Aborted`], leaving the most recently
@@ -405,6 +413,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         client,
         registry,
         mut progress,
+        progress_state,
         kill_switch,
     } = args;
 
@@ -460,6 +469,16 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         } => *decoder_position,
     }));
 
+    if let Some(state) = progress_state.as_ref() {
+        state.set_total_size(info.total_size);
+        // Pre-credit the resumed bytes so the renderer's progress bar
+        // doesn't snap from 0% on the first tick of a resume.
+        let resumed_bytes = u64::from(chunks_resumed).saturating_mul(config.chunk_size);
+        let resumed_bytes = resumed_bytes.min(info.total_size);
+        state.add_downloaded(resumed_bytes);
+        state.mark_started();
+    }
+
     if let Some(cb) = progress.as_mut() {
         cb(ProgressEvent::Started {
             url: &info.url,
@@ -474,6 +493,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         chunk_size: config.chunk_size,
         workers: config.workers,
         retry: config.retry.clone(),
+        progress: progress_state.clone(),
     };
 
     let download_done = Arc::new(AtomicBool::new(false));
@@ -559,6 +579,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     &resume_plan,
                     &config,
                     progress.as_mut(),
+                    progress_state.as_ref(),
                     kill_switch.as_ref(),
                 )?
             } else {
@@ -582,9 +603,15 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 // Run the extractor with a checkpoint observer that
                 // writes a durable checkpoint every time the cadence
                 // floor fires.
-                let extractor = Extractor::new(ExtractorConfig {
-                    punch_threshold: config.punch_threshold,
-                });
+                let extractor = {
+                    let base = Extractor::new(ExtractorConfig {
+                        punch_threshold: config.punch_threshold,
+                    });
+                    match progress_state.clone() {
+                        Some(state) => base.with_progress(state),
+                        None => base,
+                    }
+                };
 
                 match &output {
                     OutputTarget::File(path) => {
@@ -935,6 +962,7 @@ fn run_zip(
     plan: &ResumePlan,
     config: &CoordinatorConfig,
     mut progress: Option<&mut ProgressFn>,
+    progress_state: Option<&Arc<ProgressState>>,
     kill_switch: Option<&Arc<AtomicBool>>,
 ) -> Result<ExtractionStats, CoordinatorError> {
     fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
@@ -1014,6 +1042,12 @@ fn run_zip(
                 bytes_extracted_total = bytes_extracted_total.saturating_add(*bytes_written);
                 bytes_punched_total = bytes_punched_total.saturating_add(*bytes_punched);
                 entries_extracted_this_run = entries_extracted_this_run.saturating_add(1);
+                // Per-entry granularity for the renderer's
+                // bytes_extracted counter — finer than per-checkpoint
+                // (which the throttle below skips most of the time).
+                if let Some(p) = progress_state {
+                    p.add_extracted(*bytes_written);
+                }
 
                 // Throttle checkpoint writes. The "progress" we
                 // measure is bytes_extracted_total — an entry-by-entry

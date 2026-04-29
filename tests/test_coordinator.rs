@@ -32,6 +32,7 @@ use peel::coordinator::{
 use peel::decode::DecoderRegistry;
 use peel::download::RetryConfig;
 use peel::http::{Client, ClientConfig};
+use peel::progress::{spawn_renderer, ProgressRenderer, ProgressSnapshot, ProgressState};
 use peel::types::ByteOffset;
 
 #[path = "support/mod.rs"]
@@ -302,6 +303,7 @@ fn make_args(
         client: build_client(),
         registry: DecoderRegistry::with_defaults(),
         progress: None,
+        progress_state: None,
         kill_switch: None,
     }
 }
@@ -546,6 +548,102 @@ fn progress_callback_observes_started_and_finished() {
     let events = observed.lock().unwrap().clone();
     assert!(events.starts_with(&["started"]));
     assert_eq!(events.last().copied(), Some("finished"));
+}
+
+// ---- progress state plumbed end-to-end (PLAN_v2.md §6) ----------------
+
+/// Recording renderer: stores every snapshot it receives so the test
+/// can assert a non-trivial number of ticks fired and the counters
+/// progressed monotonically.
+struct RecordingRenderer {
+    snaps: Arc<Mutex<Vec<ProgressSnapshot>>>,
+    finish_called: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProgressRenderer for RecordingRenderer {
+    fn render(&mut self, snap: &ProgressSnapshot) {
+        self.snaps.lock().unwrap().push(*snap);
+    }
+    fn finish(&mut self) {
+        self.finish_called
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[test]
+fn progress_state_counters_advance_during_a_run() {
+    // Use a multi-frame body so checkpoints fire and the extractor's
+    // SinkAdapter has multiple chances to update bytes_extracted.
+    let payload_a = b"prog-frame-a-".repeat(2048);
+    let payload_b = b"prog-frame-b-larger-".repeat(4096);
+    let body = encode_zstd_frames(&[&payload_a, &payload_b]);
+    let total_compressed = body.len() as u64;
+    let total_decoded = (payload_a.len() + payload_b.len()) as u64;
+    let server = MockServer::start(ok_handler(body, Some("\"v-progstate\"")));
+
+    let work = unique_dir("progstate");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    let state = ProgressState::new();
+    let snaps: Arc<Mutex<Vec<ProgressSnapshot>>> = Arc::new(Mutex::new(Vec::new()));
+    let finish_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let renderer = RecordingRenderer {
+        snaps: Arc::clone(&snaps),
+        finish_called: Arc::clone(&finish_called),
+    };
+    // Tight render cadence so the test sees several mid-run ticks.
+    let render_handle = spawn_renderer(Arc::clone(&state), renderer, Duration::from_millis(5))
+        .expect("spawn recording renderer");
+
+    let mut args = make_args(
+        &server,
+        "progstate.zst",
+        OutputTarget::File(out_path.clone()),
+        coord_config_for_test(4096),
+    );
+    args.progress_state = Some(Arc::clone(&state));
+
+    let stats = run(args).expect("run with progress state");
+    state.mark_done();
+    render_handle.join().expect("renderer thread");
+
+    // Pipeline-side counters reach the totals.
+    assert_eq!(state.snapshot().bytes_downloaded, total_compressed);
+    assert_eq!(state.snapshot().bytes_extracted, total_decoded);
+    assert_eq!(state.snapshot().total_size, Some(total_compressed));
+    // Workers all retired.
+    assert_eq!(state.snapshot().active_workers, 0);
+    assert!(state.snapshot().total_workers >= 1);
+    assert!(state.snapshot().started);
+    assert!(state.snapshot().done);
+    // Renderer ran finish() at shutdown.
+    assert!(finish_called.load(std::sync::atomic::Ordering::Acquire));
+
+    // Renderer recorded a sequence of monotonically non-decreasing
+    // counters and saw at least some non-zero values mid-run.
+    let recorded = snaps.lock().unwrap().clone();
+    assert!(
+        recorded.len() >= 2,
+        "expected several render ticks, got {}",
+        recorded.len(),
+    );
+    let mut prev_dl = 0u64;
+    let mut prev_ex = 0u64;
+    for s in &recorded {
+        assert!(s.bytes_downloaded >= prev_dl);
+        assert!(s.bytes_extracted >= prev_ex);
+        prev_dl = s.bytes_downloaded;
+        prev_ex = s.bytes_extracted;
+    }
+    // The final tick after mark_done() reflects the terminal totals.
+    let last = recorded.last().expect("at least one snapshot");
+    assert_eq!(last.bytes_downloaded, total_compressed);
+    assert_eq!(last.bytes_extracted, total_decoded);
+
+    // Underlying `RunStats` agrees with what the state ended up at.
+    assert_eq!(stats.download.bytes_downloaded, total_compressed);
+    assert_eq!(stats.extraction.bytes_out, total_decoded);
 }
 
 // ---- resume: pick up where we left off --------------------------------
@@ -1114,6 +1212,7 @@ fn zip_resume_skips_already_extracted_entries() {
                 }
             }
         }) as ProgressFn),
+        progress_state: None,
         kill_switch: Some(Arc::clone(&kill_switch)),
     };
     let err = run(args1).expect_err("phase1 must abort");

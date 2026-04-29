@@ -184,6 +184,7 @@ fn make_args(
         client: build_client(),
         registry: DecoderRegistry::with_defaults(),
         progress,
+        progress_state: None,
         kill_switch,
     }
 }

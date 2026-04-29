@@ -35,7 +35,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,7 @@ use super::worker::{
 };
 use crate::bitmap::ChunkBitmap;
 use crate::http::{Client, ClientError, Url};
+use crate::progress::ProgressState;
 use crate::types::{ByteOffset, ByteRange, ChunkIndex};
 
 /// Default chunk size: 4 MiB. Matches `aria2c` and `curl`'s ranged
@@ -169,6 +170,11 @@ pub struct SchedulerConfig {
     pub workers: u32,
     /// Per-chunk retry policy.
     pub retry: RetryConfig,
+    /// Optional shared progress sink (`PLAN_v2.md` §6). When set, the
+    /// scheduler updates `total_workers` once and workers update
+    /// `bytes_downloaded` / `active_workers` as they fetch chunks.
+    /// `None` keeps the scheduler silent.
+    pub progress: Option<Arc<ProgressState>>,
 }
 
 impl Default for SchedulerConfig {
@@ -177,6 +183,7 @@ impl Default for SchedulerConfig {
             chunk_size: DEFAULT_CHUNK_SIZE,
             workers: DEFAULT_WORKERS,
             retry: RetryConfig::default(),
+            progress: None,
         }
     }
 }
@@ -300,6 +307,13 @@ pub fn run(
         });
     }
 
+    if let Some(p) = config.progress.as_ref() {
+        if info.accept_ranges {
+            p.set_total_workers(u64::from(config.workers));
+        } else {
+            p.set_total_workers(1);
+        }
+    }
     if info.accept_ranges {
         let mut stats = run_parallel(client, info, sparse, bitmap, cursor, config, total_chunks)?;
         stats.elapsed = started.elapsed();
@@ -358,6 +372,7 @@ fn run_parallel(
             url: &info.url,
             fingerprint: &info.fingerprint,
             sparse,
+            progress: config.progress.as_deref(),
         };
         // Spawn workers.
         for w_id in 0..workers {
@@ -507,7 +522,13 @@ fn worker_loop(
             }
         };
 
+        if let Some(p) = ctx.progress {
+            p.worker_started();
+        }
         let outcome = download_chunk(ctx, chunk, range, retry, cancel);
+        if let Some(p) = ctx.progress {
+            p.worker_finished();
+        }
 
         let msg = match outcome {
             Ok(ChunkOutcome { bytes, attempts }) => Completion {
@@ -602,6 +623,15 @@ fn run_single_stream(
             .min(64 * 1024)
     ];
 
+    if let Some(p) = config.progress.as_ref() {
+        // Single-stream mode is one logical worker reading the body
+        // sequentially; mark it active for the duration.
+        p.worker_started();
+    }
+    let single_stream_progress = config.progress.clone();
+    let _ss_guard = SingleStreamGuard {
+        progress: single_stream_progress.as_deref(),
+    };
     while written < total_size {
         let remaining = total_size - written;
         let want = u64::try_from(buf.len()).unwrap_or(u64::MAX).min(remaining);
@@ -621,6 +651,9 @@ fn run_single_stream(
         sparse
             .pwrite_at(ByteOffset::new(written), &slice[..n])
             .map_err(SchedulerError::SparseFile)?;
+        if let Some(p) = config.progress.as_ref() {
+            p.add_downloaded(n as u64);
+        }
 
         // Mark every chunk that's now fully covered by `written + n`.
         let prev_complete_end = written / chunk_size;
@@ -690,6 +723,21 @@ struct Completion {
     bytes: u64,
     attempts: u32,
     result: Result<(), WorkerError>,
+}
+
+/// RAII guard for the single-stream path: fires
+/// [`ProgressState::worker_finished`] on drop. Pairs with the
+/// matching `worker_started` call earlier in [`run_single_stream`].
+struct SingleStreamGuard<'a> {
+    progress: Option<&'a ProgressState>,
+}
+
+impl Drop for SingleStreamGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.progress {
+            p.worker_finished();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -123,6 +123,7 @@ impl Cli {
             client,
             registry: DecoderRegistry::with_defaults(),
             progress: None,
+            progress_state: None,
             kill_switch: None,
         })
     }

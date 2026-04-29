@@ -226,6 +226,7 @@ fn make_args(
         client: build_client(),
         registry,
         progress: None,
+        progress_state: None,
         kill_switch: None,
     }
 }
