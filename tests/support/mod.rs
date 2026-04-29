@@ -8,3 +8,4 @@
 #![allow(dead_code)] // Different integration tests use different subsets.
 
 pub mod mock_server;
+pub mod tar_fixtures;

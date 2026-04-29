@@ -27,9 +27,12 @@
 //! - [`decode`] — the [`decode::StreamingDecoder`] protocol every
 //!   format-specific decoder honors, plus the in-tree zstd
 //!   implementation and a suffix-keyed [`decode::DecoderRegistry`].
+//! - [`sink`] — the [`sink::Sink`] trait every extraction target
+//!   honors, the always-quiescent [`sink::RawSink`], and the
+//!   member-aligned streaming [`sink::TarSink`].
 //!
-//! Future modules (`checkpoint`, `sink`, `extractor`, `coordinator`)
-//! are introduced one plan section at a time. Until they exist, the
+//! Future modules (`checkpoint`, `extractor`, `coordinator`) are
+//! introduced one plan section at a time. Until they exist, the
 //! binary in [`main.rs`](../src/main.rs) is intentionally a stub.
 //!
 //! [`docs/PLAN.md`]: https://github.com/ondofinance/pux/blob/main/docs/PLAN.md
@@ -46,4 +49,5 @@ pub mod error;
 pub mod http;
 #[cfg(unix)]
 pub mod punch;
+pub mod sink;
 pub mod types;
