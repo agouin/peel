@@ -9,12 +9,16 @@
 //!
 //! # Concurrency model
 //!
-//! [`SparseFile::pwrite_at`] and [`SparseFile::read_at`] use POSIX
-//! `pwrite`/`pread` (via [`FileExt`]). Both take `&self`, do not move
-//! the kernel-side file offset, and are safe to invoke concurrently
-//! from any number of threads. Workers therefore only need to
-//! coordinate on **which** chunk they write — the bitmap from
-//! [`crate::bitmap`] — not on access to the file.
+//! [`SparseFile::pwrite_at`] and [`SparseFile::read_at`] route the
+//! actual syscalls through an [`IoBackend`]. The default
+//! [`crate::io_backend::BlockingBackend`] uses POSIX `pwrite`/`pread`
+//! semantics: each call carries its own offset, does not move the
+//! kernel-side file position, and is safe to invoke concurrently from
+//! any number of threads. The §7.2 io_uring backend preserves those
+//! semantics while batching submissions through a dedicated IO thread.
+//! Workers therefore only need to coordinate on **which** chunk they
+//! write — the bitmap from [`crate::bitmap`] — not on access to the
+//! file.
 //!
 //! # Punching
 //!
@@ -31,11 +35,12 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::io_backend::{default_backend, IoBackend};
 use crate::punch::{PunchError, PunchHole};
 use crate::types::ByteOffset;
 
@@ -107,15 +112,18 @@ pub enum SparseFileError {
 /// The compressed-source landing file.
 ///
 /// A `SparseFile` is a thin wrapper around an [`std::fs::File`] opened
-/// `O_RDWR | O_CREAT`. Construction sets the file's logical length to
+/// `O_RDWR | O_CREAT` plus an [`IoBackend`] that performs the actual
+/// syscalls. Construction sets the file's logical length to
 /// `total_size` so that `pread` of any byte in `[0, total_size)`
 /// succeeds, returning zeros for ranges that workers haven't written
 /// yet.
 ///
 /// # Lifecycle
 ///
-/// 1. Coordinator calls [`SparseFile::open_or_create`] with the
-///    expected total size from the HTTP `Content-Length`.
+/// 1. Coordinator calls [`SparseFile::open_or_create`] (or
+///    [`SparseFile::open_or_create_with_backend`] when it wants to
+///    pin a specific [`IoBackend`]) with the expected total size from
+///    the HTTP `Content-Length`.
 /// 2. Workers issue [`SparseFile::pwrite_at`] for downloaded chunks.
 /// 3. The decoder reads bytes back via [`SparseFile::read_at`].
 /// 4. After a checkpoint is durable, the coordinator calls
@@ -125,11 +133,16 @@ pub struct SparseFile {
     file: std::fs::File,
     total_size: u64,
     path: PathBuf,
+    backend: Arc<dyn IoBackend>,
 }
 
 impl SparseFile {
     /// Open `path` for read-write, creating it if needed, and set its
-    /// logical length to `total_size`.
+    /// logical length to `total_size`. The caller-controlled IO path
+    /// is the [`crate::io_backend::default_backend`] (currently
+    /// [`crate::io_backend::BlockingBackend`]); use
+    /// [`Self::open_or_create_with_backend`] to pin a specific
+    /// backend.
     ///
     /// Setting the length is unconditional: an existing file is
     /// resized to `total_size` (extending it produces holes; shrinking
@@ -142,6 +155,25 @@ impl SparseFile {
     /// Returns [`SparseFileError::Open`] if the file cannot be opened
     /// or [`SparseFileError::SetLen`] if `ftruncate` fails.
     pub fn open_or_create(path: &Path, total_size: u64) -> Result<Self, SparseFileError> {
+        Self::open_or_create_with_backend(path, total_size, default_backend())
+    }
+
+    /// Open `path` and pin a specific [`IoBackend`] for every
+    /// subsequent IO call.
+    ///
+    /// Identical semantics to [`Self::open_or_create`] except the
+    /// caller chooses the backend explicitly. The coordinator uses
+    /// this form once the §7.2 selection logic lands; tests use it to
+    /// inject stub backends.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::open_or_create`].
+    pub fn open_or_create_with_backend(
+        path: &Path,
+        total_size: u64,
+        backend: Arc<dyn IoBackend>,
+    ) -> Result<Self, SparseFileError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -164,6 +196,7 @@ impl SparseFile {
             file,
             total_size,
             path: path.to_path_buf(),
+            backend,
         })
     }
 
@@ -188,12 +221,20 @@ impl SparseFile {
         self.file.as_fd()
     }
 
+    /// The diagnostic name of the [`IoBackend`] handling this file's
+    /// syscalls (e.g. `"blocking"`, `"uring"`).
+    #[must_use]
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
+    }
+
     /// Write `buf` at byte offset `offset`.
     ///
-    /// Equivalent to `pwrite(2)`: does not move the file's kernel-side
-    /// position, is safe to call concurrently from multiple threads,
-    /// and writes the entire buffer (loops internally on partial
-    /// writes).
+    /// Routes the actual syscall through the configured [`IoBackend`].
+    /// The blocking backend uses `pwrite(2)` semantics: the file's
+    /// kernel-side position is untouched and the call is safe to
+    /// invoke concurrently from multiple threads. The full buffer is
+    /// always written (the backend loops on partial writes).
     ///
     /// # Errors
     ///
@@ -219,8 +260,8 @@ impl SparseFile {
             });
         }
 
-        self.file
-            .write_all_at(buf, raw_offset)
+        self.backend
+            .pwrite_all_at(self.file.as_fd(), raw_offset, buf)
             .map_err(|source| SparseFileError::Io {
                 offset: raw_offset,
                 len,
@@ -231,9 +272,11 @@ impl SparseFile {
     /// Read up to `buf.len()` bytes starting at `offset`, returning the
     /// number of bytes actually read.
     ///
+    /// Routes the actual syscall through the configured [`IoBackend`].
     /// Short reads at end-of-file are reported by a return value less
-    /// than `buf.len()`. Uses `pread(2)` via [`FileExt::read_at`] and
-    /// is safe to call concurrently with other reads or writes.
+    /// than `buf.len()`. The blocking backend uses `pread(2)`; both
+    /// backends are safe to invoke concurrently with other reads or
+    /// writes.
     ///
     /// # Errors
     ///
@@ -255,8 +298,8 @@ impl SparseFile {
                 len,
             })?;
 
-        self.file
-            .read_at(buf, raw_offset)
+        self.backend
+            .pread_at(self.file.as_fd(), raw_offset, buf)
             .map_err(|source| SparseFileError::Io {
                 offset: raw_offset,
                 len,
@@ -283,8 +326,8 @@ impl SparseFile {
                 len,
             })?;
 
-        self.file
-            .read_exact_at(buf, raw_offset)
+        self.backend
+            .pread_exact_at(self.file.as_fd(), raw_offset, buf)
             .map_err(|source| SparseFileError::Io {
                 offset: raw_offset,
                 len,
@@ -314,7 +357,7 @@ impl SparseFile {
             .map_err(SparseFileError::Punch)
     }
 
-    /// `fsync` the underlying file.
+    /// `fsync` the underlying file via the configured [`IoBackend`].
     ///
     /// # Errors
     ///
@@ -322,11 +365,13 @@ impl SparseFile {
     /// `offset = 0` and `len = total_size`, since `fsync` covers the
     /// whole file.
     pub fn sync_all(&self) -> Result<(), SparseFileError> {
-        self.file.sync_all().map_err(|source| SparseFileError::Io {
-            offset: 0,
-            len: self.total_size,
-            source,
-        })
+        self.backend
+            .sync_all(self.file.as_fd())
+            .map_err(|source| SparseFileError::Io {
+                offset: 0,
+                len: self.total_size,
+                source,
+            })
     }
 }
 
@@ -483,5 +528,30 @@ mod tests {
         let f = SparseFile::open_or_create(&path, 8192).expect("open");
         f.punch(&NoopPuncher::new(), ByteOffset::ZERO, 4096)
             .expect("noop punch");
+    }
+
+    #[test]
+    fn default_constructor_uses_blocking_backend() {
+        let path = unique_temp_path("default_backend");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create(&path, 64).expect("open");
+        assert_eq!(f.backend_name(), "blocking");
+    }
+
+    #[test]
+    fn explicit_backend_constructor_round_trips() {
+        use crate::io_backend::BlockingBackend;
+        let path = unique_temp_path("explicit_backend");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let backend: Arc<dyn crate::io_backend::IoBackend> = Arc::new(BlockingBackend::new());
+        let f = SparseFile::open_or_create_with_backend(&path, 256, backend)
+            .expect("open with backend");
+        assert_eq!(f.backend_name(), "blocking");
+
+        let payload: Vec<u8> = (0u8..32).collect();
+        f.pwrite_at(ByteOffset::new(0), &payload).expect("write");
+        let mut got = vec![0u8; payload.len()];
+        f.read_exact_at(ByteOffset::new(0), &mut got).expect("read");
+        assert_eq!(got, payload);
     }
 }

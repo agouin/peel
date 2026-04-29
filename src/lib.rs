@@ -49,6 +49,11 @@
 //!   shared `ProgressState` updated by writers (workers, extractor,
 //!   ZIP pipeline) plus a TTY / log renderer the binary spawns at
 //!   the boundary.
+//! - [`io_backend`] (Unix only) — file-IO seam (`PLAN_v2.md` §7):
+//!   the [`io_backend::IoBackend`] trait every backend honors, the
+//!   always-available [`io_backend::BlockingBackend`] wrapping
+//!   `pwrite`/`pread`/`fsync`, and (in §7.2) the Linux io_uring
+//!   implementation that batches submissions across workers.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -69,6 +74,8 @@ pub mod error;
 #[cfg(unix)]
 pub mod extractor;
 pub mod http;
+#[cfg(unix)]
+pub mod io_backend;
 pub mod progress;
 #[cfg(unix)]
 pub mod punch;
