@@ -43,12 +43,16 @@ Crates pre-approved for use, with the role they fill:
 |----------------|---------------------------------------------|--------------------------------------|
 | `zstd`         | zstd compression/decompression              | Bindings to upstream libzstd         |
 | `flate2`       | gzip/deflate                                | Use the `rust_backend` feature       |
+| `xz2`          | xz / LZMA decompression                     | Bindings to upstream liblzma; `PLAN_v2.md` §3 |
+| `lz4_flex`     | lz4 frame decompression                     | Pure Rust; `PLAN_v2.md` §4           |
+| `io-uring`     | io_uring submission/completion API          | Linux only; sync API only — no async runtime; `PLAN_v2.md` §7 |
 | `thiserror`    | Library error type derivation               | Library code only                    |
 | `anyhow`       | Application error type                      | Binary/CLI boundary only             |
 | `clap`         | CLI argument parsing                        | Use `derive` feature                 |
 | `tracing`      | Structured logging                          | Replace `println!` debugging         |
 | `tracing-subscriber` | Tracing setup at binary boundary       | Binary only                          |
 | `tempfile`     | Test scratch files                          | Dev-dependency only                  |
+| `sha2`         | SHA-256 reference for cross-checking tests  | Dev-dependency only — runtime SHA-256 is hand-rolled in `hash/sha256.rs`; `PLAN_v2.md` §10 |
 
 That's the list. **Anything not on this list requires human approval before
 adding to `Cargo.toml`.** Approval criteria:
