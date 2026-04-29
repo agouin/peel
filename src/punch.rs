@@ -1,0 +1,419 @@
+//! Hole punching: releasing the disk blocks underlying a byte range of a
+//! file while preserving the file's logical size.
+//!
+//! # Why this matters
+//!
+//! `pux` writes the compressed source into a sparse file as it downloads
+//! and, in parallel, decodes the prefix of that file into the extracted
+//! output. Once the decoder has consumed bytes `[0, X)` of the source
+//! and we have a durable checkpoint past that point, the underlying
+//! blocks for `[0, X)` are no longer needed and can be released back to
+//! the filesystem. This module is the OS-portable interface for that
+//! release.
+//!
+//! # Layering
+//!
+//! - [`PunchHole`] is the trait every implementation satisfies. It is
+//!   object-safe and `Send + Sync`, so a single shared puncher can be
+//!   handed to the download and extractor threads.
+//! - [`NoopPuncher`] is the always-available fallback. It returns
+//!   success without releasing any blocks; the caller still gets correct
+//!   output, just at the cost of holding the entire compressed source on
+//!   disk until completion.
+//! - [`LinuxPuncher`] (Linux only) calls
+//!   `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` directly via
+//!   the C ABI. Filesystems that reject the operation (NFS, FAT, certain
+//!   FUSE mounts) report `EOPNOTSUPP`/`ENOTSUP`/`EINVAL`, which is mapped
+//!   to [`PunchError::Unsupported`] so the caller can downgrade to
+//!   [`NoopPuncher`] without aborting.
+//! - [`default_puncher`] picks the best implementation for the running
+//!   platform.
+//!
+//! Other platforms (macOS `F_PUNCHHOLE`, Windows `FSCTL_SET_ZERO_DATA`)
+//! are deferred per `docs/PLAN.md` §2; the trait is shaped to admit them
+//! without changes to its callers.
+//!
+//! # Alignment
+//!
+//! Most filesystems require punched ranges to be aligned to the
+//! filesystem block size; misaligned tails are silently retained by the
+//! kernel rather than treated as an error. Callers should align with
+//! [`align_down`] and [`PunchHole::block_size_hint`] before invoking
+//! [`PunchHole::punch`].
+
+#![cfg(unix)]
+
+use std::os::fd::BorrowedFd;
+
+use thiserror::Error;
+
+use crate::types::ByteOffset;
+
+/// Errors produced by [`PunchHole`] implementations.
+#[derive(Debug, Error)]
+pub enum PunchError {
+    /// The kernel or filesystem refused the punch as fundamentally
+    /// unsupported for this file (errno `EOPNOTSUPP`, `ENOTSUP`, or
+    /// `EINVAL`). Callers should replace the puncher with
+    /// [`NoopPuncher`] and continue without space reclamation.
+    #[error("hole punching is not supported on this filesystem (errno {errno})")]
+    Unsupported {
+        /// The raw errno value that triggered the downgrade.
+        errno: i32,
+    },
+
+    /// The requested offset or length cannot be represented in the
+    /// platform's signed `off_t`. Defensive; real-world file offsets are
+    /// well below `i64::MAX`.
+    #[error("punch offset {offset} or length {length} exceeds platform off_t limit")]
+    OffsetOverflow {
+        /// The offset that overflowed.
+        offset: u64,
+        /// The length that overflowed.
+        length: u64,
+    },
+
+    /// The kernel returned an unexpected errno from the punch syscall.
+    /// The original [`std::io::Error`] is preserved via `#[source]`, so
+    /// the caller can recover [`std::io::Error::raw_os_error`] or walk
+    /// the `Display` chain.
+    #[error("fallocate(PUNCH_HOLE) failed at offset {offset} length {length}")]
+    Io {
+        /// The byte offset passed to the syscall.
+        offset: u64,
+        /// The byte length passed to the syscall.
+        length: u64,
+        /// The underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Releases disk blocks for byte ranges of an open file.
+///
+/// Implementations are object-safe (no generics on methods) and
+/// `Send + Sync`, so a single puncher can be shared across threads. In
+/// practice all implementations are zero-sized.
+pub trait PunchHole: Send + Sync {
+    /// Release the disk blocks underlying `[offset, offset + length)` of
+    /// the file referenced by `fd`. The file's logical size is preserved
+    /// and reads from the punched range observe zero bytes.
+    ///
+    /// `length == 0` is a valid no-op and never errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PunchError::Unsupported`] if the filesystem cannot punch
+    /// the region, [`PunchError::OffsetOverflow`] if the arguments cannot
+    /// fit the underlying syscall's `off_t`, or [`PunchError::Io`] for any
+    /// other OS error.
+    fn punch(&self, fd: BorrowedFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError>;
+
+    /// Filesystem block alignment expected by this puncher, in bytes.
+    /// A conservative default for unknown filesystems is 4096.
+    fn block_size_hint(&self) -> u64;
+}
+
+/// A puncher that never releases blocks. Always succeeds.
+///
+/// Use as a fallback when the platform has no hole-punching syscall, or
+/// after observing [`PunchError::Unsupported`] from another puncher.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopPuncher;
+
+impl NoopPuncher {
+    /// Construct a fresh [`NoopPuncher`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl PunchHole for NoopPuncher {
+    fn punch(
+        &self,
+        _fd: BorrowedFd<'_>,
+        _offset: ByteOffset,
+        _length: u64,
+    ) -> Result<(), PunchError> {
+        Ok(())
+    }
+
+    fn block_size_hint(&self) -> u64 {
+        4096
+    }
+}
+
+/// Round `value` down to the nearest multiple of `alignment`.
+///
+/// Returns `None` if `alignment` is zero. Otherwise the result `r`
+/// satisfies `r <= value` and `r % alignment == 0`.
+///
+/// # Examples
+///
+/// ```
+/// use pux::punch::align_down;
+///
+/// assert_eq!(align_down(8195, 4096), Some(8192));
+/// assert_eq!(align_down(4096, 4096), Some(4096));
+/// assert_eq!(align_down(0, 4096), Some(0));
+/// assert_eq!(align_down(8195, 0), None);
+/// ```
+#[must_use]
+pub const fn align_down(value: u64, alignment: u64) -> Option<u64> {
+    match value.checked_div(alignment) {
+        // (value / alignment) * alignment is bounded above by `value`,
+        // so the multiplication cannot overflow `u64`.
+        Some(quotient) => Some(quotient * alignment),
+        None => None,
+    }
+}
+
+/// Return the best [`PunchHole`] implementation for the current platform.
+///
+/// On Linux this is a [`LinuxPuncher`]; on every other Unix it is a
+/// [`NoopPuncher`]. Callers that observe [`PunchError::Unsupported`]
+/// from the returned puncher should replace it with [`NoopPuncher`] and
+/// continue.
+#[must_use]
+pub fn default_puncher() -> Box<dyn PunchHole> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(LinuxPuncher::new())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Box::new(NoopPuncher::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::LinuxPuncher;
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    use super::{PunchError, PunchHole};
+    use crate::types::ByteOffset;
+
+    /// `fallocate` mode flag: keep the file's logical size unchanged.
+    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    /// `fallocate` mode flag: punch a hole over the indicated range.
+    const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+
+    /// Linux errno: "operation not supported". On Linux `ENOTSUP` and
+    /// `EOPNOTSUPP` share the same numeric value.
+    const EOPNOTSUPP: i32 = 95;
+    /// Linux errno: "invalid argument". Some filesystems use this in
+    /// place of `EOPNOTSUPP` to report that a punch is unrepresentable.
+    const EINVAL: i32 = 22;
+
+    extern "C" {
+        // `fallocate64` is the explicitly 64-bit-offset variant of
+        // `fallocate`, exposed by both glibc and musl. Using it avoids
+        // the `_FILE_OFFSET_BITS` ambiguity that affects bare
+        // `fallocate` on 32-bit ABIs and matches the C signature
+        // `int fallocate64(int fd, int mode, off64_t offset, off64_t len);`.
+        fn fallocate64(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+    }
+
+    /// Linux puncher backed by
+    /// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+    ///
+    /// Works on ext4, xfs, btrfs, tmpfs, f2fs, and other modern Linux
+    /// filesystems. NFS, FAT, and some FUSE mounts return
+    /// `EOPNOTSUPP`/`EINVAL`, which is surfaced as
+    /// [`PunchError::Unsupported`].
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct LinuxPuncher;
+
+    impl LinuxPuncher {
+        /// Construct a fresh [`LinuxPuncher`].
+        #[must_use]
+        pub const fn new() -> Self {
+            Self
+        }
+    }
+
+    impl PunchHole for LinuxPuncher {
+        fn punch(
+            &self,
+            fd: BorrowedFd<'_>,
+            offset: ByteOffset,
+            length: u64,
+        ) -> Result<(), PunchError> {
+            if length == 0 {
+                return Ok(());
+            }
+
+            let raw_offset = offset.get();
+            let i_offset = i64::try_from(raw_offset).map_err(|_| PunchError::OffsetOverflow {
+                offset: raw_offset,
+                length,
+            })?;
+            let i_length = i64::try_from(length).map_err(|_| PunchError::OffsetOverflow {
+                offset: raw_offset,
+                length,
+            })?;
+
+            let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+            // SAFETY: `fd` is a `BorrowedFd<'_>` whose lifetime brackets
+            // this call, so `fd.as_raw_fd()` is a valid file descriptor
+            // for the duration of the syscall. `mode`, `i_offset`, and
+            // `i_length` are plain integers carried across the C ABI by
+            // value and have no aliasing concerns. `fallocate64` returns
+            // an `int` status; on error it sets the thread-local errno
+            // which we read via `io::Error::last_os_error`.
+            let rc = unsafe { fallocate64(fd.as_raw_fd(), mode, i_offset, i_length) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(e) if e == EOPNOTSUPP || e == EINVAL => {
+                    Err(PunchError::Unsupported { errno: e })
+                }
+                _ => Err(PunchError::Io {
+                    offset: raw_offset,
+                    length,
+                    source: err,
+                }),
+            }
+        }
+
+        fn block_size_hint(&self) -> u64 {
+            4096
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::fd::AsFd;
+
+    // ---- align_down ---------------------------------------------------
+
+    #[test]
+    fn align_down_returns_zero_for_value_below_alignment() {
+        assert_eq!(align_down(0, 4096), Some(0));
+        assert_eq!(align_down(1, 4096), Some(0));
+        assert_eq!(align_down(4095, 4096), Some(0));
+    }
+
+    #[test]
+    fn align_down_passes_through_exact_multiples() {
+        assert_eq!(align_down(4096, 4096), Some(4096));
+        assert_eq!(align_down(4096 * 7, 4096), Some(4096 * 7));
+    }
+
+    #[test]
+    fn align_down_truncates_partial_tail() {
+        assert_eq!(align_down(8195, 4096), Some(8192));
+        assert_eq!(align_down(12_999, 4096), Some(12_288));
+    }
+
+    #[test]
+    fn align_down_rejects_zero_alignment() {
+        assert_eq!(align_down(123, 0), None);
+        assert_eq!(align_down(0, 0), None);
+    }
+
+    #[test]
+    fn align_down_handles_max_value() {
+        let r = align_down(u64::MAX, 4096).expect("non-zero alignment");
+        assert_eq!(r % 4096, 0);
+        assert_eq!(r, (u64::MAX / 4096) * 4096);
+    }
+
+    #[test]
+    fn align_down_property_is_idempotent() {
+        // Aligning an already-aligned value is the identity.
+        for v in [0u64, 1, 4096, 8192, 1_000_000, u64::MAX / 2] {
+            for a in [1u64, 2, 512, 4096, 65_536] {
+                let once = align_down(v, a).expect("a > 0");
+                let twice = align_down(once, a).expect("a > 0");
+                assert_eq!(once, twice);
+                assert_eq!(once % a, 0);
+                assert!(once <= v);
+            }
+        }
+    }
+
+    // ---- NoopPuncher --------------------------------------------------
+
+    #[test]
+    fn noop_puncher_block_size_hint_is_4096() {
+        assert_eq!(NoopPuncher::new().block_size_hint(), 4096);
+    }
+
+    #[test]
+    fn noop_puncher_returns_ok_for_any_args() {
+        // Any borrowed fd will do; stdout is always open.
+        let stdout = std::io::stdout();
+        let fd = stdout.as_fd();
+        let p = NoopPuncher::new();
+        assert!(p.punch(fd, ByteOffset::ZERO, 0).is_ok());
+        assert!(p.punch(fd, ByteOffset::new(4096), 4096).is_ok());
+        assert!(p
+            .punch(fd, ByteOffset::new(u64::MAX / 2), u64::MAX / 2)
+            .is_ok());
+    }
+
+    // ---- default_puncher ---------------------------------------------
+
+    #[test]
+    fn default_puncher_reports_nonzero_block_size_hint() {
+        let p = default_puncher();
+        assert!(p.block_size_hint() > 0);
+    }
+
+    // ---- LinuxPuncher (linux-only) -----------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_puncher_rejects_offset_above_i64_max() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_fd();
+        let p = LinuxPuncher::new();
+        let off = ByteOffset::new(u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1));
+        match p.punch(fd, off, 1) {
+            Err(PunchError::OffsetOverflow { offset, length }) => {
+                assert_eq!(offset, off.get());
+                assert_eq!(length, 1);
+            }
+            other => panic!("expected OffsetOverflow, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_puncher_rejects_length_above_i64_max() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_fd();
+        let p = LinuxPuncher::new();
+        let len = u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1);
+        match p.punch(fd, ByteOffset::ZERO, len) {
+            Err(PunchError::OffsetOverflow { offset, length }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(length, len);
+            }
+            other => panic!("expected OffsetOverflow, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_puncher_zero_length_is_noop_ok() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_fd();
+        let p = LinuxPuncher::new();
+        // No syscall happens for length 0, so a non-regular fd (stdout)
+        // is fine; we are checking the early-return contract.
+        assert!(p.punch(fd, ByteOffset::ZERO, 0).is_ok());
+        assert!(p.punch(fd, ByteOffset::new(1024), 0).is_ok());
+    }
+}
