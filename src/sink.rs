@@ -28,6 +28,11 @@
 //! - [`tar::TarSink`] — streaming tar extractor. Hand-rolled because
 //!   member-aligned quiescence is part of the contract and the upstream
 //!   `tar` crate does not expose it. Quiescent between members.
+//! - [`zip::ZipSink`] — per-entry ZIP extractor. Driven by the ZIP
+//!   pipeline rather than via the [`Sink`] trait (ZIP entries arrive
+//!   in discrete, pre-sized chunks rather than as one byte stream),
+//!   but enforces the same path-safety rules and is quiescent
+//!   between entries. See `docs/PLAN_v2.md` §5.
 //!
 //! # Errors
 //!
@@ -39,9 +44,11 @@
 
 pub mod raw;
 pub mod tar;
+pub mod zip;
 
 pub use raw::RawSink;
 pub use tar::TarSink;
+pub use zip::{BeginEntryOutcome, EntryFinalize, ZipSink};
 
 use std::path::PathBuf;
 

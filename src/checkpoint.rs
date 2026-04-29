@@ -33,6 +33,11 @@
 //!   u8  sink_state_tag
 //!     tag 0 (Raw):  u64 bytes_written
 //!     tag 1 (Tar):  u32 count, then count × (u32 len + utf8 bytes)
+//!     tag 2 (Zip, v2+):
+//!                  u32 entries_completed.len, then count × u32 index
+//!                  u8  current_entry.is_some
+//!                  if some: u32 current_entry_index
+//!                  u64 current_entry_offset
 //! ```
 //!
 //! # Forward compatibility
@@ -92,7 +97,14 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 
 /// The format version this build writes and is the highest version it
 /// can read. Future builds bump this when the body layout changes.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// History:
+///
+/// - **v1** — `Raw` and `Tar` sink states.
+/// - **v2** — adds the `Zip` sink state for per-entry ZIP extraction
+///   (`docs/PLAN_v2.md` §5). The body layout is otherwise unchanged;
+///   v2 readers parse v1 files transparently.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -101,6 +113,9 @@ const HEADER_LEN: usize = 8 + 4 + 8 + 8;
 const SINK_TAG_RAW: u8 = 0;
 /// Tag for [`SinkState::Tar`] in the on-disk format.
 const SINK_TAG_TAR: u8 = 1;
+/// Tag for [`SinkState::Zip`] in the on-disk format. Added in v2 of
+/// the checkpoint layout.
+const SINK_TAG_ZIP: u8 = 2;
 
 /// Errors produced by [`Checkpoint::read`] / [`Checkpoint::write`] and
 /// the in-memory [`Checkpoint::deserialize`] / [`Checkpoint::serialize`]
@@ -235,6 +250,30 @@ pub enum SinkState {
         /// the extraction root) and are stored in extraction order.
         members_completed: Vec<String>,
     },
+
+    /// State for [`crate::sink::ZipSink`].
+    ///
+    /// ZIP archives are extracted per-entry in central-directory
+    /// order. The checkpoint records which entries are durable on
+    /// disk via `entries_completed`, and (when a crash interrupts an
+    /// entry) the in-flight entry index plus the byte offset within
+    /// it. STORED entries can resume from `current_entry_offset`;
+    /// DEFLATE / zstd entries truncate back to zero on resume because
+    /// neither codec exposes a serializable mid-stream state. See
+    /// `docs/PLAN_v2.md` §5 step 7.
+    Zip {
+        /// Indices (within the central directory) of entries that
+        /// finished extracting before this checkpoint was written.
+        /// Ordered, deduplicated in the producer; the on-disk form
+        /// trusts the producer rather than re-checking on read.
+        entries_completed: Vec<u32>,
+        /// Index of the entry that was in flight when the checkpoint
+        /// was written, if any. `None` means the sink was quiescent.
+        current_entry: Option<u32>,
+        /// Bytes already written into the in-flight entry. `0` when
+        /// `current_entry` is `None`.
+        current_entry_offset: u64,
+    },
 }
 
 /// On-disk checkpoint of a download+extraction in progress.
@@ -312,6 +351,26 @@ impl Checkpoint {
                 for name in members_completed.iter().take(count as usize) {
                     write_string(&mut body, name);
                 }
+            }
+            SinkState::Zip {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+            } => {
+                body.push(SINK_TAG_ZIP);
+                let count = u32::try_from(entries_completed.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for idx in entries_completed.iter().take(count as usize) {
+                    write_u32(&mut body, *idx);
+                }
+                match current_entry {
+                    Some(idx) => {
+                        body.push(1);
+                        write_u32(&mut body, *idx);
+                    }
+                    None => body.push(0),
+                }
+                write_u64(&mut body, *current_entry_offset);
             }
         }
 
@@ -395,15 +454,19 @@ impl Checkpoint {
             });
         }
 
-        // Future versions branch on `format_version` here; for now only
-        // version 1 is defined.
-        debug_assert_eq!(format_version, 1);
-        Self::decode_body_v1(body)
+        // v1 and v2 share the same body layout up to the sink tag;
+        // v2 adds [`SINK_TAG_ZIP`] as an accepted tag value. The
+        // `decode_body` helper handles both. Future versions that
+        // *change* the layout will branch here.
+        debug_assert!(matches!(format_version, 1 | 2));
+        Self::decode_body(body)
     }
 
-    /// Decode the version-1 body layout. Caller has validated the
-    /// header's framing and checksum.
-    fn decode_body_v1(body: &[u8]) -> Result<Self, CheckpointError> {
+    /// Decode the body layout. v1 and v2 differ only in which sink
+    /// tags they accept; the helper accepts any of the three known
+    /// tags and the version gate above protects against
+    /// misinterpreting a future layout-changing version.
+    fn decode_body(body: &[u8]) -> Result<Self, CheckpointError> {
         let mut cursor = Cursor::new(body);
         let url = cursor.read_string("url")?;
         let etag = cursor.read_optional_string("etag")?;
@@ -433,6 +496,30 @@ impl Checkpoint {
                 }
                 SinkState::Tar {
                     members_completed: members,
+                }
+            }
+            SINK_TAG_ZIP => {
+                let count = cursor.read_u32("sink.zip.entries_completed.len")?;
+                let mut entries = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    entries.push(cursor.read_u32("sink.zip.entries_completed[i]")?);
+                }
+                let current_present = cursor.read_u8("sink.zip.current_entry.is_some")?;
+                let current_entry = match current_present {
+                    0 => None,
+                    1 => Some(cursor.read_u32("sink.zip.current_entry")?),
+                    other => {
+                        return Err(CheckpointError::InvalidPresence {
+                            field: "sink.zip.current_entry",
+                            value: other,
+                        });
+                    }
+                };
+                let current_entry_offset = cursor.read_u64("sink.zip.current_entry_offset")?;
+                SinkState::Zip {
+                    entries_completed: entries,
+                    current_entry,
+                    current_entry_offset,
                 }
             }
             other => {
@@ -900,6 +987,79 @@ mod tests {
         assert_eq!(parsed, original);
     }
 
+    fn sample_zip(current: Option<u32>, current_offset: u64) -> Checkpoint {
+        Checkpoint {
+            url: "https://example.com/archive.zip".into(),
+            etag: Some("\"v9\"".into()),
+            last_modified: None,
+            total_size: 9_876_543,
+            chunk_size: 4 * 1024 * 1024,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![0xCC; 8],
+            created_at: UNIX_EPOCH + Duration::new(1_700_000_000, 0),
+            sink_state: SinkState::Zip {
+                entries_completed: vec![0, 1, 2, 5, 7],
+                current_entry: current,
+                current_entry_offset: current_offset,
+            },
+        }
+    }
+
+    #[test]
+    fn round_trip_zip_sink_quiescent() {
+        let original = sample_zip(None, 0);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_zip_sink_mid_entry() {
+        let original = sample_zip(Some(8), 1_234_567);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_zip_sink_no_completed_entries() {
+        // Edge case: zero completed entries with a current_entry
+        // mid-flight. Exercises the empty-vec encoding.
+        let mut ckpt = sample_zip(Some(0), 100);
+        if let SinkState::Zip {
+            entries_completed, ..
+        } = &mut ckpt.sink_state
+        {
+            entries_completed.clear();
+        }
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn checkpoint_format_version_is_two() {
+        // Sanity: PLAN_v2 §5 step 7 calls for bumping the version
+        // when SinkState::Zip lands. If a future change resets it,
+        // this guards against silently dropping the upgrade-required
+        // signal v1 readers depend on.
+        assert_eq!(FORMAT_VERSION, 2);
+    }
+
+    #[test]
+    fn v1_checkpoint_bytes_still_parse_after_version_bump() {
+        // Hand-build a v1 file (Raw sink) by replaying what a v1
+        // writer would have produced: identical body, version field
+        // = 1. The current reader must accept it.
+        let original = sample_raw();
+        let mut bytes = original.serialize();
+        // Patch the version field down to 1.
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        // Recompute the body checksum is *not* needed — only the
+        // version bytes changed and they're outside the body.
+        let parsed = Checkpoint::deserialize(&bytes).expect("v1 still parses");
+        assert_eq!(parsed, original);
+    }
+
     #[test]
     fn round_trip_with_unicode_strings() {
         let mut ckpt = sample_raw();
@@ -1259,15 +1419,30 @@ mod tests {
             let bitmap_completed = random_bytes(&mut rng, 1024);
             let created_at = UNIX_EPOCH + Duration::new(rng.next_u64() % 4_000_000_000, 12_345);
 
-            let sink_state = if rng.next_bool() {
-                SinkState::Raw {
+            let sink_state = match rng.next_u32() % 3 {
+                0 => SinkState::Raw {
                     bytes_written: rng.next_u64(),
+                },
+                1 => {
+                    let n = (rng.next_u32() as usize) % 8;
+                    let members = (0..n).map(|_| random_string(&mut rng, 64)).collect();
+                    SinkState::Tar {
+                        members_completed: members,
+                    }
                 }
-            } else {
-                let n = (rng.next_u32() as usize) % 8;
-                let members = (0..n).map(|_| random_string(&mut rng, 64)).collect();
-                SinkState::Tar {
-                    members_completed: members,
+                _ => {
+                    let count = (rng.next_u32() as usize) % 16;
+                    let entries = (0..count).map(|_| rng.next_u32()).collect();
+                    let current = if rng.next_bool() {
+                        Some(rng.next_u32())
+                    } else {
+                        None
+                    };
+                    SinkState::Zip {
+                        entries_completed: entries,
+                        current_entry: current,
+                        current_entry_offset: rng.next_u64(),
+                    }
                 }
             };
 
