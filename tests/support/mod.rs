@@ -9,3 +9,4 @@
 
 pub mod mock_server;
 pub mod tar_fixtures;
+pub mod zip_fixtures;

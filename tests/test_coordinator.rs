@@ -39,6 +39,7 @@ mod support;
 
 use support::mock_server::{MockRequest, MockResponse, MockServer};
 use support::tar_fixtures::{build_header, build_pax_body, build_simple_archive, end_of_archive};
+use support::zip_fixtures::{build_zip, ZipEntrySpec};
 
 // ---- helpers -----------------------------------------------------------
 
@@ -900,6 +901,254 @@ fn pax_prefixed_tar_extracts_via_magic_detection() {
     run(args).expect("pax tar run");
     let extracted = fs::read(out_dir.join(&long_path)).expect("pax-overridden file present");
     assert_eq!(extracted, payload);
+}
+
+// ---- happy path: zip output (PLAN_v2 §5) ----------------------------
+
+#[test]
+fn happy_path_zip_to_dir_extracts_mixed_methods() {
+    // Multi-entry archive exercising all three round-one methods.
+    // The DEFLATE payload is large enough that DEFLATE actually
+    // does work (so the test exercises a non-trivial flate2 path).
+    let mut deflate_payload = Vec::with_capacity(32 * 1024);
+    while deflate_payload.len() < 32 * 1024 {
+        deflate_payload.extend_from_slice(b"the quick brown fox jumps over the lazy dog. ");
+    }
+    deflate_payload.truncate(32 * 1024);
+    let zstd_payload = b"zstd entry payload, ".repeat(200);
+
+    let archive = build_zip(&[
+        ZipEntrySpec::stored("readme.txt", b"hello, zip!".to_vec()),
+        ZipEntrySpec::deflate("compressible.txt", deflate_payload.clone()),
+        ZipEntrySpec::zstd("nested/big.bin", zstd_payload.clone()),
+        ZipEntrySpec::directory("emptydir"),
+    ]);
+    let archive_len = archive.len() as u64;
+    let server = MockServer::start(ok_handler(archive, Some("\"v-zip\"")));
+
+    let work = unique_dir("happy_zip");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let mut config = coord_config_for_test(4096);
+    config.chunk_size = 1024.max(archive_len.div_ceil(8));
+    let args = make_args(
+        &server,
+        "release.zip",
+        OutputTarget::Dir(out_dir.clone()),
+        config,
+    );
+
+    let stats = run(args).expect("zip happy run");
+    assert!(!stats.resumed);
+    let total_uncompressed =
+        b"hello, zip!".len() as u64 + deflate_payload.len() as u64 + zstd_payload.len() as u64;
+    assert_eq!(stats.extraction.bytes_out, total_uncompressed);
+
+    assert_eq!(
+        fs::read(out_dir.join("readme.txt")).unwrap(),
+        b"hello, zip!"
+    );
+    assert_eq!(
+        fs::read(out_dir.join("compressible.txt")).unwrap(),
+        deflate_payload,
+    );
+    assert_eq!(
+        fs::read(out_dir.join("nested/big.bin")).unwrap(),
+        zstd_payload,
+    );
+    assert!(out_dir.join("emptydir").is_dir());
+
+    // Sidecars cleaned up on success.
+    let sidecar_part = work.join("out.peel.part");
+    let sidecar_ckpt = work.join("out.peel.ckpt");
+    assert!(
+        !sidecar_part.exists(),
+        "expected no .part: {sidecar_part:?}"
+    );
+    assert!(
+        !sidecar_ckpt.exists(),
+        "expected no .ckpt: {sidecar_ckpt:?}"
+    );
+}
+
+#[test]
+fn zip_to_file_output_is_rejected() {
+    let archive = build_zip(&[ZipEntrySpec::stored("a.txt", b"hi".to_vec())]);
+    let server = MockServer::start(ok_handler(archive, Some("\"v-zipfile\"")));
+
+    let work = unique_dir("zip_file_out");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    let args = make_args(
+        &server,
+        "release.zip",
+        OutputTarget::File(out_path),
+        coord_config_for_test(4096),
+    );
+    let err = run(args).expect_err("zip + -o must abort");
+    assert!(matches!(err, CoordinatorError::ZipNeedsDirectory));
+}
+
+#[test]
+fn zip_unsupported_method_surfaces_specific_feature_name() {
+    // Manually craft a zip with method 14 (LZMA) — round-one should
+    // refuse with a feature-named UnsupportedFeature error.
+    let mut archive = Vec::new();
+    // LFH for a single entry, method = 14 (LZMA), 0-byte content.
+    archive.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    archive.extend_from_slice(&20u16.to_le_bytes()); // version_needed
+    archive.extend_from_slice(&0u16.to_le_bytes()); // gp_flags
+    archive.extend_from_slice(&14u16.to_le_bytes()); // compression_method = LZMA
+    archive.extend_from_slice(&0u16.to_le_bytes()); // mtime
+    archive.extend_from_slice(&0u16.to_le_bytes()); // mdate
+    archive.extend_from_slice(&0u32.to_le_bytes()); // crc
+    archive.extend_from_slice(&0u32.to_le_bytes()); // compressed_size
+    archive.extend_from_slice(&0u32.to_le_bytes()); // uncompressed_size
+    let name = b"weird.bin";
+    archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes()); // extra
+    archive.extend_from_slice(name);
+    let lfh_offset = 0u32;
+    let cd_offset = archive.len() as u32;
+    // CDE
+    archive.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+    archive.extend_from_slice(&20u16.to_le_bytes()); // made_by
+    archive.extend_from_slice(&20u16.to_le_bytes()); // needed
+    archive.extend_from_slice(&0u16.to_le_bytes()); // gp_flags
+    archive.extend_from_slice(&14u16.to_le_bytes()); // method
+    archive.extend_from_slice(&0u16.to_le_bytes()); // mtime
+    archive.extend_from_slice(&0u16.to_le_bytes()); // mdate
+    archive.extend_from_slice(&0u32.to_le_bytes()); // crc
+    archive.extend_from_slice(&0u32.to_le_bytes()); // csize
+    archive.extend_from_slice(&0u32.to_le_bytes()); // usize
+    archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes()); // extra
+    archive.extend_from_slice(&0u16.to_le_bytes()); // comment
+    archive.extend_from_slice(&0u16.to_le_bytes()); // disk_start
+    archive.extend_from_slice(&0u16.to_le_bytes()); // internal
+    archive.extend_from_slice(&0u32.to_le_bytes()); // external
+    archive.extend_from_slice(&lfh_offset.to_le_bytes());
+    archive.extend_from_slice(name);
+    let cd_size = archive.len() as u32 - cd_offset;
+    // EOCD
+    archive.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes()); // disk
+    archive.extend_from_slice(&0u16.to_le_bytes()); // cd_start_disk
+    archive.extend_from_slice(&1u16.to_le_bytes()); // entries_this_disk
+    archive.extend_from_slice(&1u16.to_le_bytes()); // entries_total
+    archive.extend_from_slice(&cd_size.to_le_bytes());
+    archive.extend_from_slice(&cd_offset.to_le_bytes());
+    archive.extend_from_slice(&0u16.to_le_bytes()); // comment
+
+    let server = MockServer::start(ok_handler(archive, Some("\"v-lzma-zip\"")));
+    let work = unique_dir("zip_lzma");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let args = make_args(
+        &server,
+        "weird.zip",
+        OutputTarget::Dir(out_dir),
+        coord_config_for_test(4096),
+    );
+    let err = run(args).expect_err("LZMA in zip must be rejected");
+    // Walk the error chain looking for "LZMA" — the message lives
+    // inside the wrapped EntryDecodeError → ZipError chain.
+    let mut found = false;
+    let top: &dyn std::error::Error = &err;
+    if top.to_string().contains("LZMA") {
+        found = true;
+    } else {
+        let mut cur = top.source();
+        while let Some(s) = cur {
+            if s.to_string().contains("LZMA") {
+                found = true;
+                break;
+            }
+            cur = s.source();
+        }
+    }
+    assert!(found, "expected LZMA in error chain, got {err:?}");
+}
+
+#[test]
+fn zip_resume_skips_already_extracted_entries() {
+    // Build a multi-entry zip; run it once with the kill switch
+    // tripping after the first entry's checkpoint write; resume and
+    // verify the remaining entries land cleanly with the first
+    // entry's on-disk content preserved.
+    let archive = build_zip(&[
+        ZipEntrySpec::stored("a.txt", b"first entry payload".to_vec()),
+        ZipEntrySpec::stored("b.txt", b"second entry payload".to_vec()),
+        ZipEntrySpec::stored("c.txt", b"third entry payload".to_vec()),
+    ]);
+    let server = MockServer::start(ok_handler(archive, Some("\"v-zip-resume\"")));
+
+    let work = unique_dir("zip_resume");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    // Phase 1: kill after the first checkpoint write.
+    let kill_switch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut cfg1 = coord_config_for_test(64);
+    cfg1.checkpoint_min_bytes = 1; // every entry triggers a checkpoint
+    cfg1.checkpoint_min_interval = Duration::from_millis(0);
+    let kill_switch_inner = Arc::clone(&kill_switch);
+    let mut after_first_ckpt = false;
+    let args1 = RunArgs {
+        url: format!("{}/release.zip", server.base_url()),
+        output: OutputTarget::Dir(out_dir.clone()),
+        config: cfg1,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: Some(Box::new(move |event: ProgressEvent<'_>| {
+            if let ProgressEvent::CheckpointWritten { .. } = event {
+                if !after_first_ckpt {
+                    after_first_ckpt = true;
+                    kill_switch_inner.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }) as ProgressFn),
+        kill_switch: Some(Arc::clone(&kill_switch)),
+    };
+    let err = run(args1).expect_err("phase1 must abort");
+    assert!(matches!(err, CoordinatorError::Aborted { .. }));
+    // First entry should be on disk; checkpoint should exist.
+    assert_eq!(
+        fs::read(out_dir.join("a.txt")).unwrap(),
+        b"first entry payload",
+    );
+    assert!(work.join("out.peel.ckpt").exists());
+
+    // Phase 2: resume cleanly.
+    let cfg2 = coord_config_for_test(64);
+    let args2 = make_args(
+        &server,
+        "release.zip",
+        OutputTarget::Dir(out_dir.clone()),
+        cfg2,
+    );
+    let stats = run(args2).expect("phase2");
+    assert!(stats.resumed);
+    assert_eq!(
+        fs::read(out_dir.join("a.txt")).unwrap(),
+        b"first entry payload",
+    );
+    assert_eq!(
+        fs::read(out_dir.join("b.txt")).unwrap(),
+        b"second entry payload",
+    );
+    assert_eq!(
+        fs::read(out_dir.join("c.txt")).unwrap(),
+        b"third entry payload",
+    );
+    assert!(!work.join("out.peel.part").exists());
+    assert!(!work.join("out.peel.ckpt").exists());
 }
 
 // ---- no decoder for filename ----------------------------------------

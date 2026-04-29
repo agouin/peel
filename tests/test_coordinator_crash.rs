@@ -48,6 +48,7 @@ mod support;
 
 use support::mock_server::{MockRequest, MockResponse, MockServer};
 use support::tar_fixtures::{build_header, end_of_archive, pad_block};
+use support::zip_fixtures::{build_zip, ZipEntrySpec};
 
 // ---- helpers -----------------------------------------------------------
 
@@ -1001,6 +1002,128 @@ fn random_kill_points_resume_to_identical_tar_lz4_output() {
         if got != golden_entries {
             captured_failures.lock().unwrap().push(format!(
                 "trial {trial}: tar.lz4 resume diverges from golden \
+                 (abort_after={abort_after})",
+            ));
+        }
+    }
+
+    let failures = captured_failures.lock().unwrap();
+    assert!(failures.is_empty(), "{:?}", *failures);
+}
+
+// ---- harness: zip output (PLAN_v2 §5) -------------------------------
+
+#[test]
+fn random_kill_points_resume_to_identical_zip_output() {
+    // Multi-entry archive mixing all three round-one methods. The
+    // checkpoint cadence policy in run_zip writes a checkpoint after
+    // every entry (capped by checkpoint_min_bytes/min_interval); a
+    // crash between entries is the only meaningful kill point round-
+    // one supports for ZIP, but the harness still verifies that
+    // every such resume is byte-identical.
+    let entries = vec![
+        ZipEntrySpec::stored("a.txt", b"hello, zip resume world".to_vec()),
+        ZipEntrySpec::deflate(
+            "compressible.txt",
+            b"the quick brown fox jumps over the lazy dog. ".repeat(64),
+        ),
+        ZipEntrySpec::zstd(
+            "nested/big.bin",
+            (0u8..=255).cycle().take(8 * 1024).collect::<Vec<u8>>(),
+        ),
+        ZipEntrySpec::stored("nested/sub/c.bin", vec![0xAB; 1024]),
+        ZipEntrySpec::deflate("d.bin", b"deflate payload \xC0\xFF\xEE".repeat(50)),
+        ZipEntrySpec::zstd("e.bin", b"zstd payload ".repeat(70)),
+        ZipEntrySpec::directory("emptydir"),
+        ZipEntrySpec::stored("z_last.txt", b"final entry".to_vec()),
+    ];
+    let body = build_zip(&entries);
+    let server = MockServer::start(ok_handler(body, "\"v-zip-crash\""));
+
+    let golden_dir = unique_dir("golden_zip");
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_out = golden_dir.join("out");
+    fs::create_dir_all(&golden_out).expect("golden out dir");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let args = make_args(
+        &server,
+        "release.zip",
+        OutputTarget::Dir(golden_out.clone()),
+        coord_config(4096),
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden zip run");
+    let golden_entries = read_dir_recursive(&golden_out);
+    assert!(
+        !golden_entries.is_empty(),
+        "golden zip run did not extract any files",
+    );
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    if total_checkpoints < 2 {
+        // The cadence floor on a tiny archive can collapse all
+        // entries into a single checkpoint; in that case there's no
+        // meaningful kill point. Skip rather than fail-flake.
+        return;
+    }
+
+    let trial_count = 10u64;
+    let mut rng = Lcg::seeded(0xCAFE_F00D_DEAD_BEEF);
+    let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, total_checkpoints);
+        let work = unique_dir(&format!("zip_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_dir = work.join("out");
+        fs::create_dir_all(&out_dir).expect("trial out dir");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let args = make_args(
+            &server,
+            "release.zip",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                let got = read_dir_recursive(&out_dir);
+                assert_eq!(got, golden_entries, "trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("trial {trial}: unexpected error {other:?}"),
+        }
+
+        let resume_args = make_args(
+            &server,
+            "release.zip",
+            OutputTarget::Dir(out_dir.clone()),
+            coord_config(4096),
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume ok");
+        assert!(
+            stats.resumed,
+            "trial {trial}: resume did not flag itself as resumed"
+        );
+
+        let got = read_dir_recursive(&out_dir);
+        if got != golden_entries {
+            captured_failures.lock().unwrap().push(format!(
+                "trial {trial}: zip resume diverges from golden \
                  (abort_after={abort_after})",
             ));
         }

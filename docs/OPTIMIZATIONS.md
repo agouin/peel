@@ -179,13 +179,58 @@ offset through `frame_boundary` once that contract is genuine.
 
 ### O.8 zip support
 
-**What**: stream-extract `.zip` archives.
+**Status: delivered in `PLAN_v2.md` §5 (2026-04-29).** Round-one
+ships a second pipeline architecture in
+[`src/download/zip_pipeline.rs`](../src/download/zip_pipeline.rs)
+that drives extraction in central-directory order: the trailing
+EOCD is fetched first, the central directory is parsed, and each
+entry's compressed bytes are streamed through STORED / DEFLATE /
+zstd into a per-entry [`ZipSink`](../src/sink/zip.rs) with the
+same path-safety rules as `TarSink`. Hole punching is per-entry
+(less effective than the streaming pipeline's per-frame discipline
+but real for very large entries). Resume preserves
+`entries_completed` plus the in-flight entry's index/offset; STORED
+entries resume mid-entry, DEFLATE/zstd restart the entry from its
+compressed start. Out-of-scope features (Zip64, encryption,
+multi-disk, methods other than 0/8/93) surface as
+`ZipError::UnsupportedFeature` with the specific feature named —
+filed below as `O.8b`.
 
-**Why deferred**: zip's central-directory-at-the-end design is
-fundamentally hostile to streaming and to prefix-truncation. Would
-require downloading the central directory first (the last few KB),
-then doing per-entry ranged GETs — a different pipeline architecture
-entirely. Worth it if the use case demands it; out of scope otherwise.
+---
+
+### O.8b zip extended-feature support (round-two follow-on)
+
+**What**: features round-one of `PLAN_v2.md` §5 deliberately
+deferred:
+
+- **Zip64**: archives ≥ 4 GiB or with ≥ 65535 entries (sentinel
+  `0xFFFF_FFFF` / `0xFFFF` in the EOCD or a CDE).
+- **Traditional PKWARE encryption** and **AES / strong encryption**
+  (general-purpose flag bits 0 and 6).
+- **Multi-disk / spanned archives** (`disk_start != 0`).
+- **DEFLATE64**, **BZIP2**, **LZMA-in-zip**, **PPMD**, **AES-99
+  marker**, and any other compression method beyond STORED, DEFLATE,
+  and zstd.
+- **Self-extractor stubs**: data prepended to the LFH signature.
+
+**Why deferred**: real-world zip archives users will actually run
+`peel` against (GitHub release artifacts, npm tarballs published as
+.zip, JDK distributions) almost never use any of these features.
+Each one expands the audit surface, the dependency tree (AES needs
+crypto), or both. Round-one refuses cleanly with
+`ZipError::UnsupportedFeature` naming the specific feature so
+users see "AES encryption is not supported", not "malformed
+header".
+
+**Sketch**: Zip64 needs a parallel parser path that reads the
+Zip64 EOCD locator (`0x07064b50`) and EOCD record (`0x06064b50`)
+ahead of the legacy EOCD. Encryption needs a dependency on a
+crypto crate (and a careful look at what we want to support —
+traditional PKWARE is cryptographically broken). DEFLATE64 likely
+ships as a flate2 feature flag. Self-extractor stub support is
+mostly a parser change to scan further back from the file end for
+the EOCD signature. Promote when a real corpus exists where the
+deferred features actually matter.
 
 ---
 
