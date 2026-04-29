@@ -41,6 +41,10 @@
 //!   download + extractor + checkpoint into a single resumable
 //!   pipeline. The `peel` binary calls into [`coordinator::run`]
 //!   after parsing CLI flags.
+//! - [`zip`] — ZIP archive support (parsers, sink, per-entry
+//!   pipeline). ZIP's central-directory-at-the-end design forces a
+//!   different pipeline shape than the streaming decoders in
+//!   [`decode`]; see `docs/PLAN_v2.md` §5.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -65,3 +69,4 @@ pub mod http;
 pub mod punch;
 pub mod sink;
 pub mod types;
+pub mod zip;
