@@ -105,6 +105,7 @@ fn coord_config(chunk_size: u64) -> CoordinatorConfig {
         forced_format: None,
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
+        expected_sha256: None,
     }
 }
 
@@ -1134,4 +1135,126 @@ fn random_kill_points_resume_to_identical_zip_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+}
+
+// ---- harness: sha256 integrity verification across resume ------------
+
+/// `PLAN_v2.md` §10 demo bar: a mid-download `kill -9` followed by a
+/// resume produces a digest equal to a clean-run digest. The
+/// coordinator surfaces a hash mismatch as
+/// [`CoordinatorError::Integrity`] and a successful run with the
+/// correct digest is byte-identical to a clean run; here we exercise
+/// the full kill-then-resume loop with `--sha256` armed and assert
+/// the resumed run completes cleanly (i.e. the verify step at end
+/// of run did not fire a mismatch).
+#[test]
+fn sha256_match_after_random_kill_points_resume() {
+    let payloads: Vec<Vec<u8>> = (0..16)
+        .map(|i| {
+            let n = 1024usize + (i as usize) * 137;
+            (0..n)
+                .map(|j| (i as u8).wrapping_mul(7).wrapping_add(j as u8))
+                .collect::<Vec<u8>>()
+        })
+        .collect();
+    let payload_refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+    let body = encode_zstd_frames(&payload_refs);
+    let mut hasher = peel::hash::sha256::Sha256::new();
+    hasher.update(&body);
+    let expected = hasher.finalize();
+
+    let server = MockServer::start(ok_handler(body, "\"v-sha256\""));
+
+    // Reference golden run: same as the §10 unit-tests but here we
+    // capture the byte stream and the checkpoint count so the trial
+    // loop has an upper bound to randomize over.
+    let golden_dir = unique_dir("sha256_golden");
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_path = golden_dir.join("out.bin");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let cfg = CoordinatorConfig {
+        expected_sha256: Some(expected),
+        ..coord_config(4096)
+    };
+    let args = make_args(
+        &server,
+        "raw.zst",
+        OutputTarget::File(golden_path.clone()),
+        cfg,
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden sha256 run ok");
+    let golden_bytes = fs::read(&golden_path).expect("golden read");
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    assert!(
+        total_checkpoints >= 4,
+        "need at least a few checkpoints to randomize over (got {total_checkpoints})"
+    );
+
+    let trial_count = 10u64;
+    let mut rng = Lcg::seeded(0x5_F00D_BEEF_5E55);
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, total_checkpoints);
+        let work = unique_dir(&format!("sha256_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_path = work.join("out.bin");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let cfg = CoordinatorConfig {
+            expected_sha256: Some(expected),
+            ..coord_config(4096)
+        };
+        let args = make_args(
+            &server,
+            "raw.zst",
+            OutputTarget::File(out_path.clone()),
+            cfg.clone(),
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                // Race: kill switch lost; the run finished cleanly
+                // and the integrity check passed. Verify the byte
+                // stream too and continue.
+                let got = fs::read(&out_path).expect("trial output");
+                assert_eq!(got, golden_bytes, "trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("trial {trial}: unexpected error {other:?}"),
+        }
+
+        // Resume with --sha256 still on. Verifies (a) the saved
+        // hash_state round-trips through the checkpoint format,
+        // (b) the resume's HashingReader picks the right skip
+        // count, and (c) the final digest equals `expected` so
+        // `verify_digest` does not fire.
+        let resume_args = make_args(
+            &server,
+            "raw.zst",
+            OutputTarget::File(out_path.clone()),
+            cfg,
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume with --sha256 ok");
+        assert!(stats.resumed, "trial {trial}: resume not flagged");
+
+        let got = fs::read(&out_path).expect("trial output");
+        assert_eq!(
+            got, golden_bytes,
+            "trial {trial}: resumed output diverges from golden (abort_after={abort_after})",
+        );
+    }
 }

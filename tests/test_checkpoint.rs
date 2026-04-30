@@ -56,6 +56,7 @@ fn realistic_tar_checkpoint() -> Checkpoint {
                 "linux-6.10/Makefile".into(),
             ],
         },
+        hash_state: None,
     }
 }
 
@@ -260,6 +261,7 @@ fn round_trip_raw_sink_state() {
         sink_state: SinkState::Raw {
             bytes_written: 524_288,
         },
+        hash_state: None,
     };
     ckpt.write(&path).expect("write");
 

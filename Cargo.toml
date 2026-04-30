@@ -69,6 +69,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 io-uring = { version = "0.7", default-features = false }
 
 [dev-dependencies]
+# Dev-only reference implementation used by `hash::sha256` tests to
+# cross-check the hand-rolled SHA-256 against a battle-tested upstream
+# (`PLAN_v2.md` §10 / `docs/ENGINEERING_STANDARDS.md` §2.2). The
+# runtime binary does not link `sha2`.
+sha2 = "0.10"
 
 [profile.release]
 debug = "line-tables-only"

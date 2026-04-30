@@ -95,6 +95,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         forced_format: None,
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
+        expected_sha256: None,
     }
 }
 
@@ -757,6 +758,7 @@ fn resume_picks_up_from_existing_checkpoint() {
         sink_state: SinkState::Raw {
             bytes_written: payload_a.len() as u64,
         },
+        hash_state: None,
     };
     let ckpt_path = work2.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -805,6 +807,7 @@ fn etag_mismatch_on_resume_aborts_cleanly() {
         bitmap_completed: bitmap_bytes,
         created_at: SystemTime::now(),
         sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -853,6 +856,7 @@ fn url_change_on_resume_aborts_cleanly() {
         bitmap_completed: bitmap_bytes,
         created_at: SystemTime::now(),
         sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1284,6 +1288,270 @@ fn zip_resume_skips_already_extracted_entries() {
     );
     assert!(!work.join("out.peel.part").exists());
     assert!(!work.join("out.peel.ckpt").exists());
+}
+
+// ---- sha256 integrity verification (PLAN_v2 §10) ---------------------
+
+/// Compute the SHA-256 digest of `bytes` via the in-tree hand-rolled
+/// implementation so the integration tests check the same code path
+/// the runtime binary uses. Hex-encodes for the friendlier message
+/// formats that `hash::IntegrityError` produces.
+fn sha256_hex(bytes: &[u8]) -> [u8; 32] {
+    let mut h = peel::hash::sha256::Sha256::new();
+    h.update(bytes);
+    h.finalize()
+}
+
+#[test]
+fn sha256_match_completes_clean_extraction() {
+    let payload = b"sha256-clean-run-payload".repeat(2048);
+    let body = encode_zstd(&payload);
+    let expected = sha256_hex(&body);
+    let server = MockServer::start(ok_handler(body.clone(), Some("\"v1\"")));
+
+    let work = unique_dir("sha256_clean");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    let args = make_args(
+        &server,
+        "x.zst",
+        OutputTarget::File(out_path.clone()),
+        CoordinatorConfig {
+            expected_sha256: Some(expected),
+            ..coord_config_for_test(4096)
+        },
+    );
+    let stats = run(args).expect("clean run with matching hash");
+    assert_eq!(stats.total_size, body.len() as u64);
+
+    let got = fs::read(&out_path).expect("output");
+    assert_eq!(got, payload);
+}
+
+#[test]
+fn sha256_mismatch_aborts_with_integrity_error() {
+    let payload = b"sha256-mismatch-payload".repeat(1024);
+    let body = encode_zstd(&payload);
+    // Use the SHA-256 of a different input as the expected digest;
+    // the run must abort.
+    let mut wrong = sha256_hex(b"definitely not the body");
+    // Defensive: ensure we did not accidentally match.
+    assert_ne!(wrong, sha256_hex(&body));
+    // Bit-flip just to make absolutely sure.
+    wrong[0] ^= 0x80;
+    let server = MockServer::start(ok_handler(body, Some("\"v1\"")));
+
+    let work = unique_dir("sha256_mismatch");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    let args = make_args(
+        &server,
+        "x.zst",
+        OutputTarget::File(out_path),
+        CoordinatorConfig {
+            expected_sha256: Some(wrong),
+            ..coord_config_for_test(4096)
+        },
+    );
+    let err = run(args).expect_err("hash mismatch must abort");
+    match err {
+        CoordinatorError::Integrity(peel::hash::IntegrityError::HashMismatch { expected, got }) => {
+            assert_eq!(expected.len(), 64);
+            assert_eq!(got.len(), 64);
+            assert_ne!(expected, got);
+        }
+        other => panic!("expected Integrity::HashMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn sha256_resume_with_saved_state_completes_cleanly() {
+    // Two-phase test: phase 1 runs with a kill switch that fires
+    // after the first checkpoint, leaving a `.peel.part` /
+    // `.peel.ckpt` pair on disk. Phase 2 resumes with the same
+    // `--sha256` and must finish, with the digest matching a clean
+    // run's digest.
+    let frame_a = b"frame-a-payload".repeat(2048);
+    let frame_b = b"frame-b-bigger-payload".repeat(2048);
+    let body = encode_zstd_frames(&[&frame_a, &frame_b]);
+    let expected = sha256_hex(&body);
+    let server = MockServer::start(ok_handler(body.clone(), Some("\"v1\"")));
+
+    let work = unique_dir("sha256_resume");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    // Phase 1: run with a kill switch that flips after the first
+    // checkpoint. The coordinator returns `Aborted` and leaves
+    // .peel.part / .peel.ckpt for phase 2 to pick up.
+    let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let kill_for_progress = Arc::clone(&kill);
+        let progress: ProgressFn = Box::new(move |event| {
+            if let ProgressEvent::CheckpointWritten { .. } = event {
+                kill_for_progress.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        let args = RunArgs {
+            url: format!("{}/x.zst", server.base_url()),
+            output: OutputTarget::File(out_path.clone()),
+            config: CoordinatorConfig {
+                expected_sha256: Some(expected),
+                ..coord_config_for_test(4096)
+            },
+            client: build_client(),
+            registry: DecoderRegistry::with_defaults(),
+            progress: Some(progress),
+            progress_state: None,
+            kill_switch: Some(kill),
+        };
+        let err = run(args).expect_err("kill switch must trip");
+        match err {
+            CoordinatorError::Aborted {
+                checkpoints_written,
+            } => {
+                assert!(checkpoints_written >= 1);
+            }
+            other => panic!("expected Aborted, got {other:?}"),
+        }
+    }
+
+    // Sidecars must still be on disk for phase 2 to consume.
+    assert!(work.join("out.bin.peel.part").exists());
+    assert!(work.join("out.bin.peel.ckpt").exists());
+
+    // Phase 2: resume with the same --sha256.
+    let args = make_args(
+        &server,
+        "x.zst",
+        OutputTarget::File(out_path.clone()),
+        CoordinatorConfig {
+            expected_sha256: Some(expected),
+            ..coord_config_for_test(4096)
+        },
+    );
+    let stats = run(args).expect("resume with same --sha256 succeeds");
+    assert!(stats.resumed, "phase 2 must be a resume");
+
+    let got = fs::read(&out_path).expect("output present");
+    let mut combined = frame_a.clone();
+    combined.extend_from_slice(&frame_b);
+    assert_eq!(got, combined);
+}
+
+#[test]
+fn sha256_added_on_resume_without_saved_state_errors() {
+    // Phase 1 ran without --sha256, leaving a checkpoint with
+    // `hash_state = None`. Phase 2 turns on --sha256 and resumes;
+    // the coordinator must refuse rather than emit a half-tracked
+    // digest.
+    let payload = b"resume-without-state".repeat(512);
+    let body = encode_zstd(&payload);
+    let body_len = body.len() as u64;
+    let expected = sha256_hex(&body);
+    let server = MockServer::start(ok_handler(body, Some("\"v1\"")));
+
+    let work = unique_dir("sha256_resume_no_state");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    // Hand-build a phase-1-style checkpoint with `hash_state: None`.
+    let chunk_size = 4096u64;
+    let total_chunks = body_len.div_ceil(chunk_size) as u32;
+    let bitmap_bytes = peel::bitmap::ChunkBitmap::new(total_chunks).to_bytes();
+    let ckpt = Checkpoint {
+        url: format!("{}/x.zst", server.base_url()),
+        etag: Some("\"v1\"".into()),
+        last_modified: None,
+        total_size: body_len,
+        chunk_size,
+        decoder_position: ByteOffset::new(0),
+        bitmap_completed: bitmap_bytes,
+        created_at: SystemTime::now(),
+        sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: None,
+    };
+    let ckpt_path = work.join("out.bin.peel.ckpt");
+    ckpt.write(&ckpt_path).expect("ckpt write");
+    // The .peel.part needs to exist as a placeholder so the resume
+    // path doesn't trip on the missing file before reaching the
+    // integrity-check guard. The contents don't need to be valid;
+    // the coordinator opens it and reuses the file.
+    fs::File::create(work.join("out.bin.peel.part")).expect("part placeholder");
+
+    let args = make_args(
+        &server,
+        "x.zst",
+        OutputTarget::File(out_path),
+        CoordinatorConfig {
+            chunk_size,
+            expected_sha256: Some(expected),
+            ..coord_config_for_test(chunk_size)
+        },
+    );
+    match run(args) {
+        Err(CoordinatorError::Integrity(
+            peel::hash::IntegrityError::CheckpointMissingHashState { .. },
+        )) => {}
+        other => panic!("expected CheckpointMissingHashState, got {other:?}"),
+    }
+}
+
+#[test]
+fn sha256_dropped_on_resume_with_saved_state_errors() {
+    // The mirror case: phase 1 ran with --sha256, phase 2 forgot
+    // to pass it. Refuse rather than silently dropping integrity
+    // tracking.
+    let payload = b"resume-with-state-no-flag".repeat(512);
+    let body = encode_zstd(&payload);
+    let body_len = body.len() as u64;
+    let server = MockServer::start(ok_handler(body, Some("\"v1\"")));
+
+    let work = unique_dir("sha256_resume_drop_flag");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    let mut state = peel::hash::sha256::Sha256::new();
+    state.update(b"some prior bytes");
+    let saved = state.serialize();
+
+    let chunk_size = 4096u64;
+    let total_chunks = body_len.div_ceil(chunk_size) as u32;
+    let bitmap_bytes = peel::bitmap::ChunkBitmap::new(total_chunks).to_bytes();
+    let ckpt = Checkpoint {
+        url: format!("{}/x.zst", server.base_url()),
+        etag: Some("\"v1\"".into()),
+        last_modified: None,
+        total_size: body_len,
+        chunk_size,
+        decoder_position: ByteOffset::new(0),
+        bitmap_completed: bitmap_bytes,
+        created_at: SystemTime::now(),
+        sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: Some(saved),
+    };
+    let ckpt_path = work.join("out.bin.peel.ckpt");
+    ckpt.write(&ckpt_path).expect("ckpt write");
+    fs::File::create(work.join("out.bin.peel.part")).expect("part placeholder");
+
+    let args = make_args(
+        &server,
+        "x.zst",
+        OutputTarget::File(out_path),
+        CoordinatorConfig {
+            chunk_size,
+            expected_sha256: None,
+            ..coord_config_for_test(chunk_size)
+        },
+    );
+    match run(args) {
+        Err(CoordinatorError::Integrity(peel::hash::IntegrityError::CheckpointHadHashState {
+            ..
+        })) => {}
+        other => panic!("expected CheckpointHadHashState, got {other:?}"),
+    }
 }
 
 // ---- no decoder for filename ----------------------------------------

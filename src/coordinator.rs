@@ -161,6 +161,19 @@ pub struct CoordinatorConfig {
     /// `io_uring` and surfaces a clean error if the kernel does not
     /// support it. Mirrors the `--io-backend` CLI flag.
     pub io_backend: crate::io_backend::IoBackendChoice,
+    /// SHA-256 of the expected source bytes (`docs/PLAN_v2.md` §10).
+    /// When `Some(_)`, the coordinator interposes a
+    /// [`crate::hash::HashingReader`] in front of the streaming
+    /// decoder, snapshots the in-flight state into every checkpoint,
+    /// and verifies the finalized digest at clean completion.
+    /// Mismatches are surfaced as
+    /// [`CoordinatorError::Integrity`] with a friendly explanation.
+    /// Mirrors the `--sha256 <hex>` CLI flag.
+    ///
+    /// Streaming pipeline only: ZIP archives extract per-entry and
+    /// the integrity check does not extend to that path in round-one
+    /// of `PLAN_v2.md`.
+    pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
 }
 
 impl Default for CoordinatorConfig {
@@ -178,6 +191,7 @@ impl Default for CoordinatorConfig {
             forced_format: None,
             force_format_from_magic: false,
             io_backend: crate::io_backend::IoBackendChoice::default(),
+            expected_sha256: None,
         }
     }
 }
@@ -421,6 +435,15 @@ pub enum CoordinatorError {
     /// requested on a kernel without `io_uring` support).
     #[error("io_backend setup failed")]
     IoBackend(#[source] io::Error),
+
+    /// The `--sha256` integrity check failed: either the digest of
+    /// the bytes we received did not match the user's expected
+    /// digest, or the saved hash state across runs disagreed with
+    /// the current invocation's flags. Per `docs/PLAN_v2.md` §10 we
+    /// surface this as its own variant so the binary can give it a
+    /// distinct exit code.
+    #[error("integrity check failed")]
+    Integrity(#[source] crate::hash::IntegrityError),
 }
 
 /// Run the full pipeline.
@@ -631,10 +654,20 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     kill_switch.as_ref(),
                 )?
             } else {
-                // Build the blocking reader that feeds the decoder.
-                // It starts at `decoder_position` for resume, or 0
-                // for fresh runs.
+                // Resolve the integrity-tracking hasher (if any) up
+                // front: if --sha256 is on, build it from prior
+                // hash_state (resume) or fresh, and skip the bytes
+                // that were already hashed past `decoder_position`.
+                // The same hasher is fed by the HashingReader and
+                // snapshot by the checkpoint observer (`PLAN_v2.md`
+                // §10 step 4).
                 let reader_start = cursor.load(Ordering::Acquire);
+                let hasher_setup = build_integrity_hasher(
+                    config.expected_sha256.as_ref(),
+                    prior.as_ref(),
+                    &ckpt_path,
+                    reader_start,
+                )?;
                 let reader = BlockingSparseReader::new(
                     Arc::clone(&sparse),
                     Arc::clone(&bitmap),
@@ -646,7 +679,17 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     config.reader_poll_interval,
                 );
 
-                let mut decoder = factory(Box::new(reader)).map_err(CoordinatorError::Decode)?;
+                // Interpose a HashingReader between the source and
+                // the decoder when integrity tracking is on.
+                let source: Box<dyn std::io::Read + Send> = match &hasher_setup {
+                    Some(setup) => Box::new(crate::hash::HashingReader::with_skip(
+                        Box::new(reader),
+                        Arc::clone(&setup.hasher),
+                        setup.skip_remaining,
+                    )),
+                    None => Box::new(reader),
+                };
+                let mut decoder = factory(source).map_err(CoordinatorError::Decode)?;
 
                 // Run the extractor with a checkpoint observer that
                 // writes a durable checkpoint every time the cadence
@@ -661,7 +704,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     }
                 };
 
-                match &output {
+                let hasher_handle = hasher_setup.as_ref().map(|s| Arc::clone(&s.hasher));
+                let stats = match &output {
                     OutputTarget::File(path) => {
                         let sink = build_raw_sink(path, &resume_plan)?;
                         run_one(
@@ -680,6 +724,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &config,
                             progress.as_mut(),
                             kill_switch.as_ref(),
+                            hasher_handle.as_ref(),
                         )?
                     }
                     OutputTarget::Dir(path) => {
@@ -700,9 +745,50 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &config,
                             progress.as_mut(),
                             kill_switch.as_ref(),
+                            hasher_handle.as_ref(),
                         )?
                     }
+                };
+
+                // Drop the decoder before finalizing the hasher: the
+                // decoder owns the HashingReader, which holds a
+                // clone of the SharedHasher. Dropping it releases
+                // any buffered bytes still in the BufReader through
+                // to the hasher (they were already counted) and
+                // releases that Arc reference.
+                drop(decoder);
+
+                if let (Some(setup), Some(expected)) =
+                    (hasher_setup, config.expected_sha256.as_ref())
+                {
+                    let inner = match Arc::try_unwrap(setup.hasher) {
+                        Ok(mutex) => mutex.into_inner().map_err(|_| {
+                            CoordinatorError::IoBackend(io::Error::other(
+                                "hasher mutex poisoned at finalize",
+                            ))
+                        })?,
+                        Err(arc) => {
+                            // Defensive: someone else still holds
+                            // the Arc. Clone the state, drop the
+                            // outer reference, and finalize the
+                            // clone. Functionally equivalent.
+                            let snapshot = arc
+                                .lock()
+                                .map_err(|_| {
+                                    CoordinatorError::IoBackend(io::Error::other(
+                                        "hasher mutex poisoned at finalize",
+                                    ))
+                                })?
+                                .clone();
+                            snapshot
+                        }
+                    };
+                    let computed = inner.finalize();
+                    crate::hash::verify_digest(expected, &computed)
+                        .map_err(CoordinatorError::Integrity)?;
                 }
+
+                stats
             };
 
             // Wait for the download thread to drain. By the time the
@@ -898,6 +984,7 @@ fn run_one<S: Sink>(
     config: &CoordinatorConfig,
     progress: Option<&mut ProgressFn>,
     kill_switch: Option<&Arc<AtomicBool>>,
+    hasher_for_ckpt: Option<&crate::hash::SharedHasher>,
 ) -> Result<ExtractionStats, CoordinatorError> {
     let mut last_write_at = Instant::now()
         .checked_sub(config.checkpoint_min_interval)
@@ -943,6 +1030,7 @@ fn run_one<S: Sink>(
                 .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
 
             let sink_state = sink_state_for(output, info_cb.bytes_out);
+            let hash_state = snapshot_hash_state(hasher_for_ckpt);
             let ckpt = Checkpoint {
                 url: requested_url.to_string(),
                 etag: info.fingerprint.etag.clone(),
@@ -953,6 +1041,7 @@ fn run_one<S: Sink>(
                 bitmap_completed: bitmap.to_bytes(),
                 created_at: SystemTime::now(),
                 sink_state,
+                hash_state,
             };
             ckpt.write(ckpt_path)
                 .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -1130,6 +1219,10 @@ fn run_zip(
                         current_entry: None,
                         current_entry_offset: 0,
                     },
+                    // Integrity tracking is implemented for the
+                    // streaming pipeline only; ZIP runs leave it
+                    // unset (`PLAN_v2.md` §10 + §5).
+                    hash_state: None,
                 };
                 ckpt.write(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -1176,6 +1269,106 @@ fn run_zip(
         }
         Err(other) => Err(CoordinatorError::Zip(other)),
     }
+}
+
+/// Combined SharedHasher + initial skip count returned by
+/// [`build_integrity_hasher`] when integrity tracking is enabled.
+struct IntegrityHasherSetup {
+    hasher: crate::hash::SharedHasher,
+    skip_remaining: u64,
+}
+
+/// Build the integrity hasher for this run, or `None` if `--sha256`
+/// is not set.
+///
+/// Resume semantics (`docs/PLAN_v2.md` §10 step 4):
+///
+/// - **Fresh run + `--sha256`** → fresh hasher, skip = 0.
+/// - **Resume + `--sha256` + saved hash_state** → restore hasher
+///   from the saved state. The hasher's `bytes_processed` may be
+///   larger than `decoder_position` because the previous run's
+///   BufReader had prefetched past the boundary; subtract to get
+///   the per-byte skip count for the new HashingReader.
+/// - **Resume + `--sha256` + no saved hash_state** → hard error
+///   (`IntegrityError::CheckpointMissingHashState`); we cannot
+///   rebuild a faithful end-of-run digest from a half-tracked run.
+/// - **Resume + no `--sha256` + saved hash_state** → hard error
+///   (`IntegrityError::CheckpointHadHashState`); refusing keeps
+///   the user's prior intent intact rather than silently losing it.
+fn build_integrity_hasher(
+    expected: Option<&[u8; crate::hash::sha256::DIGEST_LEN]>,
+    prior: Option<&Checkpoint>,
+    ckpt_path: &Path,
+    reader_start: u64,
+) -> Result<Option<IntegrityHasherSetup>, CoordinatorError> {
+    let prior_hash_state = prior.and_then(|p| p.hash_state.as_ref());
+
+    match (expected.is_some(), prior_hash_state) {
+        (false, Some(_)) => Err(CoordinatorError::Integrity(
+            crate::hash::IntegrityError::CheckpointHadHashState {
+                ckpt_path: ckpt_path.to_path_buf(),
+            },
+        )),
+        (false, None) => Ok(None),
+        (true, None) => {
+            // Fresh run (or a resume without integrity tracking
+            // before — surface the latter as an error rather than
+            // silently dropping coverage).
+            if prior.is_some() {
+                return Err(CoordinatorError::Integrity(
+                    crate::hash::IntegrityError::CheckpointMissingHashState {
+                        ckpt_path: ckpt_path.to_path_buf(),
+                    },
+                ));
+            }
+            Ok(Some(IntegrityHasherSetup {
+                hasher: crate::hash::shared_hasher(crate::hash::sha256::Sha256::new()),
+                skip_remaining: 0,
+            }))
+        }
+        (true, Some(state_bytes)) => {
+            let restored =
+                crate::hash::sha256::Sha256::deserialize(state_bytes).map_err(|source| {
+                    CoordinatorError::Integrity(
+                        crate::hash::IntegrityError::CheckpointHashStateDecode { source },
+                    )
+                })?;
+            // The saved hash covers source bytes
+            // `[0, restored.bytes_processed())`, but the new
+            // BlockingSparseReader will start handing out bytes from
+            // `reader_start` (the resume's `decoder_position`).
+            // Anything in `[reader_start, restored.bytes_processed())`
+            // was already hashed last run; skip those.
+            let already = restored.bytes_processed();
+            let skip_remaining = already.saturating_sub(reader_start);
+            Ok(Some(IntegrityHasherSetup {
+                hasher: crate::hash::shared_hasher(restored),
+                skip_remaining,
+            }))
+        }
+    }
+}
+
+/// Snapshot the running SHA-256 hasher's state for inclusion in the
+/// next checkpoint, when integrity tracking is on.
+///
+/// Locks the shared hasher, clones the (small, fixed-size) state,
+/// drops the lock, and serializes outside the critical section. The
+/// hasher remains usable for further `update`s — `Sha256` is `Clone`
+/// and the clone is independent of the original.
+fn snapshot_hash_state(
+    hasher: Option<&crate::hash::SharedHasher>,
+) -> Option<[u8; crate::hash::sha256::SERIALIZED_LEN]> {
+    let h = hasher?;
+    // INVARIANT: the mutex is touched from the extractor's thread
+    // only — the checkpoint observer pauses the decoder before
+    // calling here. Poisoning would mean a panic inside an
+    // earlier hash update; surfacing the error would force the
+    // coordinator into the panic path. Returning `None` (degrades
+    // to "no integrity state captured this round") is the safe
+    // option — a subsequent successful snapshot supersedes it.
+    let snapshot = h.lock().ok()?.clone();
+    Some(snapshot.serialize())
 }
 
 /// Compute the appropriate [`SinkState`] for the configured output and
@@ -1596,6 +1789,7 @@ mod tests {
             sink_state: SinkState::Tar {
                 members_completed: vec![],
             },
+            hash_state: None,
         }
     }
 

@@ -17,6 +17,7 @@ use crate::coordinator::{CoordinatorConfig, OutputTarget, RunArgs};
 use crate::decode::DecoderRegistry;
 use crate::download::{RetryConfig, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS};
 use crate::extractor::DEFAULT_PUNCH_THRESHOLD;
+use crate::hash::sha256::{parse_hex_digest, ParseHexDigestError};
 use crate::http::Client;
 use crate::io_backend::IoBackendChoice;
 
@@ -119,6 +120,21 @@ pub struct Cli {
     /// the blocking backend.
     #[arg(long = "io-backend", value_enum, default_value_t = IoBackendArg::Auto)]
     pub io_backend: IoBackendArg,
+
+    /// Verify the assembled compressed source against this SHA-256
+    /// digest (`PLAN_v2.md` §10).
+    ///
+    /// The 64-character hex string is the SHA-256 of the original
+    /// compressed file (matching what `sha256sum` prints, not the
+    /// digest of the decoded contents). On clean completion the
+    /// run aborts with a distinct error if the bytes received did
+    /// not match. The hash state is checkpointed across resumes,
+    /// so a `kill -9` and follow-up resume produce a digest
+    /// byte-identical to a clean run. Streaming pipeline only;
+    /// `.zip` archives extract per-entry and integrity checking
+    /// does not extend to that path in round-one of `PLAN_v2.md`.
+    #[arg(long = "sha256", value_name = "HEX")]
+    pub expected_sha256: Option<String>,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -151,15 +167,33 @@ impl From<IoBackendArg> for IoBackendChoice {
     }
 }
 
+/// Errors produced by [`Cli::into_run_args`].
+///
+/// Wraps [`crate::http::ClientError`] (HTTP setup) and adds variants
+/// for argument-validation failures the `clap` derive can't express
+/// declaratively.
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    /// Building the HTTP client failed.
+    #[error("HTTP client setup failed")]
+    Client(#[from] crate::http::ClientError),
+
+    /// `--sha256 <HEX>` was given but the value did not parse as a
+    /// 64-character hex digest.
+    #[error("--sha256 value is not a valid SHA-256 digest")]
+    InvalidSha256(#[source] ParseHexDigestError),
+}
+
 impl Cli {
     /// Convert the parsed CLI into a [`RunArgs`] ready for
     /// [`crate::coordinator::run`].
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`crate::http::ClientError`] if the
-    /// HTTP client cannot be constructed.
-    pub fn into_run_args(self) -> Result<RunArgs, crate::http::ClientError> {
+    /// Returns [`CliError::Client`] if the HTTP client cannot be
+    /// constructed, or [`CliError::InvalidSha256`] if the
+    /// `--sha256 <HEX>` argument failed to parse.
+    pub fn into_run_args(self) -> Result<RunArgs, CliError> {
         let output = match (self.output_dir, self.output_file) {
             (Some(d), None) => OutputTarget::Dir(d),
             (None, Some(f)) => OutputTarget::File(f),
@@ -167,6 +201,10 @@ impl Cli {
             // cannot fire in practice; the catch-all keeps the match
             // exhaustive without `unreachable!`.
             _ => OutputTarget::Dir(PathBuf::from(".")),
+        };
+        let expected_sha256 = match self.expected_sha256 {
+            Some(hex) => Some(parse_hex_digest(&hex).map_err(CliError::InvalidSha256)?),
+            None => None,
         };
         let client = Client::new()?;
         Ok(RunArgs {
@@ -185,6 +223,7 @@ impl Cli {
                 forced_format: self.forced_format,
                 force_format_from_magic: self.force_format_from_magic,
                 io_backend: self.io_backend.into(),
+                expected_sha256,
             },
             client,
             registry: DecoderRegistry::with_defaults(),
@@ -391,6 +430,63 @@ mod tests {
             .expect("parse");
         let args = cli.into_run_args().expect("run args");
         assert!(args.config.adaptive_chunk_size);
+    }
+
+    #[test]
+    fn parses_sha256_hex_into_bytes() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--sha256",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        let bytes = args.config.expected_sha256.expect("present");
+        assert_eq!(bytes[0], 0xBA);
+        assert_eq!(bytes[31], 0xAD);
+    }
+
+    #[test]
+    fn no_sha256_flag_leaves_expected_hash_none() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(args.config.expected_sha256.is_none());
+    }
+
+    #[test]
+    fn rejects_short_sha256_argument() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--sha256",
+            "abc",
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::InvalidSha256(_)));
+    }
+
+    #[test]
+    fn rejects_non_hex_sha256_argument() {
+        // 64 chars but with a non-hex character.
+        let bad: String = "Z".repeat(64);
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--sha256",
+            &bad,
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::InvalidSha256(_)));
     }
 
     #[test]

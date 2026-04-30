@@ -57,6 +57,9 @@
 //!   completion samples back via `record`. Default-on, with
 //!   `--chunk-size <N>` and `--no-adaptive-chunk-size` CLI escape
 //!   hatches.
+//! - [`hash`] — integrity hashing primitives. Currently hosts a
+//!   hand-rolled SHA-256 with serializable mid-stream state
+//!   (`PLAN_v2.md` §10) used by the `--sha256 <hex>` flag.
 //! - [`io_backend`] (Unix only) — file-IO and network-IO seam
 //!   (`PLAN_v2.md` §7 + §7b + §9): the [`io_backend::IoBackend`] trait
 //!   every backend honors, the always-available
@@ -89,6 +92,7 @@ pub mod download;
 pub mod error;
 #[cfg(unix)]
 pub mod extractor;
+pub mod hash;
 pub mod http;
 #[cfg(unix)]
 pub mod io_backend;

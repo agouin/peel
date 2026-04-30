@@ -38,6 +38,8 @@
 //!                  u8  current_entry.is_some
 //!                  if some: u32 current_entry_index
 //!                  u64 current_entry_offset
+//!   u8  hash_state_present (v3+ only)
+//!     if 1: SERIALIZED_LEN bytes of `hash::sha256::Sha256` state
 //! ```
 //!
 //! # Forward compatibility
@@ -75,6 +77,7 @@
 //!     bitmap_completed: vec![0xFF, 0x0F],
 //!     created_at: std::time::SystemTime::now(),
 //!     sink_state: SinkState::Tar { members_completed: vec!["root/a.txt".into()] },
+//!     hash_state: None,
 //! };
 //! ckpt.write(std::path::Path::new("/tmp/peel-demo.ckpt"))?;
 //! # Ok::<(), peel::checkpoint::CheckpointError>(())
@@ -104,7 +107,11 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 /// - **v2** — adds the `Zip` sink state for per-entry ZIP extraction
 ///   (`docs/PLAN_v2.md` §5). The body layout is otherwise unchanged;
 ///   v2 readers parse v1 files transparently.
-pub const FORMAT_VERSION: u32 = 2;
+/// - **v3** — appends an optional [`Checkpoint::hash_state`] field
+///   carrying the serialized SHA-256 state used by `--sha256`
+///   integrity verification (`docs/PLAN_v2.md` §10). v3 readers
+///   parse v1 / v2 files transparently with `hash_state = None`.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -309,6 +316,15 @@ pub struct Checkpoint {
     /// Sink-specific state captured at the same instant the checkpoint
     /// was taken.
     pub sink_state: SinkState,
+    /// Serialized SHA-256 state when integrity tracking is on
+    /// (`docs/PLAN_v2.md` §10), or `None` when the run is not
+    /// verifying a `--sha256` digest.
+    ///
+    /// The bytes are exactly the output of
+    /// [`crate::hash::sha256::Sha256::serialize`] and are restored
+    /// with [`crate::hash::sha256::Sha256::deserialize`] on resume.
+    /// Added in checkpoint format v3; older readers see `None`.
+    pub hash_state: Option<[u8; crate::hash::sha256::SERIALIZED_LEN]>,
 }
 
 /// Maximum body length [`Checkpoint::deserialize`] will trust before
@@ -372,6 +388,14 @@ impl Checkpoint {
                 }
                 write_u64(&mut body, *current_entry_offset);
             }
+        }
+
+        match &self.hash_state {
+            Some(bytes) => {
+                body.push(1);
+                body.extend_from_slice(bytes);
+            }
+            None => body.push(0),
         }
 
         let body_len = body.len() as u64;
@@ -455,18 +479,19 @@ impl Checkpoint {
         }
 
         // v1 and v2 share the same body layout up to the sink tag;
-        // v2 adds [`SINK_TAG_ZIP`] as an accepted tag value. The
-        // `decode_body` helper handles both. Future versions that
-        // *change* the layout will branch here.
-        debug_assert!(matches!(format_version, 1 | 2));
-        Self::decode_body(body)
+        // v2 adds [`SINK_TAG_ZIP`] as an accepted tag value. v3
+        // appends a single trailing `hash_state` field after the
+        // sink-state body. The `decode_body` helper takes the
+        // version so it can decide whether to read that trailer;
+        // future versions that *change* the layout will branch
+        // here.
+        debug_assert!(matches!(format_version, 1..=3));
+        Self::decode_body(body, format_version)
     }
 
-    /// Decode the body layout. v1 and v2 differ only in which sink
-    /// tags they accept; the helper accepts any of the three known
-    /// tags and the version gate above protects against
-    /// misinterpreting a future layout-changing version.
-    fn decode_body(body: &[u8]) -> Result<Self, CheckpointError> {
+    /// Decode the body layout. v1 / v2 / v3 share the same prefix;
+    /// v3 appends an optional `hash_state` blob after `sink_state`.
+    fn decode_body(body: &[u8], format_version: u32) -> Result<Self, CheckpointError> {
         let mut cursor = Cursor::new(body);
         let url = cursor.read_string("url")?;
         let etag = cursor.read_optional_string("etag")?;
@@ -530,10 +555,32 @@ impl Checkpoint {
             }
         };
 
+        let hash_state = if format_version >= 3 {
+            let presence = cursor.read_u8("hash_state.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    let bytes =
+                        cursor.require(crate::hash::sha256::SERIALIZED_LEN, "hash_state.bytes")?;
+                    let mut buf = [0u8; crate::hash::sha256::SERIALIZED_LEN];
+                    buf.copy_from_slice(bytes);
+                    Some(buf)
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "hash_state",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         if cursor.remaining() != 0 {
             return Err(CheckpointError::Truncated {
                 reason: format!(
-                    "{} trailing bytes after sink_state in v1 body",
+                    "{} trailing bytes after final field in v{format_version} body",
                     cursor.remaining(),
                 ),
             });
@@ -549,6 +596,7 @@ impl Checkpoint {
             bitmap_completed,
             created_at,
             sink_state,
+            hash_state,
         })
     }
 
@@ -668,6 +716,11 @@ impl Checkpoint {
             + 4
             + 1
             + 32
+            + 1
+            + self
+                .hash_state
+                .as_ref()
+                .map_or(0, |_| crate::hash::sha256::SERIALIZED_LEN)
     }
 }
 
@@ -927,6 +980,7 @@ mod tests {
             sink_state: SinkState::Raw {
                 bytes_written: 4096,
             },
+            hash_state: None,
         }
     }
 
@@ -947,6 +1001,7 @@ mod tests {
                     "root/empty/".into(),
                 ],
             },
+            hash_state: None,
         }
     }
 
@@ -1002,6 +1057,7 @@ mod tests {
                 current_entry: current,
                 current_entry_offset: current_offset,
             },
+            hash_state: None,
         }
     }
 
@@ -1037,27 +1093,102 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_two() {
-        // Sanity: PLAN_v2 §5 step 7 calls for bumping the version
-        // when SinkState::Zip lands. If a future change resets it,
-        // this guards against silently dropping the upgrade-required
-        // signal v1 readers depend on.
-        assert_eq!(FORMAT_VERSION, 2);
+    fn checkpoint_format_version_is_three() {
+        // Sanity: PLAN_v2 §10 step 4 calls for bumping the version
+        // when the optional `hash_state` trailer lands. If a future
+        // change resets it, this guards against silently dropping
+        // the upgrade-required signal v1 / v2 readers depend on.
+        assert_eq!(FORMAT_VERSION, 3);
+    }
+
+    fn build_legacy_body_raw_sink() -> Vec<u8> {
+        // Hand-build the v1 / v2 body for a `Raw`-sink checkpoint
+        // — same layout as v3 *minus* the trailing hash_state byte.
+        let mut body = Vec::new();
+        write_string(&mut body, "https://example.com/file.zst");
+        write_optional_string(&mut body, Some("\"v1\""));
+        write_optional_string(&mut body, None);
+        write_u64(&mut body, 1_048_576);
+        write_u64(&mut body, 65_536);
+        write_u64(&mut body, 32_768);
+        write_byte_array(&mut body, &[0xFFu8; 16]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 12_345);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 4096);
+        body
+    }
+
+    fn frame_legacy_body(body: &[u8], version: u32) -> Vec<u8> {
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, version);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(body);
+        buf
     }
 
     #[test]
     fn v1_checkpoint_bytes_still_parse_after_version_bump() {
-        // Hand-build a v1 file (Raw sink) by replaying what a v1
-        // writer would have produced: identical body, version field
-        // = 1. The current reader must accept it.
-        let original = sample_raw();
-        let mut bytes = original.serialize();
-        // Patch the version field down to 1.
-        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
-        // Recompute the body checksum is *not* needed — only the
-        // version bytes changed and they're outside the body.
+        // Construct a literal v1 wire image and verify the v3 reader
+        // parses it transparently (with `hash_state = None`).
+        let body = build_legacy_body_raw_sink();
+        let bytes = frame_legacy_body(&body, 1);
         let parsed = Checkpoint::deserialize(&bytes).expect("v1 still parses");
-        assert_eq!(parsed, original);
+        assert_eq!(parsed.url, "https://example.com/file.zst");
+        assert_eq!(parsed.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(parsed.total_size, 1_048_576);
+        assert!(parsed.hash_state.is_none());
+    }
+
+    #[test]
+    fn v2_checkpoint_bytes_still_parse_after_version_bump() {
+        // Same shape — a v2 file that predates the hash_state
+        // trailer must still load with `hash_state = None`.
+        let body = build_legacy_body_raw_sink();
+        let bytes = frame_legacy_body(&body, 2);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v2 still parses");
+        assert!(parsed.hash_state.is_none());
+    }
+
+    #[test]
+    fn round_trip_with_hash_state_present() {
+        let mut state = crate::hash::sha256::Sha256::new();
+        state.update(b"hello world");
+        let serialized = state.serialize();
+        let mut ckpt = sample_raw();
+        ckpt.hash_state = Some(serialized);
+
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        let bytes = parsed.hash_state.expect("present");
+        assert_eq!(bytes, serialized);
+    }
+
+    #[test]
+    fn rejects_invalid_hash_state_presence_byte() {
+        // Build a valid v3 body, then poke the trailing presence
+        // byte to an out-of-range value (only 0/1 are valid).
+        let mut bytes = sample_raw().serialize();
+        let last = bytes.len() - 1;
+        // The last body byte is the hash_state presence (None=0).
+        bytes[last] = 7;
+        // Recompute the body checksum so the integrity check
+        // doesn't fire first.
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::InvalidPresence { value, field } => {
+                assert_eq!(value, 7);
+                assert_eq!(field, "hash_state");
+            }
+            other => panic!("expected InvalidPresence(hash_state), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1083,6 +1214,7 @@ mod tests {
             sink_state: SinkState::Tar {
                 members_completed: Vec::new(),
             },
+            hash_state: None,
         };
         let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
         assert_eq!(parsed, ckpt);
@@ -1224,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_trailing_bytes_in_v1_body() {
+    fn rejects_trailing_bytes_in_body() {
         let mut bytes = sample_raw().serialize();
         // Append one extra byte in the body and update length+checksum
         // so that only the trailing-bytes guard fires.
@@ -1446,6 +1578,17 @@ mod tests {
                 }
             };
 
+            // Half the trials carry a populated hash_state to
+            // exercise the v3 trailer; the other half exercise the
+            // hash_state=None path that v1 / v2 also produce.
+            let hash_state = if rng.next_bool() {
+                let mut state = crate::hash::sha256::Sha256::new();
+                state.update(&random_bytes(&mut rng, 256));
+                Some(state.serialize())
+            } else {
+                None
+            };
+
             let ckpt = Checkpoint {
                 url,
                 etag,
@@ -1456,6 +1599,7 @@ mod tests {
                 bitmap_completed,
                 created_at,
                 sink_state,
+                hash_state,
             };
             let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
             assert_eq!(parsed, ckpt);
