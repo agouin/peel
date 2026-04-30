@@ -319,8 +319,21 @@ impl Cli {
         };
         let max_disk_buffer =
             parse_disk_buffer(&self.max_disk_buffer).map_err(CliError::InvalidDiskBuffer)?;
+        let http_version: HttpVersion = self.http_version.into();
+        // Log the HTTP version selection at startup. Mirrors the
+        // `io_backend=...` line that `crate::io_backend::select_backend`
+        // emits, so the two appear together in the early subscriber
+        // output. With `Auto` the actual H1/H2 outcome is per-origin
+        // via ALPN and only known after the first connection.
+        match http_version {
+            HttpVersion::Auto => tracing::info!("http_version=auto (ALPN-negotiated H1/H2)"),
+            HttpVersion::Http1Only => tracing::info!("http_version=h1 (forced)"),
+            HttpVersion::Http2Only => {
+                tracing::info!("http_version=h2 (forced; h2c prior-knowledge over plaintext)")
+            }
+        }
         let client = Client::with_config(ClientConfig {
-            http_version: self.http_version.into(),
+            http_version,
             ..ClientConfig::default()
         })?;
         Ok(RunArgs {
