@@ -22,7 +22,8 @@ peel https://example.com/dataset.tar.zst -C ./out
   to the filesystem as the decoder advances. Peak compressed-side disk
   is ~the download window, not the archive size.
 - **Multi-format.** `.tar`, `.tar.zst`/`.zst`, `.tar.xz`/`.xz`,
-  `.tar.lz4`/`.lz4`, and `.zip` (STORED + DEFLATE + zstd entries).
+  `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`, and `.zip` (STORED + DEFLATE +
+  zstd entries).
   Format detection is suffix-first with magic-byte fallback; mismatches
   fail closed unless you opt in with `--force-format-from-magic` or
   pin a decoder with `--format <name>`.
@@ -151,6 +152,7 @@ planning.
 | `.zst` / `.tar.zst` | ✓ | per zstd frame | ✓ |
 | `.xz` / `.tar.xz` | ✓ | per xz Stream¹ | ✓ |
 | `.lz4` / `.tar.lz4` | ✓ | per lz4 block | ✓ |
+| `.gz` / `.tar.gz` | ✓ | per gzip member | ✓ |
 | `.zip` | per-entry² | per entry | ✓ |
 
 ¹ Default-encoded `.tar.xz` is single-Block; per-Block granularity is

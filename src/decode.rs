@@ -65,6 +65,7 @@ use thiserror::Error;
 
 use crate::types::ByteOffset;
 
+pub mod gzip;
 pub mod identity;
 pub mod lz4;
 pub mod xz;
@@ -268,6 +269,10 @@ impl DecoderRegistry {
     ///   `04 22 4D 18` at offset 0. Round-one supports
     ///   block-independent frames only (the lz4 CLI's default); see
     ///   [`lz4::Lz4Decoder`] for the full feature matrix.
+    /// - `"gzip"` — `.gz` / `.tar.gz` suffixes; magic `1F 8B` at
+    ///   offset 0. Frame granularity is per-member (each gzip member
+    ///   ends with its own CRC32 + ISIZE trailer and is an
+    ///   independent restart point).
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
@@ -312,6 +317,15 @@ impl DecoderRegistry {
                 bytes: &[0x04, 0x22, 0x4D, 0x18],
             }],
             lz4::factory,
+        );
+        r.register_format(
+            "gzip",
+            &[".gz", ".tar.gz"],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &[0x1F, 0x8B],
+            }],
+            gzip::factory,
         );
         // ZIP doesn't use the streaming-decoder loop — see
         // `docs/PLAN_v2.md` §5 and `crate::zip::streaming_factory_placeholder`.
@@ -563,8 +577,12 @@ mod tests {
         // sentinel `streaming_factory_placeholder` — the coordinator
         // dispatches to the ZIP pipeline before invoking it).
         assert!(r.factory_for_name("release.zip").is_some());
+        // `.gz` and `.tar.gz` registered alongside the other
+        // streaming formats.
+        assert!(r.factory_for_name("dataset.gz").is_some());
+        assert!(r.factory_for_name("dataset.tar.gz").is_some());
         // A suffix that no shipping decoder owns still misses.
-        assert!(r.factory_for_name("dataset.gz").is_none());
+        assert!(r.factory_for_name("dataset.bz2").is_none());
     }
 
     #[test]
@@ -656,10 +674,13 @@ mod tests {
         let r = DecoderRegistry::with_defaults();
         let prefix = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
         assert!(r.factory_for_prefix(&prefix).is_some());
-        assert!(r.factory_for_prefix(&[0x1F, 0x8B, 0x00, 0x00]).is_none());
+        // gzip's `1F 8B` magic now resolves to the gzip factory.
+        assert!(r.factory_for_prefix(&[0x1F, 0x8B, 0x00, 0x00]).is_some());
         assert!(r.factory_for_format_name("zstd").is_some());
         assert!(r.factory_for_format_name("ZSTD").is_some());
-        assert!(r.factory_for_format_name("gzip").is_none());
+        assert!(r.factory_for_format_name("gzip").is_some());
+        // A format name no shipping decoder owns still misses.
+        assert!(r.factory_for_format_name("bzip2").is_none());
     }
 
     #[test]
