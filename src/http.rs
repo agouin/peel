@@ -49,7 +49,7 @@ pub mod response;
 pub mod url;
 
 #[cfg(unix)]
-pub use client::{Client, ClientConfig, ClientError};
+pub use client::{Client, ClientConfig, ClientError, HttpVersion};
 pub use range::{ContentRange, RangeError};
 pub use request::Method;
 pub use response::{BodyReader, Headers, Response, Status};

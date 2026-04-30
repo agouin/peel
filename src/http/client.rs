@@ -172,6 +172,23 @@ pub enum ClientError {
 }
 
 /// Tunable knobs for [`Client`].
+/// Which HTTP version(s) the client may use.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
+pub enum HttpVersion {
+    /// Default: ALPN-negotiate over TLS (preferring H2 when the server
+    /// offers it, falling back to H1.1), and use HTTP/1.1 over
+    /// plaintext where ALPN does not apply.
+    #[default]
+    Auto,
+    /// Use HTTP/1.1 only. Disables H2 ALPN advertisement.
+    Http1Only,
+    /// Use HTTP/2 only. Over TLS this requires the server to negotiate
+    /// `h2`; over plaintext it forces "prior-knowledge" h2c, which
+    /// only works against servers that explicitly speak h2c.
+    Http2Only,
+}
+
+/// Tunable knobs for [`Client`].
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// Maximum redirects followed on a single call. Defaults to
@@ -190,6 +207,9 @@ pub struct ClientConfig {
     /// Optional `User-Agent` override; if `None`, `peel/<version>`
     /// is sent.
     pub user_agent: Option<String>,
+    /// Which HTTP version(s) to use. Defaults to
+    /// [`HttpVersion::Auto`] (ALPN-negotiated H1 / H2).
+    pub http_version: HttpVersion,
 }
 
 impl Default for ClientConfig {
@@ -201,6 +221,7 @@ impl Default for ClientConfig {
             pool_capacity: DEFAULT_POOL_CAPACITY,
             read_buffer_bytes: DEFAULT_READ_BUFFER_BYTES,
             user_agent: None,
+            http_version: HttpVersion::Auto,
         }
     }
 }
@@ -515,6 +536,7 @@ fn spawn_runtime_thread(
     let read_buffer_bytes = config.read_buffer_bytes;
     let max_header_bytes = config.max_header_bytes;
     let timeout = config.timeout;
+    let http_version = config.http_version;
 
     thread::Builder::new()
         .name("peel-http-rt".into())
@@ -542,18 +564,38 @@ fn spawn_runtime_thread(
                 http_connector.set_connect_timeout(Some(timeout));
                 http_connector.enforce_http(false);
 
-                let https = HttpsConnectorBuilder::new()
+                // The ALPN advertisement on the TLS connector and the
+                // protocol forced on plaintext connections are
+                // controlled separately; both follow `http_version`.
+                // Over TLS, hyper-rustls advertises only the protocols
+                // we enable here. Over plaintext, hyper-util uses H1
+                // by default; setting `http2_only(true)` on the
+                // legacy::Client builder forces H2 prior-knowledge
+                // (h2c) for the H2-only path.
+                let https_base = HttpsConnectorBuilder::new()
                     .with_tls_config(tls)
-                    .https_or_http()
-                    .enable_http1()
-                    .enable_http2()
-                    .wrap_connector(http_connector);
+                    .https_or_http();
+                let https = match http_version {
+                    HttpVersion::Auto => https_base
+                        .enable_http1()
+                        .enable_http2()
+                        .wrap_connector(http_connector),
+                    HttpVersion::Http1Only => {
+                        https_base.enable_http1().wrap_connector(http_connector)
+                    }
+                    HttpVersion::Http2Only => {
+                        https_base.enable_http2().wrap_connector(http_connector)
+                    }
+                };
 
-                let hyper_client: LegacyClient<_, Empty<Bytes>> =
-                    LegacyClient::builder(TokioExecutor::new())
-                        .pool_max_idle_per_host(pool_capacity)
-                        .http1_max_buf_size(max_header_bytes.max(read_buffer_bytes))
-                        .build(https);
+                let mut builder = LegacyClient::builder(TokioExecutor::new());
+                builder
+                    .pool_max_idle_per_host(pool_capacity)
+                    .http1_max_buf_size(max_header_bytes.max(read_buffer_bytes));
+                if matches!(http_version, HttpVersion::Http2Only) {
+                    builder.http2_only(true);
+                }
+                let hyper_client: LegacyClient<_, Empty<Bytes>> = builder.build(https);
 
                 while let Some(envelope) = request_rx.recv().await {
                     let client = hyper_client.clone();

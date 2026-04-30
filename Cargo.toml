@@ -96,6 +96,13 @@ io-uring = { version = "0.7", default-features = false }
 # (`PLAN_v2.md` §10 / `docs/ENGINEERING_STANDARDS.md` §2.2). The
 # runtime binary does not link `sha2`.
 sha2 = "0.10"
+# Dev-only: enable hyper's `server` feature for an in-process H2
+# (h2c, plaintext prior-knowledge) test server in
+# `tests/support/h2c_server.rs`. The `[dependencies]` block already
+# pulls hyper for the runtime client; this adds the server APIs only
+# for `cargo test` and does not affect release binaries. Cargo unions
+# features between dev and runtime for test builds.
+hyper = { version = "1", default-features = false, features = ["server"] }
 
 [profile.release]
 debug = "line-tables-only"
