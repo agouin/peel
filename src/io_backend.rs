@@ -184,7 +184,7 @@ pub fn default_backend() -> Arc<dyn IoBackend> {
     Arc::new(BlockingBackend::new())
 }
 
-/// CLI-facing choice of file-IO backend (PLAN_v2.md §7).
+/// CLI-facing choice of file-IO backend (PLAN_v2.md §7 + §9).
 ///
 /// `Auto` is the default and matches the §7 demo behavior: try
 /// `io_uring` on Linux, fall back to blocking with a `tracing::warn!`
@@ -192,7 +192,16 @@ pub fn default_backend() -> Arc<dyn IoBackend> {
 /// pre-§7 path (used for A/B comparison and on platforms without
 /// `io_uring`). `Uring` *requires* `io_uring`; selection fails if the
 /// kernel does not support it, surfaced as an [`io::Error`] for the
-/// CLI boundary to format.
+/// CLI boundary to format. `Mmap` selects the §9 memory-mapped sparse
+/// file: workers `memcpy` into a `MAP_SHARED` region and the
+/// coordinator's puncher uses `madvise(MADV_REMOVE)`. `Mmap` is
+/// Linux-only; on other platforms selection fails the same way `Uring`
+/// does.
+///
+/// `Mmap` only changes the *file-IO* path. The HTTP client's network
+/// IO continues to go through the always-available blocking backend
+/// (no `connect`/`recv`/`send` analog of `mmap` exists). The
+/// coordinator sources both halves separately.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum IoBackendChoice {
     /// Pick the best available backend at runtime.
@@ -202,6 +211,9 @@ pub enum IoBackendChoice {
     Blocking,
     /// Force the Linux `io_uring` backend.
     Uring,
+    /// Memory-map the sparse file; release blocks via
+    /// `madvise(MADV_REMOVE)`. Linux-only.
+    Mmap,
 }
 
 /// Resolve the user's [`IoBackendChoice`] into a concrete
@@ -209,12 +221,18 @@ pub enum IoBackendChoice {
 ///
 /// `Auto` may downgrade silently (with a `tracing::warn!`) to the
 /// blocking backend; `Uring` errors out cleanly when the kernel does
-/// not support it.
+/// not support it. `Mmap` is a *file-IO-only* path: the returned
+/// [`IoBackend`] is always the blocking implementation (for the HTTP
+/// client's sockets); the coordinator handles the actual mmap of the
+/// sparse file separately via
+/// [`crate::download::SparseFile::open_or_create_mmap`].
+/// `Mmap` is Linux-only and errors out on other platforms.
 ///
 /// # Errors
 ///
-/// Returns an [`io::Error`] when [`IoBackendChoice::Uring`] is selected
-/// but `io_uring` is unavailable.
+/// Returns an [`io::Error`] when [`IoBackendChoice::Uring`] or
+/// [`IoBackendChoice::Mmap`] is selected on a platform that does not
+/// support it.
 pub fn select_backend(choice: IoBackendChoice, workers: u32) -> io::Result<Arc<dyn IoBackend>> {
     match choice {
         IoBackendChoice::Blocking => {
@@ -223,7 +241,28 @@ pub fn select_backend(choice: IoBackendChoice, workers: u32) -> io::Result<Arc<d
         }
         IoBackendChoice::Auto => Ok(select_auto(workers)),
         IoBackendChoice::Uring => select_uring(),
+        IoBackendChoice::Mmap => select_mmap_socket(),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn select_mmap_socket() -> io::Result<Arc<dyn IoBackend>> {
+    // The mmap storage backend changes the *file* IO path only. The
+    // HTTP client still needs an `IoBackend` for `connect`/`recv`/
+    // `send`; the §7b uring backend is overkill for that on its own,
+    // so we deliberately pair `mmap` with the always-available
+    // blocking socket backend.
+    tracing::info!("io_backend=mmap (file IO via mmap, sockets via blocking)");
+    Ok(default_backend())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn select_mmap_socket() -> io::Result<Arc<dyn IoBackend>> {
+    Err(io::Error::other(
+        "--io-backend mmap is only supported on Linux \
+         (madvise(MADV_REMOVE) is Linux-specific); \
+         use --io-backend blocking or remove the flag",
+    ))
 }
 
 #[cfg(target_os = "linux")]

@@ -7,15 +7,26 @@
 //! offset-addressed IO from worker threads, and dispatching hole-punch
 //! requests to a [`PunchHole`] implementation.
 //!
-//! # Concurrency model
+//! # Storage modes
 //!
-//! [`SparseFile::pwrite_at`] and [`SparseFile::read_at`] route the
-//! actual syscalls through an [`IoBackend`]. The default
-//! [`crate::io_backend::BlockingBackend`] uses POSIX `pwrite`/`pread`
-//! semantics: each call carries its own offset, does not move the
-//! kernel-side file position, and is safe to invoke concurrently from
-//! any number of threads. The §7.2 io_uring backend preserves those
-//! semantics while batching submissions through a dedicated IO thread.
+//! Two storage modes coexist behind the same public surface
+//! (`PLAN_v2.md` §9):
+//!
+//! - **pwrite/pread** (default). Workers hit `pwrite(2)` / `pread(2)`
+//!   syscalls routed through an [`IoBackend`]. The default
+//!   [`crate::io_backend::BlockingBackend`] uses POSIX semantics: each
+//!   call carries its own offset, does not move the kernel-side file
+//!   position, and is safe to invoke concurrently from any number of
+//!   threads. The §7.2 io_uring backend preserves those semantics while
+//!   batching submissions through a dedicated IO thread.
+//! - **mmap** (`--io-backend mmap`). Workers `memcpy` into a
+//!   `MAP_SHARED` mapping of the file; the kernel handles writeback.
+//!   `sync_all` translates to `msync(MS_ASYNC)` on the mapping.
+//!   Selected explicitly via [`SparseFile::open_or_create_mmap`] (the
+//!   coordinator wires it up when the `--io-backend` flag picks
+//!   `mmap`). Linux-only: the corresponding mmap puncher uses
+//!   `madvise(MADV_REMOVE)`, which is a Linux-specific syscall.
+//!
 //! Workers therefore only need to coordinate on **which** chunk they
 //! write — the bitmap from [`crate::bitmap`] — not on access to the
 //! file.
@@ -28,7 +39,10 @@
 //! `Unsupported`) and hands it to [`SparseFile::punch`] when the
 //! decoder advances past a checkpoint. Keeping the puncher out of the
 //! struct lets us share the file across threads with no further
-//! plumbing.
+//! plumbing. In `mmap` mode the coordinator constructs the puncher via
+//! [`SparseFile::make_mmap_puncher`], which packages the mapping's
+//! base + length into a [`crate::punch::LinuxPuncher::for_mmap`]
+//! instance.
 
 #![cfg(unix)]
 
@@ -40,7 +54,11 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+use super::mmap_region::MmapRegion;
 use crate::io_backend::{default_backend, IoBackend};
+#[cfg(target_os = "linux")]
+use crate::punch::LinuxPuncher;
 use crate::punch::{PunchError, PunchHole};
 use crate::types::ByteOffset;
 
@@ -107,23 +125,48 @@ pub enum SparseFileError {
     /// The wrapped [`PunchHole`] implementation returned an error.
     #[error("hole punch failed")]
     Punch(#[source] PunchError),
+
+    /// `mmap`-mode construction failed before a [`SparseFile`] could be
+    /// returned. Wrapped from the underlying `mmap(2)` failure.
+    /// Linux-only because the mmap storage backend is gated on Linux
+    /// (`PLAN_v2.md` §9 — relies on `madvise(MADV_REMOVE)`).
+    #[cfg(target_os = "linux")]
+    #[error("mmap of {path} (length {total_size}) failed")]
+    Mmap {
+        /// The path being mapped.
+        path: PathBuf,
+        /// The length the file was set to before mapping.
+        total_size: u64,
+        /// The underlying OS error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// The compressed-source landing file.
 ///
-/// A `SparseFile` is a thin wrapper around an [`std::fs::File`] opened
-/// `O_RDWR | O_CREAT` plus an [`IoBackend`] that performs the actual
-/// syscalls. Construction sets the file's logical length to
-/// `total_size` so that `pread` of any byte in `[0, total_size)`
-/// succeeds, returning zeros for ranges that workers haven't written
-/// yet.
+/// A `SparseFile` wraps an [`std::fs::File`] opened `O_RDWR | O_CREAT`
+/// plus a chosen storage backend. Construction sets the file's logical
+/// length to `total_size` so that `pread` of any byte in
+/// `[0, total_size)` succeeds, returning zeros for ranges that workers
+/// haven't written yet.
+///
+/// Two storage backends coexist behind the same public surface
+/// (`PLAN_v2.md` §9):
+///
+/// - **pwrite/pread** ([`SparseFile::open_or_create`] /
+///   [`SparseFile::open_or_create_with_backend`]). Default. Routes IO
+///   through an [`IoBackend`] (blocking pwrite or io_uring).
+/// - **mmap** ([`SparseFile::open_or_create_mmap`]). Linux-only.
+///   Workers `memcpy` into a `MAP_SHARED` region; `sync_all` translates
+///   to `msync(MS_ASYNC)`; the coordinator's puncher operates via
+///   `madvise(MADV_REMOVE)` on the same region (constructed via
+///   [`SparseFile::make_mmap_puncher`]).
 ///
 /// # Lifecycle
 ///
-/// 1. Coordinator calls [`SparseFile::open_or_create`] (or
-///    [`SparseFile::open_or_create_with_backend`] when it wants to
-///    pin a specific [`IoBackend`]) with the expected total size from
-///    the HTTP `Content-Length`.
+/// 1. Coordinator picks one of the constructors based on
+///    [`crate::io_backend::IoBackendChoice`].
 /// 2. Workers issue [`SparseFile::pwrite_at`] for downloaded chunks.
 /// 3. The decoder reads bytes back via [`SparseFile::read_at`].
 /// 4. After a checkpoint is durable, the coordinator calls
@@ -133,7 +176,24 @@ pub struct SparseFile {
     file: std::fs::File,
     total_size: u64,
     path: PathBuf,
-    backend: Arc<dyn IoBackend>,
+    storage: Storage,
+}
+
+/// Internal: the storage backend a [`SparseFile`] dispatches to.
+///
+/// `Pwrite` — the default — pushes every byte through an
+/// [`IoBackend`] syscall. `Mmap` (Linux only) keeps an
+/// `Arc<MmapRegion>` so the underlying mapping outlives any puncher we
+/// hand out (the puncher's keepalive is a clone of this `Arc`).
+#[derive(Debug)]
+enum Storage {
+    Pwrite {
+        backend: Arc<dyn IoBackend>,
+    },
+    #[cfg(target_os = "linux")]
+    Mmap {
+        region: Arc<MmapRegion>,
+    },
 }
 
 impl SparseFile {
@@ -174,29 +234,55 @@ impl SparseFile {
         total_size: u64,
         backend: Arc<dyn IoBackend>,
     ) -> Result<Self, SparseFileError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|source| SparseFileError::Open {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-        file.set_len(total_size)
-            .map_err(|source| SparseFileError::SetLen {
-                path: path.to_path_buf(),
-                total_size,
-                source,
-            })?;
-
+        let file = open_at_size(path, total_size)?;
         Ok(Self {
             file,
             total_size,
             path: path.to_path_buf(),
-            backend,
+            storage: Storage::Pwrite { backend },
+        })
+    }
+
+    /// Open `path` and map its first `total_size` bytes via
+    /// `mmap(MAP_SHARED)` (`PLAN_v2.md` §9). Workers write into the
+    /// mapping with `memcpy`; reads memcpy out; `sync_all` becomes
+    /// `msync(MS_ASYNC)`. The coordinator constructs the matching
+    /// `madvise(MADV_REMOVE)` puncher via
+    /// [`Self::make_mmap_puncher`].
+    ///
+    /// Setting the length is unconditional (matches
+    /// [`Self::open_or_create`]); the file's logical size is then
+    /// mapped end-to-end. `total_size == 0` is rejected because mmap
+    /// of length 0 is undefined and the use case never asks for it.
+    ///
+    /// This constructor is Linux-only because the only supported
+    /// puncher for the mmap path is
+    /// [`crate::punch::LinuxPuncher::for_mmap`], which depends on
+    /// `madvise(MADV_REMOVE)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparseFileError::Open`] if the file cannot be opened,
+    /// [`SparseFileError::SetLen`] if `ftruncate` fails, or
+    /// [`SparseFileError::Mmap`] if the kernel rejects the mapping
+    /// (`ENOMEM`, `ENODEV` on filesystems that don't support shared
+    /// mappings, etc.).
+    #[cfg(target_os = "linux")]
+    pub fn open_or_create_mmap(path: &Path, total_size: u64) -> Result<Self, SparseFileError> {
+        let file = open_at_size(path, total_size)?;
+        let region =
+            MmapRegion::map(&file, total_size).map_err(|source| SparseFileError::Mmap {
+                path: path.to_path_buf(),
+                total_size,
+                source,
+            })?;
+        Ok(Self {
+            file,
+            total_size,
+            path: path.to_path_buf(),
+            storage: Storage::Mmap {
+                region: Arc::new(region),
+            },
         })
     }
 
@@ -221,11 +307,60 @@ impl SparseFile {
         self.file.as_fd()
     }
 
-    /// The diagnostic name of the [`IoBackend`] handling this file's
-    /// syscalls (e.g. `"blocking"`, `"uring"`).
+    /// The diagnostic name of the storage backend handling this file's
+    /// IO (e.g. `"blocking"`, `"uring"`, `"mmap"`).
     #[must_use]
     pub fn backend_name(&self) -> &'static str {
-        self.backend.name()
+        match &self.storage {
+            Storage::Pwrite { backend } => backend.name(),
+            #[cfg(target_os = "linux")]
+            Storage::Mmap { .. } => "mmap",
+        }
+    }
+
+    /// `true` iff this file is using the `mmap` storage backend.
+    #[must_use]
+    pub fn is_mmap(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.storage, Storage::Mmap { .. })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Build the matching `madvise(MADV_REMOVE)` puncher for this
+    /// file's mmap storage (`PLAN_v2.md` §9 step 2). Returns `None`
+    /// when the file is in pwrite mode; callers in that case fall back
+    /// to [`crate::punch::default_puncher`].
+    ///
+    /// The returned puncher captures an `Arc` clone of the underlying
+    /// mapping so it remains valid for the puncher's lifetime even if
+    /// the [`SparseFile`] is dropped first. The coordinator drops the
+    /// puncher before the sparse file in practice; this is just
+    /// belt-and-suspenders.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn make_mmap_puncher(&self) -> Option<LinuxPuncher> {
+        let Storage::Mmap { region } = &self.storage else {
+            return None;
+        };
+        let base = region.base();
+        let len = region.len();
+        // The let-binding's annotation is the coercion site that turns
+        // `Arc<MmapRegion>` into `Arc<dyn Send + Sync>`; `MmapRegion`
+        // is `Send + Sync` so the unsized coercion succeeds.
+        let cloned: Arc<MmapRegion> = Arc::clone(region);
+        let keepalive: Arc<dyn Send + Sync> = cloned;
+        // SAFETY: `region` is an `Arc<MmapRegion>` whose mapping covers
+        // exactly `[base, base + len)`. `keepalive` holds a clone of
+        // that Arc, so the mapping is alive at least as long as the
+        // returned puncher. The puncher's `madvise(MADV_REMOVE)` calls
+        // operate on a sub-range of the mapping; the puncher itself
+        // never dereferences the pointer in Rust-aliased terms.
+        Some(unsafe { LinuxPuncher::for_mmap(base, len, keepalive) })
     }
 
     /// Write `buf` at byte offset `offset`.
@@ -260,13 +395,25 @@ impl SparseFile {
             });
         }
 
-        self.backend
-            .pwrite_all_at(self.file.as_fd(), raw_offset, buf)
-            .map_err(|source| SparseFileError::Io {
-                offset: raw_offset,
-                len,
-                source,
-            })
+        match &self.storage {
+            Storage::Pwrite { backend } => backend
+                .pwrite_all_at(self.file.as_fd(), raw_offset, buf)
+                .map_err(|source| SparseFileError::Io {
+                    offset: raw_offset,
+                    len,
+                    source,
+                }),
+            #[cfg(target_os = "linux")]
+            Storage::Mmap { region } => {
+                region
+                    .write_at(raw_offset, buf)
+                    .map_err(|source| SparseFileError::Io {
+                        offset: raw_offset,
+                        len,
+                        source,
+                    })
+            }
+        }
     }
 
     /// Read up to `buf.len()` bytes starting at `offset`, returning the
@@ -298,13 +445,25 @@ impl SparseFile {
                 len,
             })?;
 
-        self.backend
-            .pread_at(self.file.as_fd(), raw_offset, buf)
-            .map_err(|source| SparseFileError::Io {
-                offset: raw_offset,
-                len,
-                source,
-            })
+        match &self.storage {
+            Storage::Pwrite { backend } => backend
+                .pread_at(self.file.as_fd(), raw_offset, buf)
+                .map_err(|source| SparseFileError::Io {
+                    offset: raw_offset,
+                    len,
+                    source,
+                }),
+            #[cfg(target_os = "linux")]
+            Storage::Mmap { region } => {
+                region
+                    .read_at(raw_offset, buf)
+                    .map_err(|source| SparseFileError::Io {
+                        offset: raw_offset,
+                        len,
+                        source,
+                    })
+            }
+        }
     }
 
     /// Read exactly `buf.len()` bytes starting at `offset`, looping on
@@ -326,13 +485,39 @@ impl SparseFile {
                 len,
             })?;
 
-        self.backend
-            .pread_exact_at(self.file.as_fd(), raw_offset, buf)
-            .map_err(|source| SparseFileError::Io {
-                offset: raw_offset,
-                len,
-                source,
-            })
+        match &self.storage {
+            Storage::Pwrite { backend } => backend
+                .pread_exact_at(self.file.as_fd(), raw_offset, buf)
+                .map_err(|source| SparseFileError::Io {
+                    offset: raw_offset,
+                    len,
+                    source,
+                }),
+            #[cfg(target_os = "linux")]
+            Storage::Mmap { region } => {
+                let n = region
+                    .read_at(raw_offset, buf)
+                    .map_err(|source| SparseFileError::Io {
+                        offset: raw_offset,
+                        len,
+                        source,
+                    })?;
+                if n != buf.len() {
+                    return Err(SparseFileError::Io {
+                        offset: raw_offset,
+                        len,
+                        source: io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "mmap read_exact_at hit EOF after {n} of {} bytes at offset {raw_offset}",
+                                buf.len(),
+                            ),
+                        ),
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Release the underlying disk blocks for `[offset, offset + length)`.
@@ -357,22 +542,69 @@ impl SparseFile {
             .map_err(SparseFileError::Punch)
     }
 
-    /// `fsync` the underlying file via the configured [`IoBackend`].
+    /// Flush pending writes for the entire file.
+    ///
+    /// In `pwrite` mode this is `fsync(2)` via the configured
+    /// [`IoBackend`] (full durability). In `mmap` mode it is
+    /// `msync(MS_ASYNC)` over the mapping per `PLAN_v2.md` §9 step 3:
+    /// the call schedules writeback without waiting for it, bounding
+    /// the kernel-side dirty-page window without paying the latency of
+    /// a full sync. Resume safety in mmap mode is gated on the
+    /// quiescent-checkpoint discipline rather than per-flush
+    /// durability.
     ///
     /// # Errors
     ///
     /// Returns the OS error wrapped in [`SparseFileError::Io`] with
-    /// `offset = 0` and `len = total_size`, since `fsync` covers the
-    /// whole file.
+    /// `offset = 0` and `len = total_size`, since the operation covers
+    /// the whole file.
     pub fn sync_all(&self) -> Result<(), SparseFileError> {
-        self.backend
-            .sync_all(self.file.as_fd())
-            .map_err(|source| SparseFileError::Io {
-                offset: 0,
-                len: self.total_size,
-                source,
-            })
+        match &self.storage {
+            Storage::Pwrite { backend } => {
+                backend
+                    .sync_all(self.file.as_fd())
+                    .map_err(|source| SparseFileError::Io {
+                        offset: 0,
+                        len: self.total_size,
+                        source,
+                    })
+            }
+            #[cfg(target_os = "linux")]
+            Storage::Mmap { region } => {
+                region.msync_async().map_err(|source| SparseFileError::Io {
+                    offset: 0,
+                    len: self.total_size,
+                    source,
+                })
+            }
+        }
     }
+}
+
+/// Open `path` `O_RDWR | O_CREAT` and `ftruncate` it to `total_size`.
+///
+/// Shared between [`SparseFile::open_or_create_with_backend`] and
+/// [`SparseFile::open_or_create_mmap`] so the open/truncate dance and
+/// its error mapping stay in one place.
+fn open_at_size(path: &Path, total_size: u64) -> Result<std::fs::File, SparseFileError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| SparseFileError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    file.set_len(total_size)
+        .map_err(|source| SparseFileError::SetLen {
+            path: path.to_path_buf(),
+            total_size,
+            source,
+        })?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -553,5 +785,117 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         f.read_exact_at(ByteOffset::new(0), &mut got).expect("read");
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn pwrite_mode_is_not_mmap() {
+        let path = unique_temp_path("not_mmap");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create(&path, 64).expect("open");
+        assert!(!f.is_mmap());
+        assert!(f.make_mmap_puncher_returns_none_when_not_mmap());
+    }
+
+    impl SparseFile {
+        // Test-only convenience: make sure `make_mmap_puncher` returns
+        // `None` when the file is in pwrite mode. Linux-only because the
+        // method itself is gated on Linux. On non-Linux platforms this
+        // helper short-circuits to `true` so the public test above
+        // remains portable.
+        fn make_mmap_puncher_returns_none_when_not_mmap(&self) -> bool {
+            #[cfg(target_os = "linux")]
+            {
+                self.make_mmap_puncher().is_none()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_constructor_reports_mmap_backend() {
+        let path = unique_temp_path("mmap_backend");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create_mmap(&path, 8192).expect("mmap");
+        assert_eq!(f.backend_name(), "mmap");
+        assert!(f.is_mmap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_pwrite_then_read_round_trips() {
+        let path = unique_temp_path("mmap_round_trip");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create_mmap(&path, 4096).expect("mmap");
+
+        let payload: Vec<u8> = (0u8..32).collect();
+        f.pwrite_at(ByteOffset::new(128), &payload).expect("write");
+
+        let mut buf = vec![0u8; payload.len()];
+        f.read_exact_at(ByteOffset::new(128), &mut buf)
+            .expect("read");
+        assert_eq!(buf, payload);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_read_before_write_returns_zeros() {
+        let path = unique_temp_path("mmap_read_zeros");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create_mmap(&path, 4096).expect("mmap");
+
+        let mut buf = vec![0xAAu8; 64];
+        let n = f.read_at(ByteOffset::new(2048), &mut buf).expect("read");
+        assert_eq!(n, 64);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_pwrite_past_total_size_is_out_of_bounds() {
+        let path = unique_temp_path("mmap_oob");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create_mmap(&path, 100).expect("mmap");
+
+        let buf = [0u8; 64];
+        match f.pwrite_at(ByteOffset::new(50), &buf) {
+            Err(SparseFileError::OutOfBounds { .. }) => {}
+            other => panic!("expected OutOfBounds, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_sync_all_succeeds() {
+        let path = unique_temp_path("mmap_sync");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create_mmap(&path, 4096).expect("mmap");
+        f.sync_all().expect("msync(MS_ASYNC)");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_make_puncher_returns_some() {
+        let path = unique_temp_path("mmap_puncher");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create_mmap(&path, 4096).expect("mmap");
+        let p = f.make_mmap_puncher().expect("mmap puncher");
+        assert!(p.is_mmap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_punch_via_noop_succeeds() {
+        use crate::punch::NoopPuncher;
+        let path = unique_temp_path("mmap_punch_noop");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create_mmap(&path, 8192).expect("mmap");
+        // Noop punch should still succeed in mmap mode — we exercise
+        // the dispatch path rather than the syscall.
+        f.punch(&NoopPuncher::new(), ByteOffset::ZERO, 4096)
+            .expect("noop punch");
     }
 }

@@ -106,13 +106,17 @@ pub struct Cli {
     #[arg(long = "force-format-from-magic", default_value_t = false)]
     pub force_format_from_magic: bool,
 
-    /// File-IO backend selection (PLAN_v2.md §7).
+    /// File-IO backend selection (PLAN_v2.md §7 + §9).
     ///
     /// `auto` (default) prefers `io_uring` on Linux and falls back to
     /// the blocking backend with a warning if the kernel does not
     /// support it. `blocking` forces the pre-§7 `pwrite`/`pread` path
     /// (useful for A/B comparison). `uring` requires `io_uring` and
-    /// errors out if it is unavailable.
+    /// errors out if it is unavailable. `mmap` selects the §9
+    /// memory-mapped sparse-file path: workers `memcpy` into a
+    /// `MAP_SHARED` region and the puncher uses
+    /// `madvise(MADV_REMOVE)`. Linux-only; sockets continue to use
+    /// the blocking backend.
     #[arg(long = "io-backend", value_enum, default_value_t = IoBackendArg::Auto)]
     pub io_backend: IoBackendArg,
 }
@@ -132,6 +136,8 @@ pub enum IoBackendArg {
     Blocking,
     /// Force the Linux `io_uring` backend.
     Uring,
+    /// Force the Linux memory-mapped sparse-file backend.
+    Mmap,
 }
 
 impl From<IoBackendArg> for IoBackendChoice {
@@ -140,6 +146,7 @@ impl From<IoBackendArg> for IoBackendChoice {
             IoBackendArg::Auto => Self::Auto,
             IoBackendArg::Blocking => Self::Blocking,
             IoBackendArg::Uring => Self::Uring,
+            IoBackendArg::Mmap => Self::Mmap,
         }
     }
 }
@@ -297,6 +304,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_io_backend_mmap() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--io-backend",
+            "mmap",
+        ])
+        .expect("parse");
+        assert_eq!(cli.io_backend, IoBackendArg::Mmap);
+    }
+
+    #[test]
     fn rejects_unknown_io_backend() {
         let err = Cli::try_parse_from([
             "peel",
@@ -323,6 +344,10 @@ mod tests {
         assert_eq!(
             IoBackendChoice::from(IoBackendArg::Uring),
             IoBackendChoice::Uring
+        );
+        assert_eq!(
+            IoBackendChoice::from(IoBackendArg::Mmap),
+            IoBackendChoice::Mmap
         );
     }
 

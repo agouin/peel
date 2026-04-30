@@ -212,3 +212,120 @@ fn parallel_workers_write_a_sparse_file_and_bitmap_reflects_it() {
         "on-disk usage {on_disk_bytes} bytes vastly exceeds logical {logical_bytes} bytes",
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mmap_parallel_workers_round_trip_chunks() {
+    // §9 demo: same N-worker pattern as the parallel test above, but
+    // through the `mmap` storage backend. Asserts: every chunk written
+    // through the mapping reads back identically; sparseness is
+    // preserved under `MAP_SHARED + ftruncate`.
+    let path = unique_temp_path("mmap_parallel");
+    let _cleanup = CleanupOnDrop(path.clone());
+
+    let file = Arc::new(SparseFile::open_or_create_mmap(&path, ONE_GIB).expect("mmap 1 GiB"));
+    assert_eq!(file.backend_name(), "mmap");
+    let bitmap = Arc::new(ChunkBitmap::new(TOTAL_CHUNKS));
+    let assignments = pick_distinct_chunks(0xABCD_EF01);
+    assert_eq!(assignments.len(), WORKER_COUNT as usize);
+
+    thread::scope(|scope| {
+        for &chunk_idx in &assignments {
+            let file = Arc::clone(&file);
+            let bitmap = Arc::clone(&bitmap);
+            scope.spawn(move || {
+                let mut payload = vec![0u8; CHUNK_SIZE as usize];
+                fill_pattern(chunk_idx, &mut payload);
+                let offset = ByteOffset::new(u64::from(chunk_idx) * CHUNK_SIZE);
+                file.pwrite_at(offset, &payload).expect("worker mmap write");
+                bitmap.mark_complete(ChunkIndex::new(chunk_idx));
+            });
+        }
+    });
+
+    // Every assigned chunk reads back exactly what its worker wrote.
+    let mut readback = vec![0u8; CHUNK_SIZE as usize];
+    let mut expected = vec![0u8; CHUNK_SIZE as usize];
+    for &chunk_idx in &assignments {
+        let offset = ByteOffset::new(u64::from(chunk_idx) * CHUNK_SIZE);
+        file.read_exact_at(offset, &mut readback).expect("read");
+        fill_pattern(chunk_idx, &mut expected);
+        assert_eq!(
+            readback, expected,
+            "mmap content mismatch at chunk {chunk_idx}"
+        );
+    }
+
+    // Sparseness check, mirroring the pwrite test. Skip when the
+    // filesystem materialized the holes.
+    file.sync_all().expect("msync(MS_ASYNC)");
+    let meta = std::fs::metadata(&path).expect("metadata");
+    assert_eq!(meta.len(), ONE_GIB, "logical size must be 1 GiB");
+
+    let on_disk_bytes = meta.blocks() * 512;
+    let logical_bytes = u64::from(WORKER_COUNT) * CHUNK_SIZE;
+    let dense_threshold = ONE_GIB / 2;
+    if on_disk_bytes < dense_threshold {
+        let upper_bound = logical_bytes.saturating_mul(4) + 4 * 1024 * 1024;
+        assert!(
+            on_disk_bytes <= upper_bound,
+            "mmap on-disk usage {on_disk_bytes} bytes exceeds logical {logical_bytes} bytes",
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mmap_madv_remove_releases_blocks_when_supported() {
+    use peel::punch::{PunchError, PunchHole};
+
+    // §9 step 2 demo: write ~4 MiB of dense data through the mmap
+    // SparseFile, then have the mmap puncher (`madvise(MADV_REMOVE)`)
+    // release the underlying blocks. Verify the on-disk block count
+    // shrinks; treat `Unsupported` (e.g. host filesystem rejects
+    // MADV_REMOVE) as a skip.
+    const FOUR_MIB: u64 = 4 * 1024 * 1024;
+
+    let path = unique_temp_path("mmap_madv_release");
+    let _cleanup = CleanupOnDrop(path.clone());
+
+    let f = SparseFile::open_or_create_mmap(&path, FOUR_MIB).expect("mmap 4 MiB");
+    let payload = vec![0xCDu8; FOUR_MIB as usize];
+    f.pwrite_at(ByteOffset::ZERO, &payload).expect("write");
+    f.sync_all().expect("msync");
+    // Drop the mmap-internal write barrier into the file metadata as
+    // well: an explicit fsync via the path is the closest portable
+    // proxy without pulling msync(MS_SYNC) into the public API.
+    let std_file = std::fs::File::open(&path).expect("reopen");
+    std_file.sync_all().expect("fsync");
+
+    let meta_before = std::fs::metadata(&path).expect("metadata");
+    let blocks_before = meta_before.blocks();
+    if blocks_before < FOUR_MIB / 4096 {
+        // Filesystem refused to materialize the dense write — skip.
+        return;
+    }
+
+    let puncher = f.make_mmap_puncher().expect("mmap puncher");
+    let block = puncher.block_size_hint();
+    match puncher.punch(f.as_fd(), ByteOffset::ZERO, FOUR_MIB) {
+        Ok(()) => {
+            f.sync_all().expect("post-punch msync");
+            let std_file = std::fs::File::open(&path).expect("reopen");
+            std_file.sync_all().expect("fsync");
+            let meta_after = std::fs::metadata(&path).expect("metadata");
+            assert_eq!(meta_after.len(), FOUR_MIB, "logical size preserved");
+            assert!(
+                meta_after.blocks() < blocks_before,
+                "expected madvise(MADV_REMOVE) to release blocks (before={}, after={}, block_hint={})",
+                blocks_before,
+                meta_after.blocks(),
+                block,
+            );
+        }
+        Err(PunchError::Unsupported { .. }) => {
+            // Filesystem rejects MADV_REMOVE — treat as skip.
+        }
+        Err(other) => panic!("unexpected mmap-mode punch error: {other}"),
+    }
+}

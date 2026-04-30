@@ -24,6 +24,7 @@
 #![cfg(unix)]
 
 pub mod chunk_policy;
+pub mod mmap_region;
 pub mod scheduler;
 pub mod sparse_file;
 pub mod worker;
@@ -33,6 +34,7 @@ pub use chunk_policy::{
     ChunkSizePolicy, ResizeDecision, Sample, DEFAULT_INITIAL_DISPATCH_BYTES, HYSTERESIS,
     MAX_DISPATCH_BYTES, MIN_DISPATCH_BYTES,
 };
+pub use mmap_region::MmapRegion;
 pub use scheduler::{
     chunk_count, discover, run, DownloadInfo, DownloadMode, DownloadStats, SchedulerConfig,
     SchedulerError, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,

@@ -370,6 +370,40 @@ fn happy_path_zst_to_file_round_trips_bytes() {
     assert!(!work.join("out.bin.peel.ckpt").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn happy_path_zst_to_file_round_trips_bytes_under_mmap_backend() {
+    // The full coordinator end-to-end on the §9 mmap storage backend.
+    // Asserts that workers writing through `memcpy` into a `MAP_SHARED`
+    // region produce the same extracted output as the pwrite path,
+    // and that the on-disk sidecars are cleaned up identically.
+    let payload = b"mmap backend payload for the raw sink, ".repeat(2048);
+    let body = encode_zstd(&payload);
+    let body_len = body.len() as u64;
+    let server = MockServer::start(ok_handler(body, Some("\"v-mmap\"")));
+
+    let work = unique_dir("happy_file_mmap");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    let mut config = coord_config_for_test(4096);
+    config.chunk_size = 1024.max(body_len.div_ceil(8));
+    config.io_backend = peel::io_backend::IoBackendChoice::Mmap;
+    let args = make_args(
+        &server,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        config,
+    );
+
+    let stats = run(args).expect("mmap-backend run");
+    assert_eq!(stats.extraction.bytes_out, payload.len() as u64);
+    assert!(!stats.resumed);
+    assert_eq!(fs::read(&out_path).expect("read"), payload);
+    assert!(!work.join("out.bin.peel.part").exists());
+    assert!(!work.join("out.bin.peel.ckpt").exists());
+}
+
 // ---- happy path: tar output --------------------------------------------
 
 #[test]

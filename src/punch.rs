@@ -22,9 +22,12 @@
 //!   disk until completion.
 //! - [`LinuxPuncher`] (Linux only) calls
 //!   `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` directly via
-//!   the C ABI. Filesystems that reject the operation (NFS, FAT, certain
-//!   FUSE mounts) report `EOPNOTSUPP`/`ENOTSUP`/`EINVAL`, which is mapped
-//!   to [`PunchError::Unsupported`] so the caller can downgrade to
+//!   the C ABI in its default `fallocate` mode, or
+//!   `madvise(MADV_REMOVE)` against an `mmap`'d region in its
+//!   `for_mmap` mode (`PLAN_v2.md` §9). Filesystems that reject the
+//!   operation (NFS, FAT, certain FUSE mounts) report
+//!   `EOPNOTSUPP`/`ENOTSUP`/`EINVAL`, which is mapped to
+//!   [`PunchError::Unsupported`] so the caller can downgrade to
 //!   [`NoopPuncher`] without aborting.
 //! - [`default_puncher`] picks the best implementation for the running
 //!   platform.
@@ -192,8 +195,11 @@ pub use linux::LinuxPuncher;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::ffi::c_void;
     use std::io;
     use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::ptr::NonNull;
+    use std::sync::Arc;
 
     use super::{PunchError, PunchHole};
     use crate::types::ByteOffset;
@@ -203,12 +209,23 @@ mod linux {
     /// `fallocate` mode flag: punch a hole over the indicated range.
     const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
 
+    /// `madvise` advice value: tell the kernel the pages backing a range
+    /// of an `mmap`'d region are no longer needed and the underlying
+    /// blocks may be released. Equivalent to `fallocate(PUNCH_HOLE)` for
+    /// the file-backed case but applied through the virtual-memory
+    /// interface; supported on tmpfs and ext4 today (per `mmap(2)` /
+    /// `madvise(2)` man pages).
+    const MADV_REMOVE: i32 = 9;
+
     /// Linux errno: "operation not supported". On Linux `ENOTSUP` and
     /// `EOPNOTSUPP` share the same numeric value.
     const EOPNOTSUPP: i32 = 95;
     /// Linux errno: "invalid argument". Some filesystems use this in
     /// place of `EOPNOTSUPP` to report that a punch is unrepresentable.
     const EINVAL: i32 = 22;
+    /// Linux errno: "function not implemented". Older kernels and some
+    /// non-tmpfs/non-ext4 filesystems return this for `MADV_REMOVE`.
+    const ENOSYS: i32 = 38;
 
     extern "C" {
         // `fallocate64` is the explicitly 64-bit-offset variant of
@@ -217,23 +234,140 @@ mod linux {
         // `fallocate` on 32-bit ABIs and matches the C signature
         // `int fallocate64(int fd, int mode, off64_t offset, off64_t len);`.
         fn fallocate64(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+
+        // `int madvise(void *addr, size_t length, int advice);` —
+        // advisory hint to the kernel about how a memory region will be
+        // used. We submit `MADV_REMOVE` to release the underlying blocks
+        // of an `mmap`'d shared file range without taking the file
+        // descriptor's `fallocate` path.
+        fn madvise(addr: *mut c_void, length: usize, advice: i32) -> i32;
     }
 
-    /// Linux puncher backed by
-    /// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+    /// Linux puncher with two modes (`PLAN_v2.md` §9).
+    ///
+    /// In its default mode the puncher calls
+    /// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` against
+    /// the borrowed file descriptor — the same path the MVP `peel`
+    /// shipped with. After [`Self::for_mmap`], the puncher instead calls
+    /// `madvise(MADV_REMOVE)` against an `mmap`'d region, ignoring the
+    /// passed-in `fd` argument: the mmap-backed `SparseFile` (`§9`)
+    /// holds the mapped region, the puncher just dereferences into it.
     ///
     /// Works on ext4, xfs, btrfs, tmpfs, f2fs, and other modern Linux
-    /// filesystems. NFS, FAT, and some FUSE mounts return
-    /// `EOPNOTSUPP`/`EINVAL`, which is surfaced as
-    /// [`PunchError::Unsupported`].
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct LinuxPuncher;
+    /// filesystems for the fallocate path; tmpfs and ext4 specifically
+    /// support `MADV_REMOVE`. Filesystems that reject either operation
+    /// report `EOPNOTSUPP`/`EINVAL`/`ENOSYS`, which is surfaced as
+    /// [`PunchError::Unsupported`] so the caller can downgrade to
+    /// [`super::NoopPuncher`] without aborting.
+    #[derive(Debug, Clone)]
+    pub struct LinuxPuncher {
+        mode: PunchMode,
+    }
+
+    /// Internal: which syscall to issue. The `MadvRemove` arm carries
+    /// the mmap region the puncher was bound to via [`LinuxPuncher::for_mmap`].
+    #[derive(Debug, Clone)]
+    enum PunchMode {
+        Fallocate,
+        MadvRemove(Arc<MmapHandle>),
+    }
+
+    /// The mmap region a `MadvRemove`-mode puncher writes through.
+    ///
+    /// `keepalive` is an opaque `Arc` that pins whatever owner holds the
+    /// underlying mapping — typically `Arc<MmapRegion>` from
+    /// [`crate::download::sparse_file`]. Storing it as
+    /// `Arc<dyn Send + Sync>` keeps `punch.rs` free of `download`-layer
+    /// types; the only contract is "drop me last".
+    pub(super) struct MmapHandle {
+        base: SendSyncPtr,
+        len: usize,
+        _keepalive: Arc<dyn Send + Sync>,
+    }
+
+    impl std::fmt::Debug for MmapHandle {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MmapHandle")
+                .field("base", &self.base.0.as_ptr())
+                .field("len", &self.len)
+                .finish()
+        }
+    }
+
+    /// `NonNull<u8>` is `!Send` + `!Sync` by default. The mmap base
+    /// pointer is shared across threads safely: the kernel synchronizes
+    /// reads/writes against the underlying file, and our puncher only
+    /// passes the pointer back to `madvise(2)`, never dereferencing it.
+    /// The `unsafe impl`s assert that contract.
+    #[derive(Clone, Copy)]
+    struct SendSyncPtr(NonNull<u8>);
+
+    // SAFETY: the puncher only forwards the pointer to `madvise(2)`,
+    // which is thread-safe. The kernel-side mmap region is `MAP_SHARED`
+    // and kernel-synchronized.
+    unsafe impl Send for SendSyncPtr {}
+    // SAFETY: same justification as `Send`.
+    unsafe impl Sync for SendSyncPtr {}
 
     impl LinuxPuncher {
-        /// Construct a fresh [`LinuxPuncher`].
+        /// Construct a fresh [`LinuxPuncher`] in the default
+        /// `fallocate(PUNCH_HOLE)` mode.
         #[must_use]
         pub const fn new() -> Self {
-            Self
+            Self {
+                mode: PunchMode::Fallocate,
+            }
+        }
+
+        /// Construct a [`LinuxPuncher`] that punches via
+        /// `madvise(MADV_REMOVE)` against the `mmap`'d region
+        /// `[base, base + len)`.
+        ///
+        /// `keepalive` must hold a reference (typically
+        /// `Arc<MmapRegion>` from
+        /// [`crate::download::sparse_file`]) that keeps the mapping
+        /// alive for at least as long as this puncher, then drops it
+        /// (so `munmap` runs) when the puncher is dropped. The puncher
+        /// itself only forwards the pointer to `madvise(2)`; it never
+        /// dereferences the memory.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure:
+        /// - `[base, base + len)` is a single contiguous `mmap`'d region
+        ///   (typically `MAP_SHARED`) on a `mmap`-mappable filesystem.
+        /// - `keepalive` keeps the mapping alive at least as long as the
+        ///   returned puncher, so the pointer remains valid for every
+        ///   `madvise(2)` call.
+        /// - `len` is the exact length passed to `mmap(2)`. Range checks
+        ///   inside `punch` assume `[base, base + len)` is the upper
+        ///   bound on valid offsets.
+        #[must_use]
+        pub unsafe fn for_mmap(
+            base: NonNull<u8>,
+            len: usize,
+            keepalive: Arc<dyn Send + Sync>,
+        ) -> Self {
+            Self {
+                mode: PunchMode::MadvRemove(Arc::new(MmapHandle {
+                    base: SendSyncPtr(base),
+                    len,
+                    _keepalive: keepalive,
+                })),
+            }
+        }
+
+        /// `true` iff this puncher is in `MadvRemove` mode (i.e., was
+        /// constructed via [`Self::for_mmap`]).
+        #[must_use]
+        pub fn is_mmap(&self) -> bool {
+            matches!(self.mode, PunchMode::MadvRemove(_))
+        }
+    }
+
+    impl Default for LinuxPuncher {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -247,44 +381,118 @@ mod linux {
             if length == 0 {
                 return Ok(());
             }
-
-            let raw_offset = offset.get();
-            let i_offset = i64::try_from(raw_offset).map_err(|_| PunchError::OffsetOverflow {
-                offset: raw_offset,
-                length,
-            })?;
-            let i_length = i64::try_from(length).map_err(|_| PunchError::OffsetOverflow {
-                offset: raw_offset,
-                length,
-            })?;
-
-            let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
-            // SAFETY: `fd` is a `BorrowedFd<'_>` whose lifetime brackets
-            // this call, so `fd.as_raw_fd()` is a valid file descriptor
-            // for the duration of the syscall. `mode`, `i_offset`, and
-            // `i_length` are plain integers carried across the C ABI by
-            // value and have no aliasing concerns. `fallocate64` returns
-            // an `int` status; on error it sets the thread-local errno
-            // which we read via `io::Error::last_os_error`.
-            let rc = unsafe { fallocate64(fd.as_raw_fd(), mode, i_offset, i_length) };
-            if rc == 0 {
-                return Ok(());
-            }
-            let err = io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(e) if e == EOPNOTSUPP || e == EINVAL => {
-                    Err(PunchError::Unsupported { errno: e })
-                }
-                _ => Err(PunchError::Io {
-                    offset: raw_offset,
-                    length,
-                    source: err,
-                }),
+            match &self.mode {
+                PunchMode::Fallocate => fallocate_punch(fd, offset, length),
+                PunchMode::MadvRemove(handle) => madv_remove_punch(handle, offset, length),
             }
         }
 
         fn block_size_hint(&self) -> u64 {
             4096
+        }
+    }
+
+    fn fallocate_punch(
+        fd: BorrowedFd<'_>,
+        offset: ByteOffset,
+        length: u64,
+    ) -> Result<(), PunchError> {
+        let raw_offset = offset.get();
+        let i_offset = i64::try_from(raw_offset).map_err(|_| PunchError::OffsetOverflow {
+            offset: raw_offset,
+            length,
+        })?;
+        let i_length = i64::try_from(length).map_err(|_| PunchError::OffsetOverflow {
+            offset: raw_offset,
+            length,
+        })?;
+
+        let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+        // SAFETY: `fd` is a `BorrowedFd<'_>` whose lifetime brackets
+        // this call, so `fd.as_raw_fd()` is a valid file descriptor
+        // for the duration of the syscall. `mode`, `i_offset`, and
+        // `i_length` are plain integers carried across the C ABI by
+        // value and have no aliasing concerns. `fallocate64` returns
+        // an `int` status; on error it sets the thread-local errno
+        // which we read via `io::Error::last_os_error`.
+        let rc = unsafe { fallocate64(fd.as_raw_fd(), mode, i_offset, i_length) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(e) if e == EOPNOTSUPP || e == EINVAL => Err(PunchError::Unsupported { errno: e }),
+            _ => Err(PunchError::Io {
+                offset: raw_offset,
+                length,
+                source: err,
+            }),
+        }
+    }
+
+    fn madv_remove_punch(
+        handle: &MmapHandle,
+        offset: ByteOffset,
+        length: u64,
+    ) -> Result<(), PunchError> {
+        let raw_offset = offset.get();
+        // `madvise(2)` takes `size_t`; the existing `PunchError::OffsetOverflow`
+        // arm covers ranges that don't fit. Reuse it on `usize` overflow,
+        // mirroring the fallocate path's handling of `i64` overflow.
+        let off = usize::try_from(raw_offset).map_err(|_| PunchError::OffsetOverflow {
+            offset: raw_offset,
+            length,
+        })?;
+        let len = usize::try_from(length).map_err(|_| PunchError::OffsetOverflow {
+            offset: raw_offset,
+            length,
+        })?;
+        let end = off.checked_add(len).ok_or(PunchError::OffsetOverflow {
+            offset: raw_offset,
+            length,
+        })?;
+        if end > handle.len {
+            return Err(PunchError::Io {
+                offset: raw_offset,
+                length,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "madvise(MADV_REMOVE) range [{off}, {end}) exceeds mapped length {}",
+                        handle.len
+                    ),
+                ),
+            });
+        }
+
+        // SAFETY: `[base, base + len)` is a contiguous mmap'd region
+        // (the `for_mmap` constructor's contract). `off + len <=
+        // handle.len`, so `base + off` and `base + off + len` are inside
+        // the mapping. We do not dereference the pointer, only forward
+        // it to `madvise(2)`.
+        let addr = unsafe { handle.base.0.as_ptr().add(off) };
+
+        // SAFETY: `addr` is page-aligned by construction (the caller
+        // aligns `offset` to `block_size_hint()` = 4096, and the mmap
+        // base itself is page-aligned by `mmap(2)`). `len` is unchecked
+        // here for alignment; `madvise` returns `EINVAL` for misaligned
+        // lengths, which we already map to `PunchError::Unsupported`
+        // below. The kernel performs no aliasing-relevant operations on
+        // our memory; it only operates on its own page tables.
+        let rc = unsafe { madvise(addr.cast::<c_void>(), len, MADV_REMOVE) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(e) if e == EOPNOTSUPP || e == EINVAL || e == ENOSYS => {
+                Err(PunchError::Unsupported { errno: e })
+            }
+            _ => Err(PunchError::Io {
+                offset: raw_offset,
+                length,
+                source: err,
+            }),
         }
     }
 }
@@ -415,5 +623,35 @@ mod tests {
         // is fine; we are checking the early-return contract.
         assert!(p.punch(fd, ByteOffset::ZERO, 0).is_ok());
         assert!(p.punch(fd, ByteOffset::new(1024), 0).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_puncher_default_mode_is_fallocate() {
+        let p = LinuxPuncher::new();
+        assert!(!p.is_mmap());
+    }
+
+    // for_mmap() construction itself is `unsafe`, but we can verify the
+    // mode flag flips without dereferencing the (deliberately fake)
+    // pointer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_puncher_for_mmap_flips_mode() {
+        use std::ptr::NonNull;
+        use std::sync::Arc;
+
+        // SAFETY: this puncher will not be used to call `punch`; we
+        // only inspect `is_mmap`. The pointer is therefore never
+        // dereferenced and the keepalive Arc is sufficient lifetime
+        // glue for that read-only inspection.
+        let p = unsafe {
+            LinuxPuncher::for_mmap(
+                NonNull::new(8usize as *mut u8).expect("nonzero"),
+                4096,
+                Arc::new(()) as Arc<dyn Send + Sync>,
+            )
+        };
+        assert!(p.is_mmap());
     }
 }

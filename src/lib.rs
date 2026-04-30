@@ -58,15 +58,18 @@
 //!   `--chunk-size <N>` and `--no-adaptive-chunk-size` CLI escape
 //!   hatches.
 //! - [`io_backend`] (Unix only) — file-IO and network-IO seam
-//!   (`PLAN_v2.md` §7 + §7b): the [`io_backend::IoBackend`] trait
+//!   (`PLAN_v2.md` §7 + §7b + §9): the [`io_backend::IoBackend`] trait
 //!   every backend honors, the always-available
 //!   [`io_backend::BlockingBackend`] wrapping `pwrite`/`pread`/`fsync`
 //!   and `TcpStream::connect_timeout`, and (Linux only) the
 //!   `io_backend::UringBackend` that batches both file IO and the HTTP
 //!   client's TCP `recv`/`send` through a dedicated IO thread sharing
-//!   one ring. The `--io-backend` CLI flag picks between `auto`
-//!   (default; tries uring, falls back to blocking with a warning),
-//!   `blocking`, and `uring`.
+//!   one ring. A fourth choice — `mmap` (Linux only, `PLAN_v2.md` §9)
+//!   — switches the sparse file's storage to a `MAP_SHARED` mapping
+//!   with `madvise(MADV_REMOVE)` punching while leaving the socket
+//!   path on the blocking backend. The `--io-backend` CLI flag picks
+//!   between `auto` (default; tries uring, falls back to blocking with
+//!   a warning), `blocking`, `uring`, and `mmap`.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md

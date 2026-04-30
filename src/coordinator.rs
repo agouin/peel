@@ -493,14 +493,12 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 
     let chunks_resumed = u32::try_from(bitmap.count_complete()).unwrap_or(u32::MAX);
 
-    let sparse = Arc::new(
-        SparseFile::open_or_create_with_backend(
-            &part_path,
-            info.total_size,
-            Arc::clone(&io_backend),
-        )
-        .map_err(CoordinatorError::SparseFile)?,
-    );
+    let sparse = Arc::new(open_sparse(
+        &part_path,
+        info.total_size,
+        &config,
+        &io_backend,
+    )?);
 
     let cursor = Arc::new(AtomicU64::new(match &resume_plan {
         ResumePlan::Fresh => 0,
@@ -604,7 +602,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             let format_name = registry.name_for_factory(factory).map(String::from);
             let is_zip = format_name.as_deref() == Some(ZIP_FORMAT_NAME);
 
-            let puncher: Box<dyn PunchHole> = default_puncher();
+            let puncher: Box<dyn PunchHole> = make_puncher(&sparse);
 
             let extraction_stats = if is_zip {
                 let dir = match &output {
@@ -1195,6 +1193,45 @@ fn sink_state_for(output: &OutputTarget, bytes_out: u64) -> SinkState {
             bytes_written: bytes_out,
         }
     }
+}
+
+/// Construct the [`SparseFile`] for this run, picking between the
+/// pwrite/pread storage (any platform, any non-mmap backend choice)
+/// and the §9 `mmap` storage (Linux only, requested via
+/// [`crate::io_backend::IoBackendChoice::Mmap`]).
+fn open_sparse(
+    path: &Path,
+    total_size: u64,
+    config: &CoordinatorConfig,
+    io_backend: &Arc<dyn crate::io_backend::IoBackend>,
+) -> Result<SparseFile, CoordinatorError> {
+    #[cfg(target_os = "linux")]
+    if matches!(config.io_backend, crate::io_backend::IoBackendChoice::Mmap) {
+        return SparseFile::open_or_create_mmap(path, total_size)
+            .map_err(CoordinatorError::SparseFile);
+    }
+    // `config` is only consulted on Linux (where mmap storage is
+    // selectable). Bind it to `_` on non-Linux to keep the signature
+    // uniform across platforms.
+    #[cfg(not(target_os = "linux"))]
+    let _ = config;
+
+    SparseFile::open_or_create_with_backend(path, total_size, Arc::clone(io_backend))
+        .map_err(CoordinatorError::SparseFile)
+}
+
+/// Choose the right puncher for this run: the `mmap`-mode
+/// [`crate::punch::LinuxPuncher::for_mmap`] when the sparse file is
+/// memory-mapped, otherwise the platform default
+/// (`fallocate(PUNCH_HOLE)` on Linux, [`crate::punch::NoopPuncher`]
+/// elsewhere).
+fn make_puncher(sparse: &SparseFile) -> Box<dyn PunchHole> {
+    #[cfg(target_os = "linux")]
+    if let Some(p) = sparse.make_mmap_puncher() {
+        return Box::new(p);
+    }
+    let _ = sparse;
+    default_puncher()
 }
 
 /// Compute `<anchor> + suffix` for the .peel.part / .peel.ckpt

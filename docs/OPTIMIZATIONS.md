@@ -62,16 +62,19 @@ similar — adding async runtime complexity that the MVP avoids.
 
 ### O.3 Memory-mapped sparse file
 
-**What**: `mmap` the partial download file so workers write into memory
-and the kernel handles flushing.
-
-**Why deferred**: makes hole-punching coordination harder (need to
-`madvise(MADV_REMOVE)` instead of `fallocate`), and `pwrite` is already
-fast. Real benefit only at very high concurrency.
-
-**Sketch**: investigate `MADV_REMOVE` semantics, build a parallel
-mmap-based sparse-file backend, benchmark against pwrite at various
-chunk counts.
+**Status: delivered in `PLAN_v2.md` §9 (2026-04-29).** Linux-only mmap
+storage backend for `SparseFile`, selected via `--io-backend mmap`.
+Workers `memcpy` into a `MAP_SHARED` region; `sync_all` translates to
+`msync(MS_ASYNC)`; the matching puncher (constructed via
+`SparseFile::make_mmap_puncher`) issues `madvise(MADV_REMOVE)` against
+the mapping. The `LinuxPuncher::for_mmap` constructor pairs the
+fallocate-mode puncher with an mmap-mode sibling, sharing the same
+`PunchHole` trait surface; `EOPNOTSUPP`/`EINVAL`/`ENOSYS` returns
+graceful `PunchError::Unsupported` (mirroring the fallocate path).
+Sockets continue to use the blocking backend in mmap mode — only the
+sparse file's storage changes. Default backend remains
+`pwrite`/`pread` until the mmap path has been benchmarked in
+production.
 
 ---
 
