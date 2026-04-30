@@ -380,17 +380,21 @@ make until the internal one stabilizes.
 
 ### O.17 HTTP/2 and HTTP/3
 
-**What**: upgrade the hand-rolled HTTP client beyond HTTP/1.1.
+**Status: HTTP/2 delivered (2026-04-30).** The hand-rolled HTTP/1.1
+implementation was replaced with `hyper` + `hyper-util` +
+`hyper-rustls`, ALPN-negotiating between H1 and H2 per origin. A
+current-thread `tokio` runtime is owned by `http::Client` and confined
+to it; the rest of the codebase remains synchronous. See
+`ENGINEERING_STANDARDS.md` §2.3 / §2.5 for the policy text and
+`src/http/client.rs` for the implementation. The H1 throughput
+argument from the deferred sketch still holds — H2 is on by default
+because hyper does both, not because we expect a speedup over N
+parallel ranged H1 streams; it exists so origins that only speak H2
+work without extra config.
 
-**Why deferred**: HTTP/1.1 with parallel connections is sufficient
-for ranged downloads. HTTP/2 multiplexing would let us use one
-connection but doesn't speed things up versus N parallel HTTP/1.1
-connections in our use case. HTTP/3 (QUIC) is a much larger lift
-and not a clear win for bulk transfer.
-
-**Sketch**: out of scope for "hand-rolled"; if pursued, this is
-where we'd revisit the dependency policy and consider `hyper` or
-`reqwest`.
+**HTTP/3 (QUIC)** remains deferred: a much larger lift, no clear win
+for bulk transfer over a single ranged TCP fan-out, and would require
+a QUIC stack on top of the current TLS dependency.
 
 ---
 

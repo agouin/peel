@@ -51,8 +51,18 @@ Crates pre-approved for use, with the role they fill:
 | `clap`         | CLI argument parsing                        | Use `derive` feature                 |
 | `tracing`      | Structured logging                          | Replace `println!` debugging         |
 | `tracing-subscriber` | Tracing setup at binary boundary       | Binary only                          |
+| `hyper`        | HTTP/1.1 + HTTP/2 protocol implementation   | Confined to `http::client`; see §2.3 |
+| `hyper-util`   | hyper connector + legacy pooled client      | Confined to `http::client`; see §2.3 |
+| `hyper-rustls` | rustls TLS connector for hyper, with ALPN   | Confined to `http::client`; see §2.3 / §2.4 |
+| `http`         | hyper's request/response/header types       | Confined to `http::client`           |
+| `http-body-util` | body adapters (`BodyExt::frame`, `Empty`) | Confined to `http::client`           |
+| `bytes`        | hyper's body byte buffer type               | Confined to `http::client`           |
+| `tokio`        | current-thread runtime owned by `http::Client` | `rt`, `net`, `time`, `macros` features only; see §2.5 |
 | `tempfile`     | Test scratch files                          | Dev-dependency only                  |
 | `sha2`         | SHA-256 reference for cross-checking tests  | Dev-dependency only — runtime SHA-256 is hand-rolled in `hash/sha256.rs`; `PLAN_v2.md` §10 |
+
+`h2` arrives transitively via `hyper`'s `http2` feature; it is not a
+direct dependency and does not need its own row.
 
 That's the list. **Anything not on this list requires human approval before
 adding to `Cargo.toml`.** Approval criteria:
@@ -67,14 +77,27 @@ adding to `Cargo.toml`.** Approval criteria:
 The only acceptable reason to add a dependency is "we genuinely cannot
 write this ourselves at acceptable quality." Convenience is not a reason.
 
-### 2.3 HTTP client: hand-rolled
+### 2.3 HTTP client: hyper-based, ALPN-negotiated H1/H2
 
-We do **not** depend on `reqwest`, `hyper`, `ureq`, or any HTTP client
-crate. The HTTP we need (HEAD + ranged GET, plus basic redirects and TLS)
-is small, and rolling it ourselves on top of `std::net::TcpStream` plus
-`rustls` (the only TLS exception, see §2.4) keeps our dependency tree
-sharp and makes the wire-level behavior auditable. The plan budgets time
-for this.
+The HTTP client is built on `hyper` + `hyper-util` + `hyper-rustls`, with
+ALPN auto-negotiating between HTTP/1.1 and HTTP/2 per origin. We
+deliberately do **not** depend on higher-level wrappers (`reqwest`,
+`ureq`, etc.) — `hyper-util`'s `legacy::Client` is the highest level we
+build on; everything above it (redirect handling, the
+`HEAD`/`get_full`/`get_range` shape, `UnexpectedStatus` checks, the
+`Read`-shaped body adapter that callers actually consume) stays in
+`http::client` so the wire-level behavior we depend on remains
+auditable.
+
+The `hyper` family is confined to the `http::client` module. Code outside
+that module does not import `hyper`, `http`, `bytes`, or `tokio`; it
+sees the same sync `Client` / `Response` / `BodyReader<R: Read>` shape
+as before, and that boundary is enforced by review.
+
+**Historical note.** Before 2026-04-30 we maintained a hand-rolled
+HTTP/1.1 implementation over `std::net::TcpStream` + `rustls`. It was
+replaced in order to add HTTP/2 support without writing a second wire
+format by hand; see `OPTIMIZATIONS.md §O.17`.
 
 ### 2.4 TLS exception
 
@@ -85,14 +108,21 @@ reasons.
 
 ### 2.5 Async runtime
 
-We are **not using async** for the MVP. Worker pool concurrency uses
-`std::thread` and `std::sync` primitives. This avoids dragging in `tokio`
-or `async-std` and their ecosystems. The performance ceiling for blocking
-IO with a small thread pool (workers are CPU-light, network-bound) is
-high enough that async buys us nothing here.
+The codebase is **synchronous**. Worker-pool concurrency uses
+`std::thread` and `std::sync` primitives. Modules outside `http::client`
+do not use `async fn`, do not import `tokio`, and do not see `Future`
+types in their public APIs.
 
-If the post-MVP optimization phase wants async, that's a deliberate
-decision documented in `OPTIMIZATIONS.md`, not a default.
+The single exception is `http::client`, which owns a current-thread
+`tokio::runtime::Runtime` purely as plumbing for `hyper`. The runtime is
+constructed inside `Client`, never escapes it, and every public method
+on `Client` is a synchronous `fn` that `block_on`s internally. Callers
+remain blocking-IO consumers reading a `BodyReader<R: Read>`. The tokio
+features enabled (`rt`, `net`, `time`, `macros`) are the minimum hyper
+needs; we do not enable `rt-multi-thread`.
+
+Any proposal to broaden tokio's footprint beyond this confinement is a
+standards change and must be amended here, not done piecewise.
 
 ---
 

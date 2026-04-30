@@ -1,31 +1,37 @@
-//! Hand-rolled HTTP/1.1 client used by the download scheduler.
+//! HTTP/1.1 + HTTP/2 client used by the download scheduler.
 //!
-//! `peel` deliberately avoids `reqwest`/`hyper`/`ureq`. The wire-level
-//! behaviour we depend on (HEAD, ranged GET, basic redirects, ETag and
-//! `Content-Range` round-tripping) is small enough to write ourselves on
-//! top of [`std::net::TcpStream`] and `rustls`. See
-//! `docs/ENGINEERING_STANDARDS.md` §2.3 for the rationale.
+//! Built on `hyper` + `hyper-util` + `hyper-rustls`, with ALPN
+//! auto-negotiating H1↔H2 per origin. Higher-level wrapper crates
+//! (`reqwest`, `ureq`, etc.) are still avoided: everything above
+//! `hyper-util::client::legacy::Client` — redirect handling,
+//! `UnexpectedStatus` checks, the synchronous public API, the
+//! `Read`-shaped body adapter that callers consume — lives in
+//! [`client`]. See `docs/ENGINEERING_STANDARDS.md` §2.3 for the
+//! rationale and §2.5 for how the `tokio` runtime is confined to this
+//! module.
 //!
 //! # Layering
 //!
 //! - [`url`] — minimal URL parser sufficient for the schemes (`http`,
 //!   `https`) and authorities the client supports.
 //! - [`range`] — `Range:` / `Content-Range:` header parsing.
-//! - [`request`] — typed [`Request`](request::Request) and its on-the-wire
-//!   serialization.
-//! - [`response`] — streaming [`Response`](response::Response) parser and
-//!   body readers (length-delimited and `chunked`).
-//! - [`client`] — the [`Client`](client::Client) itself: connection pool,
-//!   TLS, redirect handling, [`HEAD`](client::Client::head),
+//! - [`request`] — typed [`Request`](request::Request); kept for the
+//!   range/method enum types callers use.
+//! - [`response`] — [`Headers`](response::Headers), [`Status`](response::Status),
+//!   and the [`BodyReader`](response::BodyReader) `std::io::Read` adapter
+//!   over hyper's body stream.
+//! - [`client`] — the [`Client`](client::Client) itself: hyper-based
+//!   connection management, TLS via `hyper-rustls`, redirect handling,
+//!   [`HEAD`](client::Client::head),
 //!   [`get_full`](client::Client::get_full), and
 //!   [`get_range`](client::Client::get_range).
 //!
 //! # Scope
 //!
-//! HTTP/1.1 only. Plaintext over [`TcpStream`](std::net::TcpStream) and
-//! TLS via `rustls` with WebPKI roots. No HTTP/2, no compression, no
-//! cookies, no proxies. The only request bodies the client knows how to
-//! send are zero bytes.
+//! HTTP/1.1 and HTTP/2 (selected by ALPN). HTTPS via `rustls` with
+//! WebPKI roots; plaintext HTTP supported. No compression, no cookies,
+//! no proxies. The only request bodies the client knows how to send
+//! are zero bytes.
 
 // `client` depends on `crate::io_backend`, which is Unix-only (see
 // `PLAN_v2.md` §7 / §7b). The other submodules (URL parsing, header
