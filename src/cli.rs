@@ -135,6 +135,18 @@ pub struct Cli {
     /// does not extend to that path in round-one of `PLAN_v2.md`.
     #[arg(long = "sha256", value_name = "HEX")]
     pub expected_sha256: Option<String>,
+
+    /// Additional mirror URL serving the same file
+    /// (`PLAN_v2.md` §13). The flag is repeatable; the positional
+    /// `url` is the primary, and every `--mirror` is an alternate.
+    /// At startup the coordinator runs `HEAD` against every URL in
+    /// parallel and drops mirrors whose `Content-Length` (or, when
+    /// `--sha256` is unset, `ETag` / `Last-Modified`) does not
+    /// agree with the primary. Surviving mirrors are picked from
+    /// per ranged GET, biased toward the fastest live one; failures
+    /// exclude a mirror for 30 s before it is retried.
+    #[arg(long = "mirror", value_name = "URL")]
+    pub mirrors: Vec<String>,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -224,6 +236,7 @@ impl Cli {
                 force_format_from_magic: self.force_format_from_magic,
                 io_backend: self.io_backend.into(),
                 expected_sha256,
+                mirror_urls: self.mirrors,
             },
             client,
             registry: DecoderRegistry::with_defaults(),

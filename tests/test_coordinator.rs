@@ -96,6 +96,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
+        mirror_urls: Vec::new(),
     }
 }
 
@@ -1720,10 +1721,10 @@ fn worker_probe_detects_source_drift() {
         last_modified: None,
     };
     let client = build_client();
+    let mirrors = peel::download::MirrorSet::single(url.clone(), fingerprint.clone());
     let ctx = peel::download::worker::ChunkContext {
         client: &client,
-        url: &url,
-        fingerprint: &fingerprint,
+        mirrors: &mirrors,
         chunk_size,
         sparse: &sparse,
         progress: None,

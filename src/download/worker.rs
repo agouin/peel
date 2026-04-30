@@ -28,10 +28,11 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use super::mirrors::{MirrorSet, DEFAULT_MIRROR_PICK_DEADLINE};
 use super::sparse_file::{SparseFile, SparseFileError};
 use crate::hash::crc32c::Crc32c;
 use crate::http::range::{parse_content_range, RangeError};
-use crate::http::{Client, ClientError, Headers, Url};
+use crate::http::{Client, ClientError, Headers};
 use crate::progress::ProgressState;
 use crate::types::{ByteRange, ChunkIndex};
 
@@ -159,6 +160,21 @@ pub enum WorkerError {
         /// Chunk that was in flight when cancellation was observed.
         chunk: ChunkIndex,
     },
+
+    /// Every mirror in the set was excluded for the configured
+    /// backoff window when [`download_dispatch`] tried to pick one.
+    /// Surfaces only in multi-mirror runs (`PLAN_v2.md` §13);
+    /// single-mirror runs use the existing retry-with-backoff path.
+    #[error(
+        "no mirror available for chunk {chunk} after waiting {wait_secs:.1}s; \
+         every configured mirror is in the failure-backoff window"
+    )]
+    NoLiveMirror {
+        /// Chunk being fetched.
+        chunk: ChunkIndex,
+        /// How long the worker waited for a live mirror to recover.
+        wait_secs: f64,
+    },
 }
 
 impl WorkerError {
@@ -181,6 +197,7 @@ impl WorkerError {
             Self::ContentRangeMalformed { .. } => false,
             Self::SparseFile { .. } => false,
             Self::Cancelled { .. } => false,
+            Self::NoLiveMirror { .. } => false,
         }
     }
 }
@@ -333,10 +350,11 @@ pub struct Dispatch {
 pub struct ChunkContext<'a> {
     /// HTTP client used to issue the ranged GET.
     pub client: &'a Client,
-    /// URL of the source (post-redirect, from `discover()`).
-    pub url: &'a Url,
-    /// `ETag` / `Last-Modified` to verify on every response.
-    pub fingerprint: &'a SourceFingerprint,
+    /// Mirror set the worker picks from for each attempt
+    /// (`PLAN_v2.md` §13). Single-URL runs construct a one-element
+    /// set via [`MirrorSet::single`]; multi-mirror runs build the
+    /// full set in [`crate::download::discover_with_mirrors`].
+    pub mirrors: &'a MirrorSet,
     /// Bitmap chunk size — used to slice the dispatch body into
     /// per-chunk CRC-32Cs (`PLAN_v2.md` §11).
     pub chunk_size: u64,
@@ -411,8 +429,32 @@ pub fn download_dispatch(
     let mut backoff = retry.initial_backoff;
     loop {
         attempt = attempt.saturating_add(1);
-        let err = match try_once(ctx, &dispatch) {
+        // Pick a mirror for this attempt. In single-mirror runs the
+        // wait collapses to a no-op (the lone mirror is always
+        // either live or excluded). In multi-mirror runs the picker
+        // skips excluded mirrors and (transparently) blocks until
+        // one recovers, up to `DEFAULT_MIRROR_PICK_DEADLINE`.
+        let started = Instant::now();
+        let mirror_idx = match ctx
+            .mirrors
+            .pick_or_wait(DEFAULT_MIRROR_PICK_DEADLINE, cancel)
+        {
+            Some(i) => i,
+            None => {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(WorkerError::Cancelled { chunk });
+                }
+                return Err(WorkerError::NoLiveMirror {
+                    chunk,
+                    wait_secs: DEFAULT_MIRROR_PICK_DEADLINE.as_secs_f64(),
+                });
+            }
+        };
+        let outcome = try_once(ctx, mirror_idx, &dispatch);
+        let elapsed = started.elapsed();
+        let err = match outcome {
             Ok((bytes, crcs)) => {
+                ctx.mirrors.record_success(mirror_idx, elapsed);
                 // Probe dispatches verify in-line and never bubble
                 // CRCs up to the scheduler — they're already
                 // verified against the expected value.
@@ -437,9 +479,27 @@ pub fn download_dispatch(
                     crcs,
                 });
             }
-            Err(e) if !e.is_retryable() => return Err(e),
-            Err(e) => e,
+            Err(e) => {
+                ctx.mirrors.record_failure(mirror_idx);
+                e
+            }
         };
+        if !err.is_retryable() {
+            // Multi-mirror policy: a per-mirror non-retryable error
+            // (mirror-specific source rotation, malformed
+            // Content-Range, etc.) drops *that* mirror. Try the
+            // remaining mirrors before propagating; only when every
+            // mirror has been excluded do we surface
+            // `NoLiveMirror`. Single-mirror runs short-circuit
+            // immediately because there is nothing to fall back to.
+            if !ctx.mirrors.has_alternates() {
+                return Err(err);
+            }
+            // Don't sleep on a non-retryable error — the picker's
+            // exclusion-aware wait handles backoff at the
+            // mirror-set level.
+            continue;
+        }
         if attempt >= retry.max_attempts {
             return Err(err);
         }
@@ -472,12 +532,17 @@ fn sleep_with_cancel(dur: Duration, cancel: &AtomicBool) -> bool {
     }
 }
 
-fn try_once(ctx: &ChunkContext<'_>, dispatch: &Dispatch) -> Result<(u64, Vec<u32>), WorkerError> {
+fn try_once(
+    ctx: &ChunkContext<'_>,
+    mirror_idx: usize,
+    dispatch: &Dispatch,
+) -> Result<(u64, Vec<u32>), WorkerError> {
     let chunk = dispatch.first;
     let range = dispatch.range;
+    let mirror = ctx.mirrors.mirror(mirror_idx);
     let resp = ctx
         .client
-        .get_range(ctx.url, range)
+        .get_range(&mirror.url, range)
         .map_err(|source| match source {
             ClientError::UnexpectedStatus { status, .. } => {
                 WorkerError::UnexpectedStatus { chunk, status }
@@ -490,7 +555,7 @@ fn try_once(ctx: &ChunkContext<'_>, dispatch: &Dispatch) -> Result<(u64, Vec<u32
 
     verify_content_range(&resp.headers, chunk, range)?;
     verify_content_length(&resp, chunk, range.len())?;
-    verify_fingerprint(&resp.headers, ctx.fingerprint, chunk)?;
+    verify_fingerprint(&resp.headers, &mirror.fingerprint, chunk)?;
 
     let len_usize = usize::try_from(range.len()).map_err(|_| WorkerError::BodyLengthMismatch {
         chunk,
@@ -512,7 +577,7 @@ fn try_once(ctx: &ChunkContext<'_>, dispatch: &Dispatch) -> Result<(u64, Vec<u32
 
     if body.is_drained() {
         let reader = body.into_inner();
-        ctx.client.release(ctx.url, reader);
+        ctx.client.release(&mirror.url, reader);
     }
     // Otherwise drop the body, closing the underlying connection.
 

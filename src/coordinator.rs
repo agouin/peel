@@ -61,10 +61,10 @@ use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
 use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
 use crate::download::{
-    chunk_count, discover, run as run_scheduler, ChunkFingerprints, DownloadInfo, DownloadStats,
-    ProbeConfig, RetryConfig, SchedulerConfig, SchedulerError, SourceFingerprint, SparseFile,
-    SparseFileError, ZipPipeline, ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent,
-    ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
+    chunk_count, discover_with_mirrors, run as run_scheduler, ChunkFingerprints, DownloadInfo,
+    DownloadStats, ProbeConfig, RetryConfig, SchedulerConfig, SchedulerError, SourceFingerprint,
+    SparseFile, SparseFileError, ZipPipeline, ZipPipelineConfig, ZipPipelineError,
+    ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 use crate::extractor::{
     CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
@@ -174,6 +174,14 @@ pub struct CoordinatorConfig {
     /// the integrity check does not extend to that path in round-one
     /// of `PLAN_v2.md`.
     pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
+    /// Additional mirror URLs (`PLAN_v2.md` §13). Each mirror is
+    /// expected to serve byte-identical copies of the source. The
+    /// coordinator runs `HEAD` against the primary plus every mirror
+    /// in parallel, drops disagreeing mirrors with a
+    /// `tracing::warn!`, and routes ranged GETs across the surviving
+    /// set. Empty for single-URL runs (the historical default).
+    /// Mirrors the repeatable `--mirror <URL>` CLI flag.
+    pub mirror_urls: Vec<String>,
 }
 
 impl Default for CoordinatorConfig {
@@ -192,6 +200,7 @@ impl Default for CoordinatorConfig {
             force_format_from_magic: false,
             io_backend: crate::io_backend::IoBackendChoice::default(),
             expected_sha256: None,
+            mirror_urls: Vec::new(),
         }
     }
 }
@@ -501,7 +510,28 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         .with_backend(Arc::clone(&io_backend))
         .map_err(CoordinatorError::Client)?;
 
-    let info = discover(&client, &parsed_url).map_err(CoordinatorError::Scheduler)?;
+    // Parse mirror URLs up front so a malformed `--mirror` errors
+    // out before any network traffic.
+    let mirror_urls: Vec<Url> = config
+        .mirror_urls
+        .iter()
+        .map(|s| {
+            Url::parse(s).map_err(|source| CoordinatorError::InvalidUrl {
+                url: s.clone(),
+                source,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let (info, mirror_set, dropped_mirrors) = discover_with_mirrors(
+        &client,
+        &parsed_url,
+        &mirror_urls,
+        config.expected_sha256.is_some(),
+    )
+    .map_err(CoordinatorError::Scheduler)?;
+    let mirror_set = Arc::new(mirror_set);
+    let _ = dropped_mirrors; // surfaced via tracing::warn! inside discover_with_mirrors
 
     let part_path = sidecar_path(&output, &config, ".peel.part");
     let ckpt_path = sidecar_path(&output, &config, ".peel.ckpt");
@@ -607,6 +637,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         policy,
         fingerprints: Some(Arc::clone(&fingerprints)),
         probe: ProbeConfig::default(),
+        mirrors: Some(Arc::clone(&mirror_set)),
     };
 
     let download_done = Arc::new(AtomicBool::new(false));
@@ -1452,10 +1483,17 @@ fn run_resume_probe(
         range,
         kind: crate::download::DispatchKind::Probe { expected },
     };
+    // The resume probe always speaks to the primary URL: per
+    // `PLAN_v2.md` §11 the probe verifies that *the source we
+    // checkpointed against* still serves the bytes we recorded. Even
+    // when `--mirror` is in play, we only have a fingerprint
+    // recorded against the URL the prior run discovered; cross-mirror
+    // probing happens later via §11's mid-flight verifier.
+    let probe_mirrors =
+        crate::download::MirrorSet::single(info.url.clone(), info.fingerprint.clone());
     let ctx = crate::download::worker::ChunkContext {
         client,
-        url: &info.url,
-        fingerprint: &info.fingerprint,
+        mirrors: &probe_mirrors,
         chunk_size,
         sparse,
         progress: None,

@@ -45,6 +45,7 @@ use thiserror::Error;
 
 use super::chunk_fingerprints::ChunkFingerprints;
 use super::chunk_policy::{ChunkSizePolicy, Sample};
+use super::mirrors::{Mirror, MirrorSet};
 use super::sparse_file::{SparseFile, SparseFileError};
 use super::worker::{
     download_dispatch, ChunkContext, ChunkOutcome, Dispatch, DispatchKind, RetryConfig,
@@ -64,6 +65,72 @@ pub const DEFAULT_WORKERS: u32 = 4;
 /// dispatch triggers a re-fetch of an already-complete chunk.
 /// Tunable via [`SchedulerConfig::probe`].
 pub const DEFAULT_PROBE_INTERVAL: u32 = 32;
+
+/// Why a `--mirror` URL was rejected during the agreement check.
+///
+/// Not a [`SchedulerError`]: discovery only *drops* disagreeing
+/// mirrors with a `tracing::warn!`, it does not fail the run as long
+/// as the primary is reachable. This enum is exposed so library
+/// callers and tests can introspect the dropped set.
+#[derive(Debug, Clone)]
+pub enum MirrorAgreementError {
+    /// The mirror's `HEAD` failed (network error, 4xx/5xx, missing
+    /// `Content-Length`, etc.).
+    HeadFailed {
+        /// URL the HEAD was issued against.
+        url: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// The mirror's `Content-Length` did not match the primary.
+    SizeMismatch {
+        /// Mirror URL.
+        url: String,
+        /// Mirror's reported total size.
+        actual: u64,
+        /// Size the primary reported.
+        expected: u64,
+    },
+    /// The mirror's `ETag` / `Last-Modified` disagreed with the
+    /// primary's, and the run is not using `--sha256` to provide an
+    /// alternative byte-level guarantee.
+    FingerprintMismatch {
+        /// Mirror URL.
+        url: String,
+        /// Mirror-side `ETag`, if any.
+        actual_etag: Option<String>,
+        /// Primary `ETag`, if any.
+        expected_etag: Option<String>,
+        /// Mirror-side `Last-Modified`, if any.
+        actual_last_modified: Option<String>,
+        /// Primary `Last-Modified`, if any.
+        expected_last_modified: Option<String>,
+    },
+}
+
+impl std::fmt::Display for MirrorAgreementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeadFailed { url, reason } => write!(f, "{url}: HEAD failed ({reason})"),
+            Self::SizeMismatch {
+                url,
+                actual,
+                expected,
+            } => write!(f, "{url}: size {actual} disagrees with primary {expected}"),
+            Self::FingerprintMismatch {
+                url,
+                actual_etag,
+                expected_etag,
+                actual_last_modified,
+                expected_last_modified,
+            } => write!(
+                f,
+                "{url}: fingerprint mismatch (etag {actual_etag:?} vs primary {expected_etag:?}, \
+                 last-modified {actual_last_modified:?} vs primary {expected_last_modified:?})"
+            ),
+        }
+    }
+}
 
 /// Errors produced by the scheduler.
 #[derive(Debug, Error)]
@@ -221,6 +288,14 @@ pub struct SchedulerConfig {
     /// `PLAN_v2.md` §11 mid-flight probe configuration. Inert when
     /// `fingerprints` is `None`.
     pub probe: ProbeConfig,
+    /// Multi-mirror routing (`PLAN_v2.md` §13). When set, workers
+    /// pick from this set per dispatch attempt; failures exclude a
+    /// mirror for the configured backoff window and other mirrors
+    /// pick up the slack. When `None`, the scheduler builds a
+    /// one-element [`MirrorSet`] from `info.url` /
+    /// `info.fingerprint` so single-mirror runs share the same code
+    /// path.
+    pub mirrors: Option<Arc<MirrorSet>>,
 }
 
 impl Default for SchedulerConfig {
@@ -233,6 +308,7 @@ impl Default for SchedulerConfig {
             policy: None,
             fingerprints: None,
             probe: ProbeConfig::default(),
+            mirrors: None,
         }
     }
 }
@@ -338,6 +414,165 @@ pub fn discover(client: &Client, url: &Url) -> Result<DownloadInfo, SchedulerErr
     })
 }
 
+/// Discover the primary URL and validate any `--mirror` alternates
+/// in parallel (`PLAN_v2.md` §13).
+///
+/// Returns the primary's [`DownloadInfo`] alongside a [`MirrorSet`]
+/// containing the primary plus every mirror that agreed with it on
+/// `Content-Length` and (when `expected_sha256.is_none()`)
+/// `ETag` / `Last-Modified`. Mirrors that disagree are dropped with
+/// a `tracing::warn!`, accumulated into the second return value,
+/// and not used for the run.
+///
+/// # Agreement rule
+///
+/// - **Always**: `Content-Length` must match the primary. A
+///   mismatched-size mirror is unambiguously wrong, regardless of
+///   any other check.
+/// - **When `expected_sha256` is `None`**: at least one of the
+///   primary's `ETag` (strong, per RFC 7232 §2.3) or `Last-Modified`
+///   must equal the mirror's. Weak ETags only promise semantic
+///   equivalence so a weak mismatch alone is advisory; the
+///   `Last-Modified` fallback covers the common CDN case where
+///   strong ETags differ but cache-validation timestamps agree.
+/// - **When `expected_sha256` is `Some(_)`**: the per-attempt SHA-256
+///   check at end-of-run is the byte-level guarantee, so per-mirror
+///   `ETag` / `Last-Modified` disagreement is allowed.
+///
+/// # Errors
+///
+/// The primary's discovery is fatal: any [`SchedulerError`] from the
+/// primary's `HEAD` propagates. Mirror failures are *not* fatal —
+/// they are dropped and surfaced via the returned `Vec` of
+/// [`MirrorAgreementError`].
+pub fn discover_with_mirrors(
+    client: &Client,
+    primary_url: &Url,
+    mirror_urls: &[Url],
+    expected_sha256_provided: bool,
+) -> Result<(DownloadInfo, MirrorSet, Vec<MirrorAgreementError>), SchedulerError> {
+    let primary = discover(client, primary_url)?;
+    if mirror_urls.is_empty() {
+        let set = MirrorSet::single(primary.url.clone(), primary.fingerprint.clone());
+        return Ok((primary, set, Vec::new()));
+    }
+
+    // Discover every mirror in parallel: each one's HEAD is independent
+    // of the others, and serializing them would visibly delay startup.
+    // `thread::scope` keeps the borrows on `client` alive without an
+    // Arc clone.
+    let results: Vec<Result<DownloadInfo, SchedulerError>> = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(mirror_urls.len());
+        for url in mirror_urls {
+            let client_ref = client;
+            let url_clone = url.clone();
+            let h = thread::Builder::new()
+                .name("peel-mirror-discover".into())
+                .spawn_scoped(scope, move || discover(client_ref, &url_clone))
+                .ok();
+            handles.push(h);
+        }
+        handles
+            .into_iter()
+            .map(|h| match h {
+                Some(handle) => handle.join().unwrap_or_else(|_| {
+                    Err(SchedulerError::Head {
+                        url: "<panicked>".into(),
+                        source: ClientError::DnsEmpty {
+                            host: String::new(),
+                            port: 0,
+                        },
+                    })
+                }),
+                None => Err(SchedulerError::Head {
+                    url: "<spawn-failed>".into(),
+                    source: ClientError::DnsEmpty {
+                        host: String::new(),
+                        port: 0,
+                    },
+                }),
+            })
+            .collect()
+    });
+
+    let mut mirrors: Vec<Mirror> = vec![Mirror::new(
+        primary.url.clone(),
+        primary.fingerprint.clone(),
+    )];
+    let mut dropped: Vec<MirrorAgreementError> = Vec::new();
+
+    for (mirror_url, result) in mirror_urls.iter().zip(results) {
+        match result {
+            Ok(info) => {
+                if info.total_size != primary.total_size {
+                    let err = MirrorAgreementError::SizeMismatch {
+                        url: mirror_url.to_string(),
+                        actual: info.total_size,
+                        expected: primary.total_size,
+                    };
+                    tracing::warn!("dropping mirror: {}", err);
+                    dropped.push(err);
+                    continue;
+                }
+                if !expected_sha256_provided
+                    && !fingerprints_agree(&primary.fingerprint, &info.fingerprint)
+                {
+                    let err = MirrorAgreementError::FingerprintMismatch {
+                        url: mirror_url.to_string(),
+                        actual_etag: info.fingerprint.etag.clone(),
+                        expected_etag: primary.fingerprint.etag.clone(),
+                        actual_last_modified: info.fingerprint.last_modified.clone(),
+                        expected_last_modified: primary.fingerprint.last_modified.clone(),
+                    };
+                    tracing::warn!("dropping mirror: {}", err);
+                    dropped.push(err);
+                    continue;
+                }
+                mirrors.push(Mirror::new(info.url, info.fingerprint));
+            }
+            Err(scheduler_err) => {
+                let err = MirrorAgreementError::HeadFailed {
+                    url: mirror_url.to_string(),
+                    reason: scheduler_err.to_string(),
+                };
+                tracing::warn!("dropping mirror: {}", err);
+                dropped.push(err);
+            }
+        }
+    }
+
+    let set = MirrorSet::new(mirrors);
+    Ok((primary, set, dropped))
+}
+
+/// Two fingerprints agree iff at least one of (strong ETag,
+/// Last-Modified) is present on both sides and equal.
+///
+/// Mirrors that send no source-identity headers at all (no ETag,
+/// no Last-Modified) cannot be proven byte-identical to the primary,
+/// so they are kept (the primary's lack of headers is symmetric);
+/// the §11 CRC-32C probe and `--sha256` (when set) catch any actual
+/// drift later. Weak ETags are advisory per RFC 7232 §2.3.
+fn fingerprints_agree(primary: &SourceFingerprint, mirror: &SourceFingerprint) -> bool {
+    if primary.is_empty() && mirror.is_empty() {
+        return true;
+    }
+    if let (Some(a), Some(b)) = (&primary.etag, &mirror.etag) {
+        let weak = super::worker::etag_is_weak(a) || super::worker::etag_is_weak(b);
+        if !weak && a == b {
+            return true;
+        }
+    }
+    if let (Some(a), Some(b)) = (&primary.last_modified, &mirror.last_modified) {
+        if a == b {
+            return true;
+        }
+    }
+    // Both sides carry at least one identifier but none of them
+    // match — that's a fingerprint mismatch.
+    false
+}
+
 /// Run the download to completion (or first terminal error).
 ///
 /// Picks parallel or single-stream mode from `info.accept_ranges` and
@@ -432,11 +667,25 @@ fn run_parallel(
     let task_rx = Mutex::new(task_rx);
     let cancel = AtomicBool::new(false);
 
+    // Build (or borrow) the mirror set the workers pick from.
+    // Single-URL runs (no `--mirror` flag) collapse to a one-element
+    // set so the worker code path stays uniform.
+    let local_set: Arc<MirrorSet>;
+    let mirrors: &MirrorSet = match config.mirrors.as_ref() {
+        Some(set) => set.as_ref(),
+        None => {
+            local_set = Arc::new(MirrorSet::single(
+                info.url.clone(),
+                info.fingerprint.clone(),
+            ));
+            local_set.as_ref()
+        }
+    };
+
     let scheduler_outcome: Result<DownloadStats, SchedulerError> = thread::scope(|scope| {
         let ctx = ChunkContext {
             client,
-            url: &info.url,
-            fingerprint: &info.fingerprint,
+            mirrors,
             chunk_size: config.chunk_size,
             sparse,
             progress: config.progress.as_deref(),

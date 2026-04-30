@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use peel::bitmap::ChunkBitmap;
 use peel::download::{
-    chunk_count, discover, run, ChunkSizePolicy, DownloadMode, RetryConfig, SchedulerConfig,
-    SchedulerError, SparseFile, WorkerError,
+    chunk_count, discover, discover_with_mirrors, run, ChunkSizePolicy, DownloadMode, MirrorSet,
+    RetryConfig, SchedulerConfig, SchedulerError, SparseFile, WorkerError,
 };
 use peel::http::{Client, ClientConfig, Url};
 use peel::types::ChunkIndex;
@@ -77,6 +77,7 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         policy: None,
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
     }
 }
 
@@ -676,6 +677,7 @@ fn run_rejects_zero_chunk_size() {
         policy: None,
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -700,6 +702,7 @@ fn run_rejects_zero_workers() {
         policy: None,
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));
@@ -762,6 +765,7 @@ fn run_with_policy_extracts_byte_identical_output() {
         policy: Some(Arc::clone(&policy)),
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -812,6 +816,7 @@ fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
         policy: Some(Arc::clone(&policy)),
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -862,6 +867,7 @@ fn run_without_policy_keeps_one_range_per_chunk() {
         policy: None,
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
     };
 
     run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("baseline run");
@@ -920,6 +926,7 @@ fn run_with_policy_resume_honors_existing_bitmap() {
         policy: Some(policy),
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive resume");
@@ -962,6 +969,7 @@ fn scheduler_records_per_chunk_crc32c_when_fingerprints_configured() {
         policy: None,
         fingerprints: Some(Arc::clone(&fingerprints)),
         probe: peel::download::ProbeConfig { interval: 0 }, // recording only
+        mirrors: None,
     };
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("download");
     assert_eq!(stats.chunks_completed, total_chunks);
@@ -1033,6 +1041,7 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
         // should trigger a probe that hits one of the seeded-wrong
         // chunks.
         probe: peel::download::ProbeConfig { interval: 1 },
+        mirrors: None,
     };
     let err =
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect_err("must abort");
@@ -1042,4 +1051,312 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
         }
         other => panic!("expected SourceChangedDuringDownload, got {other:?}"),
     }
+}
+
+// ---- multi-mirror downloads (PLAN_v2 §13) -------------------------------
+
+/// Standard "well-behaved server" handler factory that also tracks
+/// every range request it served. The returned tuple is `(handler,
+/// hit_counter)` where the counter increments once per non-HEAD
+/// request the server processes.
+fn counted_ok_handler(
+    body: Vec<u8>,
+    etag: Option<&'static str>,
+) -> (
+    impl Fn(&MockRequest, u64) -> MockResponse + Send + Sync + 'static,
+    Arc<AtomicU64>,
+) {
+    let counter = Arc::new(AtomicU64::new(0));
+    let counter_for_handler = Arc::clone(&counter);
+    let handler = move |req: &MockRequest, _n: u64| {
+        if req.method != "HEAD" {
+            counter_for_handler.fetch_add(1, Ordering::Relaxed);
+        }
+        serve(req, &body, etag.map(str::to_string), None)
+    };
+    (handler, counter)
+}
+
+#[test]
+fn discover_with_mirrors_keeps_agreeing_mirrors() {
+    let body = make_body(8000);
+    let body_clone = body.clone();
+    let primary = MockServer::start(ok_handler(body, Some("\"v1\"")));
+    let mirror = MockServer::start(ok_handler(body_clone, Some("\"v1\"")));
+    let client = build_client();
+    let primary_url = url(&primary, "/data");
+    let mirror_url = url(&mirror, "/data");
+
+    let (info, set, dropped) =
+        discover_with_mirrors(&client, &primary_url, &[mirror_url], false).expect("discover");
+    assert_eq!(info.total_size, 8000);
+    assert_eq!(set.len(), 2);
+    assert!(dropped.is_empty());
+}
+
+#[test]
+fn discover_with_mirrors_drops_size_disagreers() {
+    let body = make_body(8000);
+    let primary = MockServer::start(ok_handler(body, Some("\"v1\"")));
+    // Same content but a different size.
+    let mirror = MockServer::start(ok_handler(make_body(7999), Some("\"v1\"")));
+    let client = build_client();
+    let primary_url = url(&primary, "/data");
+    let mirror_url = url(&mirror, "/data");
+
+    let (info, set, dropped) =
+        discover_with_mirrors(&client, &primary_url, &[mirror_url], false).expect("discover");
+    assert_eq!(info.total_size, 8000);
+    assert_eq!(set.len(), 1, "size-disagreeing mirror must be dropped");
+    assert_eq!(dropped.len(), 1);
+}
+
+#[test]
+fn discover_with_mirrors_drops_etag_disagreers_without_sha256() {
+    let body = make_body(8000);
+    let body_clone = body.clone();
+    let primary = MockServer::start(ok_handler(body, Some("\"v1\"")));
+    // Same size, different ETag, no Last-Modified to fall back on.
+    let mirror = MockServer::start(ok_handler(body_clone, Some("\"different\"")));
+    let client = build_client();
+    let primary_url = url(&primary, "/data");
+    let mirror_url = url(&mirror, "/data");
+
+    let (_info, set, dropped) =
+        discover_with_mirrors(&client, &primary_url, &[mirror_url], false).expect("discover");
+    assert_eq!(set.len(), 1);
+    assert_eq!(dropped.len(), 1);
+}
+
+#[test]
+fn discover_with_mirrors_keeps_etag_disagreers_when_sha256_set() {
+    // With --sha256 set, the run has a byte-level guarantee at end
+    // of run, so per-mirror ETag disagreement is allowed.
+    let body = make_body(8000);
+    let body_clone = body.clone();
+    let primary = MockServer::start(ok_handler(body, Some("\"v1\"")));
+    let mirror = MockServer::start(ok_handler(body_clone, Some("\"different\"")));
+    let client = build_client();
+    let primary_url = url(&primary, "/data");
+    let mirror_url = url(&mirror, "/data");
+
+    let (_info, set, dropped) =
+        discover_with_mirrors(&client, &primary_url, &[mirror_url], true).expect("discover");
+    assert_eq!(set.len(), 2, "differing ETag is OK when --sha256 is set");
+    assert!(dropped.is_empty());
+}
+
+#[test]
+fn run_routes_chunks_across_two_mirrors() {
+    // Two mirrors serving identical bytes; `workers > 1` so requests
+    // can fan out concurrently. We expect *both* mirrors to see at
+    // least one ranged GET.
+    let body = make_body(40_000);
+    let body_clone = body.clone();
+    let body_for_mirror = body.clone();
+
+    let (h1, hits1) = counted_ok_handler(body, Some("\"v1\""));
+    let (h2, hits2) = counted_ok_handler(body_for_mirror, Some("\"v1\""));
+    let primary = MockServer::start(h1);
+    let mirror = MockServer::start(h2);
+    let client = build_client();
+    let primary_url = url(&primary, "/data");
+    let mirror_url = url(&mirror, "/data");
+
+    let (info, set, dropped) =
+        discover_with_mirrors(&client, &primary_url, &[mirror_url], false).expect("discover");
+    assert!(dropped.is_empty());
+    assert_eq!(set.len(), 2);
+    let mirrors = Arc::new(set);
+
+    let chunk_size = 4096;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    let path = temp_path("two_mirrors");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size,
+        workers: 4,
+        retry: fast_retry(),
+        progress: None,
+        policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
+        mirrors: Some(Arc::clone(&mirrors)),
+    };
+    run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run");
+
+    assert_eq!(read_full(&path), body_clone);
+    let h1_hits = hits1.load(Ordering::Relaxed);
+    let h2_hits = hits2.load(Ordering::Relaxed);
+    assert!(
+        h1_hits > 0 && h2_hits > 0,
+        "expected both mirrors to serve at least one chunk; got primary={h1_hits} mirror={h2_hits}",
+    );
+    assert_eq!(h1_hits + h2_hits, u64::from(total_chunks));
+}
+
+#[test]
+fn run_falls_back_when_one_mirror_dies() {
+    // Mirror A serves the first request then drops every subsequent
+    // connection, simulating an outage. Mirror B is healthy. The
+    // download must complete via B once A is excluded.
+    let body = make_body(40_000);
+    let body_clone = body.clone();
+
+    let a_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let counter_a = Arc::clone(&a_count);
+    let body_for_a = body.clone();
+    let primary_handler = move |req: &MockRequest, _n: u64| {
+        if req.method == "HEAD" {
+            return serve(req, &body_for_a, Some("\"v1\"".into()), None);
+        }
+        let n = counter_a.fetch_add(1, Ordering::Relaxed);
+        if n == 0 {
+            // Serve the first chunk normally.
+            serve(req, &body_for_a, Some("\"v1\"".into()), None)
+        } else {
+            // Then start dropping connections.
+            MockResponse::DropConnection
+        }
+    };
+    let primary = MockServer::start(primary_handler);
+    let (h_b, hits_b) = counted_ok_handler(body.clone(), Some("\"v1\""));
+    let mirror = MockServer::start(h_b);
+    let client = build_client();
+    let primary_url = url(&primary, "/data");
+    let mirror_url = url(&mirror, "/data");
+
+    let (info, set, dropped) =
+        discover_with_mirrors(&client, &primary_url, &[mirror_url], false).expect("discover");
+    assert!(dropped.is_empty());
+    // Construct the live MirrorSet with a tiny exclusion window so
+    // that a flaky mirror's exclusion does not stretch the test
+    // timeout. The default is 30 s, way too long for a unit test.
+    let mirrors = Arc::new(MirrorSet::with_exclude_for(
+        vec![
+            peel::download::Mirror::new(
+                set.mirror(0).url.clone(),
+                set.mirror(0).fingerprint.clone(),
+            ),
+            peel::download::Mirror::new(
+                set.mirror(1).url.clone(),
+                set.mirror(1).fingerprint.clone(),
+            ),
+        ],
+        Duration::from_millis(50),
+    ));
+
+    let chunk_size = 4096;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    let path = temp_path("one_mirror_dies");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size,
+        workers: 2,
+        retry: fast_retry(),
+        progress: None,
+        policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
+        mirrors: Some(Arc::clone(&mirrors)),
+    };
+    run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
+        .expect("run completes despite mirror A failing");
+
+    assert_eq!(read_full(&path), body_clone);
+    // Mirror B must have served the bulk of the chunks.
+    let b_hits = hits_b.load(Ordering::Relaxed);
+    assert!(
+        b_hits >= u64::from(total_chunks) - 1,
+        "expected mirror B to serve almost every chunk after A failed; got {b_hits}",
+    );
+}
+
+#[test]
+fn run_completes_after_all_mirrors_recover() {
+    // Both mirrors fail their first non-HEAD request, then succeed
+    // afterwards. With a tiny exclusion window the picker waits
+    // briefly for a recovery and the download finishes. This covers
+    // the "transient failure on every mirror does not fail the
+    // whole download" rule from PLAN_v2.md §13.
+    let body = make_body(8000);
+    let body_clone = body.clone();
+
+    let make_flaky = |body: Vec<u8>| {
+        let counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let counter_h = Arc::clone(&counter);
+        let handler = move |req: &MockRequest, _n: u64| {
+            if req.method == "HEAD" {
+                return serve(req, &body, Some("\"v1\"".into()), None);
+            }
+            let n = counter_h.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                MockResponse::Reply {
+                    status: 503,
+                    reason: "Service Unavailable",
+                    headers: vec![],
+                    body: Vec::new(),
+                }
+            } else {
+                serve(req, &body, Some("\"v1\"".into()), None)
+            }
+        };
+        (handler, counter)
+    };
+    let (ha, _ca) = make_flaky(body.clone());
+    let (hb, _cb) = make_flaky(body.clone());
+    let primary = MockServer::start(ha);
+    let mirror = MockServer::start(hb);
+    let client = build_client();
+    let primary_url = url(&primary, "/data");
+    let mirror_url = url(&mirror, "/data");
+
+    let (info, set, dropped) =
+        discover_with_mirrors(&client, &primary_url, &[mirror_url], false).expect("discover");
+    assert!(dropped.is_empty());
+    // Tiny exclusion window so the picker recovers quickly when
+    // every mirror has failed at least once.
+    let mirrors = Arc::new(MirrorSet::with_exclude_for(
+        vec![
+            peel::download::Mirror::new(
+                set.mirror(0).url.clone(),
+                set.mirror(0).fingerprint.clone(),
+            ),
+            peel::download::Mirror::new(
+                set.mirror(1).url.clone(),
+                set.mirror(1).fingerprint.clone(),
+            ),
+        ],
+        Duration::from_millis(50),
+    ));
+
+    let chunk_size = 2000;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    let path = temp_path("all_recover");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size,
+        workers: 2,
+        retry: RetryConfig {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+        },
+        progress: None,
+        policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
+        mirrors: Some(Arc::clone(&mirrors)),
+    };
+    run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("recovers");
+    assert_eq!(read_full(&path), body_clone);
 }

@@ -25,6 +25,7 @@
 
 pub mod chunk_fingerprints;
 pub mod chunk_policy;
+pub mod mirrors;
 pub mod mmap_region;
 pub mod scheduler;
 pub mod sparse_file;
@@ -36,10 +37,14 @@ pub use chunk_policy::{
     ChunkSizePolicy, ResizeDecision, Sample, DEFAULT_INITIAL_DISPATCH_BYTES, HYSTERESIS,
     MAX_DISPATCH_BYTES, MIN_DISPATCH_BYTES,
 };
+pub use mirrors::{
+    Mirror, MirrorSet, MirrorStats, DEFAULT_MIRROR_EXCLUDE_FOR, DEFAULT_MIRROR_PICK_DEADLINE,
+};
 pub use mmap_region::MmapRegion;
 pub use scheduler::{
-    chunk_count, discover, run, DownloadInfo, DownloadMode, DownloadStats, ProbeConfig,
-    SchedulerConfig, SchedulerError, DEFAULT_CHUNK_SIZE, DEFAULT_PROBE_INTERVAL, DEFAULT_WORKERS,
+    chunk_count, discover, discover_with_mirrors, run, DownloadInfo, DownloadMode, DownloadStats,
+    MirrorAgreementError, ProbeConfig, SchedulerConfig, SchedulerError, DEFAULT_CHUNK_SIZE,
+    DEFAULT_PROBE_INTERVAL, DEFAULT_WORKERS,
 };
 pub use sparse_file::{SparseFile, SparseFileError};
 pub use worker::{

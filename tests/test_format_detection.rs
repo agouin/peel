@@ -96,6 +96,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
+        mirror_urls: Vec::new(),
     }
 }
 
