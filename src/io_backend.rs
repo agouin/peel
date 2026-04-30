@@ -35,17 +35,64 @@
 #![cfg(unix)]
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
+use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 pub mod uring;
 
 #[cfg(target_os = "linux")]
 pub use uring::{UringBackend, UringInitError, DEFAULT_RING_DEPTH, MIN_RING_DEPTH};
+
+/// Per-connection socket configuration handed to [`IoBackend::connect`].
+///
+/// Backends translate these knobs to whatever surface they have:
+/// [`BlockingBackend`] applies `set_read_timeout` /
+/// `set_write_timeout` / `set_nodelay` on the underlying [`TcpStream`];
+/// the §7b uring backend stores the timeouts and applies them as
+/// linked TIMEOUT SQEs around each `recv`/`send`.
+#[derive(Debug, Clone)]
+pub struct SocketConfig {
+    /// Cap on time spent inside `connect(2)` itself.
+    pub connect_timeout: Duration,
+    /// Cap on time spent inside any single `read` call. `None` means
+    /// the backend default (typically: no timeout).
+    pub read_timeout: Option<Duration>,
+    /// Cap on time spent inside any single `write` call. `None` means
+    /// the backend default.
+    pub write_timeout: Option<Duration>,
+    /// Whether to disable Nagle's algorithm on the connected socket.
+    pub nodelay: bool,
+}
+
+impl Default for SocketConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            read_timeout: Some(Duration::from_secs(30)),
+            write_timeout: Some(Duration::from_secs(30)),
+            nodelay: true,
+        }
+    }
+}
+
+/// Synchronous, byte-oriented network stream returned by
+/// [`IoBackend::connect`].
+///
+/// Both the blocking [`TcpStream`] wrapper and the §7b uring socket
+/// adapter implement this. The trait carries no methods of its own —
+/// it is the supertrait bundle [`Read`] + [`Write`] + [`Send`] that
+/// the rest of [`crate::http::client`] cares about. A blanket impl
+/// makes any `Read + Write + Send` type satisfy it for free, so the
+/// blocking backend can return `Box::new(tcp_stream)` without
+/// boilerplate.
+pub trait NetStream: Read + Write + Send {}
+impl<T: Read + Write + Send + ?Sized> NetStream for T {}
 
 /// File-IO operations performed by the download workers and the
 /// sparse file.
@@ -110,6 +157,22 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Returns the underlying [`io::Error`] for any OS-level failure.
     fn sync_all(&self, fd: BorrowedFd<'_>) -> io::Result<()>;
+
+    /// Open a TCP connection to `addr` and return a [`NetStream`]
+    /// honoring `config`'s timeouts and `nodelay`.
+    ///
+    /// The returned stream is owned: the caller is responsible for its
+    /// lifetime, which determines when the underlying file descriptor
+    /// is closed. The stream is suitable for use as the inner type of
+    /// `rustls::StreamOwned` for HTTPS, or directly for plaintext
+    /// HTTP.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] for connect failures
+    /// (`ECONNREFUSED`, `ETIMEDOUT`, `ENETUNREACH`, …) or for socket
+    /// configuration failures (`set_read_timeout`, `set_nodelay`).
+    fn connect(&self, addr: SocketAddr, config: &SocketConfig) -> io::Result<Box<dyn NetStream>>;
 }
 
 /// Construct the always-available blocking backend.
@@ -237,6 +300,14 @@ impl IoBackend for BlockingBackend {
 
     fn sync_all(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
         with_file(fd, File::sync_all)
+    }
+
+    fn connect(&self, addr: SocketAddr, config: &SocketConfig) -> io::Result<Box<dyn NetStream>> {
+        let tcp = TcpStream::connect_timeout(&addr, config.connect_timeout)?;
+        tcp.set_read_timeout(config.read_timeout)?;
+        tcp.set_write_timeout(config.write_timeout)?;
+        tcp.set_nodelay(config.nodelay)?;
+        Ok(Box::new(tcp))
     }
 }
 
@@ -407,5 +478,40 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         backend2.pread_exact_at(fd, 0, &mut got).expect("read");
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn blocking_connect_round_trips_against_loopback() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).expect("read");
+            assert_eq!(&buf, b"hello");
+            s.write_all(b"world").expect("write");
+        });
+
+        let backend = BlockingBackend::new();
+        let cfg = SocketConfig::default();
+        let mut stream = backend.connect(addr, &cfg).expect("connect");
+        stream.write_all(b"hello").expect("write");
+        let mut got = [0u8; 5];
+        stream.read_exact(&mut got).expect("read");
+        assert_eq!(&got, b"world");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn socket_config_defaults_have_nodelay_and_timeouts() {
+        let cfg = SocketConfig::default();
+        assert!(cfg.nodelay);
+        assert!(cfg.read_timeout.is_some());
+        assert!(cfg.write_timeout.is_some());
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(30));
     }
 }

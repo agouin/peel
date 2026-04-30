@@ -32,13 +32,14 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use io_uring::{opcode, types, IoUring};
 
-use super::IoBackend;
+use super::{IoBackend, NetStream, SocketConfig};
 
 /// Default ring depth.
 ///
@@ -261,6 +262,20 @@ impl IoBackend for UringBackend {
         };
         self.dispatch(req)?;
         completion.wait().map(|_| ())
+    }
+
+    fn connect(&self, addr: SocketAddr, config: &SocketConfig) -> io::Result<Box<dyn NetStream>> {
+        // §7b.1 placeholder: the Linux io_uring socket implementation
+        // (Connect / Send / Recv via SQEs sharing the IO thread) lands
+        // in §7b.2. For now route through the blocking `TcpStream`
+        // path so the trait surface compiles and the Client refactor
+        // in §7b.3 has something to plug into. The mixed
+        // "uring-files + blocking-sockets" mode is not a supported
+        // production deployment — it exists only between the §7b.1
+        // and §7b.2 commits — and the §7.3 selection logic still
+        // returns this backend the same way it returned it before
+        // §7b.1, so callers see no behavioral change.
+        super::BlockingBackend::new().connect(addr, config)
     }
 }
 
