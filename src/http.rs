@@ -35,9 +35,12 @@
 //! no proxies. The only request bodies the client knows how to send
 //! are zero bytes.
 
-// `client` still imports `crate::io_backend` for the deprecated
-// [`Client::with_config_and_backend`] no-op (see TECH-DEBT note on
-// that method). `IoBackend` is Unix-only; the gating moves with it.
+// `client` is gated to `cfg(unix)` only because the underlying
+// `hyper-util` connector implementation we use brings in a tokio
+// runtime and currently inherits Unix-only paths from the wider
+// codebase. The HTTP path itself no longer touches
+// `crate::io_backend`; that boundary moved out with the migration
+// to hyper.
 #[cfg(unix)]
 pub mod client;
 pub mod range;

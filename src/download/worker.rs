@@ -597,11 +597,8 @@ fn try_once(
         p.add_downloaded(range.len());
     }
 
-    if body.is_drained() {
-        let reader = body.into_inner();
-        ctx.client.release(&mirror.url, reader);
-    }
-    // Otherwise drop the body, closing the underlying connection.
+    // hyper-util's connection pool reclaims the connection when the
+    // body is dropped at end of scope; no explicit release step.
 
     let crcs = compute_chunk_crcs(&buf, dispatch, ctx.chunk_size);
     Ok((range.len(), crcs))

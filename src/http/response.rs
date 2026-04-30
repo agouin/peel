@@ -94,25 +94,6 @@ impl Headers {
     }
 }
 
-/// Recovered carrier returned by [`BodyReader::into_inner`] and accepted
-/// by [`super::client::Client::release`].
-///
-/// TECH-DEBT: with the move to hyper, connection reuse is handled by
-/// `hyper-util`'s internal pool; callers no longer need to release
-/// anything explicitly. This type is kept as a deprecated placeholder
-/// for the worker-loop call site in [`crate::download::worker`] until
-/// it is updated; see `release` in [`super::client::Client`].
-#[derive(Debug)]
-pub struct ConnReader {
-    _private: (),
-}
-
-impl ConnReader {
-    pub(super) fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
 /// A response whose status and headers have been parsed.
 ///
 /// The body is exposed as a separate [`BodyReader`] so the caller can
@@ -218,16 +199,6 @@ impl BodyReader {
                 finished: false,
             },
         }
-    }
-
-    /// Recover the inner reader.
-    ///
-    /// TECH-DEBT: see [`ConnReader`]. The returned token is opaque and
-    /// only useful to pass to [`super::client::Client::release`], which
-    /// is itself a no-op under hyper. Slated for removal alongside the
-    /// worker-loop call site.
-    pub fn into_inner(self) -> ConnReader {
-        ConnReader::new()
     }
 
     /// True iff the body is fully drained (either it was constructed

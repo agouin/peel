@@ -19,10 +19,10 @@
 //! its frame-driven behavior under the covers.
 //!
 //! Connection pooling is handled inside `hyper-util`'s legacy client.
-//! `Client::release` is therefore a deprecated no-op (see TECH-DEBT
-//! note on the method); the per-host idle pool is sized by
-//! `ClientConfig::pool_capacity` via
-//! `hyper_util::client::legacy::Builder::pool_max_idle_per_host`.
+//! The per-host idle pool is sized by `ClientConfig::pool_capacity`
+//! via `hyper_util::client::legacy::Builder::pool_max_idle_per_host`.
+//! There is no caller-visible "release" step — drop the body when
+//! you are done with it and the pool reclaims the connection.
 //!
 //! Redirects, `UnexpectedStatus` checks, and the per-request timeout
 //! live in this module — those are the reasons the boundary in
@@ -50,9 +50,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::range::format_range_header;
 use super::request::Method;
-use super::response::{BodyCommand, BodyReader, ConnReader, Headers, Response, Status};
+use super::response::{BodyCommand, BodyReader, Headers, Response, Status};
 use super::url::{Url, UrlError};
-use crate::io_backend::IoBackend;
 use crate::types::ByteRange;
 
 /// Default cap on the number of redirects a single call will follow.
@@ -281,55 +280,6 @@ impl Client {
         })
     }
 
-    /// Construct a client with custom [`ClientConfig`] and an explicit
-    /// [`IoBackend`].
-    ///
-    /// TECH-DEBT (HTTP/2 migration): hyper opens its own sockets
-    /// through its `HttpConnector`, so the [`IoBackend`] passed here
-    /// is no longer used for HTTP. The parameter is retained as a
-    /// deprecated no-op to keep the call sites in
-    /// [`crate::cli`] / [`crate::coordinator`] / the `tests/` suite
-    /// compiling unchanged through this commit; the next commit will
-    /// remove the parameter and update those call sites. io_uring
-    /// continues to drive filesystem IO via
-    /// [`crate::download::SparseFile`].
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::with_config`].
-    pub fn with_config_and_backend(
-        config: ClientConfig,
-        _io_backend: Arc<dyn IoBackend>,
-    ) -> Result<Self, ClientError> {
-        Self::with_config(config)
-    }
-
-    /// Diagnostic name of the IO backend driving this client's
-    /// network connections.
-    ///
-    /// TECH-DEBT (HTTP/2 migration): with hyper, network IO no longer
-    /// goes through [`IoBackend`]; this always returns `"hyper"`.
-    /// Slated for removal in the same commit that drops the
-    /// [`Self::with_config_and_backend`] no-op.
-    #[must_use]
-    pub fn io_backend_name(&self) -> &'static str {
-        "hyper"
-    }
-
-    /// Return a fresh [`Client`] with this client's [`ClientConfig`]
-    /// preserved but a different [`IoBackend`] supplied.
-    ///
-    /// TECH-DEBT (HTTP/2 migration): see
-    /// [`Self::with_config_and_backend`]. The new `IoBackend` is
-    /// ignored; this is equivalent to cloning the client.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::with_config`].
-    pub fn with_backend(self, _io_backend: Arc<dyn IoBackend>) -> Result<Self, ClientError> {
-        Self::with_config(self.inner.config.clone())
-    }
-
     /// Issue a `HEAD` request, following redirects up to the
     /// configured limit.
     ///
@@ -386,33 +336,6 @@ impl Client {
             headers: outcome.headers,
             body: outcome.body,
         })
-    }
-
-    /// Return a fully-drained connection to the idle pool for reuse.
-    ///
-    /// TECH-DEBT (HTTP/2 migration): hyper-util's legacy client owns
-    /// the idle-connection pool internally, so this method is now a
-    /// no-op. It is retained so existing callers in
-    /// [`crate::download::worker`] continue to compile; those call
-    /// sites should be deleted in a follow-up cleanup commit.
-    pub fn release(&self, _url: &Url, _reader: ConnReader) {
-        // Intentional no-op; see method docstring.
-    }
-
-    /// Number of in-flight requests waiting on the runtime task.
-    ///
-    /// Exposed for diagnostics and tests. The hyper-util pool itself
-    /// does not surface its idle count, so this is no longer the
-    /// idle-pool size — it is the count of pending request envelopes
-    /// in the channel.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn pool_size(&self) -> usize {
-        // INVARIANT: capacity is unbounded; len() is monotone in
-        // pending requests, which is good enough for diagnostics.
-        // tokio's mpsc UnboundedSender does not expose len(), so we
-        // report 0 here — the field is preserved for API stability.
-        0
     }
 
     fn send_with_redirects(
