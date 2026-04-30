@@ -139,6 +139,7 @@ fn run_demo(args: Args) -> Result<(), String> {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
 
     let started = Instant::now();

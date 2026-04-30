@@ -79,6 +79,7 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     }
 }
 
@@ -680,6 +681,7 @@ fn run_rejects_zero_chunk_size() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -706,6 +708,7 @@ fn run_rejects_zero_workers() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));
@@ -770,6 +773,7 @@ fn run_with_policy_extracts_byte_identical_output() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -822,6 +826,7 @@ fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -874,6 +879,7 @@ fn run_without_policy_keeps_one_range_per_chunk() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
 
     run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("baseline run");
@@ -934,6 +940,7 @@ fn run_with_policy_resume_honors_existing_bitmap() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive resume");
@@ -978,6 +985,7 @@ fn scheduler_records_per_chunk_crc32c_when_fingerprints_configured() {
         probe: peel::download::ProbeConfig { interval: 0 }, // recording only
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("download");
     assert_eq!(stats.chunks_completed, total_chunks);
@@ -1051,6 +1059,7 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
         probe: peel::download::ProbeConfig { interval: 1 },
         mirrors: None,
         rate_limiter: None,
+        max_disk_buffer: None,
     };
     let err =
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect_err("must abort");
@@ -1195,6 +1204,7 @@ fn run_routes_chunks_across_two_mirrors() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirrors)),
         rate_limiter: None,
+        max_disk_buffer: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run");
 
@@ -1276,6 +1286,7 @@ fn run_falls_back_when_one_mirror_dies() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirrors)),
         rate_limiter: None,
+        max_disk_buffer: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
         .expect("run completes despite mirror A failing");
@@ -1368,6 +1379,7 @@ fn run_completes_after_all_mirrors_recover() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirrors)),
         rate_limiter: None,
+        max_disk_buffer: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("recovers");
     assert_eq!(read_full(&path), body_clone);
@@ -1406,6 +1418,7 @@ fn run_parallel_with_rate_limiter_extracts_byte_identical() {
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
         rate_limiter: Some(Arc::clone(&limiter)),
+        max_disk_buffer: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");
     assert_eq!(read_full(&path), body_clone);
@@ -1442,6 +1455,7 @@ fn run_parallel_with_rate_limiter_paces_below_uncapped_rate() {
             probe: peel::download::ProbeConfig::default(),
             mirrors: None,
             rate_limiter: limiter,
+            max_disk_buffer: None,
         };
         let started = std::time::Instant::now();
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");

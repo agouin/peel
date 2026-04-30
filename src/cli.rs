@@ -162,6 +162,19 @@ pub struct Cli {
     /// per-mirror.
     #[arg(long = "max-bandwidth", value_name = "RATE")]
     pub max_bandwidth: Option<String>,
+
+    /// Cap on the on-disk lookahead — bytes downloaded but not yet
+    /// consumed by the decoder. When the gap reaches this value the
+    /// download scheduler stops dispatching new chunks until the
+    /// decoder catches up, bounding the size of the `.peel.part`
+    /// file when the network is faster than the disk. Accepts the
+    /// same size syntax as `--max-bandwidth` (e.g. `512MiB`,
+    /// `2GB`); pass `none` (or `off` / `disabled`) to disable. The
+    /// default (`1GiB`) is high enough that it rarely engages on a
+    /// healthy disk and low enough that a slow disk doesn't fill
+    /// `/tmp` on a multi-GiB archive.
+    #[arg(long = "max-disk-buffer", value_name = "SIZE", default_value = "1GiB")]
+    pub max_disk_buffer: String,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -214,6 +227,28 @@ pub enum CliError {
     /// parse as a recognized rate (e.g. `10MB/s`, `1.5GiB`).
     #[error("--max-bandwidth value is not a valid rate")]
     InvalidBandwidth(#[source] ParseBandwidthError),
+
+    /// `--max-disk-buffer <SIZE>` was given but the value did not
+    /// parse as a recognized size or one of the disable sentinels.
+    #[error("--max-disk-buffer value is not a valid size")]
+    InvalidDiskBuffer(#[source] ParseBandwidthError),
+}
+
+/// Parse a `--max-disk-buffer` value into `Option<u64>` (bytes).
+///
+/// The case-insensitive sentinels `none`, `off`, and `disabled` map
+/// to `Ok(None)` (throttle disabled). Any other value is delegated
+/// to [`parse_bandwidth`], which already accepts the decimal /
+/// binary unit suffixes the help text advertises.
+fn parse_disk_buffer(input: &str) -> Result<Option<u64>, ParseBandwidthError> {
+    let trimmed = input.trim();
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "none" | "off" | "disabled" | "0"
+    ) {
+        return Ok(None);
+    }
+    parse_bandwidth(trimmed).map(Some)
 }
 
 impl Cli {
@@ -242,6 +277,8 @@ impl Cli {
             Some(s) => Some(parse_bandwidth(&s).map_err(CliError::InvalidBandwidth)?),
             None => None,
         };
+        let max_disk_buffer =
+            parse_disk_buffer(&self.max_disk_buffer).map_err(CliError::InvalidDiskBuffer)?;
         let client = Client::new()?;
         Ok(RunArgs {
             url: self.url,
@@ -262,6 +299,7 @@ impl Cli {
                 expected_sha256,
                 mirror_urls: self.mirrors,
                 max_bandwidth_bps,
+                max_disk_buffer,
             },
             client,
             registry: DecoderRegistry::with_defaults(),
@@ -593,6 +631,66 @@ mod tests {
         .expect("parse");
         let err = cli.into_run_args().err().expect("must error");
         assert!(matches!(err, CliError::InvalidBandwidth(_)));
+    }
+
+    #[test]
+    fn parses_max_disk_buffer_default_is_one_gibibyte() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(args.config.max_disk_buffer, Some(1 << 30));
+    }
+
+    #[test]
+    fn parses_max_disk_buffer_explicit_size() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--max-disk-buffer",
+            "512MiB",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(args.config.max_disk_buffer, Some(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parses_max_disk_buffer_disable_sentinels() {
+        for sentinel in ["none", "off", "disabled", "NONE", "Off", "DISABLED", "0"] {
+            let cli = Cli::try_parse_from([
+                "peel",
+                "https://example.com/x.zst",
+                "-o",
+                "/tmp/o",
+                "--max-disk-buffer",
+                sentinel,
+            ])
+            .unwrap_or_else(|_| panic!("parse failed for sentinel {sentinel:?}"));
+            let args = cli
+                .into_run_args()
+                .unwrap_or_else(|_| panic!("run args for sentinel {sentinel:?}"));
+            assert_eq!(
+                args.config.max_disk_buffer, None,
+                "sentinel {sentinel:?} should disable the throttle",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_max_disk_buffer_unit() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--max-disk-buffer",
+            "10XB",
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::InvalidDiskBuffer(_)));
     }
 
     #[test]

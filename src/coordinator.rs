@@ -189,6 +189,15 @@ pub struct CoordinatorConfig {
     /// aggregate across mirrors per the §14 step-5 contract. Mirrors
     /// the `--max-bandwidth <RATE>` CLI flag.
     pub max_bandwidth_bps: Option<u64>,
+    /// Cap on bytes downloaded but not yet consumed by the decoder.
+    /// When `Some`, the scheduler stops dispatching new chunks once
+    /// `bytes_downloaded - bytes_decoded_input` hits this value,
+    /// resuming when the decoder catches up. This bounds the on-disk
+    /// `.peel.part` footprint when the network is faster than the
+    /// disk / decoder. `None` disables the throttle. Mirrors the
+    /// `--max-disk-buffer <SIZE>` CLI flag (default `1 GiB`,
+    /// `none` to disable).
+    pub max_disk_buffer: Option<u64>,
 }
 
 impl Default for CoordinatorConfig {
@@ -209,9 +218,15 @@ impl Default for CoordinatorConfig {
             expected_sha256: None,
             mirror_urls: Vec::new(),
             max_bandwidth_bps: None,
+            max_disk_buffer: Some(DEFAULT_MAX_DISK_BUFFER),
         }
     }
 }
+
+/// Default cap for [`CoordinatorConfig::max_disk_buffer`]: 1 GiB. Big
+/// enough that a decently-fast disk+decoder will rarely throttle, small
+/// enough that a slow disk doesn't fill /tmp on a multi-GiB archive.
+pub const DEFAULT_MAX_DISK_BUFFER: u64 = 1 << 30;
 
 /// Caller-supplied progress callback fired periodically while [`run`]
 /// is running. Errors returned here surface as
@@ -655,6 +670,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         probe: ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirror_set)),
         rate_limiter: rate_limiter.clone(),
+        max_disk_buffer: config.max_disk_buffer,
     };
 
     let download_done = Arc::new(AtomicBool::new(false));
@@ -769,6 +785,10 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     Arc::clone(&download_outcome),
                     config.reader_poll_interval,
                 );
+                let reader = match progress_state.clone() {
+                    Some(state) => reader.with_progress(state),
+                    None => reader,
+                };
 
                 // Interpose a HashingReader between the source and
                 // the decoder when integrity tracking is on.
@@ -1259,6 +1279,18 @@ fn run_zip(
         download_outcome,
         sparse_fd: sparse.as_fd(),
     };
+
+    // Disable the disk-buffer throttle for the ZIP path. ZIP is
+    // random-access (the pipeline jumps to the EOCD, then to each
+    // entry's LFH), so the streaming "lookahead = downloaded -
+    // decoded" metric the scheduler uses does not apply: the entire
+    // archive is effectively "downloaded ahead of the cursor" but
+    // none of it is wasted, since the pipeline will read from any
+    // chunk the bitmap reports complete. Override the live cap to 0
+    // (= disabled) for the duration of this run.
+    if let Some(p) = progress_state {
+        p.set_max_disk_buffer(0);
+    }
 
     // Checkpoint cadence state, mirroring `run_one`.
     let mut last_write_at = Instant::now()
@@ -1758,6 +1790,11 @@ pub struct BlockingSparseReader {
     download_done: Arc<AtomicBool>,
     download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     poll_interval: Duration,
+    /// Optional shared progress state. When set, every advance of
+    /// the cursor also publishes the new value as
+    /// `bytes_decoded_input`, so the scheduler's disk-buffer throttle
+    /// (and the renderer's lookahead indicator) can read it.
+    progress_state: Option<Arc<ProgressState>>,
 }
 
 impl BlockingSparseReader {
@@ -1785,7 +1822,21 @@ impl BlockingSparseReader {
             download_done,
             download_outcome,
             poll_interval,
+            progress_state: None,
         }
+    }
+
+    /// Hook the reader up to a shared progress state so cursor
+    /// advances publish to `bytes_decoded_input`. Returns `self` for
+    /// chained construction.
+    #[must_use]
+    fn with_progress(mut self, state: Arc<ProgressState>) -> Self {
+        // Seed the progress state at the resume offset so the
+        // first lookahead query (before the first read) reads the
+        // correct value.
+        state.set_bytes_decoded_input(self.cursor.load(Ordering::Acquire));
+        self.progress_state = Some(state);
+        self
     }
 }
 
@@ -1849,7 +1900,10 @@ impl Read for BlockingSparseReader {
                     format!("short read from sparse file at offset {pos}"),
                 ));
             }
-            self.cursor.fetch_add(n as u64, Ordering::Release);
+            let new_pos = self.cursor.fetch_add(n as u64, Ordering::Release) + n as u64;
+            if let Some(p) = self.progress_state.as_ref() {
+                p.set_bytes_decoded_input(new_pos);
+            }
             return Ok(n);
         }
     }

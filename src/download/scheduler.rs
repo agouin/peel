@@ -304,6 +304,17 @@ pub struct SchedulerConfig {
     /// mirror, so the cap is aggregate, not per-mirror. `None`
     /// disables rate limiting (the default).
     pub rate_limiter: Option<Arc<RateLimiter>>,
+    /// Cap on bytes downloaded but not yet consumed by the decoder
+    /// (the disk-side lookahead buffer). When `Some` and the gap
+    /// `bytes_downloaded - bytes_decoded_input` reaches this value,
+    /// the dispatch loop stops handing new chunks to workers until
+    /// the decoder makes progress. This bounds the on-disk footprint
+    /// of un-extracted compressed data so a fast network into a slow
+    /// disk doesn't balloon the `.peel.part` file. `None` disables
+    /// the throttle. Requires `progress` to be set; without it the
+    /// scheduler has no way to read the decoder cursor and the field
+    /// is ignored.
+    pub max_disk_buffer: Option<u64>,
 }
 
 impl Default for SchedulerConfig {
@@ -318,6 +329,7 @@ impl Default for SchedulerConfig {
             probe: ProbeConfig::default(),
             mirrors: None,
             rate_limiter: None,
+            max_disk_buffer: None,
         }
     }
 }
@@ -623,6 +635,11 @@ pub fn run(
         } else {
             p.set_total_workers(1);
         }
+        // Publish the configured disk-buffer cap so the renderer can
+        // surface it. `0` is the "disabled" sentinel inside
+        // `ProgressState`, which already maps to `None` on the
+        // snapshot side.
+        p.set_max_disk_buffer(config.max_disk_buffer.unwrap_or(0));
     }
     if info.accept_ranges {
         let mut stats = run_parallel(client, info, sparse, bitmap, cursor, config, total_chunks)?;
@@ -732,9 +749,22 @@ fn run_parallel(
         let mut probe_rng: u64 = (u64::from(total_chunks) << 32) ^ 0x9E37_79B9_7F4A_7C15;
 
         'outer: loop {
+            // Disk-buffer backpressure: if the decoder is far enough
+            // behind the downloader that the on-disk lookahead has
+            // hit the configured cap, hold off on dispatching new
+            // chunks until the gap closes. The 50 ms timeout on
+            // `done_rx.recv_timeout` below provides natural cadence;
+            // we just skip the inner dispatch while-loop here. The
+            // `disk_bound` flag tells the renderer the throttle is
+            // active; it's cleared on the next un-throttled tick.
+            let throttled = is_disk_buffer_full(config);
+            if let Some(p) = config.progress.as_ref() {
+                p.set_disk_bound(throttled);
+            }
+
             // Dispatch as many as the channel will accept without
-            // blocking.
-            while in_flight < workers && completed + in_flight < total_chunks {
+            // blocking — unless the disk-buffer throttle is engaged.
+            while !throttled && in_flight < workers && completed + in_flight < total_chunks {
                 let cursor_chunk =
                     cursor_to_chunk(cursor.load(Ordering::Relaxed), config.chunk_size);
                 let target_chunks = target_chunk_count(config.policy.as_deref(), config.chunk_size);
@@ -900,6 +930,12 @@ fn run_parallel(
             limiter.shutdown();
         }
 
+        // Clear the disk-bound flag on shutdown so a stale "DISK"
+        // badge doesn't survive past the run.
+        if let Some(p) = config.progress.as_ref() {
+            p.set_disk_bound(false);
+        }
+
         match shutdown_reason {
             Some(e) => Err(e),
             None => Ok(stats_local),
@@ -907,6 +943,27 @@ fn run_parallel(
     });
 
     scheduler_outcome
+}
+
+/// Read the current disk-side lookahead (`bytes_downloaded -
+/// bytes_decoded_input`) from the shared progress state and compare
+/// it to the live cap. The cap comes from the snapshot rather than
+/// the static config so the coordinator can disable the throttle
+/// per-flow at runtime (notably, the ZIP pipeline calls
+/// [`crate::progress::ProgressState::set_max_disk_buffer`] with `0`
+/// because random-access ZIP downloads don't fit the streaming
+/// "lookahead" model).
+fn is_disk_buffer_full(config: &SchedulerConfig) -> bool {
+    let Some(progress) = config.progress.as_ref() else {
+        return false;
+    };
+    let snap = progress.snapshot();
+    let Some(max) = snap.max_disk_buffer else {
+        return false;
+    };
+    snap.bytes_downloaded
+        .saturating_sub(snap.bytes_decoded_input)
+        >= max
 }
 
 /// Map the policy's current target byte size to a chunk count
@@ -1320,6 +1377,80 @@ mod tests {
             chunk_count(1, 0),
             Err(SchedulerError::InvalidChunkSize)
         ));
+    }
+
+    // ---- is_disk_buffer_full ------------------------------------------
+
+    #[test]
+    fn disk_buffer_throttle_disabled_without_progress_state() {
+        let cfg = SchedulerConfig {
+            max_disk_buffer: Some(1024),
+            ..Default::default()
+        };
+        // No progress state → throttle inert regardless of cap.
+        assert!(!is_disk_buffer_full(&cfg));
+    }
+
+    #[test]
+    fn disk_buffer_throttle_disabled_when_cap_unset() {
+        let progress = ProgressState::new();
+        progress.add_downloaded(1_000_000);
+        progress.set_bytes_decoded_input(0);
+        // `max_disk_buffer` left at the default 0 (= disabled).
+        let cfg = SchedulerConfig {
+            progress: Some(progress),
+            max_disk_buffer: None,
+            ..Default::default()
+        };
+        assert!(!is_disk_buffer_full(&cfg));
+    }
+
+    #[test]
+    fn disk_buffer_throttle_engages_when_lookahead_at_cap() {
+        let progress = ProgressState::new();
+        // Scheduler publishes the live cap to progress on entry; we
+        // mirror that here so `is_disk_buffer_full` reads it from the
+        // snapshot.
+        progress.set_max_disk_buffer(1024);
+        progress.add_downloaded(2_000);
+        progress.set_bytes_decoded_input(500); // lookahead = 1500 ≥ 1024
+        let cfg = SchedulerConfig {
+            progress: Some(progress),
+            max_disk_buffer: Some(1024),
+            ..Default::default()
+        };
+        assert!(is_disk_buffer_full(&cfg));
+    }
+
+    #[test]
+    fn disk_buffer_throttle_releases_when_decoder_catches_up() {
+        let progress = ProgressState::new();
+        progress.set_max_disk_buffer(1024);
+        progress.add_downloaded(1_000);
+        progress.set_bytes_decoded_input(900); // lookahead = 100 < 1024
+        let cfg = SchedulerConfig {
+            progress: Some(progress),
+            max_disk_buffer: Some(1024),
+            ..Default::default()
+        };
+        assert!(!is_disk_buffer_full(&cfg));
+    }
+
+    #[test]
+    fn disk_buffer_throttle_honors_runtime_disable() {
+        // Static config has a cap set, but the coordinator pushed `0`
+        // (= disabled) into progress at runtime — e.g. for the ZIP
+        // path. Throttle should respect the live value.
+        let progress = ProgressState::new();
+        progress.set_max_disk_buffer(0);
+        progress.add_downloaded(10_000_000);
+        progress.set_bytes_decoded_input(0);
+        let cfg = SchedulerConfig {
+            progress: Some(progress),
+            max_disk_buffer: Some(1024),
+            ..Default::default()
+        };
+        assert!(!is_disk_buffer_full(&cfg));
     }
 
     #[test]
