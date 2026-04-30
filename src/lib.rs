@@ -12,9 +12,10 @@
 //! - [`types`] — strongly-typed primitives (`ByteOffset`, `ChunkIndex`,
 //!   `ByteRange`) shared across the codebase.
 //! - [`error`] — documentation of the per-module typed-error convention.
-//! - [`punch`] (Unix only) — the `PunchHole` trait and Linux/no-op
-//!   implementations used to release blocks of the compressed source as
-//!   the decoder advances.
+//! - [`punch`] (Unix only) — the `PunchHole` trait and the
+//!   Linux (`fallocate(PUNCH_HOLE)` + `madvise(MADV_REMOVE)`),
+//!   macOS (`fcntl(F_PUNCHHOLE)`), and no-op implementations used to
+//!   release blocks of the compressed source as the decoder advances.
 //!
 //! - [`bitmap`] — lock-free chunk completion bitmap shared across the
 //!   download workers, scheduler, and decoder.

@@ -1,14 +1,16 @@
 //! Integration tests for [`peel::punch`].
 //!
 //! On Linux these exercise the real
-//! `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` syscall against
-//! a 4 MiB sparse-friendly file in the platform temp directory; if the
-//! underlying filesystem doesn't support punching we treat the
-//! [`PunchError::Unsupported`] response as a skip rather than a failure.
+//! `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` syscall, on
+//! macOS the real `fcntl(F_PUNCHHOLE)` syscall, against a 4 MiB
+//! sparse-friendly file in the platform temp directory. If the
+//! underlying filesystem doesn't support punching (NFS, FAT, HFS+,
+//! certain FUSE mounts), the [`PunchError::Unsupported`] response is
+//! treated as a skip rather than a failure.
 //!
-//! On non-Linux Unix platforms [`peel::punch::default_puncher`] returns a
-//! [`peel::punch::NoopPuncher`] and we run the same end-to-end flow as a
-//! smoke test that proves the trait dispatch works.
+//! On every other Unix platform [`peel::punch::default_puncher`] returns
+//! a [`peel::punch::NoopPuncher`] and the end-to-end flow is reduced to
+//! a smoke test that proves the trait dispatch works.
 
 #![cfg(unix)]
 
@@ -19,7 +21,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use peel::punch::PunchHole;
 use peel::punch::{align_down, default_puncher, PunchError};
 use peel::types::ByteOffset;
@@ -175,4 +177,53 @@ fn linux_punch_releases_blocks_when_supported() {
 fn linux_puncher_block_size_hint_is_4096() {
     use peel::punch::LinuxPuncher;
     assert_eq!(LinuxPuncher::new().block_size_hint(), 4096);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_punch_releases_blocks_when_supported() {
+    use peel::punch::MacosPuncher;
+
+    let path = unique_temp_path("macos_release");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let file = create_dense_file(&path, FOUR_MIB);
+
+    let blocks_before = file.metadata().expect("metadata").blocks();
+    let size_before = file.metadata().expect("metadata").len();
+
+    // Sanity: a freshly-written 4 MiB dense file should hold non-trivial
+    // disk blocks. If this fails, the host fs is doing something exotic
+    // (a memory-only sandbox, perhaps) and the rest of the test is
+    // meaningless.
+    assert!(
+        blocks_before >= FOUR_MIB / 4096,
+        "expected dense file to occupy real blocks (got {blocks_before})"
+    );
+
+    let puncher = MacosPuncher::new();
+    match puncher.punch(file.as_fd(), ByteOffset::ZERO, FOUR_MIB) {
+        Ok(()) => {
+            let meta_after = file.metadata().expect("metadata");
+            assert_eq!(meta_after.len(), size_before, "logical size preserved");
+            assert!(
+                meta_after.blocks() < blocks_before,
+                "expected block count to decrease (before={}, after={})",
+                blocks_before,
+                meta_after.blocks()
+            );
+        }
+        Err(PunchError::Unsupported { .. }) => {
+            // Acceptable on volumes that reject the operation (HFS+,
+            // FAT, network shares, certain FUSE mounts). Modern macOS
+            // boots from APFS, so this branch should be rare on CI.
+        }
+        Err(other) => panic!("unexpected error from MacosPuncher: {other}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_puncher_block_size_hint_is_4096() {
+    use peel::punch::MacosPuncher;
+    assert_eq!(MacosPuncher::new().block_size_hint(), 4096);
 }

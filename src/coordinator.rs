@@ -1625,8 +1625,8 @@ fn open_sparse(
 /// Choose the right puncher for this run: the `mmap`-mode
 /// [`crate::punch::LinuxPuncher::for_mmap`] when the sparse file is
 /// memory-mapped, otherwise the platform default
-/// (`fallocate(PUNCH_HOLE)` on Linux, [`crate::punch::NoopPuncher`]
-/// elsewhere).
+/// (`fallocate(PUNCH_HOLE)` on Linux, `fcntl(F_PUNCHHOLE)` on macOS,
+/// [`crate::punch::NoopPuncher`] elsewhere).
 fn make_puncher(sparse: &SparseFile) -> Box<dyn PunchHole> {
     #[cfg(target_os = "linux")]
     if let Some(p) = sparse.make_mmap_puncher() {

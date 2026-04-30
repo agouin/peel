@@ -29,12 +29,17 @@
 //!   `EOPNOTSUPP`/`ENOTSUP`/`EINVAL`, which is mapped to
 //!   [`PunchError::Unsupported`] so the caller can downgrade to
 //!   [`NoopPuncher`] without aborting.
+//! - [`MacosPuncher`] (macOS only) calls `fcntl(F_PUNCHHOLE)` directly
+//!   via the C ABI (`PLAN_v2.md` §12). APFS supports it; HFS+, FAT, and
+//!   most network/FUSE volumes report `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`,
+//!   which is again mapped to [`PunchError::Unsupported`] so callers can
+//!   downgrade to [`NoopPuncher`].
 //! - [`default_puncher`] picks the best implementation for the running
 //!   platform.
 //!
-//! Other platforms (macOS `F_PUNCHHOLE`, Windows `FSCTL_SET_ZERO_DATA`)
-//! are deferred per `docs/PLAN.md` §2; the trait is shaped to admit them
-//! without changes to its callers.
+//! Other platforms (Windows `FSCTL_SET_ZERO_DATA`) are deferred per
+//! `docs/PLAN.md` §2; the trait is shaped to admit them without changes
+//! to its callers.
 //!
 //! # Alignment
 //!
@@ -174,17 +179,21 @@ pub const fn align_down(value: u64, alignment: u64) -> Option<u64> {
 
 /// Return the best [`PunchHole`] implementation for the current platform.
 ///
-/// On Linux this is a [`LinuxPuncher`]; on every other Unix it is a
-/// [`NoopPuncher`]. Callers that observe [`PunchError::Unsupported`]
-/// from the returned puncher should replace it with [`NoopPuncher`] and
-/// continue.
+/// On Linux this is a [`LinuxPuncher`]; on macOS it is a
+/// [`MacosPuncher`]; on every other Unix it is a [`NoopPuncher`].
+/// Callers that observe [`PunchError::Unsupported`] from the returned
+/// puncher should replace it with [`NoopPuncher`] and continue.
 #[must_use]
 pub fn default_puncher() -> Box<dyn PunchHole> {
     #[cfg(target_os = "linux")]
     {
         Box::new(LinuxPuncher::new())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(MacosPuncher::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Box::new(NoopPuncher::new())
     }
@@ -192,6 +201,9 @@ pub fn default_puncher() -> Box<dyn PunchHole> {
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxPuncher;
+
+#[cfg(target_os = "macos")]
+pub use macos::MacosPuncher;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -497,6 +509,141 @@ mod linux {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::io;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    use super::{PunchError, PunchHole};
+    use crate::types::ByteOffset;
+
+    /// `fcntl` command number for "deallocate a range of the file"
+    /// (`F_PUNCHHOLE`). Defined as `99` in Darwin's `<sys/fcntl.h>`
+    /// (xnu's `bsd/sys/fcntl.h`). Hard-coded here instead of pulled from
+    /// the `libc` crate because `libc` is not on the dependency
+    /// allowlist (`docs/ENGINEERING_STANDARDS.md` §2.2) and the constant
+    /// is part of the stable Darwin ABI.
+    const F_PUNCHHOLE: i32 = 99;
+
+    /// Darwin errno: "operation not supported". `fcntl(F_PUNCHHOLE)`
+    /// returns this on filesystems whose VFS layer rejects the request
+    /// outright (HFS+, FAT, most FUSE mounts).
+    const ENOTSUP: i32 = 45;
+    /// Darwin errno: "operation not supported on socket". On Darwin under
+    /// `__DARWIN_UNIX03` userland this is a *distinct* numeric value from
+    /// `ENOTSUP`, unlike Linux where they share `95`.
+    const EOPNOTSUPP: i32 = 102;
+    /// Darwin errno: "invalid argument". Returned when the filesystem
+    /// accepts the command but rejects the arguments — e.g., misaligned
+    /// offsets on an APFS volume that requires sector alignment. Same
+    /// numeric value as Linux.
+    const EINVAL: i32 = 22;
+
+    /// `fcntl(2)` `F_PUNCHHOLE` argument struct, mirroring the
+    /// `fpunchhole_t` definition in Darwin's `<sys/fcntl.h>`. The header
+    /// declares only three fields; `repr(C)` inserts the natural
+    /// 4-byte pad between `fp_flags` and `fp_offset` so the struct is
+    /// 24 bytes total — matching `sizeof(struct fpunchhole)` in C.
+    #[repr(C)]
+    struct Fpunchhole {
+        /// Reserved by the kernel for future flags; must be zero today.
+        fp_flags: u32,
+        /// Byte offset of the first byte to deallocate.
+        fp_offset: i64,
+        /// Length of the region to deallocate, in bytes.
+        fp_length: i64,
+    }
+
+    extern "C" {
+        // Darwin's `fcntl(2)` is variadic at the C level
+        // (`int fcntl(int fildes, int cmd, ...);`). We declare it
+        // variadic-correctly so the Apple arm64 ABI — which lays
+        // variadic arguments out on the stack starting from the first
+        // variadic slot — is followed. Calling extern variadics from
+        // Rust is stable; only *defining* them requires nightly.
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    /// macOS puncher driving `fcntl(F_PUNCHHOLE)` (`PLAN_v2.md` §12).
+    ///
+    /// APFS supports the operation; HFS+, FAT, SMB/AFP/NFS shares, and
+    /// most FUSE mounts return `ENOTSUP`/`EOPNOTSUPP`/`EINVAL` and we
+    /// surface those as [`PunchError::Unsupported`] so the caller can
+    /// downgrade to [`super::NoopPuncher`] without aborting — the same
+    /// graceful-degrade contract `LinuxPuncher` honors.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct MacosPuncher;
+
+    impl MacosPuncher {
+        /// Construct a fresh [`MacosPuncher`].
+        #[must_use]
+        pub const fn new() -> Self {
+            Self
+        }
+    }
+
+    impl PunchHole for MacosPuncher {
+        fn punch(
+            &self,
+            fd: BorrowedFd<'_>,
+            offset: ByteOffset,
+            length: u64,
+        ) -> Result<(), PunchError> {
+            if length == 0 {
+                return Ok(());
+            }
+
+            let raw_offset = offset.get();
+            let i_offset = i64::try_from(raw_offset).map_err(|_| PunchError::OffsetOverflow {
+                offset: raw_offset,
+                length,
+            })?;
+            let i_length = i64::try_from(length).map_err(|_| PunchError::OffsetOverflow {
+                offset: raw_offset,
+                length,
+            })?;
+
+            let mut arg = Fpunchhole {
+                fp_flags: 0,
+                fp_offset: i_offset,
+                fp_length: i_length,
+            };
+
+            // SAFETY: `fd` is a `BorrowedFd<'_>` whose lifetime brackets
+            // this call, so `fd.as_raw_fd()` is a valid file descriptor
+            // for the duration of the syscall. `arg` is a stack-local
+            // `#[repr(C)]` value matching Darwin's `fpunchhole_t`
+            // layout, valid for reads/writes by the kernel for the
+            // duration of the call. `fcntl` returns an `int`; on error
+            // it sets the thread-local errno which we read via
+            // `io::Error::last_os_error`.
+            let rc = unsafe { fcntl(fd.as_raw_fd(), F_PUNCHHOLE, &mut arg as *mut Fpunchhole) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(e) if e == ENOTSUP || e == EOPNOTSUPP || e == EINVAL => {
+                    Err(PunchError::Unsupported { errno: e })
+                }
+                _ => Err(PunchError::Io {
+                    offset: raw_offset,
+                    length,
+                    source: err,
+                }),
+            }
+        }
+
+        fn block_size_hint(&self) -> u64 {
+            // APFS reports a 4096-byte block size on every Mac shipped
+            // since the format launched in 2017; matches the Linux
+            // default and keeps the `align_down` math identical across
+            // platforms.
+            4096
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +800,57 @@ mod tests {
             )
         };
         assert!(p.is_mmap());
+    }
+
+    // ---- MacosPuncher (macos-only) -----------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_puncher_block_size_hint_is_4096() {
+        assert_eq!(MacosPuncher::new().block_size_hint(), 4096);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_puncher_zero_length_is_noop_ok() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_fd();
+        let p = MacosPuncher::new();
+        // No syscall happens for length 0, so a non-regular fd (stdout)
+        // is fine; we are checking the early-return contract.
+        assert!(p.punch(fd, ByteOffset::ZERO, 0).is_ok());
+        assert!(p.punch(fd, ByteOffset::new(1024), 0).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_puncher_rejects_offset_above_i64_max() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_fd();
+        let p = MacosPuncher::new();
+        let off = ByteOffset::new(u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1));
+        match p.punch(fd, off, 1) {
+            Err(PunchError::OffsetOverflow { offset, length }) => {
+                assert_eq!(offset, off.get());
+                assert_eq!(length, 1);
+            }
+            other => panic!("expected OffsetOverflow, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_puncher_rejects_length_above_i64_max() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_fd();
+        let p = MacosPuncher::new();
+        let len = u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1);
+        match p.punch(fd, ByteOffset::ZERO, len) {
+            Err(PunchError::OffsetOverflow { offset, length }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(length, len);
+            }
+            other => panic!("expected OffsetOverflow, got {other:?}"),
+        }
     }
 }
