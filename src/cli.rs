@@ -58,8 +58,27 @@ pub struct Cli {
     pub workers: u32,
 
     /// Chunk size used to slice the source for ranged downloads.
+    ///
+    /// This is the bitmap chunk size — the unit of completion
+    /// tracked in checkpoints. With adaptive chunk-sizing enabled
+    /// (the default), the scheduler may coalesce several
+    /// consecutive chunks into a single ranged GET; this flag
+    /// continues to set the *bitmap* unit. Passing `--chunk-size`
+    /// alongside `--no-adaptive-chunk-size` forces a fixed dispatch
+    /// size for the run (`PLAN_v2.md` §8 step 4).
     #[arg(long = "chunk-size", default_value_t = DEFAULT_CHUNK_SIZE)]
     pub chunk_size: u64,
+
+    /// Disable the adaptive chunk-size policy (`PLAN_v2.md` §8).
+    ///
+    /// When set, the scheduler dispatches one bitmap chunk per
+    /// worker task, with no growth or shrink decisions over the
+    /// lifetime of the run. The `--chunk-size` value is the
+    /// fixed-size dispatch unit. Useful for benchmarking and
+    /// reproducible test runs where adaptive behaviour would
+    /// change observed throughput.
+    #[arg(long = "no-adaptive-chunk-size", default_value_t = false)]
+    pub no_adaptive_chunk_size: bool,
 
     /// Minimum gap between in-loop hole-punch syscalls.
     #[arg(long = "punch-threshold", default_value_t = DEFAULT_PUNCH_THRESHOLD)]
@@ -148,6 +167,7 @@ impl Cli {
             output,
             config: CoordinatorConfig {
                 chunk_size: self.chunk_size,
+                adaptive_chunk_size: !self.no_adaptive_chunk_size,
                 workers: self.workers,
                 retry: RetryConfig::default(),
                 punch_threshold: self.punch_threshold,
@@ -304,6 +324,48 @@ mod tests {
             IoBackendChoice::from(IoBackendArg::Uring),
             IoBackendChoice::Uring
         );
+    }
+
+    #[test]
+    fn parses_no_adaptive_chunk_size_default_off() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        assert!(!cli.no_adaptive_chunk_size);
+    }
+
+    #[test]
+    fn parses_no_adaptive_chunk_size_flag() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--no-adaptive-chunk-size",
+        ])
+        .expect("parse");
+        assert!(cli.no_adaptive_chunk_size);
+    }
+
+    #[test]
+    fn no_adaptive_chunk_size_flips_coordinator_field() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--no-adaptive-chunk-size",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(!args.config.adaptive_chunk_size);
+    }
+
+    #[test]
+    fn default_run_args_have_adaptive_enabled() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(args.config.adaptive_chunk_size);
     }
 
     #[test]

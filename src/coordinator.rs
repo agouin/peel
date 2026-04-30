@@ -106,8 +106,20 @@ impl OutputTarget {
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
     /// HTTP-side: chunk size used when slicing the source for parallel
-    /// ranged downloads.
+    /// ranged downloads. This is the **bitmap chunk size** — the
+    /// unit of completion tracked in the bitmap and persisted in
+    /// checkpoints. With adaptive sizing on (the default), the
+    /// scheduler may coalesce several consecutive bitmap chunks into
+    /// a single ranged GET; the bitmap unit itself stays fixed for
+    /// the lifetime of the run (`PLAN_v2.md` §8).
     pub chunk_size: u64,
+    /// Adaptive chunk-size policy (`PLAN_v2.md` §8). When `true`
+    /// (default), the scheduler observes per-dispatch latency / retry
+    /// rate and grows or shrinks the dispatch size accordingly,
+    /// bounded below by `chunk_size` and above by 64 MiB. When
+    /// `false`, the dispatch size stays equal to `chunk_size` for the
+    /// whole run (matches the pre-§8 behaviour).
+    pub adaptive_chunk_size: bool,
     /// HTTP-side: number of parallel download workers.
     pub workers: u32,
     /// Per-chunk retry policy (forwarded to the scheduler).
@@ -155,6 +167,7 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
+            adaptive_chunk_size: true,
             workers: DEFAULT_WORKERS,
             retry: RetryConfig::default(),
             punch_threshold: DEFAULT_PUNCH_THRESHOLD,
@@ -516,11 +529,21 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         });
     }
 
+    let policy = if config.adaptive_chunk_size {
+        Some(Arc::new(crate::download::ChunkSizePolicy::new(
+            config.chunk_size,
+            crate::download::DEFAULT_INITIAL_DISPATCH_BYTES,
+        )))
+    } else {
+        None
+    };
+
     let scheduler_cfg = SchedulerConfig {
         chunk_size: config.chunk_size,
         workers: config.workers,
         retry: config.retry.clone(),
         progress: progress_state.clone(),
+        policy,
     };
 
     let download_done = Arc::new(AtomicBool::new(false));

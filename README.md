@@ -30,6 +30,11 @@ peel https://example.com/dataset.tar.zst -C ./out
   blocking IO on older kernels or when `RLIMIT_MEMLOCK` is too low.
   Pick the path explicitly with `--io-backend [auto|blocking|uring]`
   (default: `auto`).
+- Adapts the dispatch size during a run: the scheduler observes per-GET
+  latency and retry rate and grows or shrinks how many bitmap chunks it
+  coalesces into a single ranged GET (1 MiB floor, 64 MiB cap, 30 s
+  hysteresis). Disable with `--no-adaptive-chunk-size`; force a fixed
+  bitmap unit with `--chunk-size <BYTES>`.
 
 ## Why you want this
 

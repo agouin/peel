@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use peel::bitmap::ChunkBitmap;
 use peel::download::{
-    chunk_count, discover, run, DownloadMode, RetryConfig, SchedulerConfig, SchedulerError,
-    SparseFile, WorkerError,
+    chunk_count, discover, run, ChunkSizePolicy, DownloadMode, RetryConfig, SchedulerConfig,
+    SchedulerError, SparseFile, WorkerError,
 };
 use peel::http::{Client, ClientConfig, Url};
 use peel::types::ChunkIndex;
@@ -74,6 +74,7 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         workers,
         retry: fast_retry(),
         progress: None,
+        policy: None,
     }
 }
 
@@ -670,6 +671,7 @@ fn run_rejects_zero_chunk_size() {
         workers: 1,
         retry: fast_retry(),
         progress: None,
+        policy: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -691,7 +693,226 @@ fn run_rejects_zero_workers() {
         workers: 0,
         retry: fast_retry(),
         progress: None,
+        policy: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));
+}
+
+// ---- adaptive chunk size (PLAN_v2 §8) -----------------------------------
+
+/// Wraps the standard `ok_handler` and counts how many `Range:` headers
+/// the server actually saw. With dispatch coalescing on, a download
+/// of N bitmap chunks can finish in N/coalesce_factor server hits, so
+/// a smaller hit count is direct evidence the policy is taking effect.
+fn ok_handler_with_range_counter(
+    body: Vec<u8>,
+    range_count: Arc<AtomicU64>,
+) -> impl Fn(&MockRequest, u64) -> MockResponse + Send + Sync + 'static {
+    move |req, _n| {
+        if req.method == "GET" && req.header("range").is_some() {
+            range_count.fetch_add(1, Ordering::Relaxed);
+        }
+        serve(req, &body, None, None)
+    }
+}
+
+#[test]
+fn run_with_policy_extracts_byte_identical_output() {
+    // Adaptive enabled, against the same body the non-adaptive happy
+    // path uses. The output must be byte-identical to a clean
+    // non-adaptive run — the policy must never corrupt the file.
+    let body = make_body(40_000);
+    let body_clone = body.clone();
+    let range_count = Arc::new(AtomicU64::new(0));
+    let server = MockServer::start(ok_handler_with_range_counter(
+        body,
+        Arc::clone(&range_count),
+    ));
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/data")).expect("discover");
+    let chunk_size = 1024;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+
+    let path = temp_path("adaptive_byte_identical");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    let policy = Arc::new(ChunkSizePolicy::with_bounds(
+        chunk_size,
+        4 * 1024,
+        chunk_size,
+        16 * 1024,
+        Duration::from_millis(0),
+    ));
+
+    let cfg = SchedulerConfig {
+        chunk_size,
+        workers: 4,
+        retry: fast_retry(),
+        progress: None,
+        policy: Some(Arc::clone(&policy)),
+    };
+
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
+    assert_eq!(stats.bytes_downloaded as usize, body_clone.len());
+    assert_eq!(stats.chunks_completed, total_chunks);
+    for i in 0..total_chunks {
+        assert!(bitmap.is_complete(ChunkIndex::new(i)));
+    }
+    assert_eq!(read_full(&path), body_clone);
+}
+
+#[test]
+fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
+    // 40 KiB body at 1 KiB bitmap chunks = 40 bitmap chunks. With a
+    // policy that has dispatched at 4-chunk granularity from the
+    // start, we expect ~10 range requests, not 40.
+    let body = make_body(40_000);
+    let total_chunks = 40u32;
+    let chunk_size = 1024u64;
+    let range_count = Arc::new(AtomicU64::new(0));
+    let server = MockServer::start(ok_handler_with_range_counter(
+        body,
+        Arc::clone(&range_count),
+    ));
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/data")).expect("discover");
+
+    let path = temp_path("adaptive_coalesce");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    // Pin the policy at 4 chunks per dispatch by setting min == max.
+    let policy = Arc::new(ChunkSizePolicy::with_bounds(
+        chunk_size,
+        4 * chunk_size,
+        4 * chunk_size,
+        4 * chunk_size,
+        Duration::from_millis(0),
+    ));
+
+    let cfg = SchedulerConfig {
+        chunk_size,
+        workers: 4,
+        retry: fast_retry(),
+        progress: None,
+        policy: Some(Arc::clone(&policy)),
+    };
+
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
+    assert_eq!(stats.chunks_completed, total_chunks);
+    let observed = range_count.load(Ordering::Relaxed);
+    // 40 chunks / 4 per dispatch = 10 expected range requests. Allow a
+    // small slack for the cursor wrap-around path that can re-pick a
+    // run shorter than 4 once the tail has fewer remaining chunks
+    // than the target — but we're tightly bounded above by 40 (the
+    // pre-§8 1-chunk-per-task baseline).
+    assert!(
+        observed <= 12,
+        "expected <= 12 range requests with 4-chunk dispatch, got {observed}"
+    );
+    assert!(
+        observed < u64::from(total_chunks),
+        "expected fewer requests than the {total_chunks}-chunk baseline, got {observed}"
+    );
+}
+
+#[test]
+fn run_without_policy_keeps_one_range_per_chunk() {
+    // Sanity baseline: with policy = None, every bitmap chunk is its
+    // own ranged GET — the pre-§8 behaviour. Pairs with the
+    // coalescing test above.
+    let body = make_body(40_000);
+    let total_chunks = 40u32;
+    let chunk_size = 1024u64;
+    let range_count = Arc::new(AtomicU64::new(0));
+    let server = MockServer::start(ok_handler_with_range_counter(
+        body,
+        Arc::clone(&range_count),
+    ));
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/data")).expect("discover");
+
+    let path = temp_path("nonadaptive_baseline");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    let cfg = SchedulerConfig {
+        chunk_size,
+        workers: 4,
+        retry: fast_retry(),
+        progress: None,
+        policy: None,
+    };
+
+    run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("baseline run");
+    let observed = range_count.load(Ordering::Relaxed);
+    assert_eq!(observed, u64::from(total_chunks));
+}
+
+#[test]
+fn run_with_policy_resume_honors_existing_bitmap() {
+    // Adaptive sizing must not re-dispatch chunks that resumed
+    // already-complete. We pre-mark the first half of the bitmap and
+    // verify the post-run byte count reflects only the new bytes.
+    let body = make_body(20_000);
+    let chunk_size = 1024u64;
+    let range_count = Arc::new(AtomicU64::new(0));
+    let server = MockServer::start(ok_handler_with_range_counter(
+        body.clone(),
+        Arc::clone(&range_count),
+    ));
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/data")).expect("discover");
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+
+    let path = temp_path("adaptive_resume");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    // Pre-write the first half of the file and mark those bitmap
+    // chunks complete to simulate a resume.
+    let half_chunks = total_chunks / 2;
+    use peel::types::ByteOffset;
+    sparse
+        .pwrite_at(
+            ByteOffset::new(0),
+            &body[..(half_chunks as u64 * chunk_size) as usize],
+        )
+        .expect("pre-fill");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    for i in 0..half_chunks {
+        bitmap.mark_complete(ChunkIndex::new(i));
+    }
+    let cursor = AtomicU64::new(0);
+
+    let policy = Arc::new(ChunkSizePolicy::with_bounds(
+        chunk_size,
+        2 * chunk_size,
+        chunk_size,
+        4 * chunk_size,
+        Duration::from_millis(0),
+    ));
+
+    let cfg = SchedulerConfig {
+        chunk_size,
+        workers: 4,
+        retry: fast_retry(),
+        progress: None,
+        policy: Some(policy),
+    };
+
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive resume");
+    assert_eq!(stats.chunks_resumed, half_chunks);
+    // Only the second half was downloaded.
+    let remaining_bytes = info.total_size - half_chunks as u64 * chunk_size;
+    assert_eq!(stats.bytes_downloaded, remaining_bytes);
+    // And byte-identical reassembly.
+    assert_eq!(read_full(&path), body);
 }

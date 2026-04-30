@@ -134,6 +134,7 @@ fn run_demo(args: Args) -> Result<(), String> {
         workers: args.workers,
         retry: RetryConfig::default(),
         progress: None,
+        policy: None,
     };
 
     let started = Instant::now();

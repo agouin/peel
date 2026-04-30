@@ -8,12 +8,14 @@
 //! # Threading
 //!
 //! Parallel mode uses [`std::thread::scope`] to spawn N worker threads.
-//! Workers receive [`ChunkIndex`] assignments from a bounded
+//! Workers receive [`Dispatch`] assignments from a bounded
 //! `mpsc::sync_channel` (the **task** channel) and report results on a
-//! second `mpsc::channel` (the **completion** channel). The calling
-//! thread serves as the scheduler: it picks the next chunk to dispatch
-//! based on the decoder's cursor (chunks at or past the cursor are
-//! preferred), waits on completions, and tracks progress.
+//! second `mpsc::channel` (the **completion** channel). Each
+//! [`Dispatch`] covers one or more contiguous bitmap chunks fetched in
+//! a single ranged GET (see `PLAN_v2.md` §8 — adaptive chunk size).
+//! The calling thread serves as the scheduler: it picks the next
+//! dispatch based on the decoder's cursor (chunks at or past the
+//! cursor are preferred), waits on completions, and tracks progress.
 //!
 //! # Cursor priority
 //!
@@ -41,9 +43,11 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use super::chunk_policy::{ChunkSizePolicy, Sample};
 use super::sparse_file::{SparseFile, SparseFileError};
 use super::worker::{
-    download_chunk, ChunkContext, ChunkOutcome, RetryConfig, SourceFingerprint, WorkerError,
+    download_dispatch, ChunkContext, ChunkOutcome, Dispatch, RetryConfig, SourceFingerprint,
+    WorkerError,
 };
 use crate::bitmap::ChunkBitmap;
 use crate::http::{Client, ClientError, Url};
@@ -163,7 +167,11 @@ pub struct DownloadInfo {
 /// Tunables for [`run`].
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Chunk size in bytes. Must be non-zero.
+    /// Chunk size in bytes. Must be non-zero. This is the **bitmap
+    /// chunk size** — the unit of completion tracked in the bitmap
+    /// and persisted in checkpoints. With adaptive chunk sizing
+    /// disabled (default for `--chunk-size <N>` runs), it is also
+    /// the per-task dispatch size.
     pub chunk_size: u64,
     /// Number of parallel workers in `Accept-Ranges` mode. Must be
     /// non-zero. Single-stream mode ignores this.
@@ -175,6 +183,13 @@ pub struct SchedulerConfig {
     /// `bytes_downloaded` / `active_workers` as they fetch chunks.
     /// `None` keeps the scheduler silent.
     pub progress: Option<Arc<ProgressState>>,
+    /// Optional adaptive chunk-size policy (`PLAN_v2.md` §8). When
+    /// `Some`, the scheduler coalesces consecutive incomplete chunks
+    /// into one ranged GET sized at `policy.current()`, and feeds
+    /// completion samples back to the policy so it can grow / shrink
+    /// the dispatch size over time. `None` (default) preserves the
+    /// pre-§8 1-chunk-per-task behaviour.
+    pub policy: Option<Arc<ChunkSizePolicy>>,
 }
 
 impl Default for SchedulerConfig {
@@ -184,6 +199,7 @@ impl Default for SchedulerConfig {
             workers: DEFAULT_WORKERS,
             retry: RetryConfig::default(),
             progress: None,
+            policy: None,
         }
     }
 }
@@ -361,7 +377,7 @@ fn run_parallel(
 
     let workers = config.workers;
     let pool_capacity = usize::try_from(workers).unwrap_or(usize::MAX);
-    let (task_tx, task_rx) = mpsc::sync_channel::<ChunkIndex>(pool_capacity);
+    let (task_tx, task_rx) = mpsc::sync_channel::<Dispatch>(pool_capacity);
     let (done_tx, done_rx) = mpsc::channel::<Completion>();
     let task_rx = Mutex::new(task_rx);
     let cancel = AtomicBool::new(false);
@@ -379,15 +395,11 @@ fn run_parallel(
             let task_rx = &task_rx;
             let done_tx = done_tx.clone();
             let cancel = &cancel;
-            let chunk_size = config.chunk_size;
-            let total_size = info.total_size;
             let retry = config.retry.clone();
             thread::Builder::new()
                 .name(format!("peel-download-worker-{w_id}"))
                 .spawn_scoped(scope, move || {
-                    worker_loop(
-                        &ctx, chunk_size, total_size, &retry, task_rx, done_tx, cancel,
-                    );
+                    worker_loop(&ctx, &retry, task_rx, done_tx, cancel);
                 })
                 .ok();
         }
@@ -407,20 +419,30 @@ fn run_parallel(
             while in_flight < workers && completed + in_flight < total_chunks {
                 let cursor_chunk =
                     cursor_to_chunk(cursor.load(Ordering::Relaxed), config.chunk_size);
-                let next = pick_next_chunk(&dispatched, cursor_chunk, total_chunks);
-                let Some(idx) = next else { break };
-                match task_tx.try_send(idx) {
+                let target_chunks = target_chunk_count(config.policy.as_deref(), config.chunk_size);
+                let Some(task) = pick_next_dispatch(
+                    &dispatched,
+                    cursor_chunk,
+                    total_chunks,
+                    target_chunks,
+                    config.chunk_size,
+                    info.total_size,
+                ) else {
+                    break;
+                };
+                match task_tx.try_send(task) {
                     Ok(()) => {
-                        dispatched.mark_complete(idx);
+                        let end = task.first.get().saturating_add(task.count);
+                        dispatched.complete_range(task.first, ChunkIndex::new(end));
                         in_flight += 1;
                     }
                     Err(mpsc::TrySendError::Full(_)) => break,
                     Err(mpsc::TrySendError::Disconnected(_)) => {
                         cancel.store(true, Ordering::Relaxed);
                         shutdown_reason.get_or_insert(SchedulerError::ChunkFailed {
-                            chunk: idx,
+                            chunk: task.first,
                             attempts: 0,
-                            source: WorkerError::Cancelled { chunk: idx },
+                            source: WorkerError::Cancelled { chunk: task.first },
                         });
                         break 'outer;
                     }
@@ -436,7 +458,13 @@ fn run_parallel(
             // work while workers are mid-chunk.
             let msg = match done_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(m) => m,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(policy) = config.policy.as_deref() {
+                        let remaining = u64::from(total_chunks.saturating_sub(completed));
+                        let _ = policy.evaluate(Instant::now(), remaining, workers);
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
 
@@ -446,16 +474,27 @@ fn run_parallel(
                 .saturating_add(u64::from(msg.attempts.saturating_sub(1)));
             match msg.result {
                 Ok(()) => {
-                    bitmap.mark_complete(msg.chunk);
+                    let end = msg.first.get().saturating_add(msg.count);
+                    bitmap.complete_range(msg.first, ChunkIndex::new(end));
                     stats_local.bytes_downloaded =
                         stats_local.bytes_downloaded.saturating_add(msg.bytes);
-                    stats_local.chunks_completed = stats_local.chunks_completed.saturating_add(1);
-                    completed += 1;
+                    stats_local.chunks_completed =
+                        stats_local.chunks_completed.saturating_add(msg.count);
+                    completed = completed.saturating_add(msg.count);
+                    if let Some(policy) = config.policy.as_deref() {
+                        policy.record(Sample {
+                            at: Instant::now(),
+                            elapsed: msg.elapsed,
+                            retried: msg.attempts > 1,
+                        });
+                        let remaining = u64::from(total_chunks.saturating_sub(completed));
+                        let _ = policy.evaluate(Instant::now(), remaining, workers);
+                    }
                 }
                 Err(err) => {
                     cancel.store(true, Ordering::Relaxed);
                     shutdown_reason.get_or_insert(SchedulerError::ChunkFailed {
-                        chunk: msg.chunk,
+                        chunk: msg.first,
                         attempts: msg.attempts,
                         source: err,
                     });
@@ -477,15 +516,28 @@ fn run_parallel(
     scheduler_outcome
 }
 
-/// One worker thread's lifetime: pull tasks off the shared receiver,
-/// execute, report the result, repeat. Exits cleanly when the task
-/// channel closes or `cancel` becomes true.
+/// Map the policy's current target byte size to a chunk count
+/// (rounded down). Returns `1` when the policy is absent — the
+/// pre-§8 behaviour.
+fn target_chunk_count(policy: Option<&ChunkSizePolicy>, chunk_size: u64) -> u32 {
+    let Some(policy) = policy else {
+        return 1;
+    };
+    if chunk_size == 0 {
+        return 1;
+    }
+    let bytes = policy.current();
+    let chunks = bytes / chunk_size;
+    u32::try_from(chunks.max(1)).unwrap_or(u32::MAX)
+}
+
+/// One worker thread's lifetime: pull dispatches off the shared
+/// receiver, execute, report the result, repeat. Exits cleanly when
+/// the task channel closes or `cancel` becomes true.
 fn worker_loop(
     ctx: &ChunkContext<'_>,
-    chunk_size: u64,
-    total_size: u64,
     retry: &RetryConfig,
-    task_rx: &Mutex<mpsc::Receiver<ChunkIndex>>,
+    task_rx: &Mutex<mpsc::Receiver<Dispatch>>,
     done_tx: mpsc::Sender<Completion>,
     cancel: &AtomicBool,
 ) {
@@ -493,7 +545,7 @@ fn worker_loop(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        let chunk = {
+        let dispatch = {
             // INVARIANT: the only writer to this Mutex is the scheduler
             // setting it up; if a worker panics holding the lock, all
             // threads die together inside thread::scope, so a poisoned
@@ -504,43 +556,36 @@ fn worker_loop(
                 Err(_) => return,
             };
             match rx.recv() {
-                Ok(idx) => idx,
+                Ok(d) => d,
                 Err(_) => return,
-            }
-        };
-
-        let range = match chunk_range(chunk, chunk_size, total_size) {
-            Some(r) => r,
-            None => {
-                let _ = done_tx.send(Completion {
-                    chunk,
-                    bytes: 0,
-                    attempts: 0,
-                    result: Err(WorkerError::Cancelled { chunk }),
-                });
-                return;
             }
         };
 
         if let Some(p) = ctx.progress {
             p.worker_started();
         }
-        let outcome = download_chunk(ctx, chunk, range, retry, cancel);
+        let started = Instant::now();
+        let outcome = download_dispatch(ctx, dispatch, retry, cancel);
+        let elapsed = started.elapsed();
         if let Some(p) = ctx.progress {
             p.worker_finished();
         }
 
         let msg = match outcome {
             Ok(ChunkOutcome { bytes, attempts }) => Completion {
-                chunk,
+                first: dispatch.first,
+                count: dispatch.count,
                 bytes,
                 attempts,
+                elapsed,
                 result: Ok(()),
             },
             Err(err) => Completion {
-                chunk,
+                first: dispatch.first,
+                count: dispatch.count,
                 bytes: 0,
                 attempts: 1,
+                elapsed,
                 result: Err(err),
             },
         };
@@ -710,18 +755,62 @@ fn pick_next_chunk(
     dispatched.next_incomplete_after(ChunkIndex::ZERO)
 }
 
-/// The half-open byte range covered by chunk `idx`, given the chunk
-/// size and the file's total size. Returns `None` if `idx` is past the
-/// end of the file or if arithmetic would overflow `u64`.
-fn chunk_range(idx: ChunkIndex, chunk_size: u64, total_size: u64) -> Option<ByteRange> {
-    idx.byte_range(chunk_size, total_size)
+/// Pick the next [`Dispatch`] to assign to a worker.
+///
+/// Picks the same starting chunk as [`pick_next_chunk`], then walks
+/// forward greedily as long as the next chunk is also incomplete and
+/// the running count stays under `target_chunks`. Returns `None` when
+/// every chunk is already dispatched.
+///
+/// `target_chunks` is the policy's current target in bitmap-chunk
+/// units (always `>= 1`). The bound is a *cap*, not a target — a
+/// run of fewer contiguous incomplete chunks is dispatched as-is so
+/// the next run starts on the first new gap, not on a chunk we just
+/// skipped because of the cap.
+fn pick_next_dispatch(
+    dispatched: &ChunkBitmap,
+    cursor_chunk: u32,
+    total_chunks: u32,
+    target_chunks: u32,
+    chunk_size: u64,
+    total_size: u64,
+) -> Option<Dispatch> {
+    let first = pick_next_chunk(dispatched, cursor_chunk, total_chunks)?;
+    let target = target_chunks.max(1);
+    // Walk forward to see how many consecutive chunks we can
+    // coalesce. Cap at `target_chunks` and at `total_chunks`.
+    let mut count: u32 = 1;
+    while count < target {
+        let next = first.get().checked_add(count)?;
+        if next >= total_chunks {
+            break;
+        }
+        let next_idx = ChunkIndex::new(next);
+        if dispatched.is_complete(next_idx) {
+            break;
+        }
+        count += 1;
+    }
+
+    let start_byte = u64::from(first.get()).checked_mul(chunk_size)?;
+    let end_byte = start_byte
+        .checked_add(u64::from(count).checked_mul(chunk_size)?)?
+        .min(total_size);
+    let range = ByteRange::new(ByteOffset::new(start_byte), ByteOffset::new(end_byte))?;
+    Some(Dispatch {
+        first,
+        count,
+        range,
+    })
 }
 
 #[derive(Debug)]
 struct Completion {
-    chunk: ChunkIndex,
+    first: ChunkIndex,
+    count: u32,
     bytes: u64,
     attempts: u32,
+    elapsed: Duration,
     result: Result<(), WorkerError>,
 }
 
@@ -850,18 +939,72 @@ mod tests {
         );
     }
 
-    // ---- chunk_range --------------------------------------------------
+    // ---- pick_next_dispatch -------------------------------------------
 
     #[test]
-    fn chunk_range_typical() {
-        let r = chunk_range(ChunkIndex::new(2), 4096, 16_384).expect("range");
-        assert_eq!(r.start(), ByteOffset::new(8192));
-        assert_eq!(r.end_exclusive(), ByteOffset::new(12_288));
+    fn pick_next_dispatch_single_chunk_when_target_one() {
+        let dispatched = ChunkBitmap::new(8);
+        let task = pick_next_dispatch(&dispatched, 0, 8, 1, 1024, 8 * 1024).expect("dispatch");
+        assert_eq!(task.first.get(), 0);
+        assert_eq!(task.count, 1);
+        assert_eq!(task.range.len(), 1024);
     }
 
     #[test]
-    fn chunk_range_truncates_last_partial_chunk() {
-        let r = chunk_range(ChunkIndex::new(3), 1_000, 3_500).expect("range");
-        assert_eq!(r.len(), 500);
+    fn pick_next_dispatch_coalesces_consecutive_incomplete() {
+        let dispatched = ChunkBitmap::new(8);
+        let task = pick_next_dispatch(&dispatched, 0, 8, 4, 1024, 8 * 1024).expect("dispatch");
+        assert_eq!(task.first.get(), 0);
+        assert_eq!(task.count, 4);
+        assert_eq!(task.range.len(), 4 * 1024);
+    }
+
+    #[test]
+    fn pick_next_dispatch_stops_at_already_dispatched() {
+        let dispatched = ChunkBitmap::new(8);
+        // Mark chunk 2 as already dispatched; the run starting at 0
+        // can only cover 0,1.
+        dispatched.mark_complete(ChunkIndex::new(2));
+        let task = pick_next_dispatch(&dispatched, 0, 8, 8, 1024, 8 * 1024).expect("dispatch");
+        assert_eq!(task.first.get(), 0);
+        assert_eq!(task.count, 2);
+        assert_eq!(task.range.len(), 2 * 1024);
+    }
+
+    #[test]
+    fn pick_next_dispatch_truncates_last_partial_chunk() {
+        // 3 chunks total but the last is half-sized.
+        let dispatched = ChunkBitmap::new(3);
+        let task = pick_next_dispatch(&dispatched, 0, 3, 8, 1_000, 2_500).expect("dispatch");
+        assert_eq!(task.first.get(), 0);
+        assert_eq!(task.count, 3);
+        // 2*1000 (full) + 500 (truncated last)
+        assert_eq!(task.range.len(), 2_500);
+    }
+
+    #[test]
+    fn pick_next_dispatch_returns_none_when_done() {
+        let dispatched = ChunkBitmap::new(4);
+        for i in 0..4 {
+            dispatched.mark_complete(ChunkIndex::new(i));
+        }
+        assert!(pick_next_dispatch(&dispatched, 0, 4, 8, 1024, 4 * 1024).is_none());
+    }
+
+    #[test]
+    fn target_chunk_count_no_policy_returns_one() {
+        assert_eq!(target_chunk_count(None, 4096), 1);
+    }
+
+    #[test]
+    fn target_chunk_count_with_policy_divides() {
+        let policy = Arc::new(ChunkSizePolicy::with_bounds(
+            1024,
+            4 * 1024,
+            1024,
+            64 * 1024,
+            Duration::from_millis(10),
+        ));
+        assert_eq!(target_chunk_count(Some(&policy), 1024), 4);
     }
 }

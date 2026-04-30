@@ -92,6 +92,7 @@ fn fast_retry() -> RetryConfig {
 fn coord_config(chunk_size: u64) -> CoordinatorConfig {
     CoordinatorConfig {
         chunk_size,
+        adaptive_chunk_size: false,
         workers: 2,
         retry: fast_retry(),
         punch_threshold: 4096,

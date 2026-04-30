@@ -23,17 +23,22 @@
 
 #![cfg(unix)]
 
+pub mod chunk_policy;
 pub mod scheduler;
 pub mod sparse_file;
 pub mod worker;
 pub mod zip_pipeline;
 
+pub use chunk_policy::{
+    ChunkSizePolicy, ResizeDecision, Sample, DEFAULT_INITIAL_DISPATCH_BYTES, HYSTERESIS,
+    MAX_DISPATCH_BYTES, MIN_DISPATCH_BYTES,
+};
 pub use scheduler::{
     chunk_count, discover, run, DownloadInfo, DownloadMode, DownloadStats, SchedulerConfig,
     SchedulerError, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 pub use sparse_file::{SparseFile, SparseFileError};
-pub use worker::{ChunkOutcome, RetryConfig, SourceFingerprint, WorkerError};
+pub use worker::{ChunkOutcome, Dispatch, RetryConfig, SourceFingerprint, WorkerError};
 pub use zip_pipeline::{
     BoundedSparseReader, ZipExtractionStats, ZipPipeline, ZipPipelineConfig, ZipPipelineError,
     ZipPipelineEvent, ZipResumeState,

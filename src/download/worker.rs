@@ -239,6 +239,26 @@ pub struct ChunkOutcome {
     pub attempts: u32,
 }
 
+/// One worker assignment: a contiguous run of bitmap chunks fetched
+/// in a single ranged GET.
+///
+/// `count == 1` is the original 1-chunk-per-task behaviour and the
+/// only thing the scheduler dispatches when adaptive chunk-size is
+/// disabled. With adaptive enabled (`PLAN_v2.md` §8) the scheduler
+/// coalesces up to `policy.current() / chunk_size` consecutive
+/// incomplete chunks into one [`Dispatch`].
+#[derive(Debug, Clone, Copy)]
+pub struct Dispatch {
+    /// First chunk in the run.
+    pub first: ChunkIndex,
+    /// Number of contiguous chunks (>= 1).
+    pub count: u32,
+    /// Half-open byte range covering all `count` chunks. The worker
+    /// performs **one** ranged GET against this range and writes the
+    /// whole body via a single `pwrite_at`.
+    pub range: ByteRange,
+}
+
 /// Borrowed context shared across every chunk in a single download.
 ///
 /// Bundling these references keeps [`download_chunk`]'s signature
@@ -280,6 +300,42 @@ pub fn download_chunk(
     retry: &RetryConfig,
     cancel: &AtomicBool,
 ) -> Result<ChunkOutcome, WorkerError> {
+    download_dispatch(
+        ctx,
+        Dispatch {
+            first: chunk,
+            count: 1,
+            range,
+        },
+        retry,
+        cancel,
+    )
+}
+
+/// Download an N-chunk [`Dispatch`] with retry/backoff.
+///
+/// One ranged GET, one `pwrite_at`, regardless of `dispatch.count`.
+/// On success the *whole* range is durable on disk before the
+/// function returns; the scheduler can then mark every constituent
+/// chunk complete in the bitmap. On failure no partial bytes are
+/// written (the response is read in full into a buffer first), so
+/// retries always restart cleanly.
+///
+/// `chunk` context in returned [`WorkerError`] variants names
+/// `dispatch.first` — the dispatch is atomic, so naming the first
+/// chunk is the unambiguous diagnostic anchor.
+///
+/// # Errors
+///
+/// Returns the *last* error observed if all retries are exhausted, or
+/// the first non-retryable error encountered.
+pub fn download_dispatch(
+    ctx: &ChunkContext<'_>,
+    dispatch: Dispatch,
+    retry: &RetryConfig,
+    cancel: &AtomicBool,
+) -> Result<ChunkOutcome, WorkerError> {
+    let chunk = dispatch.first;
     if cancel.load(Ordering::Relaxed) {
         return Err(WorkerError::Cancelled { chunk });
     }
@@ -287,7 +343,7 @@ pub fn download_chunk(
     let mut backoff = retry.initial_backoff;
     loop {
         attempt = attempt.saturating_add(1);
-        let err = match try_once(ctx, chunk, range) {
+        let err = match try_once(ctx, chunk, dispatch.range) {
             Ok(bytes) => {
                 return Ok(ChunkOutcome {
                     bytes,

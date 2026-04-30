@@ -27,15 +27,21 @@ it would be approached if/when prioritized.
 
 ### O.1 Adaptive chunk size
 
-**What**: tune chunk size during download based on observed throughput
-and connection RTT, instead of a fixed 4 MiB.
-
-**Why deferred**: 4 MiB is a known-good value for typical CDN setups;
-optimizing further is premature without real-world telemetry.
-
-**Sketch**: track per-worker chunk completion times; when all workers
-consistently complete chunks in <1s, double chunk size up to a cap (say
-64 MiB); when latency spikes or we see frequent retries, halve.
+**Status: delivered in `PLAN_v2.md` §8 (2026-04-29).** The bitmap chunk
+size — the on-disk planning unit and the value persisted in the
+checkpoint — is fixed for the lifetime of a run. The new
+[`ChunkSizePolicy`](../src/download/chunk_policy.rs) instead controls
+the **dispatch size**, i.e. the number of contiguous bitmap chunks
+the scheduler coalesces into a single ranged GET. The policy grows
+the dispatch size (doubling, capped at 64 MiB) when all recent
+samples completed in under 1 s and there are at least 2× workers
+chunks remaining, and shrinks it (halving, floored at the larger of
+1 MiB and the bitmap chunk size) when p95 latency exceeds 5 s or the
+recent retry rate exceeds 10 %. A 30 s hysteresis prevents
+oscillation. Adaptive sizing is on by default; `--no-adaptive-chunk-size`
+disables it without changing the default starting size, and
+`--chunk-size <N>` continues to set the bitmap chunk size for runs
+that want a fixed unit.
 
 ---
 

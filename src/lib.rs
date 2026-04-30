@@ -49,6 +49,14 @@
 //!   shared `ProgressState` updated by writers (workers, extractor,
 //!   ZIP pipeline) plus a TTY / log renderer the binary spawns at
 //!   the boundary.
+//! - [`download::chunk_policy`] (Unix only) — adaptive chunk-size
+//!   policy (`PLAN_v2.md` §8): a ring-buffered observer of recent
+//!   per-dispatch latencies and retries that decides when to grow
+//!   or shrink the size of each ranged GET. The scheduler queries
+//!   `ChunkSizePolicy::current()` when planning a dispatch and feeds
+//!   completion samples back via `record`. Default-on, with
+//!   `--chunk-size <N>` and `--no-adaptive-chunk-size` CLI escape
+//!   hatches.
 //! - [`io_backend`] (Unix only) — file-IO and network-IO seam
 //!   (`PLAN_v2.md` §7 + §7b): the [`io_backend::IoBackend`] trait
 //!   every backend honors, the always-available
