@@ -295,11 +295,20 @@ impl RateBuffer {
         }
     }
 
-    /// 5 s window, 64-sample capacity, 5 s minimum span — the defaults
-    /// PLAN_v2 §6 specifies.
+    /// Defaults the renderer threads use: a 10 s window with a 1 s
+    /// minimum span and 64-sample capacity.
+    ///
+    /// The 1 s `min_span` is the smallest span we trust as a rate
+    /// estimate — anything shorter is too jittery on a network. The
+    /// 10 s `window` is generous enough that the LogRenderer (which
+    /// ticks every 2 s, holding ≤6 samples) keeps a span of at least
+    /// 4 s in steady state without ever dropping below `min_span`.
+    /// Earlier versions used `window == min_span == 5 s`, which made
+    /// the rate flap to `None` on every other LogRenderer tick (and
+    /// hide for the entire run on downloads shorter than 5 s).
     #[must_use]
-    pub fn five_second() -> Self {
-        Self::new(Duration::from_secs(5), 64, Duration::from_secs(5))
+    pub fn for_renderer() -> Self {
+        Self::new(Duration::from_secs(10), 64, Duration::from_secs(1))
     }
 
     /// Push a new `(now, total_bytes)` observation. Old samples
@@ -535,8 +544,8 @@ impl<W: Write + Send> TtyRenderer<W> {
     pub fn new(out: W) -> Self {
         Self {
             out,
-            rate_dl: RateBuffer::five_second(),
-            rate_ex: RateBuffer::five_second(),
+            rate_dl: RateBuffer::for_renderer(),
+            rate_ex: RateBuffer::for_renderer(),
             style: BarStyle::detect(),
             terminal_width_override: None,
             bar_max_columns: MAX_BAR_COLUMNS,
@@ -552,8 +561,8 @@ impl<W: Write + Send> TtyRenderer<W> {
         let bar = bar_width.max(4);
         Self {
             out,
-            rate_dl: RateBuffer::five_second(),
-            rate_ex: RateBuffer::five_second(),
+            rate_dl: RateBuffer::for_renderer(),
+            rate_ex: RateBuffer::for_renderer(),
             style: BarStyle::Ascii,
             terminal_width_override: None,
             bar_max_columns: bar,
@@ -567,8 +576,8 @@ impl<W: Write + Send> TtyRenderer<W> {
     pub fn with_style_and_width(out: W, style: BarStyle, terminal_width: usize) -> Self {
         Self {
             out,
-            rate_dl: RateBuffer::five_second(),
-            rate_ex: RateBuffer::five_second(),
+            rate_dl: RateBuffer::for_renderer(),
+            rate_ex: RateBuffer::for_renderer(),
             style,
             terminal_width_override: Some(terminal_width.max(20)),
             bar_max_columns: MAX_BAR_COLUMNS,
@@ -686,13 +695,21 @@ impl LogRenderer {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            rate_dl: RateBuffer::five_second(),
-            rate_ex: RateBuffer::five_second(),
+            rate_dl: RateBuffer::for_renderer(),
+            rate_ex: RateBuffer::for_renderer(),
         }
     }
 
-    /// Format the structured line that [`Self::render`] will emit.
-    /// Pure: tests call this without a tracing subscriber.
+    /// Format the line [`Self::render`] will emit. Pure: tests call
+    /// it without a tracing subscriber.
+    ///
+    /// Mirrors the TTY renderer's three-line block in shape — sizes
+    /// via [`format_bytes`], rates via [`format_rate`], ETA via
+    /// [`format_eta`] — flattened onto one log line so each tick is a
+    /// single record. A bottleneck label (`bottleneck=disk` or
+    /// `=net`) is appended when the classifier has a verdict, with
+    /// no ANSI color escapes (the log subscriber is responsible for
+    /// any styling it wants to apply).
     pub fn format_line(&mut self, snap: &ProgressSnapshot, now: Instant) -> String {
         self.rate_dl.push(now, snap.bytes_downloaded);
         self.rate_ex.push(now, snap.bytes_extracted);
@@ -700,31 +717,38 @@ impl LogRenderer {
         let ex_rate = self.rate_ex.rate_bytes_per_sec();
         let percent = overall_percent(snap);
         let eta = compute_eta(snap, dl_rate, ex_rate);
+        let bottleneck = classify_bottleneck(snap, dl_rate, ex_rate);
+
+        let pct = percent
+            .map(|p| format!("{p:.1}%"))
+            .unwrap_or_else(|| "?".into());
+        let downloaded = format_bytes(snap.bytes_downloaded);
         let total = snap
             .total_size
-            .map(|n| n.to_string())
+            .map(format_bytes)
             .unwrap_or_else(|| "?".into());
+        let extracted = format_bytes(snap.bytes_extracted);
         let est = snap
             .extracted_estimate
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".into());
-        let pct = percent
-            .map(|p| format!("{p:.1}"))
-            .unwrap_or_else(|| "?".into());
-        let dl = dl_rate
-            .map(|r| format!("{r:.0}"))
-            .unwrap_or_else(|| "?".into());
-        let ex = ex_rate
-            .map(|r| format!("{r:.0}"))
-            .unwrap_or_else(|| "?".into());
-        let eta_s = eta
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|| "?".into());
-        format!(
-            "progress: pct={pct}% downloaded={}/{total} extracted={}/{est} \
-             dl_bps={dl} ex_bps={ex} workers={}/{} eta_secs={eta_s}",
-            snap.bytes_downloaded, snap.bytes_extracted, snap.active_workers, snap.total_workers,
-        )
+            .map(format_bytes)
+            .unwrap_or_else(|| "unknown".into());
+        let dl = dl_rate.map(format_rate).unwrap_or_else(|| "—".into());
+        let ex = ex_rate.map(format_rate).unwrap_or_else(|| "—".into());
+        let eta_s = format_eta(eta);
+        let mut line = format!(
+            "progress: {pct}  download {downloaded} / {total} @ {dl}  \
+             extract {extracted} / {est} @ {ex}  workers {}/{}  ETA {eta_s}",
+            snap.active_workers, snap.total_workers,
+        );
+        if let Some(b) = bottleneck {
+            let label = match b {
+                Bottleneck::Disk => "disk",
+                Bottleneck::Network => "net",
+            };
+            line.push_str("  bottleneck=");
+            line.push_str(label);
+        }
+        line
     }
 }
 
@@ -1610,7 +1634,37 @@ mod tests {
     }
 
     #[test]
-    fn log_renderer_format_line_is_structured() {
+    fn log_renderer_format_line_is_human_readable() {
+        let mut r = LogRenderer::new();
+        let snap = ProgressSnapshot {
+            total_size: Some(2 * 1024 * 1024),
+            bytes_downloaded: 1024 * 1024,
+            bytes_extracted: 512 * 1024,
+            extracted_estimate: Some(2 * 1024 * 1024),
+            active_workers: 2,
+            total_workers: 4,
+            started: true,
+            done: false,
+            bytes_decoded_input: 0,
+            max_disk_buffer: None,
+            disk_bound: false,
+        };
+        let line = r.format_line(&snap, Instant::now());
+        // Sizes are KiB/MiB-formatted, not raw bytes.
+        assert!(
+            line.contains("1.0 MiB / 2.0 MiB"),
+            "expected human-readable download sizes in {line:?}"
+        );
+        assert!(
+            line.contains("512.0 KiB / 2.0 MiB"),
+            "expected human-readable extract sizes in {line:?}"
+        );
+        assert!(line.contains("workers 2/4"));
+        assert!(line.contains("ETA"));
+    }
+
+    #[test]
+    fn log_renderer_format_line_emits_bottleneck_label() {
         let mut r = LogRenderer::new();
         let snap = ProgressSnapshot {
             total_size: Some(2000),
@@ -1621,14 +1675,17 @@ mod tests {
             total_workers: 4,
             started: true,
             done: false,
-            bytes_decoded_input: 0,
-            max_disk_buffer: None,
-            disk_bound: false,
+            bytes_decoded_input: 200,
+            max_disk_buffer: Some(100),
+            disk_bound: true,
         };
         let line = r.format_line(&snap, Instant::now());
-        assert!(line.contains("downloaded=1000/2000"));
-        assert!(line.contains("extracted=500/2000"));
-        assert!(line.contains("workers=2/4"));
+        assert!(line.contains("bottleneck=disk"), "got {line:?}");
+        // No ANSI escapes in log mode — the subscriber owns styling.
+        assert!(
+            !line.contains("\x1b["),
+            "log line had ANSI escape: {line:?}"
+        );
     }
 
     #[test]
