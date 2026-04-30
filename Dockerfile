@@ -29,12 +29,15 @@ set -euo pipefail
 case "${TARGETPLATFORM}" in
   linux/amd64)
     triple=x86_64-unknown-linux-gnu
-    cross_pkg=gcc-x86-64-linux-gnu
+    # libc6-dev-*-cross is Recommends, not Depends, of the cross gcc;
+    # without it the cross compiler falls through to the host's libc
+    # headers (multiarch path) and breaks zstd-sys / ring builds.
+    cross_pkgs="gcc-x86-64-linux-gnu libc6-dev-amd64-cross"
     cc=x86_64-linux-gnu-gcc
     ;;
   linux/arm64)
     triple=aarch64-unknown-linux-gnu
-    cross_pkg=gcc-aarch64-linux-gnu
+    cross_pkgs="gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
     cc=aarch64-linux-gnu-gcc
     ;;
   *)
@@ -45,7 +48,7 @@ esac
 
 if [[ "${TARGETPLATFORM}" != "${BUILDPLATFORM}" ]]; then
   apt-get update
-  apt-get install -y --no-install-recommends "${cross_pkg}"
+  apt-get install -y --no-install-recommends ${cross_pkgs}
   rm -rf /var/lib/apt/lists/*
 fi
 
