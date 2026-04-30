@@ -61,10 +61,10 @@ use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
 use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
 use crate::download::{
-    chunk_count, discover, run as run_scheduler, DownloadInfo, DownloadStats, RetryConfig,
-    SchedulerConfig, SchedulerError, SourceFingerprint, SparseFile, SparseFileError, ZipPipeline,
-    ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE,
-    DEFAULT_WORKERS,
+    chunk_count, discover, run as run_scheduler, ChunkFingerprints, DownloadInfo, DownloadStats,
+    ProbeConfig, RetryConfig, SchedulerConfig, SchedulerError, SourceFingerprint, SparseFile,
+    SparseFileError, ZipPipeline, ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent,
+    ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 use crate::extractor::{
     CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
@@ -396,6 +396,26 @@ pub enum CoordinatorError {
         reason: String,
     },
 
+    /// The `PLAN_v2.md` §11 resume probe re-fetched a chunk we
+    /// thought was already complete and observed a CRC-32C that
+    /// disagreed with the value the prior run wrote into the
+    /// checkpoint. The source must have changed between runs;
+    /// the user must either delete the sidecars and start fresh
+    /// or aim peel at the original bytes.
+    #[error(
+        "source changed since the prior checkpoint: chunk {chunk} probe CRC32C \
+         (expected {expected:#010x}, observed {actual:#010x}). \
+         Delete .peel.part / .peel.ckpt and re-run."
+    )]
+    SourceChangedSinceCheckpoint {
+        /// Chunk whose probe failed.
+        chunk: ChunkIndex,
+        /// CRC-32C the prior run recorded.
+        expected: u32,
+        /// CRC-32C this run just computed.
+        actual: u32,
+    },
+
     /// The configured chunk count overflowed `u32`.
     #[error("source too large for the configured chunk size: {chunks} chunks")]
     TooManyChunks {
@@ -516,12 +536,32 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 
     let chunks_resumed = u32::try_from(bitmap.count_complete()).unwrap_or(u32::MAX);
 
+    // §11 per-chunk CRC-32C fingerprint store. Pre-populated from
+    // the prior checkpoint when resuming a v4 run; an empty store
+    // when starting fresh or resuming a pre-§11 checkpoint.
+    let fingerprints = Arc::new(build_fingerprints(total_chunks, &resume_plan)?);
+
     let sparse = Arc::new(open_sparse(
         &part_path,
         info.total_size,
         &config,
         &io_backend,
     )?);
+
+    // §11 resume verification: when resuming with non-empty
+    // per-chunk fingerprints, pick a random already-complete chunk
+    // and re-fetch it. Mismatch ⇒ `SourceChangedSinceCheckpoint`.
+    if matches!(resume_plan, ResumePlan::Resume { .. }) && bitmap.count_complete() > 0 {
+        run_resume_probe(
+            &client,
+            &info,
+            &sparse,
+            &bitmap,
+            &fingerprints,
+            config.chunk_size,
+            &config.retry,
+        )?;
+    }
 
     let cursor = Arc::new(AtomicU64::new(match &resume_plan {
         ResumePlan::Fresh => 0,
@@ -565,6 +605,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         retry: config.retry.clone(),
         progress: progress_state.clone(),
         policy,
+        fingerprints: Some(Arc::clone(&fingerprints)),
+        probe: ProbeConfig::default(),
     };
 
     let download_done = Arc::new(AtomicBool::new(false));
@@ -637,6 +679,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 run_zip(
                     &sparse,
                     &bitmap,
+                    &fingerprints,
                     &cursor,
                     &download_done,
                     &download_outcome,
@@ -719,6 +762,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &info,
                             &url,
                             &bitmap,
+                            &fingerprints,
                             chunk_size,
                             &output,
                             &config,
@@ -740,6 +784,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &info,
                             &url,
                             &bitmap,
+                            &fingerprints,
                             chunk_size,
                             &output,
                             &config,
@@ -853,6 +898,7 @@ enum ResumePlan {
         decoder_position: u64,
         bitmap_bytes: Vec<u8>,
         sink_state: SinkState,
+        chunk_crc32c: Option<Vec<u32>>,
     },
 }
 
@@ -919,12 +965,23 @@ fn build_resume_plan(
         decoder_position: prior.decoder_position.get(),
         bitmap_bytes: prior.bitmap_completed.clone(),
         sink_state: prior.sink_state.clone(),
+        chunk_crc32c: prior.chunk_crc32c.clone(),
     })
 }
 
 fn fingerprint_matches(prior: &Checkpoint, fingerprint: &SourceFingerprint) -> bool {
     if let (Some(a), Some(b)) = (&prior.etag, &fingerprint.etag) {
-        if a != b {
+        // Weak ETags only promise semantic equivalence (RFC 7232
+        // §2.3); a weak-tag mismatch is advisory because §11's
+        // per-chunk CRC-32C probe runs right after this and gives
+        // us a real byte-level guard. Treating weak mismatches as
+        // a hard error here would force users to re-download for
+        // upstream cache normalization that didn't actually change
+        // the bytes.
+        if a != b
+            && !crate::download::worker::etag_is_weak(a)
+            && !crate::download::worker::etag_is_weak(b)
+        {
             return false;
         }
     }
@@ -936,7 +993,8 @@ fn fingerprint_matches(prior: &Checkpoint, fingerprint: &SourceFingerprint) -> b
     // If neither side carries an identifier we fall through and accept
     // the resume; we cannot prove the source unchanged but neither can
     // a fresh `HEAD`, so the only honest move is to take the user's
-    // request at face value.
+    // request at face value. The §11 resume probe will catch any
+    // genuine byte drift before we accept the bitmap.
     true
 }
 
@@ -979,6 +1037,7 @@ fn run_one<S: Sink>(
     info: &DownloadInfo,
     requested_url: &str,
     bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
     chunk_size: u64,
     output: &OutputTarget,
     config: &CoordinatorConfig,
@@ -1031,6 +1090,11 @@ fn run_one<S: Sink>(
 
             let sink_state = sink_state_for(output, info_cb.bytes_out);
             let hash_state = snapshot_hash_state(hasher_for_ckpt);
+            let chunk_crc32c = if fingerprints.is_empty() {
+                None
+            } else {
+                Some(fingerprints.to_vec())
+            };
             let ckpt = Checkpoint {
                 url: requested_url.to_string(),
                 etag: info.fingerprint.etag.clone(),
@@ -1042,6 +1106,7 @@ fn run_one<S: Sink>(
                 created_at: SystemTime::now(),
                 sink_state,
                 hash_state,
+                chunk_crc32c,
             };
             ckpt.write(ckpt_path)
                 .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -1086,6 +1151,7 @@ fn run_one<S: Sink>(
 fn run_zip(
     sparse: &SparseFile,
     bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
     cursor: &Arc<AtomicU64>,
     download_done: &Arc<AtomicBool>,
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
@@ -1205,6 +1271,11 @@ fn run_zip(
                     .sync_all()
                     .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
 
+                let chunk_crc32c = if fingerprints.is_empty() {
+                    None
+                } else {
+                    Some(fingerprints.to_vec())
+                };
                 let ckpt = Checkpoint {
                     url: requested_url.to_string(),
                     etag: info.fingerprint.etag.clone(),
@@ -1223,6 +1294,7 @@ fn run_zip(
                     // streaming pipeline only; ZIP runs leave it
                     // unset (`PLAN_v2.md` §10 + §5).
                     hash_state: None,
+                    chunk_crc32c,
                 };
                 ckpt.write(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -1268,6 +1340,143 @@ fn run_zip(
             })
         }
         Err(other) => Err(CoordinatorError::Zip(other)),
+    }
+}
+
+/// Build a fresh [`ChunkFingerprints`] store sized to the run's
+/// chunk count, pre-populated from the resume plan when applicable.
+///
+/// `Fresh` runs return an all-zero store. `Resume` runs whose
+/// checkpoint carries a `chunk_crc32c` of matching length restore
+/// every fingerprint into the store. A length mismatch surfaces as
+/// [`CoordinatorError::SourceChanged`] — the chunk count derived
+/// from `total_size / chunk_size` did not agree with what the
+/// checkpoint recorded, which means the source layout shifted and
+/// resume is unsafe.
+fn build_fingerprints(
+    total_chunks: u32,
+    plan: &ResumePlan,
+) -> Result<ChunkFingerprints, CoordinatorError> {
+    let store = ChunkFingerprints::new(total_chunks);
+    if let ResumePlan::Resume {
+        chunk_crc32c: Some(crcs),
+        ..
+    } = plan
+    {
+        if u32::try_from(crcs.len()).unwrap_or(u32::MAX) != total_chunks {
+            return Err(CoordinatorError::SourceChanged {
+                reason: format!(
+                    "checkpoint chunk_crc32c length {} does not match expected chunk \
+                     count {total_chunks}",
+                    crcs.len(),
+                ),
+            });
+        }
+        for (i, crc) in crcs.iter().enumerate() {
+            store.record(ChunkIndex::new(i as u32), *crc);
+        }
+    }
+    Ok(store)
+}
+
+/// Re-fetch a single already-complete chunk and verify its
+/// CRC-32C against the stored fingerprint (`PLAN_v2.md` §11).
+///
+/// Picks a random chunk whose bitmap bit is set and whose
+/// fingerprint is non-zero; bytes that have not been seen by §11
+/// (resumed-from-pre-§11 checkpoints; chunks without a recorded
+/// fingerprint) are silently skipped. A successful probe leaves
+/// the sparse file unchanged. A CRC-32C mismatch is surfaced as
+/// [`CoordinatorError::SourceChangedSinceCheckpoint`].
+fn run_resume_probe(
+    client: &Client,
+    info: &DownloadInfo,
+    sparse: &SparseFile,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    chunk_size: u64,
+    retry: &RetryConfig,
+) -> Result<(), CoordinatorError> {
+    let total_chunks = bitmap.len();
+    if total_chunks == 0 || chunk_size == 0 || fingerprints.is_empty() {
+        return Ok(());
+    }
+
+    // Pick the first complete + fingerprinted chunk in a
+    // pseudorandom walk. Deterministic-ish so the test harness can
+    // reason about which chunk gets probed.
+    let mut rng: u64 =
+        (u64::from(total_chunks) << 32) ^ 0xC0DE_FACE_5A5A_5A5A_u64 ^ info.total_size;
+    let mut picked: Option<(ChunkIndex, u32)> = None;
+    for _ in 0..16 {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let idx = u32::try_from(rng.wrapping_shr(32) % u64::from(total_chunks))
+            .unwrap_or(0)
+            .min(total_chunks - 1);
+        let chunk = ChunkIndex::new(idx);
+        if !bitmap.is_complete(chunk) {
+            continue;
+        }
+        let crc = fingerprints.get(chunk);
+        if crc == 0 {
+            continue;
+        }
+        picked = Some((chunk, crc));
+        break;
+    }
+
+    let Some((chunk, expected)) = picked else {
+        // No fingerprinted chunk to probe (resume from pre-§11
+        // checkpoint, or every fingerprint slot is unset). The §11
+        // contract is "verify what we can"; absent fingerprints
+        // means we can't, and that's fine — fall through.
+        return Ok(());
+    };
+
+    let start_byte = u64::from(chunk.get()).saturating_mul(chunk_size);
+    if start_byte >= info.total_size {
+        return Ok(());
+    }
+    let end_byte = start_byte.saturating_add(chunk_size).min(info.total_size);
+    let Some(range) =
+        crate::types::ByteRange::new(ByteOffset::new(start_byte), ByteOffset::new(end_byte))
+    else {
+        return Ok(());
+    };
+
+    let dispatch = crate::download::Dispatch {
+        first: chunk,
+        count: 1,
+        range,
+        kind: crate::download::DispatchKind::Probe { expected },
+    };
+    let ctx = crate::download::worker::ChunkContext {
+        client,
+        url: &info.url,
+        fingerprint: &info.fingerprint,
+        chunk_size,
+        sparse,
+        progress: None,
+    };
+    let cancel = AtomicBool::new(false);
+    match crate::download::worker::download_dispatch(&ctx, dispatch, retry, &cancel) {
+        Ok(_) => Ok(()),
+        Err(crate::download::WorkerError::SourceDriftDetected {
+            chunk,
+            expected,
+            actual,
+        }) => Err(CoordinatorError::SourceChangedSinceCheckpoint {
+            chunk,
+            expected,
+            actual,
+        }),
+        Err(other) => Err(CoordinatorError::Scheduler(SchedulerError::ChunkFailed {
+            chunk,
+            attempts: 1,
+            source: other,
+        })),
     }
 }
 
@@ -1790,6 +1999,7 @@ mod tests {
                 members_completed: vec![],
             },
             hash_state: None,
+            chunk_crc32c: None,
         }
     }
 

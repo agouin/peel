@@ -135,6 +135,8 @@ fn run_demo(args: Args) -> Result<(), String> {
         retry: RetryConfig::default(),
         progress: None,
         policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     };
 
     let started = Instant::now();

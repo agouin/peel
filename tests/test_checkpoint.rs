@@ -57,6 +57,7 @@ fn realistic_tar_checkpoint() -> Checkpoint {
             ],
         },
         hash_state: None,
+        chunk_crc32c: None,
     }
 }
 
@@ -262,6 +263,7 @@ fn round_trip_raw_sink_state() {
             bytes_written: 524_288,
         },
         hash_state: None,
+        chunk_crc32c: None,
     };
     ckpt.write(&path).expect("write");
 

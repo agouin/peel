@@ -759,6 +759,7 @@ fn resume_picks_up_from_existing_checkpoint() {
             bytes_written: payload_a.len() as u64,
         },
         hash_state: None,
+        chunk_crc32c: None,
     };
     let ckpt_path = work2.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -808,6 +809,7 @@ fn etag_mismatch_on_resume_aborts_cleanly() {
         created_at: SystemTime::now(),
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: None,
+        chunk_crc32c: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -857,6 +859,7 @@ fn url_change_on_resume_aborts_cleanly() {
         created_at: SystemTime::now(),
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: None,
+        chunk_crc32c: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1472,6 +1475,7 @@ fn sha256_added_on_resume_without_saved_state_errors() {
         created_at: SystemTime::now(),
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: None,
+        chunk_crc32c: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1531,6 +1535,7 @@ fn sha256_dropped_on_resume_with_saved_state_errors() {
         created_at: SystemTime::now(),
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: Some(saved),
+        chunk_crc32c: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1551,6 +1556,197 @@ fn sha256_dropped_on_resume_with_saved_state_errors() {
             ..
         })) => {}
         other => panic!("expected CheckpointHadHashState, got {other:?}"),
+    }
+}
+
+// ---- §11 mid-flight source-change detection -------------------------
+
+#[test]
+fn source_drift_on_resume_is_caught_by_probe() {
+    // First run: download to completion against `body_a` so the
+    // checkpoint contains §11 fingerprints. Then construct a *new*
+    // checkpoint pointing at `body_b` (size matches, ETag matches —
+    // the only thing that differs is the byte content) and rerun;
+    // the §11 resume probe must fail before any new bytes are
+    // downloaded.
+    //
+    // Demo from PLAN_v2 §11: "A mock that returns a different file
+    // on resume triggers SourceChangedSinceCheckpoint on the very
+    // first probe."
+    let payload_a = b"resume-aaaa".repeat(4096);
+    let payload_b = b"resume-bbbb".repeat(4096); // same length
+    assert_eq!(payload_a.len(), payload_b.len());
+    let body_a = encode_zstd(&payload_a);
+    let body_b = encode_zstd(&payload_b);
+    // Pad so both bodies are the same length, otherwise build_resume_plan
+    // catches it earlier on size mismatch.
+    let target_len = body_a.len().max(body_b.len());
+    let mut body_a = body_a;
+    body_a.resize(target_len, 0);
+    let mut body_b = body_b;
+    body_b.resize(target_len, 0);
+
+    let server = MockServer::start({
+        let body_a_clone = body_a.clone();
+        let body_b_clone = body_b.clone();
+        move |req, n| {
+            // First N requests serve body_a (checkpoint capture);
+            // requests after that serve body_b (resume probe).
+            let body = if n < 32 { &body_a_clone } else { &body_b_clone };
+            serve(req, body, Some("\"v1\"".into()))
+        }
+    });
+
+    let work = unique_dir("resume_drift");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+    let chunk_size = 1024u64;
+    let mut config = coord_config_for_test(chunk_size);
+    config.checkpoint_min_bytes = 1;
+    config.checkpoint_min_interval = Duration::from_millis(0);
+
+    // Run 1: full download succeeds against body_a.
+    let args1 = make_args(
+        &server,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        config.clone(),
+    );
+    let stats1 = run(args1).expect("first run");
+    assert!(!stats1.resumed);
+    fs::remove_file(&out_path).ok();
+
+    // Hand-build a checkpoint as if we'd crashed mid-run with the
+    // body_a fingerprints captured. We need real CRC-32C values to
+    // mimic what a real run would have written, so we compute them
+    // here over body_a's chunks.
+    let total_chunks = (body_a.len() as u64).div_ceil(chunk_size) as u32;
+    let bitmap = peel::bitmap::ChunkBitmap::new(total_chunks);
+    // Mark every chunk complete so the §11 probe has something to
+    // verify against.
+    for i in 0..total_chunks {
+        bitmap.mark_complete(peel::types::ChunkIndex::new(i));
+    }
+    let mut crcs = Vec::with_capacity(total_chunks as usize);
+    for i in 0..total_chunks {
+        let lo = (i as u64 * chunk_size) as usize;
+        let hi = ((i as u64 + 1) * chunk_size).min(body_a.len() as u64) as usize;
+        crcs.push(peel::hash::crc32c::castagnoli(&body_a[lo..hi]));
+    }
+    let ckpt = Checkpoint {
+        url: format!("{}/data.zst", server.base_url()),
+        etag: Some("\"v1\"".into()),
+        last_modified: None,
+        total_size: body_a.len() as u64,
+        chunk_size,
+        decoder_position: ByteOffset::new(0),
+        bitmap_completed: bitmap.to_bytes(),
+        created_at: SystemTime::now(),
+        sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: None,
+        chunk_crc32c: Some(crcs),
+    };
+    let part_path = work.join("out.bin.peel.part");
+    let ckpt_path = work.join("out.bin.peel.ckpt");
+    ckpt.write(&ckpt_path).expect("ckpt write");
+    fs::write(&part_path, vec![0u8; body_a.len()]).expect("part placeholder");
+
+    // Resume — the server now serves body_b for the next request.
+    // We've made 1 HEAD + ranged-GETs in run 1; force the swap by
+    // rebuilding the server with the swap counter at 1.
+    drop(server);
+    let server2 = MockServer::start({
+        let body_b_clone = body_b.clone();
+        move |req, _n| serve(req, &body_b_clone, Some("\"v1\"".into()))
+    });
+    // Rewrite the URL in the checkpoint to point at the new server.
+    let mut ckpt2 = ckpt.clone();
+    ckpt2.url = format!("{}/data.zst", server2.base_url());
+    ckpt2.write(&ckpt_path).expect("ckpt rewrite");
+
+    let args2 = make_args(
+        &server2,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        config,
+    );
+    let err = run(args2).expect_err("must detect drift");
+    match err {
+        CoordinatorError::SourceChangedSinceCheckpoint { .. } => {}
+        other => panic!("expected SourceChangedSinceCheckpoint, got {other:?}"),
+    }
+
+    // .peel.part / .peel.ckpt left on disk as documented; verify.
+    assert!(ckpt_path.exists(), "checkpoint should remain after error");
+}
+
+#[test]
+fn worker_probe_detects_source_drift() {
+    // Unit-level demo of PLAN_v2 §11: when a probe re-fetches a
+    // chunk that drifted under us, the worker reports
+    // `WorkerError::SourceDriftDetected`. The mock here serves
+    // body_b; the dispatch's expected CRC was captured against
+    // body_a; the worker's in-line probe verification flags the
+    // mismatch.
+    use peel::download::{Dispatch, DispatchKind};
+    use peel::types::{ByteOffset, ByteRange, ChunkIndex};
+    use std::sync::atomic::AtomicBool;
+
+    let body_a = b"chunk-zero-original-content-padded-".repeat(64);
+    let body_b: Vec<u8> = body_a.iter().map(|b| b ^ 0xFF).collect();
+    assert_eq!(body_a.len(), body_b.len());
+    let total_size = body_a.len() as u64;
+    let chunk_size = total_size; // single-chunk file
+
+    let server = MockServer::start({
+        let body_b_clone = body_b.clone();
+        move |req, _n| serve(req, &body_b_clone, Some("\"v1\"".into()))
+    });
+
+    // Compute the CRC-32C of body_a — the value a previous fetch
+    // would have stored before the source swapped.
+    let expected_crc = peel::hash::crc32c::castagnoli(&body_a);
+
+    // Open a sparse file for the probe to write into; we don't
+    // care about the contents afterward.
+    let work = unique_dir("worker_probe");
+    let _g = CleanupDir(work.clone());
+    let part = work.join("part.bin");
+    let sparse = peel::download::SparseFile::open_or_create(&part, total_size).expect("sparse");
+
+    let url = peel::http::Url::parse(&format!("{}/data.bin", server.base_url())).expect("url");
+    let fingerprint = peel::download::SourceFingerprint {
+        etag: Some("\"v1\"".into()),
+        last_modified: None,
+    };
+    let client = build_client();
+    let ctx = peel::download::worker::ChunkContext {
+        client: &client,
+        url: &url,
+        fingerprint: &fingerprint,
+        chunk_size,
+        sparse: &sparse,
+        progress: None,
+    };
+    let dispatch = Dispatch {
+        first: ChunkIndex::ZERO,
+        count: 1,
+        range: ByteRange::new(ByteOffset::new(0), ByteOffset::new(total_size)).expect("range"),
+        kind: DispatchKind::Probe {
+            expected: expected_crc,
+        },
+    };
+    let cancel = AtomicBool::new(false);
+    let err = peel::download::worker::download_dispatch(&ctx, dispatch, &fast_retry(), &cancel)
+        .expect_err("probe must detect drift");
+    match err {
+        peel::download::WorkerError::SourceDriftDetected {
+            expected, actual, ..
+        } => {
+            assert_eq!(expected, expected_crc);
+            assert_ne!(actual, expected_crc);
+        }
+        other => panic!("expected SourceDriftDetected, got {other:?}"),
     }
 }
 

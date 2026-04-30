@@ -75,6 +75,8 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         retry: fast_retry(),
         progress: None,
         policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     }
 }
 
@@ -672,6 +674,8 @@ fn run_rejects_zero_chunk_size() {
         retry: fast_retry(),
         progress: None,
         policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -694,6 +698,8 @@ fn run_rejects_zero_workers() {
         retry: fast_retry(),
         progress: None,
         policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));
@@ -754,6 +760,8 @@ fn run_with_policy_extracts_byte_identical_output() {
         retry: fast_retry(),
         progress: None,
         policy: Some(Arc::clone(&policy)),
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -802,6 +810,8 @@ fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
         retry: fast_retry(),
         progress: None,
         policy: Some(Arc::clone(&policy)),
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -850,6 +860,8 @@ fn run_without_policy_keeps_one_range_per_chunk() {
         retry: fast_retry(),
         progress: None,
         policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     };
 
     run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("baseline run");
@@ -906,6 +918,8 @@ fn run_with_policy_resume_honors_existing_bitmap() {
         retry: fast_retry(),
         progress: None,
         policy: Some(policy),
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive resume");
@@ -915,4 +929,117 @@ fn run_with_policy_resume_honors_existing_bitmap() {
     assert_eq!(stats.bytes_downloaded, remaining_bytes);
     // And byte-identical reassembly.
     assert_eq!(read_full(&path), body);
+}
+
+// ---- §11 mid-flight verifier ----------------------------------------
+
+#[test]
+fn scheduler_records_per_chunk_crc32c_when_fingerprints_configured() {
+    // The §11 contract step 1: workers compute CRC-32C per bitmap
+    // chunk and the scheduler stores them in the fingerprint store
+    // alongside the bitmap-bit set.
+    let chunk_size = 1024u64;
+    let total_chunks = 8u32;
+    let body = make_body((chunk_size as u32 * total_chunks) as usize);
+    let server = MockServer::start(ok_handler(body.clone(), Some("\"v1\"")));
+
+    let url = url(&server, "/data.bin");
+    let client = build_client();
+    let info = discover(&client, &url).expect("discover");
+
+    let path = temp_path("crc_records");
+    let _g = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let fingerprints = Arc::new(peel::download::ChunkFingerprints::new(total_chunks));
+    let cursor = AtomicU64::new(0);
+
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size,
+        workers: 2,
+        retry: fast_retry(),
+        progress: None,
+        policy: None,
+        fingerprints: Some(Arc::clone(&fingerprints)),
+        probe: peel::download::ProbeConfig { interval: 0 }, // recording only
+    };
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("download");
+    assert_eq!(stats.chunks_completed, total_chunks);
+
+    // Every chunk's stored CRC-32C must match a fresh computation
+    // over the same byte range.
+    for i in 0..total_chunks {
+        let lo = (i as u64 * chunk_size) as usize;
+        let hi = lo + chunk_size as usize;
+        let want = peel::hash::crc32c::castagnoli(&body[lo..hi]);
+        assert_eq!(
+            fingerprints.get(ChunkIndex::new(i)),
+            want,
+            "chunk {i} fingerprint disagrees",
+        );
+    }
+}
+
+#[test]
+fn scheduler_aborts_on_probe_drift_with_typed_error() {
+    // Demo from PLAN_v2 §11: the §11 probe re-fetches an
+    // already-complete chunk and surfaces drift as
+    // `SourceChangedDuringDownload`. We force the probe to land
+    // by setting probe.interval = 1, completing every chunk
+    // ourselves to seed the fingerprint store with a known-bad
+    // CRC, and then watching the scheduler probe and abort.
+    let chunk_size = 1024u64;
+    let total_chunks = 4u32;
+    let body = make_body((chunk_size as u32 * total_chunks) as usize);
+    let server = MockServer::start(ok_handler(body.clone(), Some("\"v1\"")));
+
+    let url = url(&server, "/data.bin");
+    let client = build_client();
+    let info = discover(&client, &url).expect("discover");
+
+    let path = temp_path("probe_drift");
+    let _g = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+
+    // Pre-mark every chunk as complete and seed the fingerprint
+    // store with deliberately-wrong CRC values, so the scheduler's
+    // very first probe immediately observes a mismatch. The
+    // scheduler-side dispatch loop won't bother fetching the
+    // already-complete chunks, but it *will* tick its
+    // completions counter when probes come back.
+    //
+    // To make probes fire at all, we leave the last chunk
+    // incomplete so the scheduler still has work to do. After it
+    // completes that one chunk the probe interval (=1) fires and
+    // re-fetches a (real) prior chunk against a wrong stored CRC.
+    let fingerprints = Arc::new(peel::download::ChunkFingerprints::new(total_chunks));
+    for i in 0..total_chunks - 1 {
+        bitmap.mark_complete(ChunkIndex::new(i));
+        // Wrong CRC: anything that disagrees with the actual
+        // body bytes. Use 0xDEAD_BEEF as a deterministic sentinel.
+        fingerprints.record(ChunkIndex::new(i), 0xDEAD_BEEF);
+    }
+    let cursor = AtomicU64::new(0);
+
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size,
+        workers: 1,
+        retry: fast_retry(),
+        progress: None,
+        policy: None,
+        fingerprints: Some(Arc::clone(&fingerprints)),
+        // Probe after every Fetch — the very first completion
+        // should trigger a probe that hits one of the seeded-wrong
+        // chunks.
+        probe: peel::download::ProbeConfig { interval: 1 },
+    };
+    let err =
+        run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect_err("must abort");
+    match err {
+        SchedulerError::SourceChangedDuringDownload { expected, .. } => {
+            assert_eq!(expected, 0xDEAD_BEEF);
+        }
+        other => panic!("expected SourceChangedDuringDownload, got {other:?}"),
+    }
 }

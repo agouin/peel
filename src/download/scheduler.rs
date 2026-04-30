@@ -43,11 +43,12 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use super::chunk_fingerprints::ChunkFingerprints;
 use super::chunk_policy::{ChunkSizePolicy, Sample};
 use super::sparse_file::{SparseFile, SparseFileError};
 use super::worker::{
-    download_dispatch, ChunkContext, ChunkOutcome, Dispatch, RetryConfig, SourceFingerprint,
-    WorkerError,
+    download_dispatch, ChunkContext, ChunkOutcome, Dispatch, DispatchKind, RetryConfig,
+    SourceFingerprint, WorkerError,
 };
 use crate::bitmap::ChunkBitmap;
 use crate::http::{Client, ClientError, Url};
@@ -59,6 +60,10 @@ use crate::types::{ByteOffset, ByteRange, ChunkIndex};
 pub const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// Default worker count.
 pub const DEFAULT_WORKERS: u32 = 4;
+/// Default §11 mid-flight probe interval: every 32nd completed
+/// dispatch triggers a re-fetch of an already-complete chunk.
+/// Tunable via [`SchedulerConfig::probe`].
+pub const DEFAULT_PROBE_INTERVAL: u32 = 32;
 
 /// Errors produced by the scheduler.
 #[derive(Debug, Error)]
@@ -119,6 +124,23 @@ pub enum SchedulerError {
         /// Underlying worker error.
         #[source]
         source: WorkerError,
+    },
+
+    /// A `PLAN_v2.md` §11 mid-flight probe re-fetched an
+    /// already-complete chunk and observed a CRC-32C that disagreed
+    /// with the value the original fetch recorded. The source must
+    /// have changed between the two fetches.
+    #[error(
+        "source changed during download: chunk {chunk} probe CRC32C mismatch \
+         (expected {expected:#010x}, observed {actual:#010x})"
+    )]
+    SourceChangedDuringDownload {
+        /// Chunk whose probe failed.
+        chunk: ChunkIndex,
+        /// CRC-32C the original fetch recorded.
+        expected: u32,
+        /// CRC-32C the probe just computed.
+        actual: u32,
     },
 
     /// The single-stream fallback hit a transport error or framing
@@ -190,6 +212,15 @@ pub struct SchedulerConfig {
     /// the dispatch size over time. `None` (default) preserves the
     /// pre-§8 1-chunk-per-task behaviour.
     pub policy: Option<Arc<ChunkSizePolicy>>,
+    /// Optional per-chunk CRC-32C fingerprint store (`PLAN_v2.md`
+    /// §11). When set, the scheduler records each completed chunk's
+    /// CRC-32C and periodically issues a probe re-fetch to verify
+    /// the source has not drifted under us. `None` disables both
+    /// recording and probing — the pre-§11 behaviour.
+    pub fingerprints: Option<Arc<ChunkFingerprints>>,
+    /// `PLAN_v2.md` §11 mid-flight probe configuration. Inert when
+    /// `fingerprints` is `None`.
+    pub probe: ProbeConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -200,6 +231,25 @@ impl Default for SchedulerConfig {
             retry: RetryConfig::default(),
             progress: None,
             policy: None,
+            fingerprints: None,
+            probe: ProbeConfig::default(),
+        }
+    }
+}
+
+/// Knobs for the `PLAN_v2.md` §11 mid-flight verifier.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeConfig {
+    /// Issue one probe every `interval` successful fetches. `0`
+    /// disables probing while leaving fingerprint recording on,
+    /// which is useful for the resume-only verification path.
+    pub interval: u32,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_PROBE_INTERVAL,
         }
     }
 }
@@ -387,6 +437,7 @@ fn run_parallel(
             client,
             url: &info.url,
             fingerprint: &info.fingerprint,
+            chunk_size: config.chunk_size,
             sparse,
             progress: config.progress.as_deref(),
         };
@@ -412,6 +463,14 @@ fn run_parallel(
         let mut in_flight: u32 = 0;
         let mut stats_local = stats.clone();
         let mut shutdown_reason: Option<SchedulerError> = None;
+        // §11 mid-flight verifier state: counts successful Fetch
+        // completions and queues a Probe every `probe.interval`
+        // completions (when fingerprints are configured).
+        let mut completions_since_probe: u32 = 0;
+        // Lightweight LCG to randomise which already-complete chunk
+        // we probe. Seeded from total_chunks so the choice differs
+        // per run but stays deterministic given the same source.
+        let mut probe_rng: u64 = (u64::from(total_chunks) << 32) ^ 0x9E37_79B9_7F4A_7C15;
 
         'outer: loop {
             // Dispatch as many as the channel will accept without
@@ -449,7 +508,11 @@ fn run_parallel(
                 }
             }
 
-            if completed >= total_chunks {
+            // Exit only when the bitmap is full *and* no probes
+            // are still mid-flight. A probe waiting to complete
+            // could still discover drift; bailing on it would lose
+            // the §11 signal.
+            if completed >= total_chunks && in_flight == 0 {
                 break;
             }
 
@@ -473,31 +536,94 @@ fn run_parallel(
                 .retries
                 .saturating_add(u64::from(msg.attempts.saturating_sub(1)));
             match msg.result {
-                Ok(()) => {
-                    let end = msg.first.get().saturating_add(msg.count);
-                    bitmap.complete_range(msg.first, ChunkIndex::new(end));
-                    stats_local.bytes_downloaded =
-                        stats_local.bytes_downloaded.saturating_add(msg.bytes);
-                    stats_local.chunks_completed =
-                        stats_local.chunks_completed.saturating_add(msg.count);
-                    completed = completed.saturating_add(msg.count);
-                    if let Some(policy) = config.policy.as_deref() {
-                        policy.record(Sample {
-                            at: Instant::now(),
-                            elapsed: msg.elapsed,
-                            retried: msg.attempts > 1,
-                        });
-                        let remaining = u64::from(total_chunks.saturating_sub(completed));
-                        let _ = policy.evaluate(Instant::now(), remaining, workers);
+                Ok(()) => match msg.kind {
+                    DispatchKind::Fetch => {
+                        let end = msg.first.get().saturating_add(msg.count);
+                        bitmap.complete_range(msg.first, ChunkIndex::new(end));
+                        stats_local.bytes_downloaded =
+                            stats_local.bytes_downloaded.saturating_add(msg.bytes);
+                        stats_local.chunks_completed =
+                            stats_local.chunks_completed.saturating_add(msg.count);
+                        completed = completed.saturating_add(msg.count);
+                        // Record per-chunk CRC-32C fingerprints for
+                        // §11's drift detector. The CRCs come back
+                        // in chunk order; pad / trim defensively.
+                        if let Some(fps) = config.fingerprints.as_deref() {
+                            for (i, crc) in msg.crcs.iter().enumerate().take(msg.count as usize) {
+                                let idx = msg.first.get().saturating_add(i as u32);
+                                if idx < total_chunks {
+                                    fps.record(ChunkIndex::new(idx), *crc);
+                                }
+                            }
+                        }
+                        if let Some(policy) = config.policy.as_deref() {
+                            policy.record(Sample {
+                                at: Instant::now(),
+                                elapsed: msg.elapsed,
+                                retried: msg.attempts > 1,
+                            });
+                            let remaining = u64::from(total_chunks.saturating_sub(completed));
+                            let _ = policy.evaluate(Instant::now(), remaining, workers);
+                        }
+
+                        // §11 probe scheduler: every Nth Fetch
+                        // completion, pick a random already-complete
+                        // chunk and queue a Probe re-fetch. Skip when
+                        // fingerprints are off, when interval is 0,
+                        // or when there is no chunk to probe yet.
+                        completions_since_probe = completions_since_probe.saturating_add(1);
+                        if let (Some(fps), Some(probe)) =
+                            (config.fingerprints.as_deref(), Some(&config.probe))
+                        {
+                            if probe.interval > 0
+                                && completions_since_probe >= probe.interval
+                                && completed > 0
+                            {
+                                completions_since_probe = 0;
+                                if let Some(probe_dispatch) = pick_probe_dispatch(
+                                    bitmap,
+                                    fps,
+                                    total_chunks,
+                                    config.chunk_size,
+                                    info.total_size,
+                                    &mut probe_rng,
+                                ) {
+                                    // Best-effort enqueue: a full
+                                    // channel just defers the probe
+                                    // to the next cadence tick.
+                                    if task_tx.try_send(probe_dispatch).is_ok() {
+                                        in_flight += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
+                    DispatchKind::Probe { expected: _ } => {
+                        // Probe success: the worker already verified
+                        // CRC-32C in-line. No bitmap / completion
+                        // bookkeeping; the bytes were already counted
+                        // in the original Fetch.
+                    }
+                },
                 Err(err) => {
                     cancel.store(true, Ordering::Relaxed);
-                    shutdown_reason.get_or_insert(SchedulerError::ChunkFailed {
-                        chunk: msg.first,
-                        attempts: msg.attempts,
-                        source: err,
-                    });
+                    let mapped = match err {
+                        WorkerError::SourceDriftDetected {
+                            chunk,
+                            expected,
+                            actual,
+                        } => SchedulerError::SourceChangedDuringDownload {
+                            chunk,
+                            expected,
+                            actual,
+                        },
+                        other => SchedulerError::ChunkFailed {
+                            chunk: msg.first,
+                            attempts: msg.attempts,
+                            source: other,
+                        },
+                    };
+                    shutdown_reason.get_or_insert(mapped);
                     break;
                 }
             }
@@ -572,12 +698,18 @@ fn worker_loop(
         }
 
         let msg = match outcome {
-            Ok(ChunkOutcome { bytes, attempts }) => Completion {
+            Ok(ChunkOutcome {
+                bytes,
+                attempts,
+                crcs,
+            }) => Completion {
                 first: dispatch.first,
                 count: dispatch.count,
                 bytes,
                 attempts,
                 elapsed,
+                kind: dispatch.kind,
+                crcs,
                 result: Ok(()),
             },
             Err(err) => Completion {
@@ -586,6 +718,8 @@ fn worker_loop(
                 bytes: 0,
                 attempts: 1,
                 elapsed,
+                kind: dispatch.kind,
+                crcs: Vec::new(),
                 result: Err(err),
             },
         };
@@ -801,7 +935,61 @@ fn pick_next_dispatch(
         first,
         count,
         range,
+        kind: DispatchKind::Fetch,
     })
+}
+
+/// Pick a single already-complete chunk and build a [`Dispatch`]
+/// that re-fetches it as a §11 verification probe.
+///
+/// Returns `None` when no probe-eligible chunk exists yet — either
+/// the bitmap is fully empty (the very first dispatches haven't
+/// landed) or fingerprints recording is racing the bitmap and the
+/// CRC for the picked chunk hasn't been written. The §11 contract
+/// is "every Nth completion *attempts* a probe"; we don't insist
+/// every attempt actually finds a target.
+fn pick_probe_dispatch(
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    total_chunks: u32,
+    chunk_size: u64,
+    total_size: u64,
+    rng_state: &mut u64,
+) -> Option<Dispatch> {
+    if total_chunks == 0 || chunk_size == 0 {
+        return None;
+    }
+    // Sample up to 8 random indices and pick the first one whose
+    // bitmap bit is set and whose fingerprint is non-zero.
+    for _ in 0..8 {
+        *rng_state = rng_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let idx = u32::try_from(rng_state.wrapping_shr(32) % u64::from(total_chunks))
+            .unwrap_or(0)
+            .min(total_chunks - 1);
+        let chunk_idx = ChunkIndex::new(idx);
+        if !bitmap.is_complete(chunk_idx) {
+            continue;
+        }
+        let expected = fingerprints.get(chunk_idx);
+        if expected == 0 {
+            continue;
+        }
+        let start_byte = u64::from(idx).checked_mul(chunk_size)?;
+        if start_byte >= total_size {
+            continue;
+        }
+        let end_byte = start_byte.saturating_add(chunk_size).min(total_size);
+        let range = ByteRange::new(ByteOffset::new(start_byte), ByteOffset::new(end_byte))?;
+        return Some(Dispatch {
+            first: chunk_idx,
+            count: 1,
+            range,
+            kind: DispatchKind::Probe { expected },
+        });
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -811,6 +999,8 @@ struct Completion {
     bytes: u64,
     attempts: u32,
     elapsed: Duration,
+    kind: DispatchKind,
+    crcs: Vec<u32>,
     result: Result<(), WorkerError>,
 }
 

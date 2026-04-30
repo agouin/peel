@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::sparse_file::{SparseFile, SparseFileError};
+use crate::hash::crc32c::Crc32c;
 use crate::http::range::{parse_content_range, RangeError};
 use crate::http::{Client, ClientError, Headers, Url};
 use crate::progress::ProgressState;
@@ -76,6 +77,23 @@ pub enum WorkerError {
         expected_last_modified: Option<String>,
         /// `Last-Modified` returned now.
         actual_last_modified: Option<String>,
+    },
+
+    /// A `PLAN_v2.md` §11 mid-flight probe re-fetched a chunk whose
+    /// CRC-32C disagreed with the value recorded at first-fetch.
+    /// The source must have changed between the original GET and the
+    /// probe — abort the run rather than continue with mixed bytes.
+    #[error(
+        "source changed during download: chunk {chunk} probe CRC32C \
+         (expected {expected:#010x}, observed {actual:#010x})"
+    )]
+    SourceDriftDetected {
+        /// Chunk whose probe failed.
+        chunk: ChunkIndex,
+        /// CRC-32C the original fetch recorded.
+        expected: u32,
+        /// CRC-32C the probe just computed.
+        actual: u32,
     },
 
     /// The server's `Content-Range` did not match what we asked for.
@@ -158,6 +176,7 @@ impl WorkerError {
             Self::BodyIo { .. } => true,
             Self::BodyLengthMismatch { .. } => true,
             Self::SourceChanged { .. } => false,
+            Self::SourceDriftDetected { .. } => false,
             Self::ContentRangeMismatch { .. } => false,
             Self::ContentRangeMalformed { .. } => false,
             Self::SparseFile { .. } => false,
@@ -180,9 +199,14 @@ fn is_transport_retryable(err: &ClientError) -> bool {
 ///
 /// Both fields are optional — RFC 7232 only requires that *one* of them
 /// is present for a cacheable resource, and many real-world servers send
-/// only one. The worker enforces equality on whichever fields the
-/// initial `HEAD` saw: a server that drops the header on subsequent
-/// responses is treated as having changed identity.
+/// only one. The worker enforces equality on the **strong** ETag and on
+/// `Last-Modified`. **Weak ETags** (the `W/`-prefixed variant per
+/// RFC 7232 §2.3) are treated as advisory: a weak validator only
+/// promises semantic equivalence, not byte equivalence, and some
+/// reverse proxies normalize weak ETags between cache hits, so a
+/// mismatch on its own is not enough to abort. The §11 per-chunk
+/// CRC-32C check (`PLAN_v2.md` §11) is the byte-level guard that
+/// catches genuine drift even when the ETag did not.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct SourceFingerprint {
     /// `ETag` value verbatim (including any `W/` weak prefix).
@@ -208,6 +232,15 @@ impl SourceFingerprint {
     }
 }
 
+/// True iff `etag` is a weak validator per RFC 7232 §2.3 (the
+/// `W/`-prefixed form). Weak validators promise semantic
+/// equivalence only, not byte equivalence, so we don't error on a
+/// weak-ETag mismatch — the §11 CRC-32C check is the byte guard.
+#[must_use]
+pub fn etag_is_weak(etag: &str) -> bool {
+    etag.starts_with("W/") || etag.starts_with("w/")
+}
+
 /// Tunables for the worker's retry loop.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -231,12 +264,40 @@ impl Default for RetryConfig {
 }
 
 /// What [`download_chunk`] reports on success.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ChunkOutcome {
     /// Bytes written to the sparse file.
     pub bytes: u64,
     /// Number of attempts taken (1 = first attempt succeeded).
     pub attempts: u32,
+    /// CRC-32C per bitmap chunk in the dispatch, in chunk order
+    /// (`PLAN_v2.md` §11). Empty for `Probe` dispatches — the probe
+    /// path verifies in-line and never bubbles raw fingerprints up.
+    pub crcs: Vec<u32>,
+}
+
+/// What kind of work a [`Dispatch`] represents.
+///
+/// Most dispatches are [`DispatchKind::Fetch`] — fetch the bytes
+/// covering one or more bitmap chunks and write them into the
+/// sparse file. The §11 mid-flight verifier additionally issues
+/// [`DispatchKind::Probe`] dispatches that re-fetch a single
+/// already-complete chunk and compare its CRC-32C against the
+/// value the original fetch recorded.
+#[derive(Debug, Clone, Copy)]
+pub enum DispatchKind {
+    /// Plain ranged GET that writes its body into the sparse file
+    /// and records per-chunk CRC-32Cs.
+    Fetch,
+    /// `PLAN_v2.md` §11 mid-flight probe: re-fetch the dispatch's
+    /// single chunk, recompute its CRC-32C, and compare against
+    /// `expected`. The probe still writes the bytes back into the
+    /// sparse file (idempotent on a stable source); a CRC mismatch
+    /// surfaces as [`WorkerError::SourceDriftDetected`].
+    Probe {
+        /// CRC-32C the original fetch recorded.
+        expected: u32,
+    },
 }
 
 /// One worker assignment: a contiguous run of bitmap chunks fetched
@@ -246,7 +307,8 @@ pub struct ChunkOutcome {
 /// only thing the scheduler dispatches when adaptive chunk-size is
 /// disabled. With adaptive enabled (`PLAN_v2.md` §8) the scheduler
 /// coalesces up to `policy.current() / chunk_size` consecutive
-/// incomplete chunks into one [`Dispatch`].
+/// incomplete chunks into one [`Dispatch`]. Probe dispatches always
+/// have `count == 1`.
 #[derive(Debug, Clone, Copy)]
 pub struct Dispatch {
     /// First chunk in the run.
@@ -257,6 +319,8 @@ pub struct Dispatch {
     /// performs **one** ranged GET against this range and writes the
     /// whole body via a single `pwrite_at`.
     pub range: ByteRange,
+    /// Whether this is a normal fetch or a §11 mid-flight probe.
+    pub kind: DispatchKind,
 }
 
 /// Borrowed context shared across every chunk in a single download.
@@ -273,6 +337,9 @@ pub struct ChunkContext<'a> {
     pub url: &'a Url,
     /// `ETag` / `Last-Modified` to verify on every response.
     pub fingerprint: &'a SourceFingerprint,
+    /// Bitmap chunk size — used to slice the dispatch body into
+    /// per-chunk CRC-32Cs (`PLAN_v2.md` §11).
+    pub chunk_size: u64,
     /// Sparse file the chunk's bytes are written into.
     pub sparse: &'a SparseFile,
     /// Optional progress sink the worker `fetch_add`s into after
@@ -306,6 +373,7 @@ pub fn download_chunk(
             first: chunk,
             count: 1,
             range,
+            kind: DispatchKind::Fetch,
         },
         retry,
         cancel,
@@ -343,12 +411,31 @@ pub fn download_dispatch(
     let mut backoff = retry.initial_backoff;
     loop {
         attempt = attempt.saturating_add(1);
-        let err = match try_once(ctx, chunk, dispatch.range) {
-            Ok(bytes) => {
+        let err = match try_once(ctx, &dispatch) {
+            Ok((bytes, crcs)) => {
+                // Probe dispatches verify in-line and never bubble
+                // CRCs up to the scheduler — they're already
+                // verified against the expected value.
+                if let DispatchKind::Probe { expected } = dispatch.kind {
+                    let actual = crcs.first().copied().unwrap_or(0);
+                    if actual != expected {
+                        return Err(WorkerError::SourceDriftDetected {
+                            chunk,
+                            expected,
+                            actual,
+                        });
+                    }
+                    return Ok(ChunkOutcome {
+                        bytes,
+                        attempts: attempt,
+                        crcs: Vec::new(),
+                    });
+                }
                 return Ok(ChunkOutcome {
                     bytes,
                     attempts: attempt,
-                })
+                    crcs,
+                });
             }
             Err(e) if !e.is_retryable() => return Err(e),
             Err(e) => e,
@@ -385,11 +472,9 @@ fn sleep_with_cancel(dur: Duration, cancel: &AtomicBool) -> bool {
     }
 }
 
-fn try_once(
-    ctx: &ChunkContext<'_>,
-    chunk: ChunkIndex,
-    range: ByteRange,
-) -> Result<u64, WorkerError> {
+fn try_once(ctx: &ChunkContext<'_>, dispatch: &Dispatch) -> Result<(u64, Vec<u32>), WorkerError> {
+    let chunk = dispatch.first;
+    let range = dispatch.range;
     let resp = ctx
         .client
         .get_range(ctx.url, range)
@@ -431,7 +516,38 @@ fn try_once(
     }
     // Otherwise drop the body, closing the underlying connection.
 
-    Ok(range.len())
+    let crcs = compute_chunk_crcs(&buf, dispatch, ctx.chunk_size);
+    Ok((range.len(), crcs))
+}
+
+/// Slice the dispatch body at bitmap-chunk boundaries and compute
+/// one CRC-32C per resulting slice.
+///
+/// The first slice spans `[range.start(), range.start() + chunk_size)`,
+/// the second `[range.start() + chunk_size, range.start() + 2*chunk_size)`,
+/// and so on. The final slice may be shorter than `chunk_size` for
+/// the file's tail chunk; we rely on `dispatch.range.len()` matching
+/// the worker's expectation of `count * chunk_size` capped at
+/// `total_size`. With `chunk_size == 0` (a config-rejected case) we
+/// fall back to one CRC over the whole buffer, matching the
+/// scheduler's earlier defensive check.
+fn compute_chunk_crcs(buf: &[u8], dispatch: &Dispatch, chunk_size: u64) -> Vec<u32> {
+    if chunk_size == 0 || dispatch.count <= 1 {
+        let mut hasher = Crc32c::new();
+        hasher.update(buf);
+        return vec![hasher.finalize()];
+    }
+    let chunk_size_usize = usize::try_from(chunk_size).unwrap_or(usize::MAX);
+    let mut out = Vec::with_capacity(dispatch.count as usize);
+    let mut offset = 0usize;
+    while offset < buf.len() && out.len() < dispatch.count as usize {
+        let end = offset.saturating_add(chunk_size_usize).min(buf.len());
+        let mut hasher = Crc32c::new();
+        hasher.update(&buf[offset..end]);
+        out.push(hasher.finalize());
+        offset = end;
+    }
+    out
 }
 
 fn verify_content_range(
@@ -486,7 +602,11 @@ fn verify_fingerprint(
     let actual_lm = headers.get("last-modified").map(str::to_string);
 
     if let Some(want) = &expected.etag {
-        if actual_etag.as_deref() != Some(want.as_str()) {
+        // RFC 7232 §2.3: weak ETags only validate semantic
+        // equivalence, so a mismatch on its own is advisory. The
+        // §11 CRC-32C probe is the byte-level guard.
+        let mismatch = actual_etag.as_deref() != Some(want.as_str());
+        if mismatch && !etag_is_weak(want) {
             return Err(WorkerError::SourceChanged {
                 chunk,
                 expected_etag: Some(want.clone()),
@@ -728,6 +848,45 @@ mod tests {
         let h = Headers::default();
         let fp = SourceFingerprint::default();
         verify_fingerprint(&h, &fp, ChunkIndex::ZERO).expect("nothing to check");
+    }
+
+    #[test]
+    fn weak_etag_mismatch_is_advisory() {
+        // Per RFC 7232 §2.3 a weak ETag (W/-prefixed) only validates
+        // semantic equivalence, so a value drift at the byte level
+        // does not by itself prove the source changed. §11's
+        // CRC-32C probe is the byte-level guard.
+        let mut h = Headers::default();
+        h.append("ETag", "W/\"v2\"");
+        let fp = SourceFingerprint {
+            etag: Some("W/\"v1\"".into()),
+            last_modified: None,
+        };
+        verify_fingerprint(&h, &fp, ChunkIndex::ZERO).expect("weak mismatch is advisory");
+    }
+
+    #[test]
+    fn strong_etag_mismatch_still_errors_when_only_one_is_strong() {
+        // A weak expected vs strong actual (or vice versa) — only
+        // when *both* sides are weak do we treat it as advisory.
+        let mut h = Headers::default();
+        h.append("ETag", "\"strong\"");
+        let fp = SourceFingerprint {
+            etag: Some("W/\"weak\"".into()),
+            last_modified: None,
+        };
+        // Source-side is weak; we treat this as advisory because
+        // weak validators carry no byte-level promise. §11 catches
+        // any actual drift.
+        verify_fingerprint(&h, &fp, ChunkIndex::ZERO).expect("weak expected is advisory");
+    }
+
+    #[test]
+    fn etag_is_weak_detects_w_prefix() {
+        assert!(etag_is_weak("W/\"abc\""));
+        assert!(etag_is_weak("w/\"abc\""));
+        assert!(!etag_is_weak("\"abc\""));
+        assert!(!etag_is_weak(""));
     }
 
     // ---- sleep_with_cancel --------------------------------------------

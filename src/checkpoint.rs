@@ -40,6 +40,8 @@
 //!                  u64 current_entry_offset
 //!   u8  hash_state_present (v3+ only)
 //!     if 1: SERIALIZED_LEN bytes of `hash::sha256::Sha256` state
+//!   u8  chunk_crc32c_present (v4+ only)
+//!     if 1: u32 count, then count × u32 CRC-32C values
 //! ```
 //!
 //! # Forward compatibility
@@ -78,6 +80,7 @@
 //!     created_at: std::time::SystemTime::now(),
 //!     sink_state: SinkState::Tar { members_completed: vec!["root/a.txt".into()] },
 //!     hash_state: None,
+//!     chunk_crc32c: None,
 //! };
 //! ckpt.write(std::path::Path::new("/tmp/peel-demo.ckpt"))?;
 //! # Ok::<(), peel::checkpoint::CheckpointError>(())
@@ -111,7 +114,11 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   carrying the serialized SHA-256 state used by `--sha256`
 ///   integrity verification (`docs/PLAN_v2.md` §10). v3 readers
 ///   parse v1 / v2 files transparently with `hash_state = None`.
-pub const FORMAT_VERSION: u32 = 3;
+/// - **v4** — appends an optional [`Checkpoint::chunk_crc32c`]
+///   per-chunk fingerprint vector for `PLAN_v2.md` §11's mid-flight
+///   source-change detector. v4 readers parse v1 / v2 / v3 files
+///   transparently with `chunk_crc32c = None`.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -325,6 +332,17 @@ pub struct Checkpoint {
     /// with [`crate::hash::sha256::Sha256::deserialize`] on resume.
     /// Added in checkpoint format v3; older readers see `None`.
     pub hash_state: Option<[u8; crate::hash::sha256::SERIALIZED_LEN]>,
+    /// Per-bitmap-chunk CRC-32C fingerprints (`PLAN_v2.md` §11)
+    /// captured by the download workers, or `None` when the §11
+    /// drift detector is off (or the checkpoint predates v4).
+    ///
+    /// Length, when `Some`, equals the chunk count implied by
+    /// `total_size / chunk_size`. Workers populate the slot for
+    /// each completed chunk as they record CRCs; an unset slot
+    /// (chunk not yet downloaded) holds `0`. Coordinator's resume
+    /// path uses the populated slots to verify the source has not
+    /// changed since the checkpoint was written.
+    pub chunk_crc32c: Option<Vec<u32>>,
 }
 
 /// Maximum body length [`Checkpoint::deserialize`] will trust before
@@ -394,6 +412,18 @@ impl Checkpoint {
             Some(bytes) => {
                 body.push(1);
                 body.extend_from_slice(bytes);
+            }
+            None => body.push(0),
+        }
+
+        match &self.chunk_crc32c {
+            Some(crcs) => {
+                body.push(1);
+                let count = u32::try_from(crcs.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for crc in crcs.iter().take(count as usize) {
+                    write_u32(&mut body, *crc);
+                }
             }
             None => body.push(0),
         }
@@ -481,11 +511,11 @@ impl Checkpoint {
         // v1 and v2 share the same body layout up to the sink tag;
         // v2 adds [`SINK_TAG_ZIP`] as an accepted tag value. v3
         // appends a single trailing `hash_state` field after the
-        // sink-state body. The `decode_body` helper takes the
-        // version so it can decide whether to read that trailer;
-        // future versions that *change* the layout will branch
-        // here.
-        debug_assert!(matches!(format_version, 1..=3));
+        // sink-state body. v4 appends a `chunk_crc32c` trailer after
+        // that. The `decode_body` helper takes the version so it can
+        // decide whether to read each trailer; future versions that
+        // *change* the layout will branch here.
+        debug_assert!(matches!(format_version, 1..=4));
         Self::decode_body(body, format_version)
     }
 
@@ -577,6 +607,29 @@ impl Checkpoint {
             None
         };
 
+        let chunk_crc32c = if format_version >= 4 {
+            let presence = cursor.read_u8("chunk_crc32c.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    let count = cursor.read_u32("chunk_crc32c.len")?;
+                    let mut crcs = Vec::with_capacity(count as usize);
+                    for _ in 0..count {
+                        crcs.push(cursor.read_u32("chunk_crc32c[i]")?);
+                    }
+                    Some(crcs)
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "chunk_crc32c",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         if cursor.remaining() != 0 {
             return Err(CheckpointError::Truncated {
                 reason: format!(
@@ -597,6 +650,7 @@ impl Checkpoint {
             created_at,
             sink_state,
             hash_state,
+            chunk_crc32c,
         })
     }
 
@@ -721,6 +775,8 @@ impl Checkpoint {
                 .hash_state
                 .as_ref()
                 .map_or(0, |_| crate::hash::sha256::SERIALIZED_LEN)
+            + 1
+            + self.chunk_crc32c.as_ref().map_or(0, |c| 4 + c.len() * 4)
     }
 }
 
@@ -981,6 +1037,7 @@ mod tests {
                 bytes_written: 4096,
             },
             hash_state: None,
+            chunk_crc32c: None,
         }
     }
 
@@ -1002,6 +1059,7 @@ mod tests {
                 ],
             },
             hash_state: None,
+            chunk_crc32c: None,
         }
     }
 
@@ -1058,6 +1116,7 @@ mod tests {
                 current_entry_offset: current_offset,
             },
             hash_state: None,
+            chunk_crc32c: None,
         }
     }
 
@@ -1093,12 +1152,12 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_three() {
-        // Sanity: PLAN_v2 §10 step 4 calls for bumping the version
-        // when the optional `hash_state` trailer lands. If a future
+    fn checkpoint_format_version_is_four() {
+        // Sanity: PLAN_v2 §10 step 4 (v3) and §11 step 1 (v4) each
+        // bump this when an optional trailer lands. If a future
         // change resets it, this guards against silently dropping
-        // the upgrade-required signal v1 / v2 readers depend on.
-        assert_eq!(FORMAT_VERSION, 3);
+        // the upgrade-required signal older readers depend on.
+        assert_eq!(FORMAT_VERSION, 4);
     }
 
     fn build_legacy_body_raw_sink() -> Vec<u8> {
@@ -1170,12 +1229,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_hash_state_presence_byte() {
-        // Build a valid v3 body, then poke the trailing presence
-        // byte to an out-of-range value (only 0/1 are valid).
+        // Build a valid v4 body with both trailing flags absent
+        // (hash_state = None at byte -2, chunk_crc32c = None at
+        // byte -1) and poke the hash_state byte specifically.
         let mut bytes = sample_raw().serialize();
-        let last = bytes.len() - 1;
-        // The last body byte is the hash_state presence (None=0).
-        bytes[last] = 7;
+        let hash_state_byte = bytes.len() - 2;
+        bytes[hash_state_byte] = 7;
         // Recompute the body checksum so the integrity check
         // doesn't fire first.
         let body_start = HEADER_LEN;
@@ -1189,6 +1248,34 @@ mod tests {
             }
             other => panic!("expected InvalidPresence(hash_state), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_invalid_chunk_crc32c_presence_byte() {
+        // Build a valid v4 body and poke the trailing chunk_crc32c
+        // presence byte (offset -1) to an out-of-range value.
+        let mut bytes = sample_raw().serialize();
+        let last = bytes.len() - 1;
+        bytes[last] = 5;
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::InvalidPresence { value, field } => {
+                assert_eq!(value, 5);
+                assert_eq!(field, "chunk_crc32c");
+            }
+            other => panic!("expected InvalidPresence(chunk_crc32c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_with_chunk_crc32c_present() {
+        let mut ckpt = sample_raw();
+        ckpt.chunk_crc32c = Some(vec![0xDEAD_BEEF, 0xCAFE_F00D, 0x1234_5678]);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
     }
 
     #[test]
@@ -1215,6 +1302,7 @@ mod tests {
                 members_completed: Vec::new(),
             },
             hash_state: None,
+            chunk_crc32c: None,
         };
         let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
         assert_eq!(parsed, ckpt);
@@ -1589,6 +1677,16 @@ mod tests {
                 None
             };
 
+            // Half the trials carry a §11 chunk-CRC32C vector to
+            // exercise the v4 trailer; the other half leave it
+            // unset so v3-shape inputs round-trip too.
+            let chunk_crc32c = if rng.next_bool() {
+                let n = (rng.next_u32() as usize) % 16;
+                Some((0..n).map(|_| rng.next_u32()).collect())
+            } else {
+                None
+            };
+
             let ckpt = Checkpoint {
                 url,
                 etag,
@@ -1600,6 +1698,7 @@ mod tests {
                 created_at,
                 sink_state,
                 hash_state,
+                chunk_crc32c,
             };
             let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
             assert_eq!(parsed, ckpt);
