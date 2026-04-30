@@ -27,12 +27,17 @@
 //! cookies, no proxies. The only request bodies the client knows how to
 //! send are zero bytes.
 
+// `client` depends on `crate::io_backend`, which is Unix-only (see
+// `PLAN_v2.md` §7 / §7b). The other submodules (URL parsing, header
+// parsing, request / response framing) stay cross-platform.
+#[cfg(unix)]
 pub mod client;
 pub mod range;
 pub mod request;
 pub mod response;
 pub mod url;
 
+#[cfg(unix)]
 pub use client::{Client, ClientConfig, ClientError};
 pub use range::{ContentRange, RangeError};
 pub use request::{Method, Request, RequestError};

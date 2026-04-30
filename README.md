@@ -23,11 +23,13 @@ peel https://example.com/dataset.tar.zst -C ./out
   size.
 - Checkpoints at compression-frame boundaries so a `kill -9` mid-run
   resumes exactly where it left off.
-- On Linux, batches the parallel `pwrite`/`pread`/`fsync` syscalls
-  through a single `io_uring` ring on a dedicated IO thread. Falls back
-  cleanly to blocking IO on older kernels or when `RLIMIT_MEMLOCK` is
-  too low. Pick the path explicitly with `--io-backend
-  [auto|blocking|uring]` (default: `auto`).
+- On Linux, batches the parallel `pwrite`/`pread`/`fsync` syscalls and
+  the download workers' TCP `recv`/`send` through a single `io_uring`
+  ring on a dedicated IO thread. Per-op timeouts on socket reads/writes
+  are enforced via linked LinkTimeout SQEs. Falls back cleanly to
+  blocking IO on older kernels or when `RLIMIT_MEMLOCK` is too low.
+  Pick the path explicitly with `--io-backend [auto|blocking|uring]`
+  (default: `auto`).
 
 ## Why you want this
 

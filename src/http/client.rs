@@ -12,8 +12,10 @@
 //! the caller. Retries with exponential backoff live in the download
 //! scheduler (PLAN §5).
 
+#![cfg(unix)]
+
 use std::io::{self, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +26,7 @@ use thiserror::Error;
 use super::request::{Method, Request, RequestError};
 use super::response::{BodyReader, Headers, Response, ResponseError, Status};
 use super::url::{Scheme, Url, UrlError};
+use crate::io_backend::{default_backend, IoBackend, NetStream, SocketConfig};
 use crate::types::ByteRange;
 
 /// Default cap on the number of redirects a single call will follow.
@@ -155,20 +158,15 @@ impl Default for ClientConfig {
     }
 }
 
-/// A connection that can read and write bytes synchronously. Implemented
-/// by [`TcpStream`] and `rustls::StreamOwned<...>`.
-trait ReadWrite: Read + Write + Send {}
-impl<T: Read + Write + Send> ReadWrite for T {}
-
 /// Concrete connection type carried inside the pool and inside
 /// caller-visible response bodies. Hides whether the stream is plaintext
-/// or TLS-wrapped.
+/// or TLS-wrapped, and which IO backend produced the underlying socket.
 pub struct ConnStream {
-    inner: Box<dyn ReadWrite + Send>,
+    inner: Box<dyn NetStream>,
 }
 
 impl ConnStream {
-    fn new(inner: Box<dyn ReadWrite + Send>) -> Self {
+    fn new(inner: Box<dyn NetStream>) -> Self {
         Self { inner }
     }
 }
@@ -238,6 +236,12 @@ struct ClientInner {
     tls_config: Arc<rustls::ClientConfig>,
     pool: Mutex<Vec<PooledConn>>,
     config: ClientConfig,
+    /// File-IO backend whose [`IoBackend::connect`] is used for every
+    /// outbound socket. Defaults to the blocking backend; the §7.3
+    /// CLI selection logic shares one backend across the Client and
+    /// the [`crate::download::SparseFile`] so the chosen path is
+    /// observable end-to-end.
+    io_backend: Arc<dyn IoBackend>,
 }
 
 /// The result of a `HEAD` request.
@@ -256,8 +260,8 @@ pub struct HeadResult {
 pub type ClientResponse = Response<ConnReader>;
 
 impl Client {
-    /// Construct a client with default configuration and the bundled
-    /// WebPKI root store.
+    /// Construct a client with default configuration, the default IO
+    /// backend (blocking), and the bundled WebPKI root store.
     ///
     /// # Errors
     ///
@@ -265,23 +269,68 @@ impl Client {
     /// default cryptographic provider (extremely unusual; would imply a
     /// build/feature mismatch).
     pub fn new() -> Result<Self, ClientError> {
-        Self::with_config(ClientConfig::default())
+        Self::with_config_and_backend(ClientConfig::default(), default_backend())
     }
 
-    /// Construct a client with custom [`ClientConfig`].
+    /// Construct a client with custom [`ClientConfig`] and the default
+    /// IO backend.
     ///
     /// # Errors
     ///
     /// Same conditions as [`Self::new`].
     pub fn with_config(config: ClientConfig) -> Result<Self, ClientError> {
+        Self::with_config_and_backend(config, default_backend())
+    }
+
+    /// Construct a client with custom [`ClientConfig`] and an
+    /// explicit [`IoBackend`].
+    ///
+    /// The §7.3 selection logic in
+    /// [`crate::io_backend::select_backend`] returns one
+    /// `Arc<dyn IoBackend>` that is shared across the
+    /// [`crate::download::SparseFile`] *and* this client, so the
+    /// chosen path (blocking or `io_uring`) governs both the file IO
+    /// and the network IO of a run.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::new`].
+    pub fn with_config_and_backend(
+        config: ClientConfig,
+        io_backend: Arc<dyn IoBackend>,
+    ) -> Result<Self, ClientError> {
         let tls_config = build_tls_config()?;
         Ok(Self {
             inner: Arc::new(ClientInner {
                 tls_config: Arc::new(tls_config),
                 pool: Mutex::new(Vec::new()),
                 config,
+                io_backend,
             }),
         })
+    }
+
+    /// The diagnostic name of the IO backend driving this client's
+    /// network connections (e.g. `"blocking"`, `"uring"`).
+    #[must_use]
+    pub fn io_backend_name(&self) -> &'static str {
+        self.inner.io_backend.name()
+    }
+
+    /// Return a fresh [`Client`] with this client's [`ClientConfig`]
+    /// preserved but its IO backend replaced by `io_backend`.
+    ///
+    /// The connection pool is *not* carried over (the new backend may
+    /// be incompatible with the cached connections — e.g. moving from
+    /// blocking to uring after the pool already cached a `TcpStream`).
+    /// TLS state is rebuilt; this is cheap.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::with_config_and_backend`].
+    pub fn with_backend(self, io_backend: Arc<dyn IoBackend>) -> Result<Self, ClientError> {
+        let config = self.inner.config.clone();
+        Self::with_config_and_backend(config, io_backend)
     }
 
     /// Issue a `HEAD` request, following redirects up to the configured
@@ -513,7 +562,7 @@ impl Client {
                 port: url.port(),
             })?;
 
-        let tcp = self.connect_tcp(addr, url)?;
+        let socket = self.dial_socket(addr, url)?;
 
         if url.scheme().is_tls() {
             let server_name = ServerName::try_from(url.host().to_string()).map_err(|_| {
@@ -527,25 +576,37 @@ impl Client {
                     source,
                 },
             )?;
-            let stream = StreamOwned::new(conn, tcp);
+            let stream = StreamOwned::new(conn, socket);
             Ok(ConnStream::new(Box::new(stream)))
         } else {
-            Ok(ConnStream::new(Box::new(tcp)))
+            Ok(ConnStream::new(socket))
         }
     }
 
-    fn connect_tcp(&self, addr: SocketAddr, url: &Url) -> Result<TcpStream, ClientError> {
+    /// Open a fresh socket via the configured [`IoBackend`].
+    ///
+    /// `BlockingBackend::connect` reproduces the historical
+    /// `TcpStream::connect_timeout + set_read_timeout +
+    /// set_write_timeout + set_nodelay` sequence; `UringBackend::connect`
+    /// returns a [`crate::io_backend::UringBackend`]-owned
+    /// [`UringSocket`] that routes each read/write through the
+    /// shared submission ring.
+    fn dial_socket(&self, addr: SocketAddr, url: &Url) -> Result<Box<dyn NetStream>, ClientError> {
         let timeout = self.inner.config.timeout;
-        let map_io = |source: io::Error| ClientError::Io {
-            host: url.host().to_string(),
-            port: url.port(),
-            source,
+        let cfg = SocketConfig {
+            connect_timeout: timeout,
+            read_timeout: Some(timeout),
+            write_timeout: Some(timeout),
+            nodelay: true,
         };
-        let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(map_io)?;
-        tcp.set_read_timeout(Some(timeout)).map_err(map_io)?;
-        tcp.set_write_timeout(Some(timeout)).map_err(map_io)?;
-        tcp.set_nodelay(true).map_err(map_io)?;
-        Ok(tcp)
+        self.inner
+            .io_backend
+            .connect(addr, &cfg)
+            .map_err(|source| ClientError::Io {
+                host: url.host().to_string(),
+                port: url.port(),
+                source,
+            })
     }
 
     fn return_connection(&self, host_key: HostKey, reader: ConnReader) {

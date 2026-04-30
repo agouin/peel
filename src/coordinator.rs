@@ -435,6 +435,16 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         source,
     })?;
 
+    // Resolve the IO backend up front so it can be shared by the HTTP
+    // client (sockets) and the sparse file (file IO). select_backend
+    // is the single place where the user's --io-backend choice is
+    // materialized; logging/warning side effects fire inside it.
+    let io_backend = crate::io_backend::select_backend(config.io_backend, config.workers)
+        .map_err(CoordinatorError::IoBackend)?;
+    let client = client
+        .with_backend(Arc::clone(&io_backend))
+        .map_err(CoordinatorError::Client)?;
+
     let info = discover(&client, &parsed_url).map_err(CoordinatorError::Scheduler)?;
 
     let part_path = sidecar_path(&output, &config, ".peel.part");
@@ -470,11 +480,13 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 
     let chunks_resumed = u32::try_from(bitmap.count_complete()).unwrap_or(u32::MAX);
 
-    let io_backend = crate::io_backend::select_backend(config.io_backend, config.workers)
-        .map_err(CoordinatorError::IoBackend)?;
     let sparse = Arc::new(
-        SparseFile::open_or_create_with_backend(&part_path, info.total_size, io_backend)
-            .map_err(CoordinatorError::SparseFile)?,
+        SparseFile::open_or_create_with_backend(
+            &part_path,
+            info.total_size,
+            Arc::clone(&io_backend),
+        )
+        .map_err(CoordinatorError::SparseFile)?,
     );
 
     let cursor = Arc::new(AtomicU64::new(match &resume_plan {

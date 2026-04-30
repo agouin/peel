@@ -49,14 +49,16 @@
 //!   shared `ProgressState` updated by writers (workers, extractor,
 //!   ZIP pipeline) plus a TTY / log renderer the binary spawns at
 //!   the boundary.
-//! - [`io_backend`] (Unix only) — file-IO seam (`PLAN_v2.md` §7):
-//!   the [`io_backend::IoBackend`] trait every backend honors, the
-//!   always-available [`io_backend::BlockingBackend`] wrapping
-//!   `pwrite`/`pread`/`fsync`, and (Linux only) the
-//!   `io_backend::UringBackend` that batches submissions across
-//!   workers through a dedicated IO thread. The `--io-backend` CLI
-//!   flag picks between `auto` (default; tries uring, falls back to
-//!   blocking with a warning), `blocking`, and `uring`.
+//! - [`io_backend`] (Unix only) — file-IO and network-IO seam
+//!   (`PLAN_v2.md` §7 + §7b): the [`io_backend::IoBackend`] trait
+//!   every backend honors, the always-available
+//!   [`io_backend::BlockingBackend`] wrapping `pwrite`/`pread`/`fsync`
+//!   and `TcpStream::connect_timeout`, and (Linux only) the
+//!   `io_backend::UringBackend` that batches both file IO and the HTTP
+//!   client's TCP `recv`/`send` through a dedicated IO thread sharing
+//!   one ring. The `--io-backend` CLI flag picks between `auto`
+//!   (default; tries uring, falls back to blocking with a warning),
+//!   `blocking`, and `uring`.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
