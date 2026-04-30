@@ -1,10 +1,15 @@
 [package]
-name = "peel"
+name = "peel-rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
-publish = false
 description = "Streaming, resumable, space-efficient extractor for compressed archives downloaded over HTTP."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/agouin/peel"
+homepage = "https://github.com/agouin/peel"
+readme = "README.md"
+keywords = ["download", "extract", "archive", "streaming", "tar"]
+categories = ["command-line-utilities", "compression", "network-programming"]
 
 [lib]
 name = "peel"

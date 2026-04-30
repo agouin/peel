@@ -1,16 +1,20 @@
 # Optimizations & Future Work
 
-> **Status: post-MVP work is now active (2026-04-29).** The MVP in `PLAN.md`
-> has shipped (phases 1–10 complete). Items in this file are now eligible
-> for prioritization, but the rule still stands: **promotion from this file
+> **Status: PLAN_v2 round one shipped (2026-04-30).** The MVP in `PLAN.md`
+> landed 2026-04-29 (phases 1–10), and round one of `PLAN_v2.md` followed
+> immediately on top, delivering `O.1`, `O.2`, `O.3`, `O.6`, `O.7`, `O.8`,
+> `O.10`, `O.11`, `O.13`, `O.14`, and `O.19`. Their entries below are
+> annotated **"delivered in PLAN_v2 §<phase>"** and kept as historical
+> record — do not re-pull them. The remaining items are eligible for
+> prioritization, but the rule still stands: **promotion from this file
 > to active work happens through deliberate human review**, not by an agent
 > deciding "while I'm here…" When an item is selected, it should be lifted
 > into a successor plan (a new sequenced doc, same discipline as the
 > original `PLAN.md`) before implementation begins.
 
 This file started as a **wishlist of things explicitly deferred** during
-MVP. Now that the MVP is complete, it serves as the input queue for the
-next planning round.
+MVP. With round one of `PLAN_v2.md` now shipped on top of the MVP, it
+serves as the input queue for the next planning round.
 
 The point of having this file is twofold:
 
@@ -47,16 +51,20 @@ that want a fixed unit.
 
 ### O.2 io_uring for downloads and writes
 
-**What**: replace blocking `read`/`pwrite` with `io_uring` submission
-queues for higher throughput at high IO concurrency.
-
-**Why deferred**: blocking IO with a small thread pool is more than
-fast enough for network-bound work; `io_uring` adds Linux-only
-complexity for marginal gains in our use case.
-
-**Sketch**: introduce a Linux-specific IO backend behind a trait; keep
-the portable blocking backend as default. Likely needs `tokio-uring` or
-similar — adding async runtime complexity that the MVP avoids.
+**Status: delivered in `PLAN_v2.md` §7 + §7b (2026-04-29).** Both halves
+of the IO path now route through the [`IoBackend`](../src/io_backend.rs)
+trait. `UringBackend` (Linux-only, gated on a runtime capability probe)
+submits the parallel `pwrite`/`pread`/`fsync` SQEs *and* the download
+workers' TCP `connect`/`send`/`recv` SQEs through a single ring on a
+dedicated IO thread; per-op timeouts are linked `LinkTimeout` SQEs so
+worker cancellation is prompt without polling. `rustls` rides on top
+unchanged because [`UringSocket`](../src/io_backend/uring.rs) implements
+`std::io::{Read, Write}`. No async runtime was added — the IO thread
+uses `Submitter::submit_and_wait` and workers block on per-op
+completion notifiers. The probe falls back cleanly (with a `warn!`
+naming the cause) when the kernel rejects ring construction (kernel
+< 5.6, `RLIMIT_MEMLOCK` too low, seccomp blocking); `--io-backend
+[auto|blocking|uring|mmap]` lets a user pin a path explicitly.
 
 ---
 
@@ -264,27 +272,32 @@ end, sync marker.
 
 ### O.10 Multi-mirror downloads
 
-**What**: accept multiple URLs for the same file (with the same hash);
-download chunks from whichever mirror responds fastest.
-
-**Why deferred**: not in MVP; common in package managers but not
-universally needed for arbitrary archive downloads.
-
-**Sketch**: scheduler accepts `Vec<Url>`, runs HEAD against each in
-parallel to verify size + ETag/checksum, then dispatches chunk
-requests to the fastest-responding mirror with fallback on failure.
+**Status: delivered in `PLAN_v2.md` §13 (2026-04-30).** `--mirror <URL>`
+is repeatable; the positional URL is the primary, every `--mirror` is
+an alternate. At startup the coordinator runs `HEAD` against every URL
+in parallel and drops any whose `Content-Length` (or, when `--sha256`
+is unset, `ETag` / `Last-Modified`) disagrees with the primary. The
+scheduler picks per ranged GET, biased toward the fastest live mirror
+via per-mirror health (success rate, latency p95); a failing mirror
+is excluded for 30 s before being retried instead of failing the run.
+`--sha256` cross-checks every mirror against the same expected digest;
+the §11 CRC32C drift detection runs across mirrors as well as across
+resume.
 
 ---
 
 ### O.11 Bandwidth limiting
 
-**What**: `--max-bandwidth 10MB/s` flag.
-
-**Why deferred**: easy to add but not load-bearing for MVP.
-
-**Sketch**: token-bucket rate limiter shared across workers; each
-worker `acquire()`s tokens equal to bytes-about-to-be-read before
-issuing each socket read.
+**Status: delivered in `PLAN_v2.md` §14 (2026-04-30).** `--max-bandwidth
+<RATE>` accepts decimal (`K`/`M`/`G`/`T`, 1000-based per network
+convention) and binary (`Ki`/`Mi`/`Gi`/`Ti`) suffixes; trailing `B`
+and `/s` are accepted and ignored. The cap is **aggregate** across all
+workers and (per §13) all mirrors via a shared token-bucket rate
+limiter — bytes are tokens, refill rate is the configured limit,
+bucket capacity is `max(1 MiB, rate × 250 ms)` to absorb bursts.
+Workers acquire tokens *before* dispatching each socket read, so the
+limiter sits above the IO backend and applies uniformly to both the
+blocking and uring paths.
 
 ---
 
@@ -304,18 +317,26 @@ real users with real interrupted downloads.
 
 ### O.13 Integrity verification
 
-**What**: `--sha256 abc...` flag verifies the assembled compressed
-file's hash against an expected value before extraction.
-
-**Why deferred**: useful but orthogonal to the core resumable-extraction
-loop. ETag already gives us "did the source change during download";
-this would add "is the result what was expected" on top.
-
-**Sketch**: maintain a streaming SHA-256 hasher fed by the extractor's
-input stream; check at completion. Resume needs to handle this:
-either start over (safe) or store the partial hasher state in the
-checkpoint (complex; SHA-256 state is small but the API isn't built
-for serialization).
+**Status: delivered in `PLAN_v2.md` §10 (2026-04-30); extended by §11
+(mid-flight drift detection).** `--sha256 <HEX>` verifies the
+assembled compressed source against the expected 64-hex digest. The
+implementation is a hand-rolled, resumable SHA-256
+([`src/hash/sha256.rs`](../src/hash/sha256.rs)); the running state is
+serialized into the checkpoint at every quiescent frame boundary so a
+resumed run produces a digest byte-identical to a clean run (and to
+`sha256sum` on the original compressed file). Tests cross-check
+against the `sha2` dev-dependency and the NIST FIPS 180-4 vectors.
+A mismatch raises `IntegrityError::HashMismatch` with an exit code
+distinct from generic IO failure. Streaming pipeline only — `.zip`
+archives extract per-entry and integrity checking does not extend to
+that path in round-one (filed implicitly under `O.8b` if needed).
+**§11** layers per-chunk CRC32C fingerprints on top: every Nth chunk
+(default `N = 32`) is re-fetched as a probe and aborts with
+`SourceChangedDuringDownload` on mismatch; resume probes a random
+already-complete chunk against the live source and aborts with
+`SourceChangedSinceCheckpoint` on mismatch. ETag handling was
+tightened in the same phase to honor strong/weak distinctions and
+Last-Modified.
 
 ---
 
@@ -323,13 +344,15 @@ for serialization).
 
 ### O.14 macOS `F_PUNCHHOLE` puncher
 
-**What**: implement the `PunchHole` trait for macOS.
-
-**Why deferred**: MVP is Linux-first. The trait abstraction means
-adding macOS is purely additive.
-
-**Sketch**: `fcntl(fd, F_PUNCHHOLE, &fpunchhole_arg)` — already
-sketched in the Python prototype. APFS supports it.
+**Status: delivered in `PLAN_v2.md` §12 (2026-04-30).**
+[`MacosPuncher`](../src/punch.rs) calls `fcntl(fd, F_PUNCHHOLE,
+&fpunchhole_arg)` directly via `libc`, with the same
+`ENOTSUP`/`EINVAL` graceful-degrade path as `LinuxPuncher`.
+`default_puncher()` selects the right implementation by
+`cfg(target_os)`, so the macOS build links the macOS puncher and the
+blocking IO backend (the io_uring path stays Linux-only). On-disk
+source footprint shrinks during extraction on APFS the same way it
+does on ext4.
 
 ---
 
@@ -384,11 +407,17 @@ served by piping to a separate uploader tool.
 
 ### O.19 Progress UI improvements
 
-**What**: TUI with multiple progress bars (per worker), bandwidth
-graphs, ETA, etc.
-
-**Why deferred**: a single redrawn line is enough for MVP. Going
-further means a `crossterm`/`ratatui` dependency.
+**Status: delivered in `PLAN_v2.md` §6 (2026-04-30).** No new TUI
+dependency. [`progress.rs`](../src/progress.rs) renders a redrawn
+multi-line block with hand-rolled ANSI (`\x1b7`/`\x1b8` save/restore,
+`\x1b[K` erase-to-EOL): percent complete, compressed bytes
+downloaded / total, decompressed bytes written, download rate
+(rolling 5 s), disk write rate (rolling 5 s), ETA (whichever rate is
+the bottleneck), and active worker count. `IsTerminal` switches the
+non-TTY path to periodic `tracing::info!` lines. The `ProgressState`
+ring buffer added here is the same one the §8 adaptive chunk-size
+policy and the §13 multi-mirror health tracker hang off of, so future
+phases extend it instead of building parallel state.
 
 ---
 
@@ -468,14 +497,32 @@ attack vector).
 
 ## When to revisit this list
 
-**This is the moment.** The MVP shipped on 2026-04-29 and we're now in the
-post-MVP phase. Look at this list and ask:
+**This is the moment, again.** The MVP shipped 2026-04-29 and round
+one of `PLAN_v2.md` shipped on top of it (§§6, 7, 7b, 8–14
+delivered). What's left here splits cleanly into three buckets:
+
+- **Round-two follow-ons filed during round one** — `O.6b` (xz
+  per-Block boundaries), `O.7b` (lz4 per-block boundaries), `O.8b`
+  (zip Zip64/AES/extra-method support). These are the most concrete
+  candidates because the round-one phases that filed them named the
+  exact corpora and motivations that would justify promoting them.
+- **Performance items still deferred** — `O.4` (parallel zstd block
+  decoding), `O.5` (NUMA placement). Both remain niche; promote only
+  if profiling on a real corpus shows them load-bearing.
+- **Operational and metadata items** — `O.9` (native peel container
+  format), `O.12` (resume across version changes), `O.15`–`O.18`
+  (Windows, daemon/library mode, HTTP/2/3, pluggable destinations),
+  `O.20`–`O.25` (continuous fuzzing, real-world corpus tests,
+  differential testing, file modes, xattrs, links). Larger surface,
+  larger commitment; pick deliberately.
+
+Look at this list and ask:
 
 1. What did real users actually need that we deferred?
-2. What did we discover during MVP work that changed our priors?
+2. What did we discover during round one that changed our priors?
 3. Which items are dependencies of others?
 
-Then a *new* `PLAN.md` (or `PLAN_v2.md`) gets written with a focused
-slice of these promoted to scope, in dependency order, with the same
-discipline as the original MVP plan. Don't try to "knock out a few
-optimizations" outside of that process.
+Then a *new* successor plan (`PLAN_v3.md` or similar) gets written
+with a focused slice of these promoted to scope, in dependency order,
+with the same discipline as `PLAN.md` and `PLAN_v2.md`. Don't try to
+"knock out a few optimizations" outside of that process.
