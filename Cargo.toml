@@ -58,6 +58,16 @@ anyhow = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 
+# io_uring file-IO backend (PLAN_v2.md §7 / docs/ENGINEERING_STANDARDS.md §2.2).
+# Linux-only target dep so non-Linux builds stay clean. We use the
+# crate's sync API (`Submitter::submit_and_wait` on a dedicated IO
+# thread); no async runtime is added. The runtime probe in
+# `io_backend::uring` falls back to the blocking backend if the kernel
+# rejects the ring construction, so the dep being present does not by
+# itself force uring at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", default-features = false }
+
 [dev-dependencies]
 
 [profile.release]

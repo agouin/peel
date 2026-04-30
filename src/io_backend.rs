@@ -41,6 +41,12 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+pub mod uring;
+
+#[cfg(target_os = "linux")]
+pub use uring::{UringBackend, UringInitError, DEFAULT_RING_DEPTH, MIN_RING_DEPTH};
+
 /// File-IO operations performed by the download workers and the
 /// sparse file.
 ///
