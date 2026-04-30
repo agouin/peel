@@ -20,7 +20,7 @@ use crate::download::{
 };
 use crate::extractor::DEFAULT_PUNCH_THRESHOLD;
 use crate::hash::sha256::{parse_hex_digest, ParseHexDigestError};
-use crate::http::Client;
+use crate::http::{Client, ClientConfig, HttpVersion};
 use crate::io_backend::IoBackendChoice;
 
 /// Parsed CLI for the `peel` binary.
@@ -126,6 +126,19 @@ pub struct Cli {
     #[arg(long = "io-backend", value_enum, default_value_t = IoBackendArg::Auto)]
     pub io_backend: IoBackendArg,
 
+    /// HTTP version to use for downloads.
+    ///
+    /// `auto` (default) negotiates between HTTP/1.1 and HTTP/2 via
+    /// ALPN over TLS, and uses HTTP/1.1 over plaintext where ALPN
+    /// does not apply. `h1` forces HTTP/1.1 only — H2 is not
+    /// advertised in ALPN. `h2` forces HTTP/2: over TLS this requires
+    /// the origin to negotiate `h2` (the handshake fails otherwise);
+    /// over plaintext it forces HTTP/2 prior-knowledge ("h2c") which
+    /// only works against servers that explicitly speak it. Most
+    /// users want `auto`.
+    #[arg(long = "http-version", value_enum, default_value_t = HttpVersionArg::Auto)]
+    pub http_version: HttpVersionArg,
+
     /// Verify the assembled compressed source against this SHA-256
     /// digest (`PLAN_v2.md` §10).
     ///
@@ -207,6 +220,33 @@ impl From<IoBackendArg> for IoBackendChoice {
     }
 }
 
+/// CLI form of [`HttpVersion`].
+///
+/// Kept as a separate type so the [`clap::ValueEnum`] derive does not
+/// have to live on the library type. Mapping is mechanical via
+/// [`From`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum HttpVersionArg {
+    /// ALPN-negotiate H1 / H2 over TLS; H1 over plaintext.
+    #[default]
+    Auto,
+    /// Force HTTP/1.1.
+    H1,
+    /// Force HTTP/2 (prior-knowledge over plaintext).
+    H2,
+}
+
+impl From<HttpVersionArg> for HttpVersion {
+    fn from(arg: HttpVersionArg) -> Self {
+        match arg {
+            HttpVersionArg::Auto => Self::Auto,
+            HttpVersionArg::H1 => Self::Http1Only,
+            HttpVersionArg::H2 => Self::Http2Only,
+        }
+    }
+}
+
 /// Errors produced by [`Cli::into_run_args`].
 ///
 /// Wraps [`crate::http::ClientError`] (HTTP setup) and adds variants
@@ -279,7 +319,10 @@ impl Cli {
         };
         let max_disk_buffer =
             parse_disk_buffer(&self.max_disk_buffer).map_err(CliError::InvalidDiskBuffer)?;
-        let client = Client::new()?;
+        let client = Client::with_config(ClientConfig {
+            http_version: self.http_version.into(),
+            ..ClientConfig::default()
+        })?;
         Ok(RunArgs {
             url: self.url,
             output,
@@ -463,6 +506,68 @@ mod tests {
         assert_eq!(
             IoBackendChoice::from(IoBackendArg::Mmap),
             IoBackendChoice::Mmap
+        );
+    }
+
+    #[test]
+    fn parses_http_version_default_is_auto() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        assert_eq!(cli.http_version, HttpVersionArg::Auto);
+    }
+
+    #[test]
+    fn parses_http_version_h1() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--http-version",
+            "h1",
+        ])
+        .expect("parse");
+        assert_eq!(cli.http_version, HttpVersionArg::H1);
+    }
+
+    #[test]
+    fn parses_http_version_h2() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--http-version",
+            "h2",
+        ])
+        .expect("parse");
+        assert_eq!(cli.http_version, HttpVersionArg::H2);
+    }
+
+    #[test]
+    fn rejects_unknown_http_version() {
+        let err = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--http-version",
+            "h3",
+        ])
+        .expect_err("unknown http version");
+        let _ = err;
+    }
+
+    #[test]
+    fn http_version_arg_maps_to_library_enum() {
+        assert_eq!(HttpVersion::from(HttpVersionArg::Auto), HttpVersion::Auto);
+        assert_eq!(
+            HttpVersion::from(HttpVersionArg::H1),
+            HttpVersion::Http1Only
+        );
+        assert_eq!(
+            HttpVersion::from(HttpVersionArg::H2),
+            HttpVersion::Http2Only
         );
     }
 
