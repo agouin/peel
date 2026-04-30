@@ -1,0 +1,1042 @@
+//! Comparative streaming-extraction benchmarks: `peel` vs `curl | tool`.
+//!
+//! For every supported source format the suite builds a representative
+//! archive in memory, serves it from the in-process `MockServer`, then
+//! times two extraction strategies against the same byte stream:
+//!
+//! 1. `peel::coordinator::run` driving the full pipeline (parallel
+//!    ranged GETs → streaming decode → sink → punch).
+//! 2. The traditional baseline a user would type into a shell —
+//!    `curl URL | <decompressor> | tar -xf -` (or the format-specific
+//!    equivalent), spawned via `bash -c` so the pipe stages match what
+//!    a human invocation would do.
+//!
+//! Both runs target a fresh empty directory (or output file). The
+//! reference payload is verified for correctness on both sides; the
+//! durations are then printed in a tab-separated row keyed by format.
+//!
+//! ## How to run
+//!
+//! These tests are `#[ignore]`d so `cargo test` skips them. Invoke
+//! explicitly, in `--release` for representative numbers:
+//!
+//! ```text
+//! cargo test --release --test test_bench_streaming -- --ignored --nocapture
+//! ```
+//!
+//! The `--nocapture` flag is what makes the comparison rows appear on
+//! stdout. Tests run sequentially via `--test-threads=1` is *not*
+//! required (each test owns its mock server and tempdir), but
+//! ad-hoc-running them serially produces less noisy timings:
+//!
+//! ```text
+//! cargo test --release --test test_bench_streaming -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! ## Tool availability
+//!
+//! Each baseline shells out to a particular CLI tool (`curl`, `tar`,
+//! `zstd`, `xz`, `lz4`, `unzip`). When a tool is missing from `PATH`
+//! the corresponding benchmark prints a `[skip]` line and returns
+//! cleanly rather than failing — the benchmark grid is meant to run on
+//! whatever tools the developer happens to have installed.
+
+#![cfg(unix)]
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
+
+use peel::coordinator::{run, CoordinatorConfig, OutputTarget, RunArgs, RunStats};
+use peel::decode::DecoderRegistry;
+use peel::download::RetryConfig;
+use peel::http::{Client, ClientConfig};
+
+#[path = "support/mod.rs"]
+mod support;
+
+use support::mock_server::{MockRequest, MockResponse, MockServer};
+use support::tar_fixtures::build_simple_archive;
+use support::zip_fixtures::{build_zip, ZipEntrySpec};
+
+// ---- harness helpers --------------------------------------------------
+
+static UNIQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_dir(label: &str) -> PathBuf {
+    let pid = std::process::id();
+    let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let p = std::env::temp_dir().join(format!("peel_bench_{label}_{pid}_{nanos}_{n}"));
+    fs::create_dir_all(&p).expect("create unique_dir");
+    p
+}
+
+struct CleanupDir(PathBuf);
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// True if `name` resolves on `PATH`.
+fn tool_present(name: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name} >/dev/null 2>&1"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build a mostly-incompressible payload via an LCG so the on-the-wire
+/// size of every codec stays close to the raw payload size — that
+/// keeps "throughput" numbers from being dominated by a codec with a
+/// pathologically high compression ratio on a degenerate input.
+fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+// ---- codec encoders (in-process) --------------------------------------
+
+fn encode_zstd(payload: &[u8]) -> Vec<u8> {
+    zstd::encode_all(payload, 1).expect("encode zstd")
+}
+
+fn encode_xz(payload: &[u8]) -> Vec<u8> {
+    use xz2::stream::{Action, Check, Status, Stream};
+    let mut encoder = Stream::new_easy_encoder(6, Check::Crc64).expect("encoder");
+    let mut out: Vec<u8> = Vec::with_capacity(payload.len() / 2 + 256);
+    let mut input_pos = 0usize;
+    let mut scratch = vec![0u8; 1 << 14];
+    loop {
+        let action = if input_pos < payload.len() {
+            Action::Run
+        } else {
+            Action::Finish
+        };
+        let prev_in = encoder.total_in();
+        let prev_out = encoder.total_out();
+        let res = encoder
+            .process(&payload[input_pos..], &mut scratch, action)
+            .expect("encode step");
+        input_pos += (encoder.total_in() - prev_in) as usize;
+        let produced = (encoder.total_out() - prev_out) as usize;
+        out.extend_from_slice(&scratch[..produced]);
+        if let Status::StreamEnd = res {
+            break;
+        }
+    }
+    out
+}
+
+/// Single-frame, single-block, *uncompressed* LZ4 archive — the
+/// minimum-viable shape `peel::decode::lz4` accepts and which `lz4 -d`
+/// also decodes. Re-implemented here (rather than depending on a
+/// frame-format encoder crate) to keep the benchmark independent of
+/// dev-dep choices made elsewhere.
+fn encode_lz4_uncompressed_frame(payload: &[u8]) -> Vec<u8> {
+    const PRIME32_1: u32 = 0x9E37_79B1;
+    const PRIME32_2: u32 = 0x85EB_CA77;
+    const PRIME32_3: u32 = 0xC2B2_AE3D;
+    const PRIME32_4: u32 = 0x27D4_EB2F;
+    const PRIME32_5: u32 = 0x1656_67B1;
+
+    fn read_u32_le(bs: &[u8]) -> u32 {
+        u32::from_le_bytes([bs[0], bs[1], bs[2], bs[3]])
+    }
+    fn round(acc: u32, lane: u32) -> u32 {
+        acc.wrapping_add(lane.wrapping_mul(PRIME32_2))
+            .rotate_left(13)
+            .wrapping_mul(PRIME32_1)
+    }
+    fn xxh32(input: &[u8]) -> u32 {
+        let mut p = 0usize;
+        let len = input.len();
+        let mut h: u32;
+        if len >= 16 {
+            let mut v1 = PRIME32_1.wrapping_add(PRIME32_2);
+            let mut v2 = PRIME32_2;
+            let mut v3 = 0u32;
+            let mut v4 = 0u32.wrapping_sub(PRIME32_1);
+            let limit = len - 16;
+            loop {
+                v1 = round(v1, read_u32_le(&input[p..]));
+                v2 = round(v2, read_u32_le(&input[p + 4..]));
+                v3 = round(v3, read_u32_le(&input[p + 8..]));
+                v4 = round(v4, read_u32_le(&input[p + 12..]));
+                p += 16;
+                if p > limit {
+                    break;
+                }
+            }
+            h = v1
+                .rotate_left(1)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+        } else {
+            h = PRIME32_5;
+        }
+        h = h.wrapping_add(len as u32);
+        while p + 4 <= len {
+            h = h.wrapping_add(read_u32_le(&input[p..]).wrapping_mul(PRIME32_3));
+            h = h.rotate_left(17).wrapping_mul(PRIME32_4);
+            p += 4;
+        }
+        while p < len {
+            h = h.wrapping_add(u32::from(input[p]).wrapping_mul(PRIME32_5));
+            h = h.rotate_left(11).wrapping_mul(PRIME32_1);
+            p += 1;
+        }
+        h ^= h >> 15;
+        h = h.wrapping_mul(PRIME32_2);
+        h ^= h >> 13;
+        h = h.wrapping_mul(PRIME32_3);
+        h ^= h >> 16;
+        h
+    }
+
+    // BD byte selects the per-block max size. Bits 4-6 = 7 selects
+    // 4 MiB blocks, the largest the LZ4 Frame Format permits; we
+    // chunk the payload into ≤ 4 MiB blocks and write each as a
+    // separate uncompressed block (high bit of the size prefix set).
+    const BLOCK_MAX: usize = 4 * 1024 * 1024;
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x184D_2204u32.to_le_bytes());
+    let flg: u8 = 0b0110_0000;
+    let bd: u8 = 0b0111_0000;
+    out.push(flg);
+    out.push(bd);
+    let hc = ((xxh32(&[flg, bd]) >> 8) & 0xff) as u8;
+    out.push(hc);
+    for chunk in payload.chunks(BLOCK_MAX) {
+        let header = (chunk.len() as u32) | 0x8000_0000;
+        out.extend_from_slice(&header.to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&[0u8; 4]);
+    out
+}
+
+// ---- HTTP serving -----------------------------------------------------
+
+fn ok_handler(body: Vec<u8>) -> impl Fn(&MockRequest, u64) -> MockResponse + Send + Sync + 'static {
+    move |req, _| serve(req, &body)
+}
+
+fn serve(req: &MockRequest, body: &[u8]) -> MockResponse {
+    let head_headers: Vec<(String, String)> = vec![
+        ("Content-Length".into(), body.len().to_string()),
+        ("Accept-Ranges".into(), "bytes".into()),
+    ];
+    if req.method == "HEAD" {
+        return MockResponse::Reply {
+            status: 200,
+            reason: "OK",
+            headers: head_headers,
+            body: Vec::new(),
+        };
+    }
+    if let Some(range_hdr) = req.header("range") {
+        if let Some((a, b)) = parse_range(range_hdr) {
+            let a_us = a as usize;
+            let b_us = b as usize;
+            if b_us >= body.len() {
+                return MockResponse::Reply {
+                    status: 416,
+                    reason: "Range Not Satisfiable",
+                    headers: vec![],
+                    body: Vec::new(),
+                };
+            }
+            let slice = body[a_us..=b_us].to_vec();
+            let h = vec![(
+                "Content-Range".into(),
+                format!("bytes {a}-{b}/{}", body.len()),
+            )];
+            return MockResponse::Reply {
+                status: 206,
+                reason: "Partial Content",
+                headers: h,
+                body: slice,
+            };
+        }
+    }
+    MockResponse::Reply {
+        status: 200,
+        reason: "OK",
+        headers: vec![],
+        body: body.to_vec(),
+    }
+}
+
+fn parse_range(value: &str) -> Option<(u64, u64)> {
+    let after = value.strip_prefix("bytes=")?;
+    let (a, b) = after.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+// ---- peel-side glue ---------------------------------------------------
+
+fn build_client() -> Client {
+    Client::with_config(ClientConfig {
+        timeout: Duration::from_secs(30),
+        ..ClientConfig::default()
+    })
+    .expect("client constructs")
+}
+
+fn coord_config() -> CoordinatorConfig {
+    CoordinatorConfig {
+        chunk_size: 1 << 20, // 1 MiB
+        adaptive_chunk_size: true,
+        workers: 4,
+        retry: RetryConfig {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+        },
+        punch_threshold: 1 << 20,
+        checkpoint_min_bytes: 8 * 1024 * 1024,
+        checkpoint_min_interval: Duration::from_millis(50),
+        workdir: None,
+        reader_poll_interval: Duration::from_millis(2),
+        forced_format: None,
+        force_format_from_magic: false,
+        io_backend: peel::io_backend::IoBackendChoice::Blocking,
+        expected_sha256: None,
+        mirror_urls: Vec::new(),
+        max_bandwidth_bps: None,
+    }
+}
+
+fn run_peel(server: &MockServer, suffix: &str, output: OutputTarget) -> RunStats {
+    let args = RunArgs {
+        url: format!("{}/{suffix}", server.base_url()),
+        output,
+        config: coord_config(),
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+    };
+    run(args).expect("peel run succeeds")
+}
+
+// ---- baseline pipeline (curl | … | tar) -------------------------------
+
+/// Run `bash -c <pipeline>` and return wall-clock duration plus stderr
+/// for diagnosis on failure. The pipeline is given the URL via the
+/// `URL` env var so callers don't have to escape it into the script.
+fn time_pipeline(url: &str, pipeline: &str) -> Duration {
+    let started = Instant::now();
+    let output = Command::new("bash")
+        .arg("-eu")
+        .arg("-o")
+        .arg("pipefail")
+        .arg("-c")
+        .arg(pipeline)
+        .env("URL", url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn bash for baseline pipeline");
+    let elapsed = started.elapsed();
+    if !output.status.success() {
+        panic!(
+            "baseline pipeline exited {}: stderr=\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    elapsed
+}
+
+// ---- result reporting -------------------------------------------------
+
+struct BenchRow {
+    format: &'static str,
+    payload_bytes: u64,
+    on_wire_bytes: u64,
+    peel: Duration,
+    baseline: Duration,
+    baseline_tools: &'static str,
+}
+
+impl BenchRow {
+    fn print(&self) {
+        let mib = (self.payload_bytes as f64) / (1024.0 * 1024.0);
+        let on_wire_mib = (self.on_wire_bytes as f64) / (1024.0 * 1024.0);
+        let peel_s = self.peel.as_secs_f64();
+        let base_s = self.baseline.as_secs_f64();
+        let ratio = if base_s > 0.0 { peel_s / base_s } else { 0.0 };
+        println!(
+            "[bench] {fmt:<10} payload={mib:6.1} MiB  wire={wire:6.1} MiB  peel={peel:6.3}s  {tools}={base:6.3}s  ratio={ratio:.2}x",
+            fmt = self.format,
+            mib = mib,
+            wire = on_wire_mib,
+            peel = peel_s,
+            tools = self.baseline_tools,
+            base = base_s,
+            ratio = ratio,
+        );
+    }
+}
+
+fn skip(format: &str, missing: &str) {
+    println!("[bench] {format:<10} [skip] {missing} not on PATH");
+}
+
+// ---- payload size knob -------------------------------------------------
+
+/// 256 MiB raw payload is large enough that wall-clock differences are
+/// resolvable on a fast loopback yet small enough that the full grid
+/// completes in a few seconds on a developer laptop.
+const PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+
+/// Build a tar archive whose raw byte total is approximately
+/// `PAYLOAD_BYTES`, split across a handful of files so per-member
+/// overhead is exercised but doesn't dominate.
+fn build_tar_payload() -> Vec<u8> {
+    const FILES: usize = 8;
+    let per = PAYLOAD_BYTES / FILES;
+    let names: Vec<String> = (0..FILES)
+        .map(|i| format!("data/file_{i:02}.bin"))
+        .collect();
+    let bodies: Vec<Vec<u8>> = (0..FILES)
+        .map(|i| random_bytes(0xBEEF + i as u64, per))
+        .collect();
+    let pairs: Vec<(&str, &[u8])> = names
+        .iter()
+        .zip(bodies.iter())
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    build_simple_archive(&pairs)
+}
+
+fn assert_extracted_tar_matches(dir: &std::path::Path, archive: &[u8]) {
+    // The fixture layout is the same `data/file_NN.bin` set used by
+    // `build_tar_payload`. We validate by re-deriving the expected
+    // bodies and reading them back rather than parsing the archive.
+    const FILES: usize = 8;
+    let per = PAYLOAD_BYTES / FILES;
+    let _ = archive; // kept in signature to make the relationship explicit
+    for i in 0..FILES {
+        let path = dir.join(format!("data/file_{i:02}.bin"));
+        let actual = fs::read(&path).expect("extracted file present");
+        let expected = random_bytes(0xBEEF + i as u64, per);
+        assert_eq!(actual.len(), expected.len(), "size mismatch on file {i:02}");
+        assert_eq!(actual, expected, "contents mismatch on file {i:02}");
+    }
+}
+
+// ---- benchmarks --------------------------------------------------------
+
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_raw_zstd_to_file() {
+    if !tool_present("curl") {
+        skip("zstd-raw", "curl");
+        return;
+    }
+    if !tool_present("zstd") {
+        skip("zstd-raw", "zstd");
+        return;
+    }
+
+    let payload = random_bytes(0xC0FFEE, PAYLOAD_BYTES);
+    let body = encode_zstd(&payload);
+    let url_suffix = "data.zst";
+
+    let server = MockServer::start(ok_handler(body.clone()));
+    let url = format!("{}/{url_suffix}", server.base_url());
+
+    // ---- peel: stream zstd into a single output file ----------------
+    let work = unique_dir("zstd_raw_peel");
+    let _g_peel = CleanupDir(work.clone());
+    let out_file = work.join("out.bin");
+    let started = Instant::now();
+    let stats = run_peel(&server, url_suffix, OutputTarget::File(out_file.clone()));
+    let peel_elapsed = started.elapsed();
+    assert_eq!(stats.extraction.bytes_out, payload.len() as u64);
+    assert_eq!(fs::read(&out_file).expect("read peel output"), payload);
+
+    // ---- baseline: curl | zstd -d > file ----------------------------
+    let work_b = unique_dir("zstd_raw_curl");
+    let _g_base = CleanupDir(work_b.clone());
+    let base_file = work_b.join("out.bin");
+    let pipeline = format!(
+        r#"curl -sS "$URL" | zstd -d -q -o {}"#,
+        shell_quote(&base_file)
+    );
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_eq!(fs::read(&base_file).expect("read baseline output"), payload);
+
+    BenchRow {
+        format: "zstd-raw",
+        payload_bytes: payload.len() as u64,
+        on_wire_bytes: body.len() as u64,
+        peel: peel_elapsed,
+        baseline: base_elapsed,
+        baseline_tools: "curl|zstd",
+    }
+    .print();
+}
+
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_tar_zstd_extraction() {
+    if !tool_present("curl") {
+        skip("tar.zst", "curl");
+        return;
+    }
+    if !tool_present("zstd") {
+        skip("tar.zst", "zstd");
+        return;
+    }
+    if !tool_present("tar") {
+        skip("tar.zst", "tar");
+        return;
+    }
+
+    let archive = build_tar_payload();
+    let body = encode_zstd(&archive);
+    let suffix = "bundle.tar.zst";
+
+    let server = MockServer::start(ok_handler(body.clone()));
+    let url = format!("{}/{suffix}", server.base_url());
+
+    let work_p = unique_dir("tar_zst_peel");
+    let _g_p = CleanupDir(work_p.clone());
+    let started = Instant::now();
+    let stats = run_peel(&server, suffix, OutputTarget::Dir(work_p.clone()));
+    let peel_elapsed = started.elapsed();
+    assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
+    assert_extracted_tar_matches(&work_p, &archive);
+
+    let work_b = unique_dir("tar_zst_curl");
+    let _g_b = CleanupDir(work_b.clone());
+    let pipeline = format!(
+        r#"curl -sS "$URL" | zstd -d -q | tar -xf - -C {}"#,
+        shell_quote(&work_b)
+    );
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_extracted_tar_matches(&work_b, &archive);
+
+    BenchRow {
+        format: "tar.zst",
+        payload_bytes: archive.len() as u64,
+        on_wire_bytes: body.len() as u64,
+        peel: peel_elapsed,
+        baseline: base_elapsed,
+        baseline_tools: "curl|zstd|tar",
+    }
+    .print();
+}
+
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_tar_xz_extraction() {
+    if !tool_present("curl") {
+        skip("tar.xz", "curl");
+        return;
+    }
+    if !tool_present("xz") {
+        skip("tar.xz", "xz");
+        return;
+    }
+    if !tool_present("tar") {
+        skip("tar.xz", "tar");
+        return;
+    }
+
+    let archive = build_tar_payload();
+    let body = encode_xz(&archive);
+    let suffix = "bundle.tar.xz";
+
+    let server = MockServer::start(ok_handler(body.clone()));
+    let url = format!("{}/{suffix}", server.base_url());
+
+    let work_p = unique_dir("tar_xz_peel");
+    let _g_p = CleanupDir(work_p.clone());
+    let started = Instant::now();
+    let stats = run_peel(&server, suffix, OutputTarget::Dir(work_p.clone()));
+    let peel_elapsed = started.elapsed();
+    assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
+    assert_extracted_tar_matches(&work_p, &archive);
+
+    let work_b = unique_dir("tar_xz_curl");
+    let _g_b = CleanupDir(work_b.clone());
+    let pipeline = format!(
+        r#"curl -sS "$URL" | xz -d -q | tar -xf - -C {}"#,
+        shell_quote(&work_b)
+    );
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_extracted_tar_matches(&work_b, &archive);
+
+    BenchRow {
+        format: "tar.xz",
+        payload_bytes: archive.len() as u64,
+        on_wire_bytes: body.len() as u64,
+        peel: peel_elapsed,
+        baseline: base_elapsed,
+        baseline_tools: "curl|xz|tar",
+    }
+    .print();
+}
+
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_tar_lz4_extraction() {
+    if !tool_present("curl") {
+        skip("tar.lz4", "curl");
+        return;
+    }
+    if !tool_present("lz4") {
+        skip("tar.lz4", "lz4");
+        return;
+    }
+    if !tool_present("tar") {
+        skip("tar.lz4", "tar");
+        return;
+    }
+
+    let archive = build_tar_payload();
+    // Single uncompressed lz4 frame: peel and `lz4 -d` both accept it,
+    // and the on-wire size matches the tar's raw bytes (so this row is
+    // measuring framing/pipe overhead more than a compression ratio).
+    let body = encode_lz4_uncompressed_frame(&archive);
+    let suffix = "bundle.tar.lz4";
+
+    let server = MockServer::start(ok_handler(body.clone()));
+    let url = format!("{}/{suffix}", server.base_url());
+
+    let work_p = unique_dir("tar_lz4_peel");
+    let _g_p = CleanupDir(work_p.clone());
+    let started = Instant::now();
+    let stats = run_peel(&server, suffix, OutputTarget::Dir(work_p.clone()));
+    let peel_elapsed = started.elapsed();
+    assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
+    assert_extracted_tar_matches(&work_p, &archive);
+
+    let work_b = unique_dir("tar_lz4_curl");
+    let _g_b = CleanupDir(work_b.clone());
+    let pipeline = format!(
+        r#"curl -sS "$URL" | lz4 -d -q | tar -xf - -C {}"#,
+        shell_quote(&work_b)
+    );
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_extracted_tar_matches(&work_b, &archive);
+
+    BenchRow {
+        format: "tar.lz4",
+        payload_bytes: archive.len() as u64,
+        on_wire_bytes: body.len() as u64,
+        peel: peel_elapsed,
+        baseline: base_elapsed,
+        baseline_tools: "curl|lz4|tar",
+    }
+    .print();
+}
+
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_plain_tar_extraction() {
+    if !tool_present("curl") {
+        skip("tar", "curl");
+        return;
+    }
+    if !tool_present("tar") {
+        skip("tar", "tar");
+        return;
+    }
+
+    let archive = build_tar_payload();
+    let suffix = "bundle.tar";
+
+    let server = MockServer::start(ok_handler(archive.clone()));
+    let url = format!("{}/{suffix}", server.base_url());
+
+    let work_p = unique_dir("tar_plain_peel");
+    let _g_p = CleanupDir(work_p.clone());
+    let started = Instant::now();
+    let stats = run_peel(&server, suffix, OutputTarget::Dir(work_p.clone()));
+    let peel_elapsed = started.elapsed();
+    assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
+    assert_extracted_tar_matches(&work_p, &archive);
+
+    let work_b = unique_dir("tar_plain_curl");
+    let _g_b = CleanupDir(work_b.clone());
+    let pipeline = format!(r#"curl -sS "$URL" | tar -xf - -C {}"#, shell_quote(&work_b));
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_extracted_tar_matches(&work_b, &archive);
+
+    BenchRow {
+        format: "tar",
+        payload_bytes: archive.len() as u64,
+        on_wire_bytes: archive.len() as u64,
+        peel: peel_elapsed,
+        baseline: base_elapsed,
+        baseline_tools: "curl|tar",
+    }
+    .print();
+}
+
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_zip_extraction() {
+    if !tool_present("curl") {
+        skip("zip", "curl");
+        return;
+    }
+    if !tool_present("unzip") {
+        skip("zip", "unzip");
+        return;
+    }
+
+    // Build a multi-entry ZIP with the same logical layout as the
+    // tar fixture so the on-disk-output check below can reuse the same
+    // verifier. STORED entries keep the on-wire size dominated by the
+    // raw payloads (matching the lz4 row's framing-only spirit).
+    const FILES: usize = 8;
+    let per = PAYLOAD_BYTES / FILES;
+    let entries: Vec<ZipEntrySpec> = (0..FILES)
+        .map(|i| {
+            ZipEntrySpec::stored(
+                format!("data/file_{i:02}.bin"),
+                random_bytes(0xBEEF + i as u64, per),
+            )
+        })
+        .collect();
+    let body = build_zip(&entries);
+    let suffix = "bundle.zip";
+
+    let server = MockServer::start(ok_handler(body.clone()));
+    let url = format!("{}/{suffix}", server.base_url());
+
+    let work_p = unique_dir("zip_peel");
+    let _g_p = CleanupDir(work_p.clone());
+    let started = Instant::now();
+    let _stats = run_peel(&server, suffix, OutputTarget::Dir(work_p.clone()));
+    let peel_elapsed = started.elapsed();
+    assert_extracted_tar_matches(&work_p, &[]);
+
+    // ZIP's central directory lives at the *end* of the archive, so a
+    // streaming `curl | unzip` pipe is not a valid baseline. The
+    // canonical user-typed equivalent is download-then-extract; we
+    // measure that as the comparison.
+    let work_b = unique_dir("zip_curl");
+    let _g_b = CleanupDir(work_b.clone());
+    let zip_path = work_b.join("bundle.zip");
+    let extract_dir = work_b.join("out");
+    fs::create_dir_all(&extract_dir).expect("mkdir extract");
+    let pipeline = format!(
+        r#"curl -sS -o {zip} "$URL" && unzip -q {zip} -d {dir}"#,
+        zip = shell_quote(&zip_path),
+        dir = shell_quote(&extract_dir),
+    );
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_extracted_tar_matches(&extract_dir, &[]);
+
+    BenchRow {
+        format: "zip",
+        payload_bytes: (PAYLOAD_BYTES) as u64,
+        on_wire_bytes: body.len() as u64,
+        peel: peel_elapsed,
+        baseline: base_elapsed,
+        baseline_tools: "curl+unzip",
+    }
+    .print();
+}
+
+// ---- diagnostic: where does peel's tar overhead come from? -----------
+
+/// Run the plain-tar payload under several `CoordinatorConfig`
+/// variants and print a per-phase breakdown for each. The intent is
+/// to attribute the gap between `peel` and `curl|tar` (visible in
+/// `bench_plain_tar_extraction`) to specific knobs:
+///
+/// * `default` — the same config every other benchmark uses (4
+///   workers, 1 MiB chunks, adaptive chunk-sizing on, checkpoints
+///   every 8 MiB, 2 ms reader poll).
+/// * `single_worker_one_chunk` — one worker, chunk size = entire
+///   body, adaptive chunk-sizing off. Eliminates ranged-GET
+///   amplification (HEAD + 1 GET, like `curl`).
+/// * `no_checkpoints` — checkpoint floor raised so high it never
+///   fires. Isolates checkpoint-write cost.
+/// * `tight_reader_poll` — reader_poll_interval reduced to
+///   `Duration::ZERO`. Isolates the polling-induced wait.
+///
+/// The breakdown columns are:
+///
+/// * `download` — `RunStats::download.elapsed` (network + part-file writes).
+/// * `decode`   — `ExtractionStats::decode_time` (decode minus sink-write).
+/// * `write`    — `ExtractionStats::write_time` (sink writes only).
+/// * `punch`    — `ExtractionStats::punch_time` (hole-punch syscalls;
+///   near-zero on macOS where the puncher is the noop fallback).
+/// * `total`    — `RunStats::elapsed` (wall-clock for the whole run).
+///
+/// Sums of the per-phase columns are *less than* `total` because
+/// download and extraction overlap; the gap is the streaming-overlap
+/// budget peel is supposed to deliver.
+#[test]
+#[ignore = "diagnostic; opt-in via --ignored"]
+fn diag_plain_tar_breakdown() {
+    let archive = build_tar_payload();
+    let suffix = "bundle.tar";
+    let server = MockServer::start(ok_handler(archive.clone()));
+
+    let body_len = archive.len() as u64;
+    type VariantBuilder = fn(u64) -> CoordinatorConfig;
+    let variants: &[(&str, VariantBuilder)] = &[
+        ("default                ", |_| coord_config()),
+        ("single_worker_one_chunk", |body| {
+            let mut c = coord_config();
+            c.workers = 1;
+            c.chunk_size = body;
+            c.adaptive_chunk_size = false;
+            c
+        }),
+        ("no_checkpoints         ", |_| {
+            let mut c = coord_config();
+            c.checkpoint_min_bytes = u64::MAX;
+            c.checkpoint_min_interval = Duration::from_secs(60 * 60);
+            c
+        }),
+        ("tight_reader_poll      ", |_| {
+            let mut c = coord_config();
+            c.reader_poll_interval = Duration::ZERO;
+            c
+        }),
+    ];
+
+    println!(
+        "[diag] {:24} {:>9} {:>9} {:>9} {:>9} {:>9}  chunks",
+        "variant", "download", "decode", "write", "punch", "total"
+    );
+    for (label, build) in variants {
+        let work = unique_dir(&format!("diag_{}", label.trim()));
+        let _g = CleanupDir(work.clone());
+        let args = RunArgs {
+            url: format!("{}/{suffix}", server.base_url()),
+            output: OutputTarget::Dir(work.clone()),
+            config: build(body_len),
+            client: build_client(),
+            registry: DecoderRegistry::with_defaults(),
+            progress: None,
+            progress_state: None,
+            kill_switch: None,
+        };
+        let stats = run(args).expect("peel run succeeds");
+        let chunks = stats.download.chunks_completed;
+        println!(
+            "[diag] {label} {dl:>8.3}s {dec:>8.3}s {wr:>8.3}s {pn:>8.3}s {tot:>8.3}s  {chunks}",
+            dl = stats.download.elapsed.as_secs_f64(),
+            dec = stats.extraction.decode_time.as_secs_f64(),
+            wr = stats.extraction.write_time.as_secs_f64(),
+            pn = stats.extraction.punch_time.as_secs_f64(),
+            tot = stats.elapsed.as_secs_f64(),
+        );
+        assert_extracted_tar_matches(&work, &archive);
+    }
+}
+
+// ---- diagnostic: IO backend A/B (blocking vs mmap vs uring) ----------
+
+/// Run the plain-tar payload under each IO backend and print a
+/// breakdown row per backend.
+///
+/// The hypothesis we're testing: the loopback gap between `peel` and
+/// `curl|tar` is dominated by the part-file double-hop (workers
+/// `pwrite` to disk; decoder `pread`s back). The mmap backend should
+/// largely close that gap because workers and decoder share the same
+/// `MAP_SHARED` pages — no double memcpy through the page cache. If
+/// mmap closes most of the gap, the K8s/multi-TB use case can stay
+/// on the existing design with a backend swap rather than needing the
+/// full RAM-ring redesign.
+///
+/// The `mmap` and `uring` rows are Linux-only — on macOS/Windows the
+/// backend constructor errors out and we print a `[skip]` line. Run
+/// on Linux (a dev box, a CI runner, or a Linux Docker container —
+/// `docker run -it --rm -v $PWD:/src -w /src rust:1.93 bash` works)
+/// to get real numbers.
+///
+/// One caveat for the K8s use case: when run inside a container,
+/// `/tmp` typically lives on overlayfs. `madvise(MADV_REMOVE)` may or
+/// may not propagate cleanly to the underlying filesystem depending
+/// on storage class. The numbers you see here reflect the FS the
+/// system temp dir resolves to; for a representative K8s read, run
+/// this inside a pod with the same volume class the snapshot job
+/// will use.
+#[test]
+#[ignore = "diagnostic; opt-in via --ignored"]
+fn diag_plain_tar_io_backends() {
+    let archive = build_tar_payload();
+    let suffix = "bundle.tar";
+    let server = MockServer::start(ok_handler(archive.clone()));
+
+    println!(
+        "[diag] {:>10} {:>9} {:>9} {:>9} {:>9} {:>9}  notes",
+        "backend", "download", "decode", "write", "punch", "total"
+    );
+
+    let backends: &[(&str, peel::io_backend::IoBackendChoice, bool)] = &[
+        // blocking is the default backend used by every other bench
+        // and works everywhere. The mmap/uring rows are Linux-only
+        // and the runtime check below skips them on other platforms.
+        (
+            "blocking",
+            peel::io_backend::IoBackendChoice::Blocking,
+            true,
+        ),
+        (
+            "mmap    ",
+            peel::io_backend::IoBackendChoice::Mmap,
+            cfg!(target_os = "linux"),
+        ),
+        (
+            "uring   ",
+            peel::io_backend::IoBackendChoice::Uring,
+            cfg!(target_os = "linux"),
+        ),
+    ];
+
+    for (label, choice, supported) in backends {
+        if !*supported {
+            println!("[diag] {label} [skip] backend unavailable on this platform");
+            continue;
+        }
+        let work = unique_dir(&format!("io_{}", label.trim()));
+        let _g = CleanupDir(work.clone());
+        let mut config = coord_config();
+        config.io_backend = *choice;
+        let args = RunArgs {
+            url: format!("{}/{suffix}", server.base_url()),
+            output: OutputTarget::Dir(work.clone()),
+            config,
+            client: build_client(),
+            registry: DecoderRegistry::with_defaults(),
+            progress: None,
+            progress_state: None,
+            kill_switch: None,
+        };
+        let stats = match run(args) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("[diag] {label} [skip] backend selection failed: {e}");
+                continue;
+            }
+        };
+        assert_extracted_tar_matches(&work, &archive);
+        println!(
+            "[diag] {label} {dl:>8.3}s {dec:>8.3}s {wr:>8.3}s {pn:>8.3}s {tot:>8.3}s  punch_calls={pc} bytes_punched={bp}",
+            dl = stats.download.elapsed.as_secs_f64(),
+            dec = stats.extraction.decode_time.as_secs_f64(),
+            wr = stats.extraction.write_time.as_secs_f64(),
+            pn = stats.extraction.punch_time.as_secs_f64(),
+            tot = stats.elapsed.as_secs_f64(),
+            pc = stats.extraction.punch_calls,
+            bp = stats.extraction.bytes_punched,
+        );
+    }
+}
+
+// ---- diagnostic: same workload under a 50 MB/s bandwidth cap --------
+
+/// Re-run the plain-tar comparison with both sides throttled to a
+/// realistic-ish wide-area rate (50 MB/s aggregate). The expectation
+/// is that peel's structural overhead — the part-file double-hop and
+/// the lack of overlap visible at loopback speeds — disappears once
+/// the network is the bottleneck, leaving peel's wall-clock close to
+/// `curl|tar`'s.
+///
+/// Both sides use the same cap:
+/// * `peel` via [`CoordinatorConfig::max_bandwidth_bps`] (aggregate
+///   across workers — see `download/rate_limit.rs`).
+/// * `curl` via `--limit-rate 50M`.
+///
+/// At 50 MB/s the 256 MiB payload takes ≥ 5 seconds, so this test is
+/// noticeably slower than the others.
+#[test]
+#[ignore = "diagnostic; opt-in via --ignored"]
+fn diag_plain_tar_throttled_50mbps() {
+    if !tool_present("curl") || !tool_present("tar") {
+        skip("tar.50mbps", "curl/tar");
+        return;
+    }
+
+    let archive = build_tar_payload();
+    let suffix = "bundle.tar";
+    let server = MockServer::start(ok_handler(archive.clone()));
+    let url = format!("{}/{suffix}", server.base_url());
+
+    // ---- peel with a 50 MB/s aggregate cap --------------------------
+    let work_p = unique_dir("tar_throttled_peel");
+    let _g_p = CleanupDir(work_p.clone());
+    let mut config = coord_config();
+    config.max_bandwidth_bps = Some(50_000_000);
+    let args = RunArgs {
+        url: url.clone(),
+        output: OutputTarget::Dir(work_p.clone()),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+    };
+    let started = Instant::now();
+    let stats = run(args).expect("peel run succeeds");
+    let peel_elapsed = started.elapsed();
+    assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
+    assert_extracted_tar_matches(&work_p, &archive);
+
+    // ---- curl --limit-rate 50M | tar --------------------------------
+    let work_b = unique_dir("tar_throttled_curl");
+    let _g_b = CleanupDir(work_b.clone());
+    let pipeline = format!(
+        r#"curl -sS --limit-rate 50M "$URL" | tar -xf - -C {}"#,
+        shell_quote(&work_b)
+    );
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_extracted_tar_matches(&work_b, &archive);
+
+    let mib = (archive.len() as f64) / (1024.0 * 1024.0);
+    let peel_s = peel_elapsed.as_secs_f64();
+    let base_s = base_elapsed.as_secs_f64();
+    println!(
+        "[diag] tar @ 50MB/s  payload={mib:5.1} MiB  peel={peel_s:6.3}s  curl|tar={base_s:6.3}s  ratio={ratio:.2}x  | peel-internal: download={dl:.3}s decode={dec:.3}s",
+        ratio = peel_s / base_s.max(1e-9),
+        dl = stats.download.elapsed.as_secs_f64(),
+        dec = stats.extraction.decode_time.as_secs_f64(),
+    );
+}
+
+// ---- shell quoting (POSIX single-quote) -------------------------------
+
+/// Quote `path` for inclusion in a `bash -c` script. Wraps the string
+/// in single quotes and escapes any embedded `'`. Tempdir paths
+/// generated by [`unique_dir`] never contain `'`, so this is mostly
+/// defensive — but the cost of doing it right once is small.
+fn shell_quote(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}

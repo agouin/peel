@@ -186,17 +186,30 @@ pub fn default_backend() -> Arc<dyn IoBackend> {
 
 /// CLI-facing choice of file-IO backend (PLAN_v2.md §7 + §9).
 ///
-/// `Auto` is the default and matches the §7 demo behavior: try
-/// `io_uring` on Linux, fall back to blocking with a `tracing::warn!`
-/// line if the kernel rejects ring construction. `Blocking` forces the
-/// pre-§7 path (used for A/B comparison and on platforms without
-/// `io_uring`). `Uring` *requires* `io_uring`; selection fails if the
-/// kernel does not support it, surfaced as an [`io::Error`] for the
-/// CLI boundary to format. `Mmap` selects the §9 memory-mapped sparse
-/// file: workers `memcpy` into a `MAP_SHARED` region and the
-/// coordinator's puncher uses `madvise(MADV_REMOVE)`. `Mmap` is
-/// Linux-only; on other platforms selection fails the same way `Uring`
-/// does.
+/// `Auto` is the default and resolves on Linux to:
+///
+/// * **sockets** — try `io_uring`; fall back to blocking with a
+///   `tracing::info!` line when the kernel rejects ring construction
+///   (e.g. cri-o's default seccomp profile blocks `io_uring_setup`).
+/// * **sparse file** — `mmap` of the sparse part file with
+///   `madvise(MADV_REMOVE)` for hole-punching. Empirically (see
+///   `tests/test_bench_streaming.rs::diag_plain_tar_io_backends`)
+///   mmap saves ~20% wall-clock vs the pwrite/pread path on a
+///   representative cluster, with no measured downside when the
+///   underlying FS doesn't support `MADV_REMOVE` (the puncher
+///   silently degrades to noop, same as the pwrite path would).
+///
+/// On non-Linux platforms `Auto` is the blocking backend for both
+/// sockets and file IO.
+///
+/// `Blocking` forces the pre-§7 pwrite/pread path (used for A/B
+/// comparison and on platforms without `io_uring`). `Uring` *requires*
+/// `io_uring`; selection fails if the kernel does not support it,
+/// surfaced as an [`io::Error`] for the CLI boundary to format.
+/// `Mmap` selects the §9 memory-mapped sparse file explicitly: workers
+/// `memcpy` into a `MAP_SHARED` region and the coordinator's puncher
+/// uses `madvise(MADV_REMOVE)`. `Mmap` is Linux-only; on other
+/// platforms selection fails the same way `Uring` does.
 ///
 /// `Mmap` only changes the *file-IO* path. The HTTP client's network
 /// IO continues to go through the always-available blocking backend

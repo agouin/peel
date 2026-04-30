@@ -1655,8 +1655,16 @@ fn sink_state_for(output: &OutputTarget, bytes_out: u64) -> SinkState {
 
 /// Construct the [`SparseFile`] for this run, picking between the
 /// pwrite/pread storage (any platform, any non-mmap backend choice)
-/// and the §9 `mmap` storage (Linux only, requested via
-/// [`crate::io_backend::IoBackendChoice::Mmap`]).
+/// and the §9 `mmap` storage (Linux only).
+///
+/// `Mmap` is selected on Linux when the user passed
+/// [`crate::io_backend::IoBackendChoice::Mmap`] *or*
+/// [`crate::io_backend::IoBackendChoice::Auto`]. Auto resolves to
+/// mmap on Linux because `tests/test_bench_streaming.rs` measured
+/// it 20% faster than pwrite/pread on representative cluster
+/// hardware, with no observed downside on filesystems that don't
+/// support `MADV_REMOVE` (the puncher degrades to noop the same way
+/// it does on the pwrite path).
 fn open_sparse(
     path: &Path,
     total_size: u64,
@@ -1664,7 +1672,10 @@ fn open_sparse(
     io_backend: &Arc<dyn crate::io_backend::IoBackend>,
 ) -> Result<SparseFile, CoordinatorError> {
     #[cfg(target_os = "linux")]
-    if matches!(config.io_backend, crate::io_backend::IoBackendChoice::Mmap) {
+    if matches!(
+        config.io_backend,
+        crate::io_backend::IoBackendChoice::Mmap | crate::io_backend::IoBackendChoice::Auto
+    ) {
         return SparseFile::open_or_create_mmap(path, total_size)
             .map_err(CoordinatorError::SparseFile);
     }

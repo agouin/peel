@@ -111,15 +111,18 @@ pub struct Cli {
 
     /// File-IO backend selection (PLAN_v2.md §7 + §9).
     ///
-    /// `auto` (default) prefers `io_uring` on Linux and falls back to
-    /// the blocking backend with a warning if the kernel does not
-    /// support it. `blocking` forces the pre-§7 `pwrite`/`pread` path
-    /// (useful for A/B comparison). `uring` requires `io_uring` and
+    /// `auto` (default) on Linux selects `mmap` for the sparse part
+    /// file (workers `memcpy` into a `MAP_SHARED` region; puncher
+    /// uses `madvise(MADV_REMOVE)`) and tries `io_uring` for the HTTP
+    /// client's sockets, falling back to the blocking socket backend
+    /// with an info log when the kernel rejects ring construction
+    /// (e.g. cri-o's default seccomp profile). On non-Linux `auto` is
+    /// the blocking backend for both sockets and file IO. `blocking`
+    /// forces the pre-§7 `pwrite`/`pread` path everywhere (useful for
+    /// A/B comparison). `uring` requires `io_uring` for sockets and
     /// errors out if it is unavailable. `mmap` selects the §9
-    /// memory-mapped sparse-file path: workers `memcpy` into a
-    /// `MAP_SHARED` region and the puncher uses
-    /// `madvise(MADV_REMOVE)`. Linux-only; sockets continue to use
-    /// the blocking backend.
+    /// memory-mapped sparse-file path explicitly with the blocking
+    /// socket backend.
     #[arg(long = "io-backend", value_enum, default_value_t = IoBackendArg::Auto)]
     pub io_backend: IoBackendArg,
 
