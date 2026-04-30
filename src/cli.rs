@@ -11,13 +11,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Parser, ValueEnum};
 
 use crate::coordinator::{CoordinatorConfig, OutputTarget, RunArgs};
 use crate::decode::DecoderRegistry;
 use crate::download::{RetryConfig, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS};
 use crate::extractor::DEFAULT_PUNCH_THRESHOLD;
 use crate::http::Client;
+use crate::io_backend::IoBackendChoice;
 
 /// Parsed CLI for the `peel` binary.
 #[derive(Debug, Parser)]
@@ -85,6 +86,43 @@ pub struct Cli {
     /// Mutually exclusive with `--format`.
     #[arg(long = "force-format-from-magic", default_value_t = false)]
     pub force_format_from_magic: bool,
+
+    /// File-IO backend selection (PLAN_v2.md §7).
+    ///
+    /// `auto` (default) prefers `io_uring` on Linux and falls back to
+    /// the blocking backend with a warning if the kernel does not
+    /// support it. `blocking` forces the pre-§7 `pwrite`/`pread` path
+    /// (useful for A/B comparison). `uring` requires `io_uring` and
+    /// errors out if it is unavailable.
+    #[arg(long = "io-backend", value_enum, default_value_t = IoBackendArg::Auto)]
+    pub io_backend: IoBackendArg,
+}
+
+/// CLI form of [`IoBackendChoice`].
+///
+/// Kept as a separate type so the [`clap::ValueEnum`] derive does not
+/// have to live on the library type. Mapping is mechanical via
+/// [`From`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum IoBackendArg {
+    /// Auto-detect: try `io_uring` on Linux, fall back to blocking.
+    #[default]
+    Auto,
+    /// Force the blocking `pwrite`/`pread` backend.
+    Blocking,
+    /// Force the Linux `io_uring` backend.
+    Uring,
+}
+
+impl From<IoBackendArg> for IoBackendChoice {
+    fn from(arg: IoBackendArg) -> Self {
+        match arg {
+            IoBackendArg::Auto => Self::Auto,
+            IoBackendArg::Blocking => Self::Blocking,
+            IoBackendArg::Uring => Self::Uring,
+        }
+    }
 }
 
 impl Cli {
@@ -119,6 +157,7 @@ impl Cli {
                 reader_poll_interval: Duration::from_millis(5),
                 forced_format: self.forced_format,
                 force_format_from_magic: self.force_format_from_magic,
+                io_backend: self.io_backend.into(),
             },
             client,
             registry: DecoderRegistry::with_defaults(),
@@ -200,6 +239,71 @@ mod tests {
         .expect("parse");
         assert!(cli.force_format_from_magic);
         assert!(cli.forced_format.is_none());
+    }
+
+    #[test]
+    fn parses_io_backend_default_is_auto() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        assert_eq!(cli.io_backend, IoBackendArg::Auto);
+    }
+
+    #[test]
+    fn parses_io_backend_blocking() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--io-backend",
+            "blocking",
+        ])
+        .expect("parse");
+        assert_eq!(cli.io_backend, IoBackendArg::Blocking);
+    }
+
+    #[test]
+    fn parses_io_backend_uring() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--io-backend",
+            "uring",
+        ])
+        .expect("parse");
+        assert_eq!(cli.io_backend, IoBackendArg::Uring);
+    }
+
+    #[test]
+    fn rejects_unknown_io_backend() {
+        let err = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--io-backend",
+            "nonsense",
+        ])
+        .expect_err("unknown backend");
+        let _ = err;
+    }
+
+    #[test]
+    fn io_backend_arg_maps_to_choice() {
+        assert_eq!(
+            IoBackendChoice::from(IoBackendArg::Auto),
+            IoBackendChoice::Auto
+        );
+        assert_eq!(
+            IoBackendChoice::from(IoBackendArg::Blocking),
+            IoBackendChoice::Blocking
+        );
+        assert_eq!(
+            IoBackendChoice::from(IoBackendArg::Uring),
+            IoBackendChoice::Uring
+        );
     }
 
     #[test]

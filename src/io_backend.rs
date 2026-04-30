@@ -112,14 +112,93 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     fn sync_all(&self, fd: BorrowedFd<'_>) -> io::Result<()>;
 }
 
-/// Construct the default backend for the current platform.
+/// Construct the always-available blocking backend.
 ///
-/// In §7.1 this always returns a [`BlockingBackend`]. The §7.2
-/// io_uring backend introduces selection logic (capability probe +
-/// CLI override) that picks the best available implementation.
+/// Equivalent to `Arc::new(BlockingBackend::new())`. Useful as a
+/// fallback or when a caller knows it does not want `io_uring`.
 #[must_use]
 pub fn default_backend() -> Arc<dyn IoBackend> {
     Arc::new(BlockingBackend::new())
+}
+
+/// CLI-facing choice of file-IO backend (PLAN_v2.md §7).
+///
+/// `Auto` is the default and matches the §7 demo behavior: try
+/// `io_uring` on Linux, fall back to blocking with a `tracing::warn!`
+/// line if the kernel rejects ring construction. `Blocking` forces the
+/// pre-§7 path (used for A/B comparison and on platforms without
+/// `io_uring`). `Uring` *requires* `io_uring`; selection fails if the
+/// kernel does not support it, surfaced as an [`io::Error`] for the
+/// CLI boundary to format.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum IoBackendChoice {
+    /// Pick the best available backend at runtime.
+    #[default]
+    Auto,
+    /// Force the blocking `pwrite`/`pread` backend.
+    Blocking,
+    /// Force the Linux `io_uring` backend.
+    Uring,
+}
+
+/// Resolve the user's [`IoBackendChoice`] into a concrete
+/// [`IoBackend`] for the current platform and kernel.
+///
+/// `Auto` may downgrade silently (with a `tracing::warn!`) to the
+/// blocking backend; `Uring` errors out cleanly when the kernel does
+/// not support it.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] when [`IoBackendChoice::Uring`] is selected
+/// but `io_uring` is unavailable.
+pub fn select_backend(choice: IoBackendChoice, workers: u32) -> io::Result<Arc<dyn IoBackend>> {
+    match choice {
+        IoBackendChoice::Blocking => {
+            tracing::info!("io_backend=blocking (forced)");
+            Ok(default_backend())
+        }
+        IoBackendChoice::Auto => Ok(select_auto(workers)),
+        IoBackendChoice::Uring => select_uring(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn select_auto(workers: u32) -> Arc<dyn IoBackend> {
+    if let Some(b) = uring::UringBackend::probe(workers) {
+        tracing::info!("io_backend=uring depth={}", b.ring_depth());
+        return Arc::new(b);
+    }
+    tracing::info!("io_backend=blocking (uring unavailable, downgraded)");
+    default_backend()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn select_auto(_workers: u32) -> Arc<dyn IoBackend> {
+    tracing::info!("io_backend=blocking (uring is Linux-only)");
+    default_backend()
+}
+
+#[cfg(target_os = "linux")]
+fn select_uring() -> io::Result<Arc<dyn IoBackend>> {
+    match uring::UringBackend::try_new(uring::DEFAULT_RING_DEPTH) {
+        Ok(b) => {
+            tracing::info!("io_backend=uring depth={} (forced)", b.ring_depth());
+            Ok(Arc::new(b))
+        }
+        Err(e) => Err(io::Error::other(format!(
+            "--io-backend uring requested but the kernel does not support it: {}",
+            e.source
+        ))),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn select_uring() -> io::Result<Arc<dyn IoBackend>> {
+    Err(io::Error::other(
+        "--io-backend uring is only supported on Linux; \
+         use --io-backend blocking or remove the flag",
+    ))
 }
 
 /// The always-available blocking backend.
@@ -290,6 +369,30 @@ mod tests {
         let (file, _cleanup) = open_temp("sync_all", 32);
         let backend = BlockingBackend::new();
         backend.sync_all(file.as_fd()).expect("sync_all");
+    }
+
+    #[test]
+    fn select_blocking_returns_blocking() {
+        let b = select_backend(IoBackendChoice::Blocking, 4).expect("blocking always works");
+        assert_eq!(b.name(), "blocking");
+    }
+
+    #[test]
+    fn select_auto_yields_a_backend() {
+        // Whatever we get back must be functional; on darwin / non-uring
+        // Linux we get blocking, on uring-capable Linux we get uring.
+        let b = select_backend(IoBackendChoice::Auto, 4).expect("auto always picks something");
+        let name = b.name();
+        assert!(matches!(name, "blocking" | "uring"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn select_uring_errors_on_non_linux() {
+        let err =
+            select_backend(IoBackendChoice::Uring, 4).expect_err("uring must error on non-Linux");
+        let msg = err.to_string();
+        assert!(msg.contains("Linux"), "{msg}");
     }
 
     #[test]

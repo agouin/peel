@@ -143,6 +143,12 @@ pub struct CoordinatorConfig {
     /// boundary; left to coexist here so library callers can
     /// configure either independently.
     pub force_format_from_magic: bool,
+    /// Choice of file-IO backend (PLAN_v2.md §7). `Auto` (default)
+    /// tries `io_uring` on Linux and falls back to blocking on
+    /// failure; `Blocking` forces the pre-§7 path; `Uring` requires
+    /// `io_uring` and surfaces a clean error if the kernel does not
+    /// support it. Mirrors the `--io-backend` CLI flag.
+    pub io_backend: crate::io_backend::IoBackendChoice,
 }
 
 impl Default for CoordinatorConfig {
@@ -158,6 +164,7 @@ impl Default for CoordinatorConfig {
             reader_poll_interval: Duration::from_millis(5),
             forced_format: None,
             force_format_from_magic: false,
+            io_backend: crate::io_backend::IoBackendChoice::default(),
         }
     }
 }
@@ -395,6 +402,12 @@ pub enum CoordinatorError {
         /// moment of the abort.
         checkpoints_written: u64,
     },
+
+    /// Resolving the configured [`crate::io_backend::IoBackendChoice`]
+    /// into a concrete backend failed (e.g. `--io-backend uring`
+    /// requested on a kernel without `io_uring` support).
+    #[error("io_backend setup failed")]
+    IoBackend(#[source] io::Error),
 }
 
 /// Run the full pipeline.
@@ -457,8 +470,10 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 
     let chunks_resumed = u32::try_from(bitmap.count_complete()).unwrap_or(u32::MAX);
 
+    let io_backend = crate::io_backend::select_backend(config.io_backend, config.workers)
+        .map_err(CoordinatorError::IoBackend)?;
     let sparse = Arc::new(
-        SparseFile::open_or_create(&part_path, info.total_size)
+        SparseFile::open_or_create_with_backend(&part_path, info.total_size, io_backend)
             .map_err(CoordinatorError::SparseFile)?,
     );
 

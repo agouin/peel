@@ -93,6 +93,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         reader_poll_interval: Duration::from_millis(2),
         forced_format: None,
         force_format_from_magic: false,
+        io_backend: peel::io_backend::IoBackendChoice::Blocking,
     }
 }
 
