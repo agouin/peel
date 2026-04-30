@@ -62,6 +62,23 @@ anyhow = "1"
 # that writes those events to stderr.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+# HTTP client stack (PLAN_v2.md §3 / docs/ENGINEERING_STANDARDS.md §2.2 / §2.3).
+# All confined to `http::client`; the boundary rule from §2.3 forbids
+# imports of these crates outside that module. Feature sets are kept
+# minimal: hyper itself only `client` + `http1` + `http2`; hyper-util
+# `client-legacy` + the tokio executor; hyper-rustls just the protocol
+# layers (we build the rustls config ourselves so it composes with the
+# existing TLS dependency in §2.4). `tokio` runs as a current-thread
+# runtime confined to the client (see §2.5); `rt-multi-thread` is
+# deliberately not enabled.
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+http = { version = "1", default-features = false, features = ["std"] }
+http-body = { version = "1", default-features = false }
+http-body-util = { version = "0.1", default-features = false }
+bytes = { version = "1", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "macros", "sync"] }
 
 # io_uring file-IO backend (PLAN_v2.md §7 / docs/ENGINEERING_STANDARDS.md §2.2).
 # Linux-only target dep so non-Linux builds stay clean. We use the

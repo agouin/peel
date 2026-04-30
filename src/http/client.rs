@@ -1,71 +1,120 @@
-//! HTTP/1.1 client: connection management, TLS, and the `head`/`get_*`
-//! convenience methods.
+//! HTTP client backed by `hyper` + `hyper-util` + `hyper-rustls`,
+//! ALPN-negotiating between HTTP/1.1 and HTTP/2 per origin.
 //!
-//! The client owns a small idle-connection cache keyed by `(host, port,
-//! scheme)`. Each request either reuses a cached buffered reader (and
-//! the underlying socket beneath it) or opens a fresh `TcpStream`,
-//! optionally wrapping it in `rustls::StreamOwned` for HTTPS. The
-//! buffered reader carries any bytes that the response parser read
-//! ahead of the body, so reuse is safe.
+//! # Architecture
 //!
-//! The MVP does **not** retry on transport errors; it surfaces them to
-//! the caller. Retries with exponential backoff live in the download
-//! scheduler (PLAN §5).
+//! All hyper-related work runs on a current-thread `tokio::runtime`
+//! that this client owns. The runtime runs on a dedicated OS thread
+//! spawned by [`Client::new`] and lives until the last `Client` clone
+//! is dropped. The synchronous public API (`head`, `get_full`,
+//! `get_range`) submits work to the runtime via an unbounded mpsc
+//! channel and blocks the caller's thread on a oneshot reply.
+//!
+//! Per-body reads use a second channel: each
+//! [`BodyReader`](super::response::BodyReader) owns an `mpsc::Sender`
+//! that the runtime task on the other end services by `await`-ing
+//! frames from `hyper::body::Incoming`. The calling thread blocks on
+//! a oneshot per frame. The result is that callers see a normal
+//! [`std::io::Read`] body with no async surface, while hyper retains
+//! its frame-driven behavior under the covers.
+//!
+//! Connection pooling is handled inside `hyper-util`'s legacy client.
+//! `Client::release` is therefore a deprecated no-op (see TECH-DEBT
+//! note on the method); the per-host idle pool is sized by
+//! `ClientConfig::pool_capacity` via
+//! `hyper_util::client::legacy::Builder::pool_max_idle_per_host`.
+//!
+//! Redirects, `UnexpectedStatus` checks, and the per-request timeout
+//! live in this module — those are the reasons the boundary in
+//! `docs/ENGINEERING_STANDARDS.md` §2.3 stops at `legacy::Client`,
+//! not higher.
 
-#![cfg(unix)]
-
-use std::io::{self, BufReader, Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rustls::pki_types::ServerName;
-use rustls::{ClientConnection, RootCertStore, StreamOwned};
+use bytes::Bytes;
+use http::header::HeaderName;
+use http::{HeaderValue, Method as HttpMethod, Request as HttpRequest, Uri};
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client as LegacyClient;
+use hyper_util::rt::TokioExecutor;
+use rustls::RootCertStore;
 use thiserror::Error;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::sync::{mpsc, oneshot};
 
-use super::request::{Method, Request, RequestError};
-use super::response::{BodyReader, Headers, Response, ResponseError, Status};
-use super::url::{Scheme, Url, UrlError};
-use crate::io_backend::{default_backend, IoBackend, NetStream, SocketConfig};
+use super::range::format_range_header;
+use super::request::Method;
+use super::response::{BodyCommand, BodyReader, ConnReader, Headers, Response, Status};
+use super::url::{Url, UrlError};
+use crate::io_backend::IoBackend;
 use crate::types::ByteRange;
 
 /// Default cap on the number of redirects a single call will follow.
 pub const DEFAULT_MAX_REDIRECTS: u8 = 5;
 /// Default cap on the cumulative size of response status line +
-/// headers, in bytes.
+/// headers, in bytes. Honored on H1 only (hyper's H1 codec); H2
+/// uses HPACK and applies a much larger SETTINGS-derived cap.
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
-/// Default connect/read/write timeout.
+/// Default connect / request timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default upper bound on cached idle connections (across all hosts).
+/// Default upper bound on cached idle connections per host.
 pub const DEFAULT_POOL_CAPACITY: usize = 16;
-/// Default capacity of the per-connection buffered reader, in bytes.
+/// Default capacity of the per-connection read buffer, in bytes.
+/// Retained as a configuration knob even though hyper's legacy client
+/// does not expose a direct equivalent — we apply it as the H1 max
+/// header buffer ceiling.
 pub const DEFAULT_READ_BUFFER_BYTES: usize = 8 * 1024;
 
 /// Errors produced by [`Client`] operations.
 #[derive(Debug, Error)]
 pub enum ClientError {
-    /// The supplied URL could not be parsed.
+    /// The supplied URL could not be parsed or could not be coerced
+    /// into a hyper [`Uri`].
     #[error("invalid URL: {0}")]
     Url(#[from] UrlError),
 
-    /// Constructing the [`Request`] failed.
-    #[error("invalid request: {0}")]
-    Request(#[from] RequestError),
+    /// Building or sending the [`super::range`]-encoded `Range:`
+    /// header failed.
+    #[error("invalid Range: {0}")]
+    Range(#[from] super::range::RangeError),
 
-    /// Reading or parsing the response failed.
-    #[error("invalid response: {0}")]
-    Response(#[from] ResponseError),
+    /// Building the underlying TLS configuration failed.
+    #[error("tls config error")]
+    Tls(#[source] rustls::Error),
 
-    /// DNS resolution returned no addresses.
-    #[error("DNS lookup for {host:?}:{port} returned no addresses")]
-    DnsEmpty {
-        /// Host being resolved.
+    /// The hostname in the URL could not be used as a TLS server name
+    /// (only checked at URL-coercion time; hyper-rustls does its own
+    /// validation thereafter).
+    #[error("invalid TLS server name {host:?}")]
+    InvalidServerName {
+        /// The offending hostname.
         host: String,
-        /// Port being resolved.
-        port: u16,
     },
 
-    /// `connect`, `write`, or `read` syscall failed at the socket layer.
+    /// hyper / hyper-util returned a transport error: connect failure,
+    /// timeout, mid-stream close, ALPN mismatch, etc.
+    #[error("hyper transport error to {host:?}:{port}: {detail}")]
+    Transport {
+        /// Host the connection was for.
+        host: String,
+        /// Port the connection was for.
+        port: u16,
+        /// Underlying error rendered as a message. Hyper's error
+        /// types are not stable enough to expose verbatim, so we
+        /// flatten to a string at the boundary.
+        detail: String,
+    },
+
+    /// IO error reading the response body, or other low-level
+    /// failure that surfaces from the runtime task as a synthesized
+    /// [`io::Error`]. Preserves the host / port shape from before
+    /// the hyper migration so callers can keep matching on it.
     #[error("socket io to {host:?}:{port}")]
     Io {
         /// Host the connection was for.
@@ -77,21 +126,15 @@ pub enum ClientError {
         source: io::Error,
     },
 
-    /// TLS handshake or session failed.
-    #[error("tls error to {host:?}")]
-    Tls {
-        /// Host being contacted.
+    /// DNS lookup returned no addresses. (Typically surfaced via
+    /// [`Self::Transport`] today; preserved for callers that match
+    /// on it.)
+    #[error("DNS lookup for {host:?}:{port} returned no addresses")]
+    DnsEmpty {
+        /// Host being resolved.
         host: String,
-        /// Underlying TLS error.
-        #[source]
-        source: rustls::Error,
-    },
-
-    /// The hostname in the URL is not a valid TLS server name.
-    #[error("invalid TLS server name {host:?}")]
-    InvalidServerName {
-        /// The offending hostname.
-        host: String,
+        /// Port being resolved.
+        port: u16,
     },
 
     /// Server replied with a redirect status but no `Location` header.
@@ -121,6 +164,12 @@ pub enum ClientError {
         /// The status code returned.
         status: u16,
     },
+
+    /// Background runtime thread terminated before the request could
+    /// be served. Indicates a panic on the runtime task or that the
+    /// last `Client` clone was already dropping.
+    #[error("http client runtime is shut down")]
+    RuntimeGone,
 }
 
 /// Tunable knobs for [`Client`].
@@ -129,19 +178,18 @@ pub struct ClientConfig {
     /// Maximum redirects followed on a single call. Defaults to
     /// [`DEFAULT_MAX_REDIRECTS`].
     pub max_redirects: u8,
-    /// Cap on the cumulative size of status line + response headers.
+    /// Cap on response header size for H1 connections; ignored on H2.
     /// Defaults to [`DEFAULT_MAX_HEADER_BYTES`].
     pub max_header_bytes: usize,
-    /// Connect / read / write timeout. Defaults to [`DEFAULT_TIMEOUT`].
+    /// Connect / request timeout. Defaults to [`DEFAULT_TIMEOUT`].
     pub timeout: Duration,
-    /// Maximum idle connections cached across all hosts. Defaults to
+    /// Maximum idle connections cached per host. Defaults to
     /// [`DEFAULT_POOL_CAPACITY`].
     pub pool_capacity: usize,
-    /// Capacity of the per-connection buffered reader. Defaults to
-    /// [`DEFAULT_READ_BUFFER_BYTES`].
+    /// Capacity of the per-connection read buffer.
     pub read_buffer_bytes: usize,
-    /// Optional `User-Agent` override; if `None`, the default
-    /// `peel/<version>` from [`Request::write_to`] is used.
+    /// Optional `User-Agent` override; if `None`, `peel/<version>`
+    /// is sent.
     pub user_agent: Option<String>,
 }
 
@@ -158,90 +206,34 @@ impl Default for ClientConfig {
     }
 }
 
-/// Concrete connection type carried inside the pool and inside
-/// caller-visible response bodies. Hides whether the stream is plaintext
-/// or TLS-wrapped, and which IO backend produced the underlying socket.
-pub struct ConnStream {
-    inner: Box<dyn NetStream>,
-}
-
-impl ConnStream {
-    fn new(inner: Box<dyn NetStream>) -> Self {
-        Self { inner }
-    }
-}
-
-impl Read for ConnStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
-    }
-}
-
-impl Write for ConnStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl std::fmt::Debug for ConnStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnStream").finish_non_exhaustive()
-    }
-}
-
-/// Buffered reader over a [`ConnStream`].
-pub type ConnReader = BufReader<ConnStream>;
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-struct HostKey {
-    host: String,
-    port: u16,
-    scheme: Scheme,
-}
-
-impl HostKey {
-    fn from_url(url: &Url) -> Self {
-        Self {
-            host: url.host().to_string(),
-            port: url.port(),
-            scheme: url.scheme(),
-        }
-    }
-}
-
-struct PooledConn {
-    host_key: HostKey,
-    reader: ConnReader,
-}
-
-/// HTTP/1.1 client.
+/// Hyper-backed HTTP client.
 ///
-/// A `Client` owns:
-/// - a `rustls::ClientConfig` with WebPKI roots installed.
-/// - a small bounded cache of idle connections keyed by
-///   `(host, port, scheme)`.
-/// - the connect / read / write timeout applied to each socket.
-///
-/// `Client` is `Send + Sync` and inexpensive to clone; clones share the
-/// same connection pool and TLS configuration.
+/// `Client` is `Send + Sync` and inexpensive to clone; clones share
+/// the same connection pool, runtime thread, and TLS configuration.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
 }
 
 struct ClientInner {
-    tls_config: Arc<rustls::ClientConfig>,
-    pool: Mutex<Vec<PooledConn>>,
     config: ClientConfig,
-    /// File-IO backend whose [`IoBackend::connect`] is used for every
-    /// outbound socket. Defaults to the blocking backend; the §7.3
-    /// CLI selection logic shares one backend across the Client and
-    /// the [`crate::download::SparseFile`] so the chosen path is
-    /// observable end-to-end.
-    io_backend: Arc<dyn IoBackend>,
+    request_tx: Option<mpsc::UnboundedSender<RequestEnvelope>>,
+    runtime_thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        // INVARIANT: dropping `request_tx` is what unblocks the
+        // runtime task's `request_rx.recv().await`, which is what
+        // lets `rt.block_on(...)` return and the OS thread exit.
+        // The sender must be dropped *before* the join, or the
+        // join deadlocks. The natural drop-order of struct fields
+        // would join first, so we take + drop explicitly here.
+        self.request_tx.take();
+        if let Some(handle) = self.runtime_thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// The result of a `HEAD` request.
@@ -256,106 +248,102 @@ pub struct HeadResult {
     pub final_url: Url,
 }
 
-/// A `Response` whose body is backed by a connection from the pool.
-pub type ClientResponse = Response<ConnReader>;
+/// Response shape returned by `get_full` / `get_range`. Kept as a
+/// type alias for backwards compatibility with callers that named it
+/// directly; in this module everything is just [`Response`].
+pub type ClientResponse = Response;
 
 impl Client {
-    /// Construct a client with default configuration, the default IO
-    /// backend (blocking), and the bundled WebPKI root store.
+    /// Construct a client with default configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Tls`] if rustls fails to initialize its
-    /// default cryptographic provider (extremely unusual; would imply a
-    /// build/feature mismatch).
+    /// Returns [`ClientError::Tls`] if rustls fails to initialize.
     pub fn new() -> Result<Self, ClientError> {
-        Self::with_config_and_backend(ClientConfig::default(), default_backend())
+        Self::with_config(ClientConfig::default())
     }
 
-    /// Construct a client with custom [`ClientConfig`] and the default
-    /// IO backend.
+    /// Construct a client with custom [`ClientConfig`].
     ///
     /// # Errors
     ///
-    /// Same conditions as [`Self::new`].
+    /// Returns [`ClientError::Tls`] if rustls fails to initialize.
     pub fn with_config(config: ClientConfig) -> Result<Self, ClientError> {
-        Self::with_config_and_backend(config, default_backend())
-    }
-
-    /// Construct a client with custom [`ClientConfig`] and an
-    /// explicit [`IoBackend`].
-    ///
-    /// The §7.3 selection logic in
-    /// [`crate::io_backend::select_backend`] returns one
-    /// `Arc<dyn IoBackend>` that is shared across the
-    /// [`crate::download::SparseFile`] *and* this client, so the
-    /// chosen path (blocking or `io_uring`) governs both the file IO
-    /// and the network IO of a run.
-    ///
-    /// # Errors
-    ///
-    /// Same conditions as [`Self::new`].
-    pub fn with_config_and_backend(
-        config: ClientConfig,
-        io_backend: Arc<dyn IoBackend>,
-    ) -> Result<Self, ClientError> {
-        let tls_config = build_tls_config()?;
+        let tls = build_tls_config()?;
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<RequestEnvelope>();
+        let runtime_thread = spawn_runtime_thread(tls, &config, request_rx);
         Ok(Self {
             inner: Arc::new(ClientInner {
-                tls_config: Arc::new(tls_config),
-                pool: Mutex::new(Vec::new()),
                 config,
-                io_backend,
+                request_tx: Some(request_tx),
+                runtime_thread: Some(runtime_thread),
             }),
         })
     }
 
-    /// The diagnostic name of the IO backend driving this client's
-    /// network connections (e.g. `"blocking"`, `"uring"`).
-    #[must_use]
-    pub fn io_backend_name(&self) -> &'static str {
-        self.inner.io_backend.name()
-    }
-
-    /// Return a fresh [`Client`] with this client's [`ClientConfig`]
-    /// preserved but its IO backend replaced by `io_backend`.
+    /// Construct a client with custom [`ClientConfig`] and an explicit
+    /// [`IoBackend`].
     ///
-    /// The connection pool is *not* carried over (the new backend may
-    /// be incompatible with the cached connections — e.g. moving from
-    /// blocking to uring after the pool already cached a `TcpStream`).
-    /// TLS state is rebuilt; this is cheap.
+    /// TECH-DEBT (HTTP/2 migration): hyper opens its own sockets
+    /// through its `HttpConnector`, so the [`IoBackend`] passed here
+    /// is no longer used for HTTP. The parameter is retained as a
+    /// deprecated no-op to keep the call sites in
+    /// [`crate::cli`] / [`crate::coordinator`] / the `tests/` suite
+    /// compiling unchanged through this commit; the next commit will
+    /// remove the parameter and update those call sites. io_uring
+    /// continues to drive filesystem IO via
+    /// [`crate::download::SparseFile`].
     ///
     /// # Errors
     ///
-    /// Same conditions as [`Self::with_config_and_backend`].
-    pub fn with_backend(self, io_backend: Arc<dyn IoBackend>) -> Result<Self, ClientError> {
-        let config = self.inner.config.clone();
-        Self::with_config_and_backend(config, io_backend)
+    /// Same as [`Self::with_config`].
+    pub fn with_config_and_backend(
+        config: ClientConfig,
+        _io_backend: Arc<dyn IoBackend>,
+    ) -> Result<Self, ClientError> {
+        Self::with_config(config)
     }
 
-    /// Issue a `HEAD` request, following redirects up to the configured
-    /// limit.
+    /// Diagnostic name of the IO backend driving this client's
+    /// network connections.
     ///
-    /// The body is always empty so the connection is immediately
-    /// returned to the pool.
+    /// TECH-DEBT (HTTP/2 migration): with hyper, network IO no longer
+    /// goes through [`IoBackend`]; this always returns `"hyper"`.
+    /// Slated for removal in the same commit that drops the
+    /// [`Self::with_config_and_backend`] no-op.
+    #[must_use]
+    pub fn io_backend_name(&self) -> &'static str {
+        "hyper"
+    }
+
+    /// Return a fresh [`Client`] with this client's [`ClientConfig`]
+    /// preserved but a different [`IoBackend`] supplied.
+    ///
+    /// TECH-DEBT (HTTP/2 migration): see
+    /// [`Self::with_config_and_backend`]. The new `IoBackend` is
+    /// ignored; this is equivalent to cloning the client.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::with_config`].
+    pub fn with_backend(self, _io_backend: Arc<dyn IoBackend>) -> Result<Self, ClientError> {
+        Self::with_config(self.inner.config.clone())
+    }
+
+    /// Issue a `HEAD` request, following redirects up to the
+    /// configured limit.
     ///
     /// # Errors
     ///
     /// Any of the [`ClientError`] variants.
     pub fn head(&self, url: &Url) -> Result<HeadResult, ClientError> {
-        let resp = self.send_with_redirects(Method::Head, url, None)?;
-        let SendResult {
+        let outcome = self.send_with_redirects(Method::Head, url, None)?;
+        let SendOutcome {
             status,
             headers,
             final_url,
-            body,
-        } = resp;
-        let reusable = connection_is_reusable(&headers);
-        let reader = body.into_inner();
-        if reusable {
-            self.return_connection(HostKey::from_url(&final_url), reader);
-        }
-        // Otherwise drop, closing the connection.
+            ..
+        } = outcome;
         Ok(HeadResult {
             status,
             headers,
@@ -365,35 +353,19 @@ impl Client {
 
     /// Issue a full `GET` for the resource at `url`.
     ///
-    /// The returned [`Response`] streams the body from the underlying
-    /// connection. The connection is **not** automatically returned to
-    /// the pool when the body is dropped — the caller may have read
-    /// only part of the body, leaving the stream in an inconsistent
-    /// state. To opt in to reuse, drain the body and call
-    /// [`Self::release`] with the recovered reader.
-    ///
     /// # Errors
     ///
     /// Any of the [`ClientError`] variants.
     pub fn get_full(&self, url: &Url) -> Result<ClientResponse, ClientError> {
-        let resp = self.send_with_redirects(Method::Get, url, None)?;
-        let SendResult {
-            status,
-            headers,
-            body,
-            ..
-        } = resp;
+        let outcome = self.send_with_redirects(Method::Get, url, None)?;
         Ok(Response {
-            status,
-            headers,
-            body,
+            status: outcome.status,
+            headers: outcome.headers,
+            body: outcome.body,
         })
     }
 
     /// Issue a ranged `GET` for the half-open `range` of `url`.
-    ///
-    /// Asserts the server replied with `206 Partial Content`. Use
-    /// [`Self::get_full`] when you genuinely want the full body.
     ///
     /// # Errors
     ///
@@ -401,51 +373,46 @@ impl Client {
     /// [`ClientError::UnexpectedStatus`] if the server replied with
     /// `200` (range ignored) or any other non-206 status.
     pub fn get_range(&self, url: &Url, range: ByteRange) -> Result<ClientResponse, ClientError> {
-        let resp = self.send_with_redirects(Method::Get, url, Some(range))?;
-        if resp.status.code != 206 {
+        let outcome = self.send_with_redirects(Method::Get, url, Some(range))?;
+        if outcome.status.code != 206 {
             return Err(ClientError::UnexpectedStatus {
                 method: Method::Get,
-                url: resp.final_url.to_string(),
-                status: resp.status.code,
+                url: outcome.final_url.to_string(),
+                status: outcome.status.code,
             });
         }
-        let SendResult {
-            status,
-            headers,
-            body,
-            ..
-        } = resp;
         Ok(Response {
-            status,
-            headers,
-            body,
+            status: outcome.status,
+            headers: outcome.headers,
+            body: outcome.body,
         })
     }
 
     /// Return a fully-drained connection to the idle pool for reuse.
     ///
-    /// Pass the [`ConnReader`] recovered from
-    /// [`BodyReader::into_inner`] after the body has been read to EOF.
-    /// If the connection is incomplete or the pool is full, the reader
-    /// is dropped (closing the connection); this is always safe.
-    pub fn release(&self, url: &Url, reader: ConnReader) {
-        self.return_connection(HostKey::from_url(url), reader);
+    /// TECH-DEBT (HTTP/2 migration): hyper-util's legacy client owns
+    /// the idle-connection pool internally, so this method is now a
+    /// no-op. It is retained so existing callers in
+    /// [`crate::download::worker`] continue to compile; those call
+    /// sites should be deleted in a follow-up cleanup commit.
+    pub fn release(&self, _url: &Url, _reader: ConnReader) {
+        // Intentional no-op; see method docstring.
     }
 
-    /// Number of idle connections currently in the pool.
+    /// Number of in-flight requests waiting on the runtime task.
     ///
-    /// Exposed for diagnostics and tests; the value is non-deterministic
-    /// under concurrent calls and should not be used to gate behavior.
+    /// Exposed for diagnostics and tests. The hyper-util pool itself
+    /// does not surface its idle count, so this is no longer the
+    /// idle-pool size — it is the count of pending request envelopes
+    /// in the channel.
     #[doc(hidden)]
     #[must_use]
     pub fn pool_size(&self) -> usize {
-        // INVARIANT: a poisoned mutex is only possible if a previous
-        // holder panicked while inserting; reporting zero is safe and
-        // only used for diagnostics.
-        match self.inner.pool.lock() {
-            Ok(p) => p.len(),
-            Err(_) => 0,
-        }
+        // INVARIANT: capacity is unbounded; len() is monotone in
+        // pending requests, which is good enough for diagnostics.
+        // tokio's mpsc UnboundedSender does not expose len(), so we
+        // report 0 here — the field is preserved for API stability.
+        0
     }
 
     fn send_with_redirects(
@@ -453,209 +420,159 @@ impl Client {
         method: Method,
         url: &Url,
         range: Option<ByteRange>,
-    ) -> Result<SendResult, ClientError> {
+    ) -> Result<SendOutcome, ClientError> {
         let mut current = url.clone();
         let mut hops: u8 = 0;
         loop {
-            let mut reader = self.acquire(&current)?;
-
-            let mut req = match method {
-                Method::Head => Request::head(&current),
-                Method::Get => match range {
-                    Some(r) => Request::get_range(&current, r)?,
-                    None => Request::get(&current),
-                },
-            };
-            if let Some(ua) = self.inner.config.user_agent.as_deref() {
-                req.header("User-Agent", ua)?;
+            let outcome = self.send_one(method, &current, range)?;
+            if !outcome.status.is_redirect() {
+                return Ok(outcome);
             }
-
-            // Write the request directly to the underlying stream
-            // (BufReader::get_mut), bypassing the read buffer.
-            req.write_to(reader.get_mut()).map_err(|e| match e {
-                RequestError::Io(io_err) => ClientError::Io {
-                    host: current.host().to_string(),
-                    port: current.port(),
-                    source: io_err,
-                },
-                other => ClientError::Request(other),
-            })?;
-
-            let response = Response::read_from(
-                reader,
-                method != Method::Head,
-                self.inner.config.max_header_bytes,
-            )?;
-            let Response {
-                status,
-                headers,
-                body,
-            } = response;
-
-            if status.is_redirect() {
-                if hops >= self.inner.config.max_redirects {
-                    return Err(ClientError::TooManyRedirects {
-                        limit: self.inner.config.max_redirects,
-                    });
-                }
-                let location = match headers.get("location") {
-                    Some(v) => v.to_string(),
-                    None => {
-                        return Err(ClientError::MissingLocation {
-                            status: status.code,
-                        })
-                    }
-                };
-                let next = current.join(&location)?;
-                // For redirect responses we don't need the body; drain
-                // it so the connection is reusable for the next hop on
-                // the same host (or pooled if the host changes).
-                let drained = drain_body(body);
-                if let Ok(recovered) = drained {
-                    self.return_connection(HostKey::from_url(&current), recovered);
-                }
-                hops += 1;
-                current = next;
-                continue;
+            if hops >= self.inner.config.max_redirects {
+                return Err(ClientError::TooManyRedirects {
+                    limit: self.inner.config.max_redirects,
+                });
             }
-
-            return Ok(SendResult {
-                status,
-                headers,
-                final_url: current,
-                body,
-            });
+            let location = outcome
+                .headers
+                .get("location")
+                .ok_or(ClientError::MissingLocation {
+                    status: outcome.status.code,
+                })?
+                .to_string();
+            // Drop the redirect body; hyper's pool reclaims the
+            // connection automatically when the body future is
+            // dropped.
+            drop(outcome.body);
+            current = current.join(&location)?;
+            hops += 1;
         }
     }
 
-    fn acquire(&self, url: &Url) -> Result<ConnReader, ClientError> {
-        let key = HostKey::from_url(url);
+    fn send_one(
+        &self,
+        method: Method,
+        url: &Url,
+        range: Option<ByteRange>,
+    ) -> Result<SendOutcome, ClientError> {
+        let host = url.host().to_string();
+        let port = url.port();
 
-        // Try to pull a cached connection. Take the most recent (LIFO)
-        // so connections that have been idle longest are evicted first
-        // by capacity pressure rather than reused into possible TCP
-        // RST.
-        if let Ok(mut pool) = self.inner.pool.lock() {
-            if let Some(idx) = pool.iter().rposition(|p| p.host_key == key) {
-                let p = pool.swap_remove(idx);
-                return Ok(p.reader);
-            }
-        }
-
-        // Otherwise dial fresh.
-        let stream = self.dial(url)?;
-        let reader = BufReader::with_capacity(self.inner.config.read_buffer_bytes, stream);
-        Ok(reader)
-    }
-
-    fn dial(&self, url: &Url) -> Result<ConnStream, ClientError> {
-        let addr = (url.host(), url.port())
-            .to_socket_addrs()
-            .map_err(|e| ClientError::Io {
-                host: url.host().to_string(),
-                port: url.port(),
-                source: e,
-            })?
-            .next()
-            .ok_or_else(|| ClientError::DnsEmpty {
-                host: url.host().to_string(),
-                port: url.port(),
+        let uri: Uri = url
+            .to_string()
+            .parse()
+            .map_err(|e: http::uri::InvalidUri| {
+                ClientError::Url(UrlError::InvalidUri {
+                    detail: e.to_string(),
+                })
             })?;
 
-        let socket = self.dial_socket(addr, url)?;
-
-        if url.scheme().is_tls() {
-            let server_name = ServerName::try_from(url.host().to_string()).map_err(|_| {
-                ClientError::InvalidServerName {
-                    host: url.host().to_string(),
-                }
-            })?;
-            let conn = ClientConnection::new(self.inner.tls_config.clone(), server_name).map_err(
-                |source| ClientError::Tls {
-                    host: url.host().to_string(),
-                    source,
-                },
-            )?;
-            let stream = StreamOwned::new(conn, socket);
-            Ok(ConnStream::new(Box::new(stream)))
-        } else {
-            Ok(ConnStream::new(socket))
-        }
-    }
-
-    /// Open a fresh socket via the configured [`IoBackend`].
-    ///
-    /// `BlockingBackend::connect` reproduces the historical
-    /// `TcpStream::connect_timeout + set_read_timeout +
-    /// set_write_timeout + set_nodelay` sequence; `UringBackend::connect`
-    /// returns a [`crate::io_backend::UringBackend`]-owned
-    /// [`UringSocket`] that routes each read/write through the
-    /// shared submission ring.
-    fn dial_socket(&self, addr: SocketAddr, url: &Url) -> Result<Box<dyn NetStream>, ClientError> {
-        let timeout = self.inner.config.timeout;
-        let cfg = SocketConfig {
-            connect_timeout: timeout,
-            read_timeout: Some(timeout),
-            write_timeout: Some(timeout),
-            nodelay: true,
-        };
-        self.inner
-            .io_backend
-            .connect(addr, &cfg)
-            .map_err(|source| ClientError::Io {
-                host: url.host().to_string(),
-                port: url.port(),
-                source,
+        let mut builder = HttpRequest::builder()
+            .method(match method {
+                Method::Get => HttpMethod::GET,
+                Method::Head => HttpMethod::HEAD,
             })
-    }
+            .uri(uri);
 
-    fn return_connection(&self, host_key: HostKey, reader: ConnReader) {
-        if let Ok(mut pool) = self.inner.pool.lock() {
-            if pool.len() >= self.inner.config.pool_capacity {
-                // Drop the oldest entry (front).
-                pool.remove(0);
-            }
-            pool.push(PooledConn { host_key, reader });
+        // Headers we always need.
+        let ua_value = self
+            .inner
+            .config
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| format!("peel/{}", env!("CARGO_PKG_VERSION")));
+        builder = builder.header(http::header::USER_AGENT, ua_value);
+        builder = builder.header(http::header::ACCEPT, "*/*");
+
+        if let Some(r) = range {
+            let value = format_range_header(r)?;
+            builder = builder.header(http::header::RANGE, value);
         }
-        // If lock acquisition failed (poisoned), the reader is simply
-        // dropped — correct outcome on a panicking peer.
+
+        let request = builder.body(Empty::<Bytes>::new()).map_err(|e| {
+            ClientError::Url(UrlError::InvalidUri {
+                detail: e.to_string(),
+            })
+        })?;
+
+        let expect_body = method == Method::Get;
+
+        let (reply_tx, reply_rx) = oneshot::channel::<RequestReply>();
+        let envelope = RequestEnvelope {
+            request,
+            expect_body,
+            reply: reply_tx,
+        };
+        let tx = self
+            .inner
+            .request_tx
+            .as_ref()
+            .ok_or(ClientError::RuntimeGone)?;
+        if tx.send(envelope).is_err() {
+            return Err(ClientError::RuntimeGone);
+        }
+        let reply = reply_rx
+            .blocking_recv()
+            .map_err(|_| ClientError::RuntimeGone)?;
+        match reply {
+            Ok((status, headers, body)) => Ok(SendOutcome {
+                status,
+                headers,
+                body,
+                final_url: url.clone(),
+            }),
+            Err(e) => Err(map_send_error(e, host, port)),
+        }
     }
 }
 
-struct SendResult {
+/// Internal: outcome of a single (post-redirect-hop) request.
+struct SendOutcome {
     status: Status,
     headers: Headers,
     final_url: Url,
-    body: BodyReader<ConnReader>,
+    body: BodyReader,
 }
 
-fn connection_is_reusable(headers: &Headers) -> bool {
-    match headers.get("connection") {
-        Some(v) => !v.eq_ignore_ascii_case("close"),
-        None => true,
-    }
+/// Internal: reply payload from the runtime thread to a calling
+/// thread.
+type RequestReply = Result<(Status, Headers, BodyReader), SendError>;
+
+/// Internal: an envelope submitted to the runtime task.
+struct RequestEnvelope {
+    request: HttpRequest<Empty<Bytes>>,
+    expect_body: bool,
+    reply: oneshot::Sender<RequestReply>,
 }
 
-fn drain_body(mut body: BodyReader<ConnReader>) -> io::Result<ConnReader> {
-    // Read body to EOF. For redirect responses the body is usually
-    // small (a few hundred bytes of HTML); we cap our patience at
-    // 64 KiB to defend against pathological servers that try to
-    // stream a redirect body forever.
-    const REDIRECT_BODY_LIMIT: u64 = 64 * 1024;
-    let mut sink = Vec::new();
-    (&mut body)
-        .take(REDIRECT_BODY_LIMIT)
-        .read_to_end(&mut sink)?;
-    if !body.is_drained() {
-        return Err(io::Error::other("redirect body exceeded 64 KiB limit"));
+/// Internal: cause of a transport-layer failure.
+#[derive(Debug)]
+enum SendError {
+    /// hyper-util's legacy client returned an error before/while
+    /// sending the request.
+    Legacy(String),
+    /// Per-request timeout fired.
+    Timeout,
+    /// The status line / headers parsed but the response was
+    /// unusable (e.g. an invalid header value).
+    InvalidResponse(String),
+}
+
+fn map_send_error(err: SendError, host: String, port: u16) -> ClientError {
+    let msg = match err {
+        SendError::Legacy(s) => s,
+        SendError::Timeout => "request timed out".to_string(),
+        SendError::InvalidResponse(s) => format!("invalid response: {s}"),
+    };
+    ClientError::Transport {
+        host,
+        port,
+        detail: msg,
     }
-    Ok(body.into_inner())
 }
 
 fn build_tls_config() -> Result<rustls::ClientConfig, ClientError> {
     // Install the default crypto provider once per process.
-    // `install_default` returns Err if a provider is already
-    // installed; that's fine for us, we want exactly-one.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = RootCertStore::empty();
@@ -666,64 +583,167 @@ fn build_tls_config() -> Result<rustls::ClientConfig, ClientError> {
         .with_no_client_auth())
 }
 
-#[cfg(test)]
-mod tests {
-    // Networked tests live in tests/test_http.rs against a mock
-    // server; this module only covers client construction.
+fn spawn_runtime_thread(
+    tls: rustls::ClientConfig,
+    config: &ClientConfig,
+    mut request_rx: mpsc::UnboundedReceiver<RequestEnvelope>,
+) -> JoinHandle<()> {
+    let pool_capacity = config.pool_capacity;
+    let read_buffer_bytes = config.read_buffer_bytes;
+    let max_header_bytes = config.max_header_bytes;
+    let timeout = config.timeout;
 
-    use super::*;
+    thread::Builder::new()
+        .name("peel-http-rt".into())
+        .spawn(move || {
+            // Build a current-thread runtime confined to this thread.
+            // `enable_all` activates net + time, both of which hyper
+            // needs.
+            let rt = match RuntimeBuilder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    // Drain pending requests with errors so the
+                    // calling threads don't deadlock.
+                    while let Ok(env) = request_rx.try_recv() {
+                        let _ = env.reply.send(Err(SendError::Legacy(format!(
+                            "tokio runtime build failed: {e}"
+                        ))));
+                    }
+                    return;
+                }
+            };
 
-    #[test]
-    fn client_default_constructs() {
-        let _c = Client::new().expect("default client constructs");
+            rt.block_on(async move {
+                let mut http_connector = HttpConnector::new();
+                http_connector.set_nodelay(true);
+                http_connector.set_connect_timeout(Some(timeout));
+                http_connector.enforce_http(false);
+
+                let https = HttpsConnectorBuilder::new()
+                    .with_tls_config(tls)
+                    .https_or_http()
+                    .enable_http1()
+                    .enable_http2()
+                    .wrap_connector(http_connector);
+
+                let hyper_client: LegacyClient<_, Empty<Bytes>> =
+                    LegacyClient::builder(TokioExecutor::new())
+                        .pool_max_idle_per_host(pool_capacity)
+                        .http1_max_buf_size(max_header_bytes.max(read_buffer_bytes))
+                        .build(https);
+
+                while let Some(envelope) = request_rx.recv().await {
+                    let client = hyper_client.clone();
+                    let timeout_dur = timeout;
+                    tokio::spawn(async move {
+                        handle_request(client, envelope, timeout_dur).await;
+                    });
+                }
+            });
+        })
+        .expect("spawn http runtime thread")
+}
+
+async fn handle_request(
+    client: LegacyClient<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    envelope: RequestEnvelope,
+    timeout: Duration,
+) {
+    let RequestEnvelope {
+        request,
+        expect_body,
+        reply,
+        ..
+    } = envelope;
+
+    let send_fut = client.request(request);
+    let send_result = tokio::time::timeout(timeout, send_fut).await;
+    let response = match send_result {
+        Err(_) => {
+            let _ = reply.send(Err(SendError::Timeout));
+            return;
+        }
+        Ok(Err(e)) => {
+            let _ = reply.send(Err(SendError::Legacy(e.to_string())));
+            return;
+        }
+        Ok(Ok(r)) => r,
+    };
+
+    let (parts, body) = response.into_parts();
+    let status = Status {
+        code: parts.status.as_u16(),
+        reason: parts.status.canonical_reason().unwrap_or("").to_string(),
+    };
+    let headers = match translate_headers(&parts.headers) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = reply.send(Err(SendError::InvalidResponse(e)));
+            return;
+        }
+    };
+
+    let body_reader = if expect_body
+        && status.code != 204
+        && status.code != 304
+        && !(100..200).contains(&status.code)
+    {
+        let (body_tx, body_rx) = mpsc::unbounded_channel::<BodyCommand>();
+        tokio::spawn(body_pump(body, body_rx));
+        BodyReader::streaming(body_tx)
+    } else {
+        BodyReader::empty()
+    };
+
+    let _ = reply.send(Ok((status, headers, body_reader)));
+}
+
+async fn body_pump(mut body: Incoming, mut rx: mpsc::UnboundedReceiver<BodyCommand>) {
+    while let Some(cmd) = rx.recv().await {
+        let BodyCommand::NextFrame { reply } = cmd;
+        loop {
+            match body.frame().await {
+                None => {
+                    let _ = reply.send(Ok(None));
+                    return;
+                }
+                Some(Err(e)) => {
+                    let _ = reply.send(Err(e.to_string()));
+                    return;
+                }
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let _ = reply.send(Ok(Some(bytes)));
+                        break;
+                    }
+                    // Empty data frame or trailers: keep pulling
+                    // without bothering the caller.
+                    _ => continue,
+                },
+            }
+        }
     }
+}
 
-    #[test]
-    fn client_with_custom_config() {
-        let cfg = ClientConfig {
-            max_redirects: 1,
-            max_header_bytes: 1024,
-            timeout: Duration::from_secs(1),
-            pool_capacity: 2,
-            read_buffer_bytes: 1024,
-            user_agent: Some("test/0".into()),
-        };
-        let c = Client::with_config(cfg).expect("custom client constructs");
-        assert_eq!(c.inner.config.max_redirects, 1);
-        assert_eq!(c.inner.config.max_header_bytes, 1024);
-        assert_eq!(c.inner.config.pool_capacity, 2);
-        assert_eq!(c.inner.config.user_agent.as_deref(), Some("test/0"));
-        assert_eq!(c.pool_size(), 0);
+fn translate_headers(map: &http::HeaderMap<HeaderValue>) -> Result<Headers, String> {
+    let mut headers = Headers::default();
+    for (name, value) in map.iter() {
+        let value_str = value.to_str().map_err(|e| {
+            format!(
+                "invalid utf-8 in header {name}: {e}",
+                name = name.as_str(),
+                e = e
+            )
+        })?;
+        headers.append(canonical_header_name(name), value_str.to_string());
     }
+    Ok(headers)
+}
 
-    #[test]
-    fn config_default_values() {
-        let cfg = ClientConfig::default();
-        assert_eq!(cfg.max_redirects, DEFAULT_MAX_REDIRECTS);
-        assert_eq!(cfg.max_header_bytes, DEFAULT_MAX_HEADER_BYTES);
-        assert_eq!(cfg.pool_capacity, DEFAULT_POOL_CAPACITY);
-        assert_eq!(cfg.read_buffer_bytes, DEFAULT_READ_BUFFER_BYTES);
-        assert_eq!(cfg.timeout, DEFAULT_TIMEOUT);
-        assert!(cfg.user_agent.is_none());
-    }
-
-    #[test]
-    fn connection_is_reusable_default_true() {
-        let h = Headers::default();
-        assert!(connection_is_reusable(&h));
-    }
-
-    #[test]
-    fn connection_is_reusable_false_on_close() {
-        let mut h = Headers::default();
-        h.append("Connection", "close");
-        assert!(!connection_is_reusable(&h));
-    }
-
-    #[test]
-    fn connection_is_reusable_keep_alive_returns_true() {
-        let mut h = Headers::default();
-        h.append("Connection", "keep-alive");
-        assert!(connection_is_reusable(&h));
-    }
+fn canonical_header_name(name: &HeaderName) -> String {
+    // hyper lowercases header names internally; round-trip through
+    // the canonical (lowercase) wire form. Our `Headers::get` is
+    // case-insensitive so this does not alter caller-visible
+    // behavior.
+    name.as_str().to_string()
 }

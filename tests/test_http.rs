@@ -276,8 +276,9 @@ fn early_disconnect_returns_response_error() {
     let err = client
         .get_full(&url(&server, "/"))
         .expect_err("dropped conn must error");
-    // The response parser sees zero bytes and reports UnexpectedEof.
-    matches!(err, ClientError::Response(_));
+    // hyper sees the connection drop before any frame and surfaces it
+    // as a transport error.
+    matches!(err, ClientError::Transport { .. });
 }
 
 #[test]
@@ -288,25 +289,33 @@ fn truncated_body_during_read_errors() {
     let client = build_client();
     let mut resp = client.get_full(&url(&server, "/")).expect("headers ok");
     let mut body = Vec::new();
-    let err = resp.body.read_to_end(&mut body).expect_err("must error");
-    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    // hyper raises a transport error mid-stream once it observes the
+    // declared Content-Length cannot be satisfied. The exact
+    // `ErrorKind` surfaced depends on the hyper version (today it's
+    // wrapped via `io::Error::other`, so it is `Other`); previously
+    // the hand-rolled parser emitted `UnexpectedEof`. We assert only
+    // that the truncation surfaced as an error and that the partial
+    // bytes received are present in `body`.
+    let _err = resp.body.read_to_end(&mut body).expect_err("must error");
+    assert!(body.starts_with(b"hello"));
 }
 
 // ---- Connection pool ---------------------------------------------------
 
 #[test]
 fn head_responses_populate_idle_pool() {
+    // The previous hand-rolled client exposed an internal idle-pool
+    // size that this test asserted on. With the move to hyper-util,
+    // pool inspection is no longer available — the legacy client
+    // owns its own pool. We can still verify the *behavioral*
+    // guarantee: two HEAD requests to the same host both succeed.
+    // Connection reuse is exercised end-to-end by the keep-alive
+    // and HTTP/2 multiplexing tests; this case just confirms the
+    // pool does not break repeat requests.
     let server = MockServer::start(|_req, _n| MockResponse::ok(""));
     let client = build_client();
-    assert_eq!(client.pool_size(), 0);
     let _ = client.head(&url(&server, "/a")).expect("head ok");
-    assert_eq!(client.pool_size(), 1);
     let _ = client.head(&url(&server, "/b")).expect("head ok");
-    // Same host: should reuse the pooled connection rather than open a
-    // second one. Pool stays at 1.
-    assert_eq!(client.pool_size(), 1);
-    // The mock server saw both requests on the same connection, so it
-    // recorded request_count=2.
     assert_eq!(server.request_count(), 2);
 }
 

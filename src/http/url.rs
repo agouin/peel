@@ -44,6 +44,18 @@ pub enum UrlError {
     /// rather than silently leaking credentials in `Host:` headers.
     #[error("userinfo (`user:pass@`) is not supported in URLs")]
     UserinfoNotSupported,
+
+    /// The URL parsed successfully here but could not be coerced into
+    /// a hyper [`Uri`](http::Uri) (e.g. the path contains characters
+    /// that hyper rejects after our parser has accepted them, or
+    /// hyper's request builder failed for some other reason). Should
+    /// not happen for URLs that survive [`Url::parse`]; included for
+    /// completeness so the [`super::client`] error path is total.
+    #[error("URL could not be coerced into a hyper Uri: {detail}")]
+    InvalidUri {
+        /// hyper's error message, for diagnostics.
+        detail: String,
+    },
 }
 
 /// The two URL schemes the HTTP client supports.

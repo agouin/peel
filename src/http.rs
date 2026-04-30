@@ -15,8 +15,10 @@
 //! - [`url`] — minimal URL parser sufficient for the schemes (`http`,
 //!   `https`) and authorities the client supports.
 //! - [`range`] — `Range:` / `Content-Range:` header parsing.
-//! - [`request`] — typed [`Request`](request::Request); kept for the
-//!   range/method enum types callers use.
+//! - [`request`] — the [`Method`](request::Method) enum surfaced by
+//!   [`ClientError::UnexpectedStatus`](client::ClientError::UnexpectedStatus).
+//!   The hand-rolled request serializer that previously lived here is
+//!   gone; hyper now constructs the wire-level request itself.
 //! - [`response`] — [`Headers`](response::Headers), [`Status`](response::Status),
 //!   and the [`BodyReader`](response::BodyReader) `std::io::Read` adapter
 //!   over hyper's body stream.
@@ -33,9 +35,9 @@
 //! no proxies. The only request bodies the client knows how to send
 //! are zero bytes.
 
-// `client` depends on `crate::io_backend`, which is Unix-only (see
-// `PLAN_v2.md` §7 / §7b). The other submodules (URL parsing, header
-// parsing, request / response framing) stay cross-platform.
+// `client` still imports `crate::io_backend` for the deprecated
+// [`Client::with_config_and_backend`] no-op (see TECH-DEBT note on
+// that method). `IoBackend` is Unix-only; the gating moves with it.
 #[cfg(unix)]
 pub mod client;
 pub mod range;
@@ -46,6 +48,6 @@ pub mod url;
 #[cfg(unix)]
 pub use client::{Client, ClientConfig, ClientError};
 pub use range::{ContentRange, RangeError};
-pub use request::{Method, Request, RequestError};
-pub use response::{BodyReader, Headers, Response, ResponseError, Status};
+pub use request::Method;
+pub use response::{BodyReader, Headers, Response, Status};
 pub use url::{Scheme, Url, UrlError};

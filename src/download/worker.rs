@@ -209,7 +209,7 @@ fn is_transport_retryable(err: &ClientError) -> bool {
         err,
         ClientError::Io { .. }
             | ClientError::Tls { .. }
-            | ClientError::Response(_)
+            | ClientError::Transport { .. }
             | ClientError::DnsEmpty { .. }
     )
 }
@@ -665,8 +665,8 @@ fn verify_content_range(
     Ok(())
 }
 
-fn verify_content_length<R: io::BufRead>(
-    resp: &crate::http::Response<R>,
+fn verify_content_length(
+    resp: &crate::http::Response,
     chunk: ChunkIndex,
     expected: u64,
 ) -> Result<(), WorkerError> {
