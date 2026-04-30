@@ -107,6 +107,7 @@ fn coord_config(chunk_size: u64) -> CoordinatorConfig {
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
         mirror_urls: Vec::new(),
+        max_bandwidth_bps: None,
     }
 }
 

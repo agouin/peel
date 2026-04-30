@@ -182,6 +182,13 @@ pub struct CoordinatorConfig {
     /// set. Empty for single-URL runs (the historical default).
     /// Mirrors the repeatable `--mirror <URL>` CLI flag.
     pub mirror_urls: Vec<String>,
+    /// Aggregate bandwidth cap, in bytes/sec
+    /// (`PLAN_v2.md` §14). When `Some`, the coordinator builds a
+    /// shared [`crate::download::RateLimiter`] and feeds every
+    /// download worker (and every mirror) through it. The cap is
+    /// aggregate across mirrors per the §14 step-5 contract. Mirrors
+    /// the `--max-bandwidth <RATE>` CLI flag.
+    pub max_bandwidth_bps: Option<u64>,
 }
 
 impl Default for CoordinatorConfig {
@@ -201,6 +208,7 @@ impl Default for CoordinatorConfig {
             io_backend: crate::io_backend::IoBackendChoice::default(),
             expected_sha256: None,
             mirror_urls: Vec::new(),
+            max_bandwidth_bps: None,
         }
     }
 }
@@ -629,6 +637,14 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         None
     };
 
+    // Aggregate bandwidth limiter (`PLAN_v2.md` §14). Constructed once
+    // from the user-provided rate and shared across every worker and
+    // every mirror so the cap is aggregate, not per-mirror. `None`
+    // disables limiting (the historical default).
+    let rate_limiter = config
+        .max_bandwidth_bps
+        .map(|bps| Arc::new(crate::download::RateLimiter::new(bps)));
+
     let scheduler_cfg = SchedulerConfig {
         chunk_size: config.chunk_size,
         workers: config.workers,
@@ -638,6 +654,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         fingerprints: Some(Arc::clone(&fingerprints)),
         probe: ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirror_set)),
+        rate_limiter: rate_limiter.clone(),
     };
 
     let download_done = Arc::new(AtomicBool::new(false));
@@ -1497,6 +1514,7 @@ fn run_resume_probe(
         chunk_size,
         sparse,
         progress: None,
+        rate_limiter: None,
     };
     let cancel = AtomicBool::new(false);
     match crate::download::worker::download_dispatch(&ctx, dispatch, retry, &cancel) {

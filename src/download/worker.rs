@@ -23,12 +23,14 @@
 
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 use super::mirrors::{MirrorSet, DEFAULT_MIRROR_PICK_DEADLINE};
+use super::rate_limit::{RateLimitedReader, RateLimiter};
 use super::sparse_file::{SparseFile, SparseFileError};
 use crate::hash::crc32c::Crc32c;
 use crate::http::range::{parse_content_range, RangeError};
@@ -364,6 +366,12 @@ pub struct ChunkContext<'a> {
     /// each successful `pwrite_at` (PLAN_v2.md §6). `None` keeps the
     /// worker silent — used by tests that don't drive the renderer.
     pub progress: Option<&'a ProgressState>,
+    /// Optional aggregate bandwidth limiter (`PLAN_v2.md` §14). When
+    /// `Some`, every byte the worker reads off the wire passes
+    /// through the limiter's token bucket. `None` runs at the
+    /// network's natural throughput. Shared across all workers and
+    /// all mirrors, so the cap is aggregate.
+    pub rate_limiter: Option<&'a Arc<RateLimiter>>,
 }
 
 /// Download a single chunk with retry/backoff.
@@ -450,7 +458,7 @@ pub fn download_dispatch(
                 });
             }
         };
-        let outcome = try_once(ctx, mirror_idx, &dispatch);
+        let outcome = try_once(ctx, mirror_idx, &dispatch, cancel);
         let elapsed = started.elapsed();
         let err = match outcome {
             Ok((bytes, crcs)) => {
@@ -536,6 +544,7 @@ fn try_once(
     ctx: &ChunkContext<'_>,
     mirror_idx: usize,
     dispatch: &Dispatch,
+    cancel: &AtomicBool,
 ) -> Result<(u64, Vec<u32>), WorkerError> {
     let chunk = dispatch.first;
     let range = dispatch.range;
@@ -564,8 +573,21 @@ fn try_once(
     })?;
     let mut buf = vec![0u8; len_usize];
     let mut body = resp.body;
-    body.read_exact(&mut buf)
-        .map_err(|source| WorkerError::BodyIo { chunk, source })?;
+    // Aggregate bandwidth cap (`PLAN_v2.md` §14): when configured,
+    // wrap the body so each underlying socket read is gated by the
+    // shared token bucket. Cancellation is the same `cancel` flag the
+    // dispatch loop polls, so a stalled limiter still tears down on
+    // shutdown. Refunding tokens on a short read keeps the bucket
+    // accurate even when the server hands us a chunked frame.
+    if let Some(limiter) = ctx.rate_limiter {
+        let mut limited = RateLimitedReader::new(&mut body, Arc::clone(limiter), cancel);
+        limited
+            .read_exact(&mut buf)
+            .map_err(|source| WorkerError::BodyIo { chunk, source })?;
+    } else {
+        body.read_exact(&mut buf)
+            .map_err(|source| WorkerError::BodyIo { chunk, source })?;
+    }
 
     ctx.sparse
         .pwrite_at(range.start(), &buf)

@@ -138,6 +138,7 @@ fn run_demo(args: Args) -> Result<(), String> {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     };
 
     let started = Instant::now();

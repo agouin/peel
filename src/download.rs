@@ -27,6 +27,7 @@ pub mod chunk_fingerprints;
 pub mod chunk_policy;
 pub mod mirrors;
 pub mod mmap_region;
+pub mod rate_limit;
 pub mod scheduler;
 pub mod sparse_file;
 pub mod worker;
@@ -41,6 +42,10 @@ pub use mirrors::{
     Mirror, MirrorSet, MirrorStats, DEFAULT_MIRROR_EXCLUDE_FOR, DEFAULT_MIRROR_PICK_DEADLINE,
 };
 pub use mmap_region::MmapRegion;
+pub use rate_limit::{
+    parse_bandwidth, ParseBandwidthError, RateLimitedReader, RateLimiter, MAX_PER_READ,
+    MIN_CAPACITY,
+};
 pub use scheduler::{
     chunk_count, discover, discover_with_mirrors, run, DownloadInfo, DownloadMode, DownloadStats,
     MirrorAgreementError, ProbeConfig, SchedulerConfig, SchedulerError, DEFAULT_CHUNK_SIZE,

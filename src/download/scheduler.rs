@@ -46,6 +46,7 @@ use thiserror::Error;
 use super::chunk_fingerprints::ChunkFingerprints;
 use super::chunk_policy::{ChunkSizePolicy, Sample};
 use super::mirrors::{Mirror, MirrorSet};
+use super::rate_limit::{RateLimitedReader, RateLimiter};
 use super::sparse_file::{SparseFile, SparseFileError};
 use super::worker::{
     download_dispatch, ChunkContext, ChunkOutcome, Dispatch, DispatchKind, RetryConfig,
@@ -296,6 +297,13 @@ pub struct SchedulerConfig {
     /// `info.fingerprint` so single-mirror runs share the same code
     /// path.
     pub mirrors: Option<Arc<MirrorSet>>,
+    /// Aggregate bandwidth cap (`PLAN_v2.md` §14). When `Some`,
+    /// every byte read off the wire (parallel-mode worker bodies
+    /// and the single-stream fallback) passes through this token
+    /// bucket. The limiter is shared across every worker and every
+    /// mirror, so the cap is aggregate, not per-mirror. `None`
+    /// disables rate limiting (the default).
+    pub rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl Default for SchedulerConfig {
@@ -309,6 +317,7 @@ impl Default for SchedulerConfig {
             fingerprints: None,
             probe: ProbeConfig::default(),
             mirrors: None,
+            rate_limiter: None,
         }
     }
 }
@@ -689,6 +698,7 @@ fn run_parallel(
             chunk_size: config.chunk_size,
             sparse,
             progress: config.progress.as_deref(),
+            rate_limiter: config.rate_limiter.as_ref(),
         };
         // Spawn workers.
         for w_id in 0..workers {
@@ -882,6 +892,14 @@ fn run_parallel(
         // join then waits for them.
         drop(task_tx);
 
+        // §14: a worker stalled inside the rate limiter must observe
+        // the cancel flag promptly. Wake every blocked waiter so they
+        // re-check `cancel` and unwind without paying out the
+        // remaining sleep cadence.
+        if let Some(limiter) = config.rate_limiter.as_ref() {
+            limiter.shutdown();
+        }
+
         match shutdown_reason {
             Some(e) => Err(e),
             None => Ok(stats_local),
@@ -1060,6 +1078,12 @@ fn run_single_stream(
     let _ss_guard = SingleStreamGuard {
         progress: single_stream_progress.as_deref(),
     };
+    // Single-stream mode has no out-of-band cancel signal — the read
+    // runs synchronously on the calling thread — but the rate-limited
+    // reader still needs a flag to poll. A never-flipped `AtomicBool`
+    // is fine: the limiter falls through to its normal blocking
+    // behaviour and there's no thread to interrupt.
+    let ss_cancel = AtomicBool::new(false);
     while written < total_size {
         let remaining = total_size - written;
         let want = u64::try_from(buf.len()).unwrap_or(u64::MAX).min(remaining);
@@ -1069,7 +1093,14 @@ fn run_single_stream(
                 actual: written,
             })?;
         let slice = &mut buf[..want_usize];
-        let n = resp.body.read(slice).map_err(SchedulerError::BodyIo)?;
+        let n = match config.rate_limiter.as_ref() {
+            Some(limiter) => {
+                let mut limited =
+                    RateLimitedReader::new(&mut resp.body, Arc::clone(limiter), &ss_cancel);
+                limited.read(slice).map_err(SchedulerError::BodyIo)?
+            }
+            None => resp.body.read(slice).map_err(SchedulerError::BodyIo)?,
+        };
         if n == 0 {
             return Err(SchedulerError::SingleStreamBodyLength {
                 expected: total_size,

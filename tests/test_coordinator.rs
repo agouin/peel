@@ -97,6 +97,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
         mirror_urls: Vec::new(),
+        max_bandwidth_bps: None,
     }
 }
 
@@ -1728,6 +1729,7 @@ fn worker_probe_detects_source_drift() {
         chunk_size,
         sparse: &sparse,
         progress: None,
+        rate_limiter: None,
     };
     let dispatch = Dispatch {
         first: ChunkIndex::ZERO,

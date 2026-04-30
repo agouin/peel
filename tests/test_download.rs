@@ -78,6 +78,7 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     }
 }
 
@@ -678,6 +679,7 @@ fn run_rejects_zero_chunk_size() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -703,6 +705,7 @@ fn run_rejects_zero_workers() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));
@@ -766,6 +769,7 @@ fn run_with_policy_extracts_byte_identical_output() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -817,6 +821,7 @@ fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -868,6 +873,7 @@ fn run_without_policy_keeps_one_range_per_chunk() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     };
 
     run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("baseline run");
@@ -927,6 +933,7 @@ fn run_with_policy_resume_honors_existing_bitmap() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: None,
+        rate_limiter: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive resume");
@@ -970,6 +977,7 @@ fn scheduler_records_per_chunk_crc32c_when_fingerprints_configured() {
         fingerprints: Some(Arc::clone(&fingerprints)),
         probe: peel::download::ProbeConfig { interval: 0 }, // recording only
         mirrors: None,
+        rate_limiter: None,
     };
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("download");
     assert_eq!(stats.chunks_completed, total_chunks);
@@ -1042,6 +1050,7 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
         // chunks.
         probe: peel::download::ProbeConfig { interval: 1 },
         mirrors: None,
+        rate_limiter: None,
     };
     let err =
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect_err("must abort");
@@ -1185,6 +1194,7 @@ fn run_routes_chunks_across_two_mirrors() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirrors)),
+        rate_limiter: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run");
 
@@ -1265,6 +1275,7 @@ fn run_falls_back_when_one_mirror_dies() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirrors)),
+        rate_limiter: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
         .expect("run completes despite mirror A failing");
@@ -1356,7 +1367,104 @@ fn run_completes_after_all_mirrors_recover() {
         fingerprints: None,
         probe: peel::download::ProbeConfig::default(),
         mirrors: Some(Arc::clone(&mirrors)),
+        rate_limiter: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("recovers");
     assert_eq!(read_full(&path), body_clone);
+}
+
+// ---- §14: aggregate bandwidth limiter --------------------------------
+
+#[test]
+fn run_parallel_with_rate_limiter_extracts_byte_identical() {
+    // The limiter must not corrupt bytes — it merely paces them. Run
+    // the standard happy path with a generous limit (so the test
+    // itself isn't slow) and assert byte-identical output.
+    let body = make_body(40_000);
+    let body_clone = body.clone();
+    let server = MockServer::start(ok_handler(body, Some("\"v1\"")));
+    let client = build_client();
+
+    let info = discover(&client, &url(&server, "/data")).expect("discover");
+    let chunk_size = 4096;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+
+    let path = temp_path("rate_limit_byte_identical");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    let limiter = Arc::new(peel::download::RateLimiter::new(100 * 1024 * 1024));
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size,
+        workers: 4,
+        retry: fast_retry(),
+        progress: None,
+        policy: None,
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
+        rate_limiter: Some(Arc::clone(&limiter)),
+    };
+    run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");
+    assert_eq!(read_full(&path), body_clone);
+}
+
+#[test]
+fn run_parallel_with_rate_limiter_paces_below_uncapped_rate() {
+    // Run twice against the same body — once unlimited, once at
+    // 1 MiB/s — and assert the limited run takes meaningfully longer.
+    // The body is 4 MiB so the limited run pays the rate for the bulk
+    // of the bytes, well above measurement noise even on slow CI.
+    let body = make_body(4 * 1024 * 1024);
+    let body_clone = body.clone();
+    let server = MockServer::start(ok_handler(body, Some("\"v1\"")));
+    let client = build_client();
+
+    let info = discover(&client, &url(&server, "/data")).expect("discover");
+    let chunk_size = 256 * 1024;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+
+    let measure = |limiter: Option<Arc<peel::download::RateLimiter>>| -> Duration {
+        let path = temp_path("rate_limit_paces");
+        let cleanup = CleanupOnDrop(path.clone());
+        let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+        let bitmap = ChunkBitmap::new(total_chunks);
+        let cursor = AtomicU64::new(0);
+        let scheduler_cfg = SchedulerConfig {
+            chunk_size,
+            workers: 4,
+            retry: fast_retry(),
+            progress: None,
+            policy: None,
+            fingerprints: None,
+            probe: peel::download::ProbeConfig::default(),
+            mirrors: None,
+            rate_limiter: limiter,
+        };
+        let started = std::time::Instant::now();
+        run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");
+        let elapsed = started.elapsed();
+        assert_eq!(read_full(&path), body_clone);
+        drop(cleanup);
+        elapsed
+    };
+
+    let unlimited = measure(None);
+    let rate = 1024 * 1024; // 1 MiB/s -> 4 MiB body should take ~3 s after the burst
+    let limited = measure(Some(Arc::new(peel::download::RateLimiter::new(rate))));
+
+    // The unlimited path against a localhost mock typically completes
+    // in tens of milliseconds. The limited path must take at least
+    // ~2 s (3 MiB above the 1 MiB initial burst at 1 MiB/s, minus a
+    // generous slack for the mock's per-chunk overhead).
+    assert!(
+        limited >= Duration::from_millis(2000),
+        "limited run too fast: {limited:?}"
+    );
+    assert!(
+        limited > unlimited * 5,
+        "limiter did not slow the run noticeably: limited={limited:?}, unlimited={unlimited:?}"
+    );
 }

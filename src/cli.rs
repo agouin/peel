@@ -15,7 +15,9 @@ use clap::{ArgGroup, Parser, ValueEnum};
 
 use crate::coordinator::{CoordinatorConfig, OutputTarget, RunArgs};
 use crate::decode::DecoderRegistry;
-use crate::download::{RetryConfig, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS};
+use crate::download::{
+    parse_bandwidth, ParseBandwidthError, RetryConfig, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
+};
 use crate::extractor::DEFAULT_PUNCH_THRESHOLD;
 use crate::hash::sha256::{parse_hex_digest, ParseHexDigestError};
 use crate::http::Client;
@@ -147,6 +149,16 @@ pub struct Cli {
     /// exclude a mirror for 30 s before it is retried.
     #[arg(long = "mirror", value_name = "URL")]
     pub mirrors: Vec<String>,
+
+    /// Aggregate bandwidth cap (`PLAN_v2.md` §14). Accepts decimal
+    /// suffixes (`K`/`M`/`G`/`T`, 1000-based per network
+    /// convention) and binary suffixes (`Ki`/`Mi`/`Gi`/`Ti`,
+    /// 1024-based). A trailing `B` and `/s` are accepted and
+    /// ignored. Examples: `10MB/s`, `1.5GB/s`, `512KiB/s`,
+    /// `1000000`. The cap is aggregate across all mirrors, not
+    /// per-mirror.
+    #[arg(long = "max-bandwidth", value_name = "RATE")]
+    pub max_bandwidth: Option<String>,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -194,6 +206,11 @@ pub enum CliError {
     /// 64-character hex digest.
     #[error("--sha256 value is not a valid SHA-256 digest")]
     InvalidSha256(#[source] ParseHexDigestError),
+
+    /// `--max-bandwidth <RATE>` was given but the value did not
+    /// parse as a recognized rate (e.g. `10MB/s`, `1.5GiB`).
+    #[error("--max-bandwidth value is not a valid rate")]
+    InvalidBandwidth(#[source] ParseBandwidthError),
 }
 
 impl Cli {
@@ -218,6 +235,10 @@ impl Cli {
             Some(hex) => Some(parse_hex_digest(&hex).map_err(CliError::InvalidSha256)?),
             None => None,
         };
+        let max_bandwidth_bps = match self.max_bandwidth {
+            Some(s) => Some(parse_bandwidth(&s).map_err(CliError::InvalidBandwidth)?),
+            None => None,
+        };
         let client = Client::new()?;
         Ok(RunArgs {
             url: self.url,
@@ -237,6 +258,7 @@ impl Cli {
                 io_backend: self.io_backend.into(),
                 expected_sha256,
                 mirror_urls: self.mirrors,
+                max_bandwidth_bps,
             },
             client,
             registry: DecoderRegistry::with_defaults(),
@@ -500,6 +522,74 @@ mod tests {
         .expect("parse");
         let err = cli.into_run_args().err().expect("must error");
         assert!(matches!(err, CliError::InvalidSha256(_)));
+    }
+
+    #[test]
+    fn parses_max_bandwidth_into_bytes_per_sec() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--max-bandwidth",
+            "10MB/s",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(args.config.max_bandwidth_bps, Some(10_000_000));
+    }
+
+    #[test]
+    fn parses_max_bandwidth_binary_suffix() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--max-bandwidth",
+            "1MiB/s",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(args.config.max_bandwidth_bps, Some(1024 * 1024));
+    }
+
+    #[test]
+    fn no_max_bandwidth_flag_leaves_limit_none() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(args.config.max_bandwidth_bps.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_max_bandwidth_unit() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--max-bandwidth",
+            "10XB/s",
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::InvalidBandwidth(_)));
+    }
+
+    #[test]
+    fn rejects_zero_max_bandwidth() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--max-bandwidth",
+            "0",
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::InvalidBandwidth(_)));
     }
 
     #[test]

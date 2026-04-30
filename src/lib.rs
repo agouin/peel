@@ -61,6 +61,12 @@
 //! - [`hash`] — integrity hashing primitives. Currently hosts a
 //!   hand-rolled SHA-256 with serializable mid-stream state
 //!   (`PLAN_v2.md` §10) used by the `--sha256 <hex>` flag.
+//! - [`download::rate_limit`] (Unix only) — aggregate bandwidth
+//!   limiter (`PLAN_v2.md` §14): a token-bucket
+//!   [`download::RateLimiter`] shared across every worker (and
+//!   every mirror) plus a [`download::RateLimitedReader`] adapter
+//!   the worker wraps the response body in. The `--max-bandwidth
+//!   <RATE>` CLI flag opts in; the cap is aggregate, not per-mirror.
 //! - [`io_backend`] (Unix only) — file-IO and network-IO seam
 //!   (`PLAN_v2.md` §7 + §7b + §9): the [`io_backend::IoBackend`] trait
 //!   every backend honors, the always-available
