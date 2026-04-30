@@ -140,6 +140,7 @@ fn run_demo(args: Args) -> Result<(), String> {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
 
     let started = Instant::now();

@@ -80,6 +80,7 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     }
 }
 
@@ -682,6 +683,7 @@ fn run_rejects_zero_chunk_size() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -709,6 +711,7 @@ fn run_rejects_zero_workers() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));
@@ -774,6 +777,7 @@ fn run_with_policy_extracts_byte_identical_output() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -827,6 +831,7 @@ fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -880,6 +885,7 @@ fn run_without_policy_keeps_one_range_per_chunk() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
 
     run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("baseline run");
@@ -941,6 +947,7 @@ fn run_with_policy_resume_honors_existing_bitmap() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive resume");
@@ -986,6 +993,7 @@ fn scheduler_records_per_chunk_crc32c_when_fingerprints_configured() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("download");
     assert_eq!(stats.chunks_completed, total_chunks);
@@ -1060,6 +1068,7 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
         mirrors: None,
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
     let err =
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect_err("must abort");
@@ -1205,6 +1214,7 @@ fn run_routes_chunks_across_two_mirrors() {
         mirrors: Some(Arc::clone(&mirrors)),
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run");
 
@@ -1287,6 +1297,7 @@ fn run_falls_back_when_one_mirror_dies() {
         mirrors: Some(Arc::clone(&mirrors)),
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
         .expect("run completes despite mirror A failing");
@@ -1380,6 +1391,7 @@ fn run_completes_after_all_mirrors_recover() {
         mirrors: Some(Arc::clone(&mirrors)),
         rate_limiter: None,
         max_disk_buffer: None,
+        abort: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("recovers");
     assert_eq!(read_full(&path), body_clone);
@@ -1419,6 +1431,7 @@ fn run_parallel_with_rate_limiter_extracts_byte_identical() {
         mirrors: None,
         rate_limiter: Some(Arc::clone(&limiter)),
         max_disk_buffer: None,
+        abort: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");
     assert_eq!(read_full(&path), body_clone);
@@ -1456,6 +1469,7 @@ fn run_parallel_with_rate_limiter_paces_below_uncapped_rate() {
             mirrors: None,
             rate_limiter: limiter,
             max_disk_buffer: None,
+            abort: None,
         };
         let started = std::time::Instant::now();
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");

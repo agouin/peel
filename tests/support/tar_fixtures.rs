@@ -16,10 +16,32 @@
 /// Tar block size.
 pub const BLOCK: usize = 512;
 
+/// Magic flavors `build_header` can emit.
+#[derive(Clone, Copy)]
+pub enum HeaderMagic {
+    /// POSIX/USTAR (POSIX.1-1988): `ustar\0` + version `00`.
+    Posix,
+    /// Old-GNU (GNU tar default): `ustar  \0` (5 chars + 2 spaces +
+    /// NUL). Required to extract polkachu-style cosmos snapshots.
+    OldGnu,
+}
+
 /// Build a USTAR header with the given fields. `name` is split
 /// across the prefix/name fields automatically when its length
 /// exceeds 100 bytes.
 pub fn build_header(name: &str, size: u64, type_flag: u8) -> [u8; BLOCK] {
+    build_header_with_magic(name, size, type_flag, HeaderMagic::Posix)
+}
+
+/// Like [`build_header`] but lets the caller pick which magic +
+/// version pair the header carries — used to fuzz the sink against
+/// both POSIX and old-GNU archives.
+pub fn build_header_with_magic(
+    name: &str,
+    size: u64,
+    type_flag: u8,
+    magic: HeaderMagic,
+) -> [u8; BLOCK] {
     let mut h = [0u8; BLOCK];
     let bytes = name.as_bytes();
     let (prefix, leaf): (&[u8], &[u8]) = if bytes.len() <= 100 {
@@ -45,8 +67,15 @@ pub fn build_header(name: &str, size: u64, type_flag: u8) -> [u8; BLOCK] {
     h[124..124 + size_str.len()].copy_from_slice(size_str.as_bytes());
     h[136..147].copy_from_slice(b"00000000000");
     h[156] = type_flag;
-    h[257..263].copy_from_slice(b"ustar\0");
-    h[263..265].copy_from_slice(b"00");
+    match magic {
+        HeaderMagic::Posix => {
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+        }
+        HeaderMagic::OldGnu => {
+            h[257..265].copy_from_slice(b"ustar  \x00");
+        }
+    }
     h[148..156].fill(b' ');
     let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
     let chk = format!("{sum:06o}\0 ");
@@ -107,4 +136,47 @@ pub fn build_simple_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
     }
     archive.extend_from_slice(&end_of_archive());
     archive
+}
+
+/// Build an old-GNU `L` (long-name) extension preamble for a regular
+/// file: emits an `L` header whose body holds the NUL-terminated
+/// long path, followed by the regular header (with a truncated name
+/// per GNU conventions) and the file body.
+///
+/// The two regular header fields (name + prefix) are filled with the
+/// first up-to-100 bytes of `name`; real GNU `tar` writes the same
+/// truncated stub even though the L extension is what actually
+/// names the entry. The sink must apply the L payload as a
+/// `pending_path` override.
+pub fn build_gnu_long_name_entry(long_path: &str, data: &[u8]) -> Vec<u8> {
+    // GNU pads the long-name body with a single NUL terminator and
+    // zero-fills to a 512-byte boundary.
+    let mut payload = long_path.as_bytes().to_vec();
+    payload.push(0);
+    // The L header records the *unpadded* payload length. Use the
+    // sentinel name "./@LongLink" that real GNU tar emits — the sink
+    // must ignore it in favor of the body.
+    let l_header = build_header_with_magic(
+        "./@LongLink",
+        payload.len() as u64,
+        b'L',
+        HeaderMagic::OldGnu,
+    );
+    // GNU writes a *truncated* stub into the regular header's
+    // name+prefix fields — anything longer than 100 bytes won't fit
+    // in the leaf field at all without clobbering mode/size/cksum,
+    // so we stuff a short placeholder. The sink ignores this stub
+    // because the L extension above sets `pending_path`.
+    let bytes = long_path.as_bytes();
+    let stub_len = bytes.len().min(99);
+    let stub = std::str::from_utf8(&bytes[..stub_len]).expect("ascii-clean test paths only");
+    let regular = build_header_with_magic(stub, data.len() as u64, b'0', HeaderMagic::OldGnu);
+    let mut out = Vec::new();
+    out.extend_from_slice(&l_header);
+    out.extend_from_slice(&pad_block(&payload));
+    out.extend_from_slice(&regular);
+    out.extend_from_slice(data);
+    let pad = (BLOCK - data.len() % BLOCK) % BLOCK;
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out
 }

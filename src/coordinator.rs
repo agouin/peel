@@ -660,6 +660,15 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         .max_bandwidth_bps
         .map(|bps| Arc::new(crate::download::RateLimiter::new(bps)));
 
+    // External abort signal handed to the scheduler. Flipped to `true`
+    // by the `cancel_download_on_drop` guard below if the extraction
+    // closure exits via an error path; the scheduler's dispatch loop
+    // and worker threads observe this and unwind promptly. Without it,
+    // `thread::scope`'s implicit join would block until the download
+    // finished naturally — a 444 GiB archive on a 1 MB/s connection
+    // would look like a hang for several days.
+    let download_abort = Arc::new(AtomicBool::new(false));
+
     let scheduler_cfg = SchedulerConfig {
         chunk_size: config.chunk_size,
         workers: config.workers,
@@ -671,6 +680,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         mirrors: Some(Arc::clone(&mirror_set)),
         rate_limiter: rate_limiter.clone(),
         max_disk_buffer: config.max_disk_buffer,
+        abort: Some(Arc::clone(&download_abort)),
     };
 
     let download_done = Arc::new(AtomicBool::new(false));
@@ -682,6 +692,15 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 
     let extraction_outcome =
         thread::scope(|scope| -> Result<ExtractionOutcome, CoordinatorError> {
+            // Drop guard: any path out of this closure that does not
+            // explicitly disarm the guard (notably every `?` that
+            // propagates an error from extraction or format detection)
+            // flips the abort flag before scope's implicit join begins,
+            // so the download thread tears down promptly instead of
+            // running to completion. The Ok path calls
+            // `disarm_cancel_guard` just before returning.
+            let cancel_guard = CancelOnDrop::new(&download_abort);
+
             // Spawn the download thread.
             let dl_done = Arc::clone(&download_done);
             let dl_outcome = Arc::clone(&download_outcome);
@@ -920,6 +939,12 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 None => DownloadStats::default(),
             };
 
+            // Extraction completed cleanly. The download thread is
+            // already drained (`dl_handle.join` above); disarm so the
+            // guard's Drop does not flip the abort flag we no longer
+            // need.
+            cancel_guard.disarm();
+
             Ok(ExtractionOutcome {
                 extraction: extraction_stats,
                 download: download_stats,
@@ -956,6 +981,39 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 struct ExtractionOutcome {
     extraction: ExtractionStats,
     download: DownloadStats,
+}
+
+/// Drop guard that flips an [`AtomicBool`] to `true` on drop unless
+/// disarmed. Used inside [`run`]'s `thread::scope` closure so any
+/// error path out of the closure (the many `?` propagations through
+/// extraction and format detection) cancels the download thread
+/// before scope's implicit join begins. Without this, an extractor
+/// error would leave scope blocked until the entire archive was
+/// downloaded — a 444 GiB / 1 MB-s combination would look like a
+/// multi-day hang to the user.
+struct CancelOnDrop<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> CancelOnDrop<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        Self { flag, armed: true }
+    }
+
+    /// Consume the guard without flipping the flag. Call on the Ok
+    /// path once download cancellation is no longer wanted.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// What [`build_resume_plan`] decides to do with a prior checkpoint.

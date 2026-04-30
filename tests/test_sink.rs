@@ -19,7 +19,8 @@ use peel::sink::{RawSink, Sink, SinkError, TarSink};
 mod support;
 
 use support::tar_fixtures::{
-    build_header, build_pax_body, build_simple_archive, end_of_archive, pad_block, BLOCK,
+    build_gnu_long_name_entry, build_header, build_header_with_magic, build_pax_body,
+    build_simple_archive, end_of_archive, pad_block, HeaderMagic, BLOCK,
 };
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -297,6 +298,79 @@ fn tar_sink_rejects_bad_checksum() {
         Err(SinkError::BadChecksum { .. }) => {}
         other => panic!("expected BadChecksum, got {other:?}"),
     }
+}
+
+/// Old-GNU magic (`ustar  \0`) is accepted end-to-end. Real cosmos
+/// snapshots from polkachu and similar producers emit this layout
+/// because that's what the stock `gnu tar` CLI defaults to. Without
+/// this, peel's TarSink would reject every member's header with
+/// `MalformedHeader`.
+#[test]
+fn tar_sink_extracts_old_gnu_archive() {
+    let dir = fresh_dir("tar_oldgnu_magic");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let mut archive = Vec::new();
+    let header = build_header_with_magic("hello.txt", 5, b'0', HeaderMagic::OldGnu);
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(&pad_block(b"hello"));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive).expect("write");
+    sink.close().expect("close");
+
+    assert_eq!(
+        fs::read(dir.join("hello.txt")).expect("read"),
+        b"hello",
+        "old-GNU archive must extract identically to POSIX"
+    );
+}
+
+/// GNU long-name extension (`L` typeflag) overrides the next entry's
+/// name. Used by GNU `tar` for any path exceeding the 100/255-byte
+/// ustar limits — a regime real snapshot archives hit on deep
+/// directory trees.
+#[test]
+fn tar_sink_applies_gnu_long_name_override() {
+    let dir = fresh_dir("tar_gnu_long_name");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let long = format!("very/deep/{}/payload.bin", "seg".repeat(80));
+    let body = b"long-name body bytes".repeat(7);
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_gnu_long_name_entry(&long, &body));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive).expect("write");
+    sink.close().expect("close");
+
+    let target = dir.join(&long);
+    assert!(target.exists(), "L-overridden path must be created");
+    assert_eq!(fs::read(&target).expect("read"), body);
+}
+
+/// Streaming variant: the same long-name archive must still extract
+/// correctly when the bytes arrive a few at a time. This catches
+/// regressions where the new `LongName` state arm fails to advance
+/// across a chunk boundary.
+#[test]
+fn tar_sink_handles_gnu_long_name_byte_by_byte() {
+    let dir = fresh_dir("tar_gnu_long_byte");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let long = format!("a/{}/file.txt", "b".repeat(150));
+    let body = b"streamed payload";
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_gnu_long_name_entry(&long, body));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    feed_byte_by_byte(&mut sink, &archive).expect("byte-by-byte");
+    sink.close().expect("close");
+
+    assert_eq!(fs::read(dir.join(&long)).expect("read"), body);
 }
 
 /// PAX `path` override is applied to the next entry, lifting the 100

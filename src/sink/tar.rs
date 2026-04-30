@@ -8,20 +8,27 @@
 //!
 //! # Format support
 //!
-//! - **USTAR (POSIX.1-1988)** headers, with the canonical `ustar\0` +
-//!   `00` magic. This is what `gnu tar`, `bsdtar`, and most modern
-//!   tooling produces by default.
+//! - **USTAR (POSIX.1-1988)** headers (`ustar\0` + `00` magic) and
+//!   **old-GNU** headers (`ustar  \0` magic). The two layouts are
+//!   byte-for-byte compatible apart from those eight magic/version
+//!   bytes; the typeflag dispatch picks up the format-specific
+//!   extensions ('L' / 'K').
 //! - **PAX (POSIX.1-2001) extended headers** (typeflag `x`) for the
 //!   `path` and `size` keys. `path` lifts the 100/255-byte length
 //!   limit; `size` lifts the 8 GiB octal-encoded limit and is the
 //!   mechanism §7.4 names for "ustar size limits" handling.
+//! - **GNU long-name extensions** (typeflag `L`) for entries whose
+//!   path exceeds the 100/255-byte ustar limits. The bytes following
+//!   the `L` header are read as a NUL-terminated path and applied
+//!   to the next entry, matching what GNU `tar` does on extract.
+//!   `K` (long link target) is consumed and discarded — peel does
+//!   not extract symlinks today.
 //! - **Regular files** (`0`, `\0`) and **directories** (`5`).
 //!
 //! Everything else — symlinks (`2`), hard links (`1`), device nodes
-//! (`3`/`4`), FIFOs (`6`), GNU long-name extensions (`L`/`K`), PAX
-//! global headers (`g`) — is rejected with [`SinkError::UnsupportedEntry`].
-//! `docs/PLAN.md` §7 explicitly defers these and `OPTIMIZATIONS.md`
-//! tracks them.
+//! (`3`/`4`), FIFOs (`6`), PAX global headers (`g`) — is rejected
+//! with [`SinkError::UnsupportedEntry`]. `docs/PLAN.md` §7 explicitly
+//! defers these and `OPTIMIZATIONS.md` tracks them.
 //!
 //! # Path safety
 //!
@@ -126,6 +133,22 @@ enum State {
         padding: u16,
         /// Accumulator for the entry data; drained on completion.
         buf: Vec<u8>,
+    },
+    /// Collecting a GNU long-name ('L') or long-link ('K') extension.
+    /// The body is a NUL-terminated path that overrides the *next*
+    /// entry's name field. 'K' (long link target) is consumed and
+    /// discarded — peel does not extract symlinks today.
+    LongName {
+        /// Bytes of body still to receive.
+        remaining: u64,
+        /// Bytes of trailing zero padding still to consume.
+        padding: u16,
+        /// Accumulator for the long path; empty for 'K' since we drop
+        /// the bytes inline rather than allocate.
+        buf: Vec<u8>,
+        /// `true` for 'K' (long link target, discarded), `false` for
+        /// 'L' (long path, applied to the next entry).
+        is_link: bool,
     },
     /// End-of-archive marker observed; further bytes other than zeros
     /// are an error.
@@ -268,6 +291,39 @@ impl TarSink {
                         want
                     } else {
                         self.finish_pax_state()?;
+                        0
+                    }
+                }
+                State::LongName {
+                    remaining,
+                    padding,
+                    buf,
+                    is_link,
+                } => {
+                    if *remaining > 0 {
+                        let want = usize::try_from(*remaining)
+                            .unwrap_or(usize::MAX)
+                            .min(input.len());
+                        // 'L' captures the path; 'K' discards inline
+                        // so an oversized link target cannot grow the
+                        // buffer unbounded.
+                        if !*is_link {
+                            buf.extend_from_slice(&input[..want]);
+                        }
+                        *remaining -= want as u64;
+                        if *remaining == 0 && *padding == 0 {
+                            self.finish_long_name_state()?;
+                        }
+                        want
+                    } else if *padding > 0 {
+                        let want = usize::from(*padding).min(input.len());
+                        *padding -= want as u16;
+                        if *padding == 0 {
+                            self.finish_long_name_state()?;
+                        }
+                        want
+                    } else {
+                        self.finish_long_name_state()?;
                         0
                     }
                 }
@@ -434,6 +490,37 @@ impl TarSink {
                 };
                 Ok(())
             }
+            // GNU long-name ('L') / long-link ('K') extensions. The
+            // header's "./@LongLink" name is ignored; the body holds
+            // the real path. 'L' overrides the next entry's name; 'K'
+            // is discarded because peel does not extract symlinks.
+            // Pre-cap the allocation so a hostile archive can't ask
+            // us to reserve gigabytes of memory.
+            b'L' | b'K' => {
+                let is_link = type_flag == b'K';
+                let padding = padding_for(entry_size);
+                self.state = if entry_size == 0 && padding == 0 {
+                    State::Header {
+                        filled: 0,
+                        buf: Box::new([0u8; BLOCK]),
+                    }
+                } else {
+                    let cap_hint = usize::try_from(entry_size)
+                        .unwrap_or(usize::MAX)
+                        .min(64 * 1024);
+                    State::LongName {
+                        remaining: entry_size,
+                        padding,
+                        buf: if is_link {
+                            Vec::new()
+                        } else {
+                            Vec::with_capacity(cap_hint)
+                        },
+                        is_link,
+                    }
+                };
+                Ok(())
+            }
             other => Err(SinkError::UnsupportedEntry {
                 type_flag: other,
                 entry: entry_name,
@@ -447,6 +534,45 @@ impl TarSink {
             filled: 0,
             buf: Box::new([0u8; BLOCK]),
         };
+    }
+
+    fn finish_long_name_state(&mut self) -> Result<(), SinkError> {
+        let State::LongName {
+            remaining: _,
+            padding: _,
+            buf,
+            is_link,
+        } = std::mem::replace(
+            &mut self.state,
+            State::Header {
+                filled: 0,
+                buf: Box::new([0u8; BLOCK]),
+            },
+        )
+        else {
+            // INVARIANT: only called from within the LongName arm.
+            return Ok(());
+        };
+        if is_link {
+            // 'K' bytes were never buffered; nothing to do.
+            return Ok(());
+        }
+        // GNU stores the path NUL-terminated and pads to a 512-byte
+        // boundary with zeros. Trim at the first NUL so the override
+        // we apply matches what `tar` itself would.
+        let trimmed = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let bytes = &buf[..trimmed];
+        let path = std::str::from_utf8(bytes).map_err(|_| SinkError::MalformedHeader {
+            archive_offset: self.archive_offset,
+            reason: "GNU long-name payload is not valid UTF-8".into(),
+        })?;
+        // PAX 'path=' takes precedence if both extensions are present
+        // for the same entry — PAX is the modern spec and any archive
+        // emitting both is signaling the PAX value as authoritative.
+        if self.pending_path.is_none() {
+            self.pending_path = Some(path.to_string());
+        }
+        Ok(())
     }
 
     fn finish_pax_state(&mut self) -> Result<(), SinkError> {
@@ -618,22 +744,34 @@ impl Sink for TarSink {
                 archive_offset: self.archive_offset,
                 bytes_remaining: remaining + u64::from(padding),
             }),
+            State::LongName {
+                remaining, padding, ..
+            } => Err(SinkError::UnexpectedEof {
+                archive_offset: self.archive_offset,
+                bytes_remaining: remaining + u64::from(padding),
+            }),
         }
     }
 }
 
-/// Magic + version for the POSIX/USTAR variant we accept.
+/// Magic + version for the ustar variants we accept.
 fn validate_magic(header: &[u8; BLOCK], offset: u64) -> Result<(), SinkError> {
-    // POSIX ustar: magic "ustar\0" (6 bytes) + version "00" (2 bytes).
-    // We accept exactly this combination. Old-GNU ("ustar  \0") is
-    // deferred along with GNU long-name extensions.
+    // Two variants found in the wild:
+    //   POSIX/USTAR (POSIX.1-1988): "ustar\0" + "00"
+    //   Old-GNU (GNU tar default): "ustar  \0" — five chars, two
+    //     spaces, NUL, occupying the same eight bytes. The header
+    //     layout is otherwise byte-for-byte compatible; the
+    //     differences live in the typeflag dispatch ('L' / 'K').
     let magic = &header[257..265];
-    if magic == b"ustar\x0000" {
+    if magic == b"ustar\x0000" || magic == b"ustar  \x00" {
         Ok(())
     } else {
         Err(SinkError::MalformedHeader {
             archive_offset: offset,
-            reason: format!("magic/version is {magic:?}, expected POSIX 'ustar\\0' + '00'"),
+            reason: format!(
+                "magic/version is {magic:?}, expected POSIX 'ustar\\0'+'00' \
+                 or old-GNU 'ustar  \\0'"
+            ),
         })
     }
 }
@@ -1046,6 +1184,16 @@ mod tests {
             Err(SinkError::MalformedHeader { .. }) => {}
             other => panic!("expected MalformedHeader, got {other:?}"),
         }
+    }
+
+    /// Old-GNU magic ("ustar  \0") is accepted; this is what the
+    /// stock `gnu tar` CLI emits and what most cosmos / polkachu-style
+    /// snapshot archives use.
+    #[test]
+    fn magic_accepts_old_gnu() {
+        let mut h = [0u8; BLOCK];
+        h[257..265].copy_from_slice(b"ustar  \x00");
+        validate_magic(&h, 0).expect("old-GNU magic must validate");
     }
 
     /// A header built by `build_header` round-trips through

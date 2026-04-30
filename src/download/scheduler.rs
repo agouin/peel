@@ -315,6 +315,16 @@ pub struct SchedulerConfig {
     /// scheduler has no way to read the decoder cursor and the field
     /// is ignored.
     pub max_disk_buffer: Option<u64>,
+    /// External abort signal. When the flag flips to `true` (typically
+    /// because the extractor errored out on the coordinator side), the
+    /// dispatch loop stops handing out new tasks and the workers
+    /// observe the same flag on their next iteration so they exit as
+    /// soon as their current chunk completes. Without this signal
+    /// `thread::scope`'s implicit join in
+    /// [`crate::coordinator::run`] would block until the entire
+    /// download completed naturally — turning any extractor error into
+    /// an apparent hang for the user.
+    pub abort: Option<Arc<AtomicBool>>,
 }
 
 impl Default for SchedulerConfig {
@@ -330,6 +340,7 @@ impl Default for SchedulerConfig {
             mirrors: None,
             rate_limiter: None,
             max_disk_buffer: None,
+            abort: None,
         }
     }
 }
@@ -749,6 +760,20 @@ fn run_parallel(
         let mut probe_rng: u64 = (u64::from(total_chunks) << 32) ^ 0x9E37_79B9_7F4A_7C15;
 
         'outer: loop {
+            // External abort signal (extractor errored on the
+            // coordinator side). Mirror it into the local `cancel` so
+            // workers exit as soon as their current chunk completes,
+            // and stop dispatching new ones. We do not produce a
+            // `shutdown_reason` here because the failure already
+            // surfaced via the extraction path; any synthetic error
+            // would just race with it.
+            if let Some(flag) = config.abort.as_ref() {
+                if flag.load(Ordering::Acquire) {
+                    cancel.store(true, Ordering::Relaxed);
+                    break 'outer;
+                }
+            }
+
             // Disk-buffer backpressure: if the decoder is far enough
             // behind the downloader that the on-disk lookahead has
             // hit the configured cap, hold off on dispatching new
@@ -1135,13 +1160,32 @@ fn run_single_stream(
     let _ss_guard = SingleStreamGuard {
         progress: single_stream_progress.as_deref(),
     };
-    // Single-stream mode has no out-of-band cancel signal — the read
-    // runs synchronously on the calling thread — but the rate-limited
-    // reader still needs a flag to poll. A never-flipped `AtomicBool`
-    // is fine: the limiter falls through to its normal blocking
-    // behaviour and there's no thread to interrupt.
+    // The rate-limited reader needs a cancel flag to poll; mirror
+    // the external abort into it so a `RateLimitedReader::read`
+    // stalled inside the limiter unwinds promptly when the extractor
+    // errors out. When no external signal is configured, the flag is
+    // a never-flipped local — the limiter falls through to its normal
+    // blocking behaviour.
     let ss_cancel = AtomicBool::new(false);
     while written < total_size {
+        if let Some(flag) = config.abort.as_ref() {
+            if flag.load(Ordering::Acquire) {
+                // Wake the limiter (if any) so the next `read` call's
+                // sleep doesn't pay the full quantum, then surface the
+                // cancel so the coordinator's scope join unblocks. The
+                // returned error is shadowed by whatever the extractor
+                // already reported; we just need *some* terminal
+                // result so the download thread exits.
+                ss_cancel.store(true, Ordering::Release);
+                return Err(SchedulerError::ChunkFailed {
+                    chunk: ChunkIndex::ZERO,
+                    attempts: 1,
+                    source: WorkerError::Cancelled {
+                        chunk: ChunkIndex::ZERO,
+                    },
+                });
+            }
+        }
         let remaining = total_size - written;
         let want = u64::try_from(buf.len()).unwrap_or(u64::MAX).min(remaining);
         let want_usize =

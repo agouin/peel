@@ -556,6 +556,112 @@ fn happy_path_tar_lz4_to_dir_extracts_archive() {
     );
 }
 
+// ---- extractor error cancels download ---------------------------------
+
+/// Regression for the "scope auto-join blocks until full download" bug:
+/// when the extractor errors out partway through, the coordinator must
+/// signal the scheduler to stop dispatching new chunks so
+/// `thread::scope`'s implicit join completes promptly. Before the fix,
+/// a 444 GiB / 1 MB-s combination looked like a multi-day hang because
+/// the download thread had no cancel signal.
+///
+/// We verify by:
+///   1. Building a `tar.lz4` body whose lz4 frame is valid but whose
+///      decompressed bytes are not a tar archive (no `ustar` magic),
+///      so the sink errors on the very first 512-byte header.
+///   2. Sizing the body to many ranged-GET chunks and slowing each
+///      response so the download is meaningfully in-flight when the
+///      extractor errors.
+///   3. Running the coordinator and asserting the error bubbles up,
+///      and that the mock server saw far fewer requests than the
+///      total chunk count — proof that the abort signal
+///      short-circuited the dispatch loop instead of the run
+///      completing the whole download before propagating.
+#[test]
+fn extractor_error_cancels_download_promptly() {
+    // Plain `.tar` body so the identity decoder feeds bytes to the
+    // sink as soon as chunk 0 lands — the sink errors on the very
+    // first 512-byte header. Using `.tar.lz4` would force the
+    // decoder to buffer the entire frame's compressed block before
+    // emitting any output, masking the cancel because the download
+    // would finish first. 256 KiB at 4 KiB chunks is 64 chunks.
+    let body = vec![b'X'; 256 * 1024];
+    let body_len = body.len();
+    let chunks_total = body_len.div_ceil(4096);
+
+    // Loopback delivery is so fast that without per-request latency
+    // the entire download finishes before the extractor has a chance
+    // to error and set the abort flag. Inject a small per-GET delay
+    // so the cancel path is observable.
+    let body_arc = Arc::new(body);
+    let body_arc_clone = Arc::clone(&body_arc);
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "GET" {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        serve(req, body_arc_clone.as_ref(), Some("\"v-bad-tar\"".into()))
+    });
+
+    let work = unique_dir("extract_err_cancels");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let mut config = coord_config_for_test(4096);
+    config.chunk_size = 4096;
+    // Pin workers so the request_count math below is deterministic:
+    // at most `workers` extra chunks can be in flight at the moment
+    // the abort fires.
+    config.workers = 2;
+    // Adaptive chunk sizing would coalesce chunks into bigger GETs
+    // and complicate the request_count assertion. The fix path works
+    // either way — but a fixed dispatch size makes the test signal
+    // sharp.
+    config.adaptive_chunk_size = false;
+
+    let args = make_args(
+        &server,
+        "garbage.tar",
+        OutputTarget::Dir(out_dir.clone()),
+        config,
+    );
+
+    let started = std::time::Instant::now();
+    let err = run(args).expect_err("must surface the extractor error");
+    let elapsed = started.elapsed();
+
+    // The error must be the extractor's, not a swallowed download
+    // error or a hang — proving error propagation is unblocked.
+    match &err {
+        CoordinatorError::Extractor(_) => {}
+        other => panic!("expected Extractor error, got {other:?}"),
+    }
+
+    // Generous upper bound — even a slow CI machine should never need
+    // 30 s here. Before the fix the run waited for the full download
+    // to drain before returning; with two workers downloading 4 KiB
+    // chunks at 50 ms each, the no-cancel total would be ~64 chunks
+    // / 2 workers * 50 ms = ~1.6 s without any other slowdown. We
+    // pick 30 s as the hang-detector threshold.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "run should return promptly after extractor error; elapsed={elapsed:?}"
+    );
+
+    // The abort signal stops the dispatch loop. In-flight chunks
+    // finish (at most `workers` of them) but no new chunks are
+    // claimed. With a 50 ms per-GET delay and the extractor erroring
+    // on chunk 0's contents, only a small handful of GETs should
+    // make it through before the abort. If the cancel never fires,
+    // every chunk is requested — the assertion below distinguishes.
+    let observed = server.request_count();
+    assert!(
+        observed < chunks_total as u64 / 2,
+        "expected the abort to short-circuit dispatch; observed {observed} requests \
+         out of {chunks_total} chunks"
+    );
+}
+
 // ---- progress events fire ---------------------------------------------
 
 #[test]
