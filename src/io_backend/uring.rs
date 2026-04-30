@@ -31,15 +31,22 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring};
 
 use super::{IoBackend, NetStream, SocketConfig};
+
+/// User-data tag bit set on the LinkTimeout SQE that pairs with each
+/// timed socket op. The IO thread's CQE drain checks this bit and
+/// silently discards the timeout CQE; only the main op's CQE
+/// (`user_data` without the tag) drives a [`Completion`].
+const TIMEOUT_TAG: u64 = 1u64 << 63;
 
 /// Default ring depth.
 ///
@@ -186,6 +193,13 @@ impl UringBackend {
         tx.send(req)
             .map_err(|_| io::Error::other("uring io thread exited; cannot dispatch"))
     }
+
+    fn tx_clone(&self) -> io::Result<mpsc::SyncSender<OpRequest>> {
+        self.tx
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::other("uring backend has been dropped"))
+    }
 }
 
 impl Drop for UringBackend {
@@ -216,6 +230,7 @@ impl IoBackend for UringBackend {
             // this as `*const u8` when building Write SQEs.
             ptr: buf.as_ptr() as *mut u8,
             total_len: buf.len(),
+            timeout_ns: 0,
             completion: Arc::clone(&completion),
         };
         self.dispatch(req)?;
@@ -230,6 +245,7 @@ impl IoBackend for UringBackend {
             base_offset: offset,
             ptr: buf.as_mut_ptr(),
             total_len: buf.len(),
+            timeout_ns: 0,
             completion: Arc::clone(&completion),
         };
         self.dispatch(req)?;
@@ -244,6 +260,7 @@ impl IoBackend for UringBackend {
             base_offset: offset,
             ptr: buf.as_mut_ptr(),
             total_len: buf.len(),
+            timeout_ns: 0,
             completion: Arc::clone(&completion),
         };
         self.dispatch(req)?;
@@ -258,6 +275,7 @@ impl IoBackend for UringBackend {
             base_offset: 0,
             ptr: std::ptr::null_mut(),
             total_len: 0,
+            timeout_ns: 0,
             completion: Arc::clone(&completion),
         };
         self.dispatch(req)?;
@@ -265,33 +283,172 @@ impl IoBackend for UringBackend {
     }
 
     fn connect(&self, addr: SocketAddr, config: &SocketConfig) -> io::Result<Box<dyn NetStream>> {
-        // §7b.1 placeholder: the Linux io_uring socket implementation
-        // (Connect / Send / Recv via SQEs sharing the IO thread) lands
-        // in §7b.2. For now route through the blocking `TcpStream`
-        // path so the trait surface compiles and the Client refactor
-        // in §7b.3 has something to plug into. The mixed
-        // "uring-files + blocking-sockets" mode is not a supported
-        // production deployment — it exists only between the §7b.1
-        // and §7b.2 commits — and the §7.3 selection logic still
-        // returns this backend the same way it returned it before
-        // §7b.1, so callers see no behavioral change.
-        super::BlockingBackend::new().connect(addr, config)
+        // We use std's `TcpStream::connect_timeout` for the actual
+        // three-way handshake — it is a one-shot per connection, not
+        // on the hot per-byte path, and re-implementing it via
+        // io_uring's Connect SQE buys nothing in the workloads §7b
+        // targets. After the handshake, we strip the file descriptor
+        // out of the `TcpStream` and wrap it in [`UringSocket`] so
+        // every subsequent read/write goes through the ring.
+        //
+        // SO_RCVTIMEO / SO_SNDTIMEO would not apply here: per the
+        // io_uring kernel docs, those socket-level timeouts are
+        // *ignored* by io_uring's Recv/Send. Per-op cancellation is
+        // handled instead by linked LinkTimeout SQEs that
+        // [`UringSocket`] attaches based on the supplied
+        // [`SocketConfig`].
+        let tcp = TcpStream::connect_timeout(&addr, config.connect_timeout)?;
+        tcp.set_nodelay(config.nodelay)?;
+        let owned: OwnedFd = tcp.into();
+        let sender = self.tx_clone()?;
+        Ok(Box::new(UringSocket::new(
+            owned,
+            sender,
+            config.read_timeout,
+            config.write_timeout,
+        )))
     }
 }
 
-/// What kind of file IO an [`OpRequest`] performs.
+/// `Read + Write` adapter that routes every byte through the shared
+/// io_uring submission ring.
+///
+/// The adapter holds an [`OwnedFd`] for the connected socket and a
+/// clone of the IO-thread submission channel. Each `read` / `write`
+/// call dispatches a [`OpKind::SocketRecv`] / [`OpKind::SocketSend`]
+/// op with the configured per-op timeout (enforced by a linked
+/// LinkTimeout SQE). On cancellation the kernel returns
+/// `-ECANCELED`, which the IO thread maps to
+/// [`io::ErrorKind::TimedOut`]; rustls and the hand-rolled HTTP
+/// client see standard [`io::Error`]s either way.
+///
+/// The fd is owned: dropping the socket closes it, which by the time
+/// `Drop` runs has no in-flight uring op against it (every
+/// `read`/`write` is synchronous from the caller's POV, so the last
+/// kernel access has already returned).
+pub struct UringSocket {
+    fd: OwnedFd,
+    sender: mpsc::SyncSender<OpRequest>,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+}
+
+impl UringSocket {
+    fn new(
+        fd: OwnedFd,
+        sender: mpsc::SyncSender<OpRequest>,
+        read_timeout: Option<Duration>,
+        write_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            fd,
+            sender,
+            read_timeout,
+            write_timeout,
+        }
+    }
+
+    fn submit(
+        &self,
+        kind: OpKind,
+        ptr: *mut u8,
+        len: usize,
+        timeout: Option<Duration>,
+    ) -> io::Result<usize> {
+        let completion = Arc::new(Completion::new());
+        let timeout_ns = timeout
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
+            .unwrap_or(0);
+        let req = OpRequest {
+            kind,
+            fd: self.fd.as_raw_fd(),
+            base_offset: 0,
+            ptr,
+            total_len: len,
+            timeout_ns,
+            completion: Arc::clone(&completion),
+        };
+        self.sender
+            .send(req)
+            .map_err(|_| io::Error::other("uring io thread exited; socket op failed"))?;
+        completion.wait()
+    }
+}
+
+impl std::fmt::Debug for UringSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UringSocket")
+            .field("fd", &self.fd.as_raw_fd())
+            .field("read_timeout", &self.read_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .finish()
+    }
+}
+
+impl Read for UringSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.submit(
+            OpKind::SocketRecv,
+            buf.as_mut_ptr(),
+            buf.len(),
+            self.read_timeout,
+        )
+    }
+}
+
+impl Write for UringSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.submit(
+            OpKind::SocketSend,
+            buf.as_ptr() as *mut u8,
+            buf.len(),
+            self.write_timeout,
+        )
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Sockets do not buffer userspace writes here; the kernel's
+        // send buffer is flushed by the OS on its own schedule.
+        Ok(())
+    }
+}
+
+/// What kind of IO an [`OpRequest`] performs.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum OpKind {
-    /// Write the full buffer; resubmit on partial completions.
+    /// File: write the full buffer; resubmit on partial completions.
     WriteAll,
-    /// Read up to `total_len` bytes; complete on first CQE (short
-    /// reads OK).
+    /// File: read up to `total_len` bytes; complete on first CQE
+    /// (short reads OK).
     ReadShort,
-    /// Read exactly `total_len` bytes; resubmit on partial; report
-    /// `UnexpectedEof` if the kernel returns 0 before completing.
+    /// File: read exactly `total_len` bytes; resubmit on partial;
+    /// report `UnexpectedEof` if the kernel returns 0 before
+    /// completing.
     ReadExact,
-    /// `fsync` the fd. `ptr` and `total_len` are unused.
+    /// File: `fsync` the fd. `ptr` and `total_len` are unused.
     Fsync,
+    /// Socket: receive up to `total_len` bytes; complete on first
+    /// CQE. Returns 0 on remote close (mirrors `read(2)` semantics).
+    /// The optional [`OpRequest::timeout_ns`] is enforced via a
+    /// linked LinkTimeout SQE; on timeout the kernel cancels the
+    /// recv and the CQE returns `-ECANCELED`, which the handler maps
+    /// to [`io::ErrorKind::TimedOut`].
+    SocketRecv,
+    /// Socket: send up to `total_len` bytes; complete on first CQE.
+    /// Same timeout semantics as [`OpKind::SocketRecv`].
+    SocketSend,
+}
+
+impl OpKind {
+    fn supports_timeout(self) -> bool {
+        matches!(self, Self::SocketRecv | Self::SocketSend)
+    }
 }
 
 /// One request handed from a worker to the IO thread.
@@ -306,6 +463,10 @@ struct OpRequest {
     base_offset: u64,
     ptr: *mut u8,
     total_len: usize,
+    /// Per-op timeout in nanoseconds for [`OpKind::SocketRecv`] /
+    /// [`OpKind::SocketSend`]. `0` disables the linked timeout. File
+    /// ops ignore this field.
+    timeout_ns: u64,
     completion: Arc<Completion>,
 }
 
@@ -322,7 +483,9 @@ unsafe impl Send for OpRequest {}
 /// IO-thread side state for one in-flight op.
 ///
 /// Identical fields to [`OpRequest`] minus the kind handling, plus a
-/// `bytes_done` counter for the WriteAll / ReadExact resubmit path.
+/// `bytes_done` counter for the WriteAll / ReadExact resubmit path
+/// and the optional `timeout_ts` Box that keeps the LinkTimeout's
+/// timespec alive for the duration of the operation.
 struct InFlight {
     kind: OpKind,
     fd: RawFd,
@@ -331,10 +494,22 @@ struct InFlight {
     total_len: usize,
     bytes_done: usize,
     completion: Arc<Completion>,
+    /// Heap-allocated [`types::Timespec`] kept alive while the linked
+    /// timeout SQE is in flight. The kernel reads the timespec via the
+    /// pointer carried in the LinkTimeout SQE; the Box ensures a
+    /// stable address until the op's CQE arrives. `None` for ops
+    /// without a linked timeout.
+    ///
+    /// The field is never read from Rust code — its purpose is the
+    /// `Box`'s drop ordering. Clippy's `dead_code` lint does not see
+    /// the kernel-side reference and would flag the field
+    /// otherwise.
+    #[allow(dead_code)]
+    timeout_ts: Option<Box<types::Timespec>>,
 }
 
 impl InFlight {
-    fn from_request(req: OpRequest) -> Self {
+    fn from_request(req: OpRequest, timeout_ts: Option<Box<types::Timespec>>) -> Self {
         Self {
             kind: req.kind,
             fd: req.fd,
@@ -343,6 +518,7 @@ impl InFlight {
             total_len: req.total_len,
             bytes_done: 0,
             completion: req.completion,
+            timeout_ts,
         }
     }
 
@@ -441,34 +617,45 @@ impl Drop for InFlightTracker {
 /// Owns the [`IoUring`] handle, drains [`OpRequest`]s from `rx`, pushes
 /// SQEs, and routes CQEs back to their completion notifiers. Exits
 /// when `rx` closes and every in-flight op has resolved.
+///
+/// The in-flight cap is `depth / 2` (rounded up) so that every
+/// in-flight op may consume up to two SQE slots — one for the
+/// operation itself and one for the linked timeout used by socket
+/// ops. File ops only use one slot; the cap stays the same in both
+/// cases, which keeps the bookkeeping simple at the cost of halving
+/// the maximum file-IO concurrency. With a default depth of 256, the
+/// cap is 128, which is well above any realistic worker count.
 fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) {
-    let mut tracker = InFlightTracker::new(depth as usize);
+    let inflight_cap = ((depth as usize) / 2).max(1);
+    let mut tracker = InFlightTracker::new(inflight_cap);
     let mut next_id: u64 = 0;
     let mut sender_open = true;
 
     'main: loop {
-        // Drain new submissions until the SQ is full or the channel
-        // is empty. If we have nothing in flight we block on `recv`
-        // so the thread sleeps cleanly.
+        // Drain new submissions until the in-flight cap is hit or the
+        // channel is empty. If we have nothing in flight we block on
+        // `recv` so the thread sleeps cleanly.
         loop {
-            if tracker.map.len() >= depth as usize {
+            if tracker.map.len() >= inflight_cap {
                 break;
             }
             if tracker.map.is_empty() && sender_open {
                 match rx.recv() {
                     Ok(req) => {
-                        if !push_initial(&mut ring, next_id, &req) {
-                            // SQ overflow on initial push: should not
-                            // happen because we checked the depth
-                            // above. Complete the op with an error
-                            // and bail.
-                            req.completion
-                                .set(Err(io::Error::other("uring SQ overflow on initial push")));
-                            continue;
+                        let id = next_id & !TIMEOUT_TAG;
+                        match push_initial(&mut ring, id, &req) {
+                            Ok(timeout_ts) => {
+                                next_id = next_id.wrapping_add(1);
+                                tracker
+                                    .map
+                                    .insert(id, InFlight::from_request(req, timeout_ts));
+                            }
+                            Err(()) => {
+                                req.completion.set(Err(io::Error::other(
+                                    "uring SQ overflow on initial push",
+                                )));
+                            }
                         }
-                        let id = next_id;
-                        next_id = next_id.wrapping_add(1);
-                        tracker.map.insert(id, InFlight::from_request(req));
                     }
                     Err(_) => {
                         sender_open = false;
@@ -478,14 +665,20 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
             } else {
                 match rx.try_recv() {
                     Ok(req) => {
-                        if !push_initial(&mut ring, next_id, &req) {
-                            req.completion
-                                .set(Err(io::Error::other("uring SQ overflow on initial push")));
-                            continue;
+                        let id = next_id & !TIMEOUT_TAG;
+                        match push_initial(&mut ring, id, &req) {
+                            Ok(timeout_ts) => {
+                                next_id = next_id.wrapping_add(1);
+                                tracker
+                                    .map
+                                    .insert(id, InFlight::from_request(req, timeout_ts));
+                            }
+                            Err(()) => {
+                                req.completion.set(Err(io::Error::other(
+                                    "uring SQ overflow on initial push",
+                                )));
+                            }
                         }
-                        let id = next_id;
-                        next_id = next_id.wrapping_add(1);
-                        tracker.map.insert(id, InFlight::from_request(req));
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -534,13 +727,26 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
     // with a "io thread terminated" error so workers do not deadlock.
 }
 
-/// Push the initial SQE for a fresh request.
+/// Push the initial SQE(s) for a fresh request.
 ///
-/// Returns `false` if the SQ is full; the caller is expected to
-/// ensure that does not happen (the io_thread bounds insertions by
-/// `depth`).
-fn push_initial(ring: &mut IoUring, id: u64, req: &OpRequest) -> bool {
-    push_sqe(
+/// Returns the boxed [`types::Timespec`] that must outlive the
+/// LinkTimeout SQE, or `None` if the op did not need a linked
+/// timeout. Returns `Err(())` if the submission queue rejected the
+/// push; the caller is expected to keep the in-flight cap below the
+/// SQ capacity so this does not happen in practice.
+fn push_initial(
+    ring: &mut IoUring,
+    id: u64,
+    req: &OpRequest,
+) -> Result<Option<Box<types::Timespec>>, ()> {
+    let timeout_ts = if req.kind.supports_timeout() && req.timeout_ns > 0 {
+        Some(Box::new(types::Timespec::from(Duration::from_nanos(
+            req.timeout_ns,
+        ))))
+    } else {
+        None
+    };
+    let pushed = push_sqe(
         ring,
         id,
         req.kind,
@@ -548,10 +754,18 @@ fn push_initial(ring: &mut IoUring, id: u64, req: &OpRequest) -> bool {
         req.base_offset,
         req.ptr,
         req.total_len,
-    )
+        timeout_ts.as_deref(),
+    );
+    if !pushed {
+        return Err(());
+    }
+    Ok(timeout_ts)
 }
 
 /// Push the resume SQE for a partially-completed WriteAll / ReadExact.
+///
+/// File ops never carry a linked timeout, so this is a single-SQE
+/// push.
 fn push_resume(ring: &mut IoUring, id: u64, ifl: &InFlight) -> bool {
     let off = ifl.base_offset.saturating_add(ifl.bytes_done as u64);
     // SAFETY: `bytes_done < total_len` is checked by the caller; the
@@ -559,9 +773,17 @@ fn push_resume(ring: &mut IoUring, id: u64, ifl: &InFlight) -> bool {
     // `bytes_done` stays within the same allocation.
     let ptr = unsafe { ifl.ptr.add(ifl.bytes_done) };
     let remaining = ifl.total_len - ifl.bytes_done;
-    push_sqe(ring, id, ifl.kind, ifl.fd, off, ptr, remaining)
+    push_sqe(ring, id, ifl.kind, ifl.fd, off, ptr, remaining, None)
 }
 
+/// Push the op's SQE, plus a linked LinkTimeout SQE if `timeout_ts`
+/// is `Some`.
+///
+/// When `timeout_ts` is supplied, the main op's SQE is given the
+/// `IO_LINK` flag so the LinkTimeout that follows applies to it. The
+/// timeout's user_data has the [`TIMEOUT_TAG`] bit set; the CQE
+/// drain ignores those entries.
+#[allow(clippy::too_many_arguments)]
 fn push_sqe(
     ring: &mut IoUring,
     id: u64,
@@ -570,39 +792,87 @@ fn push_sqe(
     offset: u64,
     ptr: *mut u8,
     len: usize,
+    timeout_ts: Option<&types::Timespec>,
 ) -> bool {
     let len_u32 = u32::try_from(len).unwrap_or(u32::MAX);
-    let entry = match kind {
+    let mut entry = match kind {
         OpKind::WriteAll => opcode::Write::new(types::Fd(fd), ptr.cast::<u8>(), len_u32)
             .offset(offset)
-            .build()
-            .user_data(id),
+            .build(),
         OpKind::ReadShort | OpKind::ReadExact => opcode::Read::new(types::Fd(fd), ptr, len_u32)
             .offset(offset)
-            .build()
-            .user_data(id),
-        OpKind::Fsync => opcode::Fsync::new(types::Fd(fd)).build().user_data(id),
+            .build(),
+        OpKind::Fsync => opcode::Fsync::new(types::Fd(fd)).build(),
+        OpKind::SocketRecv => opcode::Recv::new(types::Fd(fd), ptr, len_u32).build(),
+        OpKind::SocketSend => opcode::Send::new(types::Fd(fd), ptr.cast::<u8>(), len_u32).build(),
     };
+    if timeout_ts.is_some() {
+        entry = entry.flags(squeue::Flags::IO_LINK);
+    }
+    entry = entry.user_data(id);
+
     let mut sq = ring.submission();
     // SAFETY: The buffer pointed at by `ptr` is valid for `len`
     // bytes for the duration of this submission. The calling thread
     // owns the buffer and is blocked on the matching `Completion`,
     // so the buffer cannot be deallocated or aliased until after the
     // CQE is drained. The fd is borrowed for the call's duration via
-    // the `BorrowedFd<'_>` argument on the trait method.
+    // the `BorrowedFd<'_>` argument on the trait method, or via the
+    // [`UringSocket`]'s `OwnedFd` (which lives as long as the socket
+    // is borrowed for the read/write call).
     let result = unsafe { sq.push(&entry) };
+    if result.is_err() {
+        sq.sync();
+        return false;
+    }
+
+    if let Some(ts) = timeout_ts {
+        let timeout_entry = opcode::LinkTimeout::new(ts as *const types::Timespec)
+            .build()
+            .user_data(id | TIMEOUT_TAG);
+        // SAFETY: `ts` points into a `Box<Timespec>` that the caller
+        // (the IO thread, via [`InFlight::timeout_ts`]) keeps alive
+        // until the main op's CQE is drained. The kernel only reads
+        // the timespec while the LinkTimeout SQE is live, which ends
+        // when the main op completes; both events happen before the
+        // InFlight's Drop runs.
+        let r = unsafe { sq.push(&timeout_entry) };
+        if r.is_err() {
+            // Bail: with the in-flight cap at depth/2, this should
+            // be unreachable. Sync what we have so the partial push
+            // is observable to the kernel.
+            sq.sync();
+            return false;
+        }
+    }
+
     sq.sync();
-    result.is_ok()
+    true
 }
 
 fn handle_cqe(ring: &mut IoUring, tracker: &mut InFlightTracker, id: u64, res: i32) {
+    // CQEs from the LinkTimeout sidecar carry the [`TIMEOUT_TAG`]
+    // bit. They mean "the timeout finished doing its job"; the main
+    // op's CQE (with the bit clear) is what drives the [`Completion`].
+    if id & TIMEOUT_TAG != 0 {
+        return;
+    }
+
     let mut ifl = match tracker.map.remove(&id) {
         Some(i) => i,
         None => return,
     };
 
     if res < 0 {
-        let err = io::Error::from_raw_os_error(-res);
+        // Linked timeouts cancel the main op with `-ECANCELED`. For
+        // socket ops that's the user-facing TimedOut error; for
+        // anything else propagate the raw OS error verbatim.
+        const ECANCELED: i32 = 125;
+        let err = if -res == ECANCELED && ifl.kind.supports_timeout() {
+            io::Error::from(io::ErrorKind::TimedOut)
+        } else {
+            io::Error::from_raw_os_error(-res)
+        };
         ifl.complete(Err(err));
         return;
     }
@@ -614,6 +884,14 @@ fn handle_cqe(ring: &mut IoUring, tracker: &mut InFlightTracker, id: u64, res: i
     match ifl.kind {
         OpKind::Fsync => ifl.complete(Ok(0)),
         OpKind::ReadShort => ifl.complete(Ok(bytes)),
+        OpKind::SocketRecv | OpKind::SocketSend => {
+            // Socket ops complete on the first CQE — short reads and
+            // short writes are valid in the network world. The
+            // caller (the [`UringSocket`] adapter) returns whatever
+            // the kernel delivered and the higher layer (HTTP body
+            // reader, rustls, …) loops if it needs more bytes.
+            ifl.complete(Ok(bytes));
+        }
         OpKind::WriteAll | OpKind::ReadExact => {
             if ifl.bytes_done >= ifl.total_len {
                 ifl.complete(Ok(ifl.bytes_done));
@@ -859,5 +1137,112 @@ mod tests {
     fn probe_is_idempotent() {
         let _ = UringBackend::probe(8);
         let _ = UringBackend::probe(64);
+    }
+
+    /// Connect through the uring backend to a localhost echo server,
+    /// round-trip a small payload via UringSocket's Read+Write impl.
+    #[test]
+    fn socket_round_trip_against_loopback() {
+        use std::net::TcpListener;
+
+        let Some(backend) = try_backend() else {
+            return;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 5];
+            std::io::Read::read_exact(&mut s, &mut buf).expect("server read");
+            assert_eq!(&buf, b"PING!");
+            std::io::Write::write_all(&mut s, b"PONG!").expect("server write");
+        });
+
+        let cfg = SocketConfig::default();
+        let mut stream = backend.connect(addr, &cfg).expect("connect");
+        std::io::Write::write_all(&mut stream, b"PING!").expect("client write");
+        let mut got = [0u8; 5];
+        std::io::Read::read_exact(&mut stream, &mut got).expect("client read");
+        assert_eq!(&got, b"PONG!");
+        server.join().expect("server thread");
+    }
+
+    /// Recv times out via the linked LinkTimeout SQE when the peer
+    /// never sends data.
+    #[test]
+    fn socket_recv_timeout_fires() {
+        use std::net::TcpListener;
+
+        let Some(backend) = try_backend() else {
+            return;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        // Server accepts the connection but never writes. Hold the
+        // accepted socket alive until the client's recv times out.
+        let (sender_done, receiver_done) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (_s, _) = listener.accept().expect("accept");
+            // Park until the client signals it observed the timeout.
+            let _ = receiver_done.recv();
+        });
+
+        let cfg = SocketConfig {
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Some(Duration::from_millis(100)),
+            write_timeout: Some(Duration::from_secs(1)),
+            nodelay: true,
+        };
+        let mut stream = backend.connect(addr, &cfg).expect("connect");
+
+        let mut buf = [0u8; 64];
+        let started = std::time::Instant::now();
+        let err = std::io::Read::read(&mut stream, &mut buf).expect_err("expected TimedOut");
+        let elapsed = started.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "got {err:?}");
+        // Bound the timeout's wall clock somewhere reasonable: the
+        // configured 100 ms ± a fudge factor for scheduling.
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "fired too quickly: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fired too slowly: {elapsed:?}"
+        );
+
+        let _ = sender_done.send(());
+        server.join().expect("server thread");
+    }
+
+    /// Disconnected peer surfaces as Ok(0) on read.
+    #[test]
+    fn socket_recv_returns_zero_on_remote_close() {
+        use std::net::TcpListener;
+
+        let Some(backend) = try_backend() else {
+            return;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().expect("accept");
+            drop(s); // close immediately
+        });
+
+        let cfg = SocketConfig {
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Some(Duration::from_secs(2)),
+            write_timeout: Some(Duration::from_secs(2)),
+            nodelay: true,
+        };
+        let mut stream = backend.connect(addr, &cfg).expect("connect");
+        let mut buf = [0u8; 16];
+        let n = std::io::Read::read(&mut stream, &mut buf).expect("read");
+        assert_eq!(n, 0);
+        server.join().expect("server thread");
     }
 }
