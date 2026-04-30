@@ -177,6 +177,35 @@ pub const fn align_down(value: u64, alignment: u64) -> Option<u64> {
     }
 }
 
+/// Round `value` up to the nearest multiple of `alignment`.
+///
+/// Returns `None` if `alignment` is zero or if the rounded result would
+/// overflow `u64`. Otherwise the result `r` satisfies `r >= value` and
+/// `r % alignment == 0`.
+///
+/// # Examples
+///
+/// ```
+/// use peel::punch::align_up;
+///
+/// assert_eq!(align_up(8195, 4096), Some(12288));
+/// assert_eq!(align_up(4096, 4096), Some(4096));
+/// assert_eq!(align_up(0, 4096), Some(0));
+/// assert_eq!(align_up(8195, 0), None);
+/// ```
+#[must_use]
+pub const fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    if alignment == 0 {
+        return None;
+    }
+    let rem = value % alignment;
+    if rem == 0 {
+        return Some(value);
+    }
+    let bump = alignment - rem;
+    value.checked_add(bump)
+}
+
 /// Return the best [`PunchHole`] implementation for the current platform.
 ///
 /// On Linux this is a [`LinuxPuncher`]; on macOS it is a
@@ -240,12 +269,15 @@ mod linux {
     const ENOSYS: i32 = 38;
 
     extern "C" {
-        // `fallocate64` is the explicitly 64-bit-offset variant of
-        // `fallocate`, exposed by both glibc and musl. Using it avoids
-        // the `_FILE_OFFSET_BITS` ambiguity that affects bare
-        // `fallocate` on 32-bit ABIs and matches the C signature
-        // `int fallocate64(int fd, int mode, off64_t offset, off64_t len);`.
-        fn fallocate64(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+        // `int fallocate(int fd, int mode, off_t offset, off_t len);` —
+        // the Linux-specific syscall wrapper, exposed by both glibc and
+        // musl. We declare `off_t` as `i64` because every target we
+        // support is 64-bit Linux, where `off_t` is always 64-bit. (We
+        // can't use `fallocate64`: glibc exposes it as the explicit
+        // 64-bit-offset alias, but musl does not — under musl `off_t`
+        // is unconditionally 64-bit and only the bare `fallocate`
+        // symbol exists.)
+        fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
 
         // `int madvise(void *addr, size_t length, int advice);` —
         // advisory hint to the kernel about how a memory region will be
@@ -424,10 +456,10 @@ mod linux {
         // this call, so `fd.as_raw_fd()` is a valid file descriptor
         // for the duration of the syscall. `mode`, `i_offset`, and
         // `i_length` are plain integers carried across the C ABI by
-        // value and have no aliasing concerns. `fallocate64` returns
+        // value and have no aliasing concerns. `fallocate` returns
         // an `int` status; on error it sets the thread-local errno
         // which we read via `io::Error::last_os_error`.
-        let rc = unsafe { fallocate64(fd.as_raw_fd(), mode, i_offset, i_length) };
+        let rc = unsafe { fallocate(fd.as_raw_fd(), mode, i_offset, i_length) };
         if rc == 0 {
             return Ok(());
         }
@@ -696,6 +728,38 @@ mod tests {
                 assert!(once <= v);
             }
         }
+    }
+
+    // ---- align_up -----------------------------------------------------
+
+    #[test]
+    fn align_up_zero_stays_zero() {
+        assert_eq!(align_up(0, 4096), Some(0));
+    }
+
+    #[test]
+    fn align_up_passes_through_exact_multiples() {
+        assert_eq!(align_up(4096, 4096), Some(4096));
+        assert_eq!(align_up(4096 * 7, 4096), Some(4096 * 7));
+    }
+
+    #[test]
+    fn align_up_rounds_partial_value_to_next_block() {
+        assert_eq!(align_up(1, 4096), Some(4096));
+        assert_eq!(align_up(4095, 4096), Some(4096));
+        assert_eq!(align_up(8195, 4096), Some(12_288));
+    }
+
+    #[test]
+    fn align_up_rejects_zero_alignment() {
+        assert_eq!(align_up(123, 0), None);
+        assert_eq!(align_up(0, 0), None);
+    }
+
+    #[test]
+    fn align_up_returns_none_on_overflow() {
+        assert_eq!(align_up(u64::MAX, 4096), None);
+        assert_eq!(align_up(u64::MAX - 1, 4096), None);
     }
 
     // ---- NoopPuncher --------------------------------------------------

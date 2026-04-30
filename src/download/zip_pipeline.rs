@@ -54,7 +54,7 @@ use thiserror::Error;
 use crate::bitmap::ChunkBitmap;
 use crate::download::scheduler::{DownloadStats, SchedulerError};
 use crate::download::sparse_file::{SparseFile, SparseFileError};
-use crate::punch::{PunchError, PunchHole};
+use crate::punch::{align_down, align_up, PunchError, PunchHole};
 use crate::sink::{BeginEntryOutcome, SinkError, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
 use crate::zip::format::LFH_FIXED_LEN;
@@ -324,27 +324,16 @@ impl<'a> ZipPipeline<'a> {
 
         // Step 5: punch the central directory's range. The EOCD
         // itself is small (≤ 64 KiB+22) so punching it is mostly
-        // symbolic, but it costs nothing to try; the puncher is
-        // block-aligned and degrades-gracefully on partial blocks.
-        let cd_punch_len = eocd.cd_size.saturating_add(initial_window);
-        let cd_punch_start = eocd.cd_offset;
-        match self.sparse.punch(
-            puncher,
-            ByteOffset::new(cd_punch_start),
-            cd_punch_len.min(self.config.total_size.saturating_sub(cd_punch_start)),
-        ) {
-            Ok(()) => {
-                stats.bytes_punched = stats.bytes_punched.saturating_add(
-                    cd_punch_len.min(self.config.total_size.saturating_sub(cd_punch_start)),
-                );
-            }
-            Err(SparseFileError::Punch(source)) => {
-                if !matches!(source, PunchError::Unsupported { .. }) {
-                    return Err(ZipPipelineError::Punch(source));
-                }
-            }
-            Err(other) => return Err(ZipPipelineError::Sparse(other)),
-        }
+        // symbolic, but it costs nothing to try; partial blocks at
+        // either edge are skipped via `punch_range`'s inward
+        // alignment so a crash before sidecar cleanup leaves the
+        // last entry's tail bytes intact for resume.
+        let cd_punch_end = self.config.total_size.min(
+            eocd.cd_offset
+                .saturating_add(eocd.cd_size.saturating_add(initial_window)),
+        );
+        let punched = self.punch_range(puncher, eocd.cd_offset, cd_punch_end)?;
+        stats.bytes_punched = stats.bytes_punched.saturating_add(punched);
 
         Ok(stats)
     }
@@ -555,9 +544,19 @@ impl<'a> ZipPipeline<'a> {
         Ok(lfh_total)
     }
 
-    /// Punch `[start, end)` on the sparse file. Returns the number
-    /// of bytes the call covered (matches the requested length on
-    /// success; `0` if the range was empty).
+    /// Punch the block-aligned interior of `[start, end)` on the
+    /// sparse file. Returns the number of bytes actually requested
+    /// from the puncher (`0` if the aligned range was empty).
+    ///
+    /// `start` is rounded **up** and `end` is rounded **down** to
+    /// the puncher's `block_size_hint`, so partial blocks at either
+    /// edge are left intact. This matters for ZIP: per-entry punch
+    /// ranges abut their neighbors at arbitrary offsets, and on
+    /// Linux `fallocate(FALLOC_FL_PUNCH_HOLE)` zeroes partial
+    /// filesystem blocks at the edges of the requested range. Without
+    /// inward alignment we'd silently overwrite the LFH bytes of the
+    /// next entry (or the trailing bytes of the previous one),
+    /// breaking resume.
     ///
     /// `Unsupported` errors from the puncher are absorbed silently
     /// — the streaming pipeline does the same; on a filesystem
@@ -571,8 +570,20 @@ impl<'a> ZipPipeline<'a> {
         if end <= start {
             return Ok(0);
         }
-        let len = end - start;
-        match self.sparse.punch(puncher, ByteOffset::new(start), len) {
+        let block = puncher.block_size_hint().max(1);
+        let aligned_start = match align_up(start, block) {
+            Some(v) => v,
+            None => return Ok(0),
+        };
+        let aligned_end = align_down(end, block).unwrap_or(0);
+        if aligned_end <= aligned_start {
+            return Ok(0);
+        }
+        let len = aligned_end - aligned_start;
+        match self
+            .sparse
+            .punch(puncher, ByteOffset::new(aligned_start), len)
+        {
             Ok(()) => Ok(len),
             Err(SparseFileError::Punch(source)) => {
                 if matches!(source, PunchError::Unsupported { .. }) {
