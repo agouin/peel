@@ -468,3 +468,115 @@ Roughly **5–7 weeks of focused work** for one engineer, distributed
 across the phases above. Phase 4 (FSE) and Phase 7 (decoder_state
 serialization) are the heaviest single phases. Phase 0's spike
 result will tighten this estimate.
+
+## Appendix A — Phase 0 spike memo (2026-05-01)
+
+**Verdict**: feasible. Recommend proceeding to Phase 1. Cost estimate
+unchanged.
+
+**Spike scope.** Single-file Rust binary at `/tmp/zstd-spike/`
+(~700 LOC, throwaway). Generates one hand-crafted reference frame and
+two libzstd-produced fixtures, attempts to decode each, cross-checks
+XXH64 against the xxhash spec's published vectors.
+
+**What was validated.**
+
+- *Frame header parser* (RFC 8478 §3.1.1.1.1) — single-segment +
+  8-byte FCS + no dict + no checksum case round-trips correctly.
+  Decomposing the Frame_Header_Descriptor byte (single_segment is
+  bit 5, fcs_flag is bits 7:6) is mechanical; the spec sections to
+  read are short.
+- *Block header parsing + iteration* (§3.1.1.2) — the
+  `(last_block, block_type, block_size)` triplet and the
+  Raw/RLE/Compressed type tag are straightforward. The RLE payload
+  is exactly 1 byte regardless of `block_size` — a small but easy
+  spec gotcha that would bite on first read of the RFC if you
+  weren't paying attention. Documenting it loudly in Phase 1's
+  block parser is cheap.
+- *Sliding window* — ring-buffer with `write_byte` /
+  `write_slice` worked first try for the raw/RLE paths.
+  `match_copy` was written but not exercised by the spike (no
+  Compressed_Block input).
+- *XXH64* (used for §3.1.1 Content_Checksum) — pure-Rust
+  implementation cross-checks byte-identical against four
+  published xxhash spec vectors (`""`, `"a"`, `"abc"`,
+  `"Nobody inspects the spammish repetition"`). Allocation-free,
+  ~80 LOC. Targets the shape used by `src/hash/sha256.rs` so
+  Phase 6's `src/hash/xxh64.rs` should be a near-copy.
+- *Forward and reverse bitstream readers* — both compile and
+  encode the right intent (LE LSB-first forward, MSB-first reverse
+  with leading-1 sentinel discard per §4.1.4). Not wired through
+  the decode loop in the spike (no compressed block) so they're
+  unverified beyond unit-level reasoning. Phase 2's tests will
+  catch any errors quickly.
+- *FSE distribution parser + table builder* (§4.1.1) — written
+  to the RFC's letter (probability `value-1`, repeated-zero RLE,
+  high-end "less probable" placement, position-step permutation
+  to fill positive-probability cells). Not exercised end-to-end.
+  The RFC's encoding of the variable-bit count for each
+  probability is the most error-prone single piece of code in
+  the whole decoder; it deserves its own focused unit tests in
+  Phase 4.
+
+**What was NOT validated, and why.**
+
+- *End-to-end decode of any libzstd-produced fixture.* The blocker
+  is that **even trivial inputs** at `zstd -3` (the default level)
+  emit a `Compressed_Block` containing a sequences section, not
+  the simple `Raw_Block` or `RLE_Block` types. To validate against
+  any fixture from the `zstd` CLI, the spike would need to land
+  the entire Phase 3 (Huffman + literals) and Phase 4 (FSE +
+  sequences) and Phase 5 (sequence execution) stacks — the bulk
+  of the decoder. There is no shortcut "tiny vector that exercises
+  only the easy paths" available against libzstd output. The spike
+  fell back to a hand-crafted frame that uses Raw + RLE block
+  types directly to validate the easy half of the wire format.
+- *Differential vs libzstd* — same reason; deferred to Phase 6
+  per the plan.
+
+**Cost-estimate sanity check.** Code volumes from the spike map
+to plan effort estimates as follows:
+
+| Plan phase | Spike-equivalent surface | Spike LOC | Plan estimate |
+|------------|--------------------------|-----------|---------------|
+| Phase 1    | frame parser, block iter, raw/RLE | ~150 | 1 week |
+| Phase 2    | bitstream readers | ~80 | 3 days |
+| Phase 3    | Huffman + literals | not written | 1.5 weeks |
+| Phase 4    | FSE table builder + dist parser | ~150 (parser+builder, untested) | 2 weeks |
+| Phase 5    | sequence execution + window | ~50 (window only, no exec) | 1 week |
+| Phase 6    | XXH64 + frame validation | ~80 (xxh64 done) | 3 days |
+
+The Phase 1 + Phase 2 + Phase 6 surfaces are about as much code
+as the spike produced in a single sitting; the plan's allocation
+of 1 week + 3 days + 3 days for those phases looks right with
+proper testing and review headroom. The Phase 3 / 4 / 5 stack —
+which the spike did *not* reach end-to-end — is where the
+remaining 4-ish weeks of effort live. Nothing in the spike
+suggests the plan is under- or over-estimated; the FSE
+distribution parser is pointy but tractable.
+
+**Open questions surfaced.**
+
+1. *Window-size cap interaction with libzstd defaults.* `zstd -3`
+   on small inputs emits frames whose declared `Window_Size` is
+   often smaller than the 128 MiB cap, so the cap is a non-issue
+   for typical inputs — but a `tar.zst` produced with `--long=27`
+   (28 MiB window) will trip the resume-blob ceiling decision in
+   Phase 7. The plan already calls this out (§Risks #2); flagged
+   here as a real design point and not just a future worry.
+2. *RLE block payload size gotcha* (see "Block header" bullet
+   above) — recommend a `// SAFETY-OF-PARSING:`-style comment in
+   Phase 1's block parser explaining the size-vs-payload
+   asymmetry so a reader doesn't quietly "fix" it.
+3. *Spike's `parse_fse_distribution` had an early bug* where I
+   computed `max_bits` two different ways before settling on
+   `(remaining + 1).next_power_of_two().trailing_zeros()`. Phase 4
+   should cover this with a property test that round-trips a
+   freshly-built distribution against a freshly-parsed one
+   before any other test depends on it.
+
+**Recommendation.** Proceed to Phase 1. Drop the spike code
+(throwaway per the plan); carry forward only the validated XXH64
+implementation pattern (which Phase 6 will re-implement in the
+crate's `src/hash/xxh64.rs` shape) and the bug-spotting notes
+above into Phase 1 / 4 commit messages.
