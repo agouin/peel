@@ -1,4 +1,5 @@
-//! Sequences-section decoder (RFC 8478 §3.1.1.4 + §4.2.2).
+//! Sequences-section decoder + executor (RFC 8478 §3.1.1.4,
+//! §3.1.1.5, §4.2.2).
 //!
 //! Each `Compressed_Block` ends with a sequences section that
 //! describes a run-length-encoded list of (literal_run, match_back-
@@ -15,11 +16,13 @@
 //!    extra bits, then ML extras, then LL extras; then update
 //!    states LL, ML, OF (skip the update on the last sequence).
 //!
-//! Output is a [`Vec<Sequence>`] in stream order. The caller
-//! (Phase 5 sequence-execution) walks this list against a sliding
-//! window to materialize decompressed bytes; the `offset_value`
-//! returned here is the *raw* `Offset_Value` from the spec, before
-//! the repeat-offset translation in §3.1.1.5.
+//! [`decode_sequences`] returns a `Vec<Sequence>` in stream order
+//! with raw `Offset_Value`s. [`execute`] then walks that list
+//! against a [`SlidingWindow`] and a [`RepeatOffsets`] state to
+//! produce decompressed bytes — applying literal runs, resolving
+//! `Offset_Value` to a real offset (RFC §3.1.1.5 with the
+//! `literals_length == 0` shifted-by-one special case), and
+//! invoking [`SlidingWindow::match_copy`] for each back-reference.
 
 use super::bitstream::{ForwardBitReader, ReverseBitReader};
 use super::error::ZstdError;
@@ -27,6 +30,7 @@ use super::fse::{
     parse_distribution, FseTable, MAX_LL_ACCURACY_LOG, MAX_LL_CODE, MAX_ML_ACCURACY_LOG,
     MAX_ML_CODE, MAX_OF_ACCURACY_LOG, MAX_OF_CODE, PREDEFINED_LL, PREDEFINED_ML, PREDEFINED_OF,
 };
+use super::window::SlidingWindow;
 
 /// One decoded sequence command: a literal-run length, a match-
 /// run length, and a raw `Offset_Value` (RFC 8478 §3.1.1.5).
@@ -400,6 +404,166 @@ fn transition_padded(
     Ok(next)
 }
 
+// =====================================================================
+// Sequence execution (RFC 8478 §3.1.1.5)
+// =====================================================================
+
+/// The three repeat-offset slots, ordered by recency
+/// (`slots[0]` = most recent). RFC 8478 §3.1.1.5 mandates the
+/// initial values `(1, 4, 8)` for any frame without a dictionary;
+/// Phase 1 rejects dictionary frames at the frame-header layer,
+/// so [`Default`] is sufficient here.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RepeatOffsets {
+    slots: [u32; 3],
+}
+
+impl Default for RepeatOffsets {
+    fn default() -> Self {
+        Self { slots: [1, 4, 8] }
+    }
+}
+
+impl RepeatOffsets {
+    /// Snapshot of the three slots in `(R1, R2, R3)` order. Used
+    /// by tests; the executor reads/writes them through
+    /// [`Self::resolve`].
+    #[must_use]
+    pub fn slots(&self) -> [u32; 3] {
+        self.slots
+    }
+
+    /// Resolve a sequence's `Offset_Value` to the actual offset
+    /// (the value passed to [`SlidingWindow::match_copy`]) and
+    /// update the slots in place per the spec table in
+    /// `zstd_compression_format.md` §3.1.1.5.
+    ///
+    /// # Errors
+    ///
+    /// - [`ZstdError::MalformedFrameHeader`] when `offset_value`
+    ///   is `0` or when the special case
+    ///   `(offset_value=3, literals_length=0)` resolves to
+    ///   `Repeated_Offset1 - 1 == 0`.
+    fn resolve(&mut self, offset_value: u32, literals_length: u32) -> Result<u32, ZstdError> {
+        if offset_value == 0 {
+            return Err(ZstdError::MalformedFrameHeader(
+                "sequences: Offset_Value = 0",
+            ));
+        }
+        if offset_value > 3 {
+            // Non-repeat: actual offset is offset_value - 3, slots
+            // shift back, slot[0] becomes the just-used offset.
+            let actual = offset_value - 3;
+            self.slots = [actual, self.slots[0], self.slots[1]];
+            return Ok(actual);
+        }
+        // offset_value ∈ {1, 2, 3}. The "effective slot index" is
+        // (offset_value - 1) when literals_length != 0, or
+        // (offset_value) when literals_length == 0 (shifted by one).
+        // For (offset_value=3, ll=0) we hit the
+        // `Repeated_Offset1 - 1` special case.
+        if literals_length == 0 && offset_value == 3 {
+            let actual = self.slots[0].checked_sub(1).filter(|&v| v != 0).ok_or(
+                ZstdError::MalformedFrameHeader("sequences: Repeated_Offset1 - 1 == 0"),
+            )?;
+            // This is a non-repeat update — slots shift back, new
+            // slot[0] = actual.
+            self.slots = [actual, self.slots[0], self.slots[1]];
+            return Ok(actual);
+        }
+        let effective = if literals_length == 0 {
+            // ll == 0, offset_value ∈ {1, 2}: shift index by one.
+            offset_value as usize
+        } else {
+            // ll != 0, offset_value ∈ {1, 2, 3}.
+            (offset_value - 1) as usize
+        };
+        // INVARIANT: effective ∈ {0, 1, 2}; the (3, 0) case is
+        // handled above so we never index past slot 2.
+        let actual = self.slots[effective];
+        // Repeat update: slot[0] becomes the used slot, the
+        // remaining slots are pushed back from the start through
+        // the used position. In other words, rotate slots
+        // [0..=effective] right by one.
+        match effective {
+            0 => { /* slot 0: no reorder */ }
+            1 => {
+                // swap slots 0 and 1
+                self.slots = [actual, self.slots[0], self.slots[2]];
+            }
+            2 => {
+                // rotate slot 2 → slot 0
+                self.slots = [actual, self.slots[0], self.slots[1]];
+            }
+            _ => unreachable!("effective ∈ {{0, 1, 2}}"),
+        }
+        Ok(actual)
+    }
+}
+
+/// Execute a list of sequences against a sliding window, applying
+/// literal runs and back-references in stream order, updating the
+/// repeat-offset slots, and writing the produced bytes to `out`.
+///
+/// After all sequences are processed, any literals after the last
+/// sequence's `literals_length` are appended ("trailing literals"
+/// per RFC 8478 §4.2). The total bytes appended to `out` equal
+/// `literals.len() + sum(match_length)`, which is the block's
+/// declared decompressed size.
+///
+/// # Errors
+///
+/// - [`ZstdError::MalformedFrameHeader`] when a sequence's
+///   `literals_length` exceeds the remaining `literals` buffer,
+///   when the offset is invalid, or when the repeat-slot state
+///   triggers the `Repeated_Offset1 - 1 == 0` corruption case.
+pub fn execute(
+    sequences: &[Sequence],
+    literals: &[u8],
+    window: &mut SlidingWindow,
+    repeats: &mut RepeatOffsets,
+    out: &mut Vec<u8>,
+) -> Result<(), ZstdError> {
+    let mut lit_cursor = 0usize;
+    for seq in sequences {
+        // 1. Literal run: copy `literals_length` bytes from the
+        //    literals buffer to the output and append them to the
+        //    window.
+        let ll = seq.literals_length as usize;
+        let lit_end = lit_cursor
+            .checked_add(ll)
+            .ok_or(ZstdError::MalformedFrameHeader(
+                "sequence literals_length overflow",
+            ))?;
+        if lit_end > literals.len() {
+            return Err(ZstdError::MalformedFrameHeader(
+                "sequence literals_length exceeds literals buffer",
+            ));
+        }
+        let lit_run = &literals[lit_cursor..lit_end];
+        out.extend_from_slice(lit_run);
+        window.append(lit_run);
+        lit_cursor = lit_end;
+
+        // 2. Resolve Offset_Value to actual offset, updating the
+        //    repeat slots in place.
+        let actual_offset = repeats.resolve(seq.offset_value, seq.literals_length)?;
+
+        // 3. Match copy: synthesize `match_length` bytes from
+        //    `actual_offset` bytes back, appending to both the
+        //    window and `out`.
+        window.match_copy(actual_offset, seq.match_length, out)?;
+    }
+
+    // Trailing literals: any leftover bytes in the literals buffer
+    // after the final sequence's literal run.
+    let tail = &literals[lit_cursor..];
+    out.extend_from_slice(tail);
+    window.append(tail);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,5 +846,187 @@ mod tests {
             }
         }
         assert!(blocks_seen >= 1, "no compressed blocks observed");
+    }
+
+    // ---- RepeatOffsets resolve ---------------------------------
+
+    #[test]
+    fn repeat_offsets_initial_values() {
+        let r = RepeatOffsets::default();
+        assert_eq!(r.slots(), [1, 4, 8]);
+    }
+
+    /// Lock the spec table from `zstd_compression_format.md`
+    /// §3.1.1.5 (the sequence of sequences applied to the
+    /// repeat-offset slots, including the `(3, 0)` insert-`R1-1`
+    /// special case and the subsequent `(1, 0)` shifted-by-one
+    /// repeat).
+    #[test]
+    fn repeat_offsets_spec_table_walk() {
+        let mut r = RepeatOffsets::default();
+        // Format: (offset_value, literals_length, expected_actual,
+        //          expected_slots_after).
+        let walk: &[(u32, u32, u32, [u32; 3])] = &[
+            (1114, 11, 1111, [1111, 1, 4]),
+            (1, 22, 1111, [1111, 1, 4]), // repeat 1: no change
+            (2225, 22, 2222, [2222, 1111, 1]),
+            (1114, 111, 1111, [1111, 2222, 1111]),
+            (3336, 33, 3333, [3333, 1111, 2222]),
+            (2, 22, 1111, [1111, 3333, 2222]), // repeat 2: swap slots 0,1
+            (3, 33, 2222, [2222, 1111, 3333]), // repeat 3: rotate slot 2 → 0
+            (3, 0, 2221, [2221, 2222, 1111]),  // (3, 0) inserts R1-1
+            (1, 0, 2222, [2222, 2221, 1111]),  // (1, 0) == repeat 2
+        ];
+        for &(ov, ll, expected_actual, expected_slots) in walk {
+            let actual = r.resolve(ov, ll).expect("resolve");
+            assert_eq!(actual, expected_actual, "actual offset for ({ov}, {ll})");
+            assert_eq!(r.slots(), expected_slots, "slots after ({ov}, {ll})");
+        }
+    }
+
+    #[test]
+    fn repeat_offsets_zero_is_malformed() {
+        let mut r = RepeatOffsets::default();
+        match r.resolve(0, 5) {
+            Err(ZstdError::MalformedFrameHeader(_)) => {}
+            other => panic!("expected malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeat_offsets_three_zero_with_r1_eq_one_is_malformed() {
+        // Force R1 = 1 first, then attempt (3, 0) → R1-1 = 0.
+        let mut r = RepeatOffsets::default(); // [1, 4, 8]
+        match r.resolve(3, 0) {
+            Err(ZstdError::MalformedFrameHeader(_)) => {}
+            other => panic!("expected malformed, got {other:?}"),
+        }
+    }
+
+    // ---- Sequence execution ------------------------------------
+
+    #[test]
+    fn execute_pure_literals_no_sequences() {
+        // No sequences and a non-empty literals buffer: the entire
+        // literals buffer is emitted as the trailing run.
+        let mut window = SlidingWindow::new(64).expect("window");
+        let mut repeats = RepeatOffsets::default();
+        let mut out = Vec::new();
+        execute(&[], b"hello, world", &mut window, &mut repeats, &mut out).expect("execute");
+        assert_eq!(out, b"hello, world");
+        assert_eq!(window.total_written(), 12);
+        // No sequences -> repeat slots unchanged.
+        assert_eq!(repeats.slots(), [1, 4, 8]);
+    }
+
+    #[test]
+    fn execute_one_sequence_literal_then_match() {
+        // 1 sequence: ll=3, ml=2, offset_value=4 (non-repeat, 4-3=1).
+        // literals = "abc" + "X" trailing.
+        // Expected output: "abc" (LL run) + "cc" (match offset 1
+        // length 2, repeats 'c') + "X" (trailing literals) = "abcccX".
+        let mut window = SlidingWindow::new(64).expect("window");
+        let mut repeats = RepeatOffsets::default();
+        let mut out = Vec::new();
+        let seqs = [Sequence {
+            literals_length: 3,
+            match_length: 2,
+            offset_value: 4,
+        }];
+        execute(&seqs, b"abcX", &mut window, &mut repeats, &mut out).expect("execute");
+        assert_eq!(out, b"abcccX");
+        // Slots updated: non-repeat, slot[0] = 1.
+        assert_eq!(repeats.slots(), [1, 1, 4]);
+    }
+
+    #[test]
+    fn execute_overlap_match_expands() {
+        // Match length > offset: classic "expand" case. ll=1
+        // (literal 'a'), ml=4, offset_value=4 (actual offset =1).
+        // After LL run, window has "a"; match offset 1 length 4
+        // produces "aaaa". Trailing literals empty.
+        let mut window = SlidingWindow::new(64).expect("window");
+        let mut repeats = RepeatOffsets::default();
+        let mut out = Vec::new();
+        let seqs = [Sequence {
+            literals_length: 1,
+            match_length: 4,
+            offset_value: 4,
+        }];
+        execute(&seqs, b"a", &mut window, &mut repeats, &mut out).expect("execute");
+        assert_eq!(out, b"aaaaa");
+    }
+
+    #[test]
+    fn execute_repeat_offset_update_matches_spec_walk() {
+        // Mirror the first three rows of the spec table inside an
+        // executor run. Pre-fill the window with 4096 bytes so all
+        // offsets up to 2222 are valid; that simulates several
+        // prior compressed blocks in the same frame.
+        let mut window = SlidingWindow::new(8192).expect("window");
+        let mut repeats = RepeatOffsets::default();
+        let mut out = Vec::new();
+        let prefill: Vec<u8> = (0..4096).map(|i| (i & 0xFF) as u8).collect();
+        window.append(&prefill);
+        // Sequences for this block: literals are short, all the
+        // back-references reach into the prefilled window.
+        // Seq 1: ll=11, ml=1, offset_value=1114 (non-repeat, 1111).
+        // Seq 2: ll=22, ml=1, offset_value=1 (repeat 1, no change).
+        // Seq 3: ll=22, ml=1, offset_value=2225 (non-repeat, 2222).
+        let literals: Vec<u8> = (0..(11 + 22 + 22 + 3)).map(|i| (i & 0xFF) as u8).collect();
+        let seqs = [
+            Sequence {
+                literals_length: 11,
+                match_length: 1,
+                offset_value: 1114,
+            },
+            Sequence {
+                literals_length: 22,
+                match_length: 1,
+                offset_value: 1,
+            },
+            Sequence {
+                literals_length: 22,
+                match_length: 1,
+                offset_value: 2225,
+            },
+        ];
+        execute(&seqs, &literals, &mut window, &mut repeats, &mut out).expect("execute");
+        assert_eq!(repeats.slots(), [2222, 1111, 1]);
+        // Block decompressed size = literals.len() + sum(ml).
+        assert_eq!(out.len(), literals.len() + 3);
+    }
+
+    #[test]
+    fn execute_rejects_literals_underflow() {
+        // ll=10 but literals buffer only has 5 bytes.
+        let mut window = SlidingWindow::new(64).expect("window");
+        let mut repeats = RepeatOffsets::default();
+        let mut out = Vec::new();
+        let seqs = [Sequence {
+            literals_length: 10,
+            match_length: 3,
+            offset_value: 4,
+        }];
+        match execute(&seqs, b"hello", &mut window, &mut repeats, &mut out) {
+            Err(ZstdError::MalformedFrameHeader(_)) => {}
+            other => panic!("expected malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_rejects_offset_zero() {
+        let mut window = SlidingWindow::new(64).expect("window");
+        let mut repeats = RepeatOffsets::default();
+        let mut out = Vec::new();
+        let seqs = [Sequence {
+            literals_length: 0,
+            match_length: 1,
+            offset_value: 0,
+        }];
+        match execute(&seqs, b"", &mut window, &mut repeats, &mut out) {
+            Err(ZstdError::MalformedFrameHeader(_)) => {}
+            other => panic!("expected malformed, got {other:?}"),
+        }
     }
 }

@@ -1,30 +1,30 @@
 //! Hand-rolled, pure-Rust Zstandard streaming decoder.
 //!
-//! Phase 1 of `docs/PLAN_zstd_block_decoder.md`. Lives here behind a
-//! cargo feature flag (`peel_zstd_native`) so production paths still
-//! route through [`crate::decode::zstd::ZstdDecoder`] (the upstream
-//! `zstd` crate binding) until Phase 8 swaps the implementations.
+//! Lives behind the `peel_zstd_native` cargo feature flag while
+//! production paths still route through
+//! [`crate::decode::zstd::ZstdDecoder`] (the upstream `zstd` crate
+//! binding); Phase 8 of `docs/PLAN_zstd_block_decoder.md` swaps
+//! the registry to use this module's [`factory`].
 //!
-//! # What's working in Phase 1
+//! # What's working
 //!
-//! - [`frame::parse_frame_header`] — RFC 8478 §3.1.1.1.1, including
-//!   skippable-frame magic classification.
-//! - [`block::parse_block_header`] — RFC 8478 §3.1.1.2.
-//! - `Raw_Block` and `RLE_Block` decoding — verbatim copy and
-//!   single-byte-repeated, respectively.
-//! - Skippable frame skipping (consumes magic + 4-byte length +
-//!   that many opaque user bytes).
-//! - Per-frame `frame_boundary` reporting for the multi-frame
-//!   producers we already test against the upstream wrapper.
+//! - Frame parsing: [`frame::parse_frame_header`] (§3.1.1.1.1),
+//!   skippable-frame magic classification, and per-frame
+//!   `frame_boundary` reporting for resume.
+//! - Block layer: [`block::parse_block_header`] (§3.1.1.2),
+//!   `Raw_Block`, `RLE_Block`, and `Compressed_Block` end-to-end.
+//! - Compressed_Block pipeline: literals (§3.1.1.3 / §4.2),
+//!   sequences (§3.1.1.4 / §4.2.2), and execution against a
+//!   sliding window with the three repeat-offset slots
+//!   (§3.1.1.5).
 //!
 //! # What's deferred
 //!
-//! `Compressed_Block` returns
-//! [`error::ZstdError::CompressedBlockUnimplemented`] (mapped at the
-//! trait boundary into [`crate::decode::DecodeError::Read`]) per the
-//! plan; Phases 3-5 implement the literals + sequences stack. Custom
-//! dictionaries and `windowLog > 27` are rejected at frame-header
-//! parse time.
+//! - XXH64 content-checksum verification — Phase 6.
+//! - Decoder-state serialization for crash-resume — Phase 7.
+//! - Registry / extractor wiring — Phase 8.
+//! - Custom dictionaries and `windowLog > 27` are rejected at
+//!   frame-header parse time.
 //!
 //! # Source consumption accounting
 //!
@@ -50,6 +50,7 @@ pub mod fse;
 pub mod huffman;
 pub mod literals;
 pub mod sequences;
+pub mod window;
 
 use self::block::{parse_block_header, BlockType, BLOCK_HEADER_LEN, BLOCK_MAX_SIZE};
 use self::error::ZstdError;
@@ -96,6 +97,48 @@ pub struct Decoder {
     /// Reusable scratch for skippable-frame data so we don't
     /// allocate a fresh buffer on every step.
     skip_buf: Vec<u8>,
+    /// Reusable scratch for one Compressed_Block's decompressed
+    /// output. Sized lazily up to the per-frame
+    /// `Block_Maximum_Decompressed_Size` cap and reused across
+    /// blocks; we `clear()` it at the top of each block.
+    block_out: Vec<u8>,
+    /// Per-frame state — only set while decoding inside a
+    /// regular frame. The contents reset when entering a new
+    /// frame (`AwaitingMagic` → `InFrame`) and clear on
+    /// `finish_frame`. See [`FrameDecodeState`].
+    frame_state: Option<FrameDecodeState>,
+}
+
+/// Per-frame decoding state lifted out of the [`State`] enum so
+/// the inner-block fast path can hold a `&mut` to it without
+/// matching on the state every step. Initialized when entering
+/// `InFrame` from `AwaitingMagic`; cleared on `finish_frame`.
+#[derive(Debug)]
+struct FrameDecodeState {
+    /// Sliding ring buffer for back-references (RFC 8478
+    /// §3.1.1.1.4 + §4.1.3). Sized to the frame's `window_size`,
+    /// capped at 128 MiB.
+    window: window::SlidingWindow,
+    /// Three repeat-offset slots (RFC 8478 §3.1.1.5). Reset to
+    /// the spec defaults `(1, 4, 8)` per frame.
+    repeats: sequences::RepeatOffsets,
+    /// Last Huffman tree decoded by a `Compressed_Literals_Block`,
+    /// reused by `Treeless_Literals_Block`s in the same frame.
+    prev_huffman: Option<huffman::HuffmanTree>,
+    /// Last LL/OF/ML FSE tables, reused by sequence-section
+    /// `Repeat_Mode` declarations in subsequent blocks.
+    prev_seq_tables: sequences::PrevSequenceTables,
+}
+
+impl FrameDecodeState {
+    fn new(window_size: u64) -> Result<Self, ZstdError> {
+        Ok(Self {
+            window: window::SlidingWindow::new(window_size)?,
+            repeats: sequences::RepeatOffsets::default(),
+            prev_huffman: None,
+            prev_seq_tables: sequences::PrevSequenceTables::default(),
+        })
+    }
 }
 
 /// Read exactly `buf.len()` bytes from `source`, advancing
@@ -213,6 +256,8 @@ impl Decoder {
             last_frame_boundary: None,
             payload_buf: Vec::new(),
             skip_buf: Vec::new(),
+            block_out: Vec::new(),
+            frame_state: None,
         })
     }
 
@@ -229,6 +274,11 @@ impl Decoder {
     fn finish_frame(&mut self) {
         self.last_frame_boundary = Some(ByteOffset::new(self.bytes_consumed));
         self.state = State::AwaitingMagic;
+        // Per-frame state (window, repeat slots, prior FSE/Huffman
+        // tables) is scoped to a single frame: a `Repeat_Mode`
+        // sequences-section in a *later* frame must not see the
+        // current frame's tables.
+        self.frame_state = None;
     }
 
     /// Internal: the body of one `decode_step`, returning the
@@ -274,6 +324,12 @@ impl Decoder {
                                     "frame header tail",
                                 )?;
                                 let header = parse_frame_header(&full[..5 + tail])?;
+                                // Allocate per-frame state. The
+                                // window's capacity comes from
+                                // `header.window_size` (already
+                                // capped at 128 MiB by the frame
+                                // parser).
+                                self.frame_state = Some(FrameDecodeState::new(header.window_size)?);
                                 self.state = State::InFrame {
                                     header,
                                     decoded_in_frame: 0,
@@ -385,6 +441,14 @@ impl Decoder {
                             )?;
                             sink.write_all(&self.payload_buf[..n])
                                 .map_err(ZstdError::SourceIo)?;
+                            // Append to the window so subsequent
+                            // Compressed_Blocks in this frame can
+                            // back-reference these bytes.
+                            self.frame_state
+                                .as_mut()
+                                .expect("frame_state present in InFrame")
+                                .window
+                                .append(&self.payload_buf[..n]);
                             decoded = decoded.saturating_add(n as u64);
                         }
                         BlockType::Rle => {
@@ -405,10 +469,85 @@ impl Decoder {
                             }
                             sink.write_all(&self.payload_buf[..n])
                                 .map_err(ZstdError::SourceIo)?;
+                            self.frame_state
+                                .as_mut()
+                                .expect("frame_state present in InFrame")
+                                .window
+                                .append(&self.payload_buf[..n]);
                             decoded = decoded.saturating_add(n as u64);
                         }
                         BlockType::Compressed => {
-                            return Err(ZstdError::CompressedBlockUnimplemented);
+                            // Read the entire compressed block
+                            // payload into the scratch buffer.
+                            let n = bh.block_size as usize;
+                            if self.payload_buf.len() < n {
+                                self.payload_buf.resize(n, 0);
+                            }
+                            let source = self.source.as_mut().expect("source present");
+                            read_exact_into(
+                                source.as_mut(),
+                                &mut self.bytes_consumed,
+                                &mut self.payload_buf[..n],
+                                "compressed block payload",
+                            )?;
+                            let payload = &self.payload_buf[..n];
+                            let frame_state = self
+                                .frame_state
+                                .as_mut()
+                                .expect("frame_state present in InFrame");
+
+                            // 1. Literals section (RFC 8478 §3.1.1.3).
+                            let lh = literals::parse_literals_header(payload)?;
+                            let lit_start = usize::from(lh.header_size);
+                            let lit_end = lit_start.checked_add(lh.payload_size as usize).ok_or(
+                                ZstdError::MalformedFrameHeader(
+                                    "literals section spans past block",
+                                ),
+                            )?;
+                            if lit_end > payload.len() {
+                                return Err(ZstdError::MalformedFrameHeader(
+                                    "literals section spans past block",
+                                ));
+                            }
+                            let literals_buf = literals::decode_literals(
+                                &lh,
+                                &payload[lit_start..lit_end],
+                                &mut frame_state.prev_huffman,
+                            )?;
+
+                            // 2. Sequences section (RFC 8478 §3.1.1.4).
+                            let seq_section = &payload[lit_end..];
+                            let seqs = sequences::decode_sequences(
+                                seq_section,
+                                &mut frame_state.prev_seq_tables,
+                            )?;
+
+                            // 3. Execute: walk sequences, materialize
+                            //    bytes into `block_out`, update window
+                            //    and repeat slots.
+                            self.block_out.clear();
+                            sequences::execute(
+                                &seqs,
+                                &literals_buf,
+                                &mut frame_state.window,
+                                &mut frame_state.repeats,
+                                &mut self.block_out,
+                            )?;
+
+                            // Block_Maximum_Decompressed_Size cap
+                            // (RFC §3.1.1.2): per-block decoded size
+                            // ≤ min(Window_Size, 128 KiB).
+                            let decompressed_cap =
+                                u64::from(BLOCK_MAX_SIZE).min(frame_header.window_size);
+                            if self.block_out.len() as u64 > decompressed_cap {
+                                return Err(ZstdError::MalformedFrameHeader(
+                                    "Compressed_Block decompressed size exceeds Block_Maximum_Size",
+                                ));
+                            }
+
+                            sink.write_all(&self.block_out)
+                                .map_err(ZstdError::SourceIo)?;
+                            decoded = decoded.saturating_add(self.block_out.len() as u64);
                         }
                     }
 
@@ -679,15 +818,13 @@ mod tests {
         assert_eq!(out, b"foo");
     }
 
-    /// `Compressed_Block` is the deliberate Phase-1 hole — it must
-    /// surface a clean error rather than panicking or silently
-    /// producing garbage.
+    /// A malformed `Compressed_Block` (zero-byte payload, but a
+    /// Compressed type tag) must surface a clean error rather than
+    /// panicking. This regressed the Phase-1 placeholder; Phase 5
+    /// hooks the real decoder up but garbage-in still produces
+    /// `Err`.
     #[test]
-    fn compressed_block_returns_unimplemented_error() {
-        // We don't need a *real* compressed payload; the parser
-        // dispatches on the block type tag before touching the
-        // payload bytes. (The `payload_on_wire` pull happens after
-        // the type-dispatch error is returned.)
+    fn malformed_compressed_block_surfaces_clean_error() {
         let frame = build_frame(0, false, &[compressed(true, &[])]);
         let mut decoder = Decoder::new(Box::new(Cursor::new(frame))).expect("construct");
         let mut sink = Vec::new();
@@ -695,14 +832,7 @@ mod tests {
             match decoder.decode_step(&mut sink) {
                 Ok(DecodeStatus::Eof) => panic!("expected error"),
                 Ok(DecodeStatus::MoreData) => continue,
-                Err(DecodeError::Read { source, .. }) => {
-                    let msg = source.to_string();
-                    assert!(
-                        msg.contains("compressed block decoding not yet implemented"),
-                        "unexpected msg: {msg}"
-                    );
-                    break;
-                }
+                Err(DecodeError::Read { .. }) => break,
                 Err(other) => panic!("unexpected error variant: {other:?}"),
             }
         }
@@ -992,5 +1122,129 @@ mod tests {
         let mut hit_fse = false;
         validate_literals_in_frame(&payload, &mut hit_fse);
         let _ = hit_fse;
+    }
+
+    // ---- Phase 5 end-to-end differential -----------------------
+    //
+    // Now that Compressed_Block is wired through decode_step, the
+    // streaming decoder should round-trip arbitrary payloads
+    // byte-identical to the upstream `zstd` crate. These tests
+    // are the Phase 5 exit criterion (per
+    // `docs/PLAN_zstd_block_decoder.md`).
+
+    fn round_trip_via_native(payload: &[u8], level: i32) {
+        let compressed = ::zstd::encode_all(payload, level).expect("encode");
+        let mut decoder = Decoder::new(Box::new(Cursor::new(compressed))).expect("construct");
+        let mut sink = Vec::with_capacity(payload.len());
+        loop {
+            let status = decoder.decode_step(&mut sink).expect("step");
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        if sink != payload {
+            let n = sink.len().min(64);
+            let p = payload.len().min(64);
+            panic!(
+                "native decode mismatch (level {level}): expected {} bytes, got {}; first bytes expected={:02x?}, got={:02x?}",
+                payload.len(),
+                sink.len(),
+                &payload[..p],
+                &sink[..n]
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_text_payload_levels_1_3_9() {
+        let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. \
+            pack my box with five dozen liquor jugs. how vexingly quick \
+            daft zebras jump! sphinx of black quartz, judge my vow. "
+            .repeat(200);
+        for level in [1, 3, 9] {
+            round_trip_via_native(&payload, level);
+        }
+    }
+
+    #[test]
+    fn round_trip_wide_alphabet_payload_levels_1_3_9() {
+        for size in [4 * 1024, 32 * 1024, 128 * 1024] {
+            let payload = wide_alphabet_compressible_payload(size);
+            for level in [1, 3, 9] {
+                round_trip_via_native(&payload, level);
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_random_short_payloads() {
+        // Deterministic LCG so we don't pull in a dev-dep RNG.
+        // Keep these short; this catches edge cases like 0-byte
+        // and 1-byte payloads, single-block frames, and small
+        // sequence sections.
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        for trial in 0..16 {
+            // Mix in `trial` so each iteration uses a fresh seed.
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1442695040888963407 ^ trial);
+            let len = (state as usize) & 0x1FFF; // 0..=8191
+            let mut payload = vec![0u8; len];
+            for byte in payload.iter_mut() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1442695040888963407);
+                *byte = (state >> 33) as u8;
+            }
+            round_trip_via_native(&payload, 3);
+        }
+    }
+
+    #[test]
+    fn round_trip_small_repetitive_payload_uses_back_references() {
+        // A short repetitive payload that the encoder will emit
+        // primarily via back-references — exercises the executor's
+        // overlap path and repeat-offset slots.
+        let payload = b"abcdefgh".repeat(64); // 512 bytes, period 8
+        round_trip_via_native(&payload, 3);
+    }
+
+    #[test]
+    fn round_trip_multi_block_frame() {
+        // Force several Compressed_Blocks in one frame: the
+        // largest block decompressed-size is min(window_size, 128
+        // KiB), so a > 128 KiB payload produces multiple blocks
+        // and exercises cross-block back-references and
+        // Repeat_Mode for the FSE tables.
+        let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. \
+            pack my box with five dozen liquor jugs. how vexingly quick \
+            daft zebras jump! sphinx of black quartz, judge my vow. "
+            .repeat(2000); // ~290 KiB -> at least 3 blocks at default settings
+        round_trip_via_native(&payload, 3);
+    }
+
+    #[test]
+    fn round_trip_multi_frame_concatenation() {
+        // Two separate frames concatenated. The decoder should
+        // reset per-frame state (window, repeat slots, FSE tables,
+        // Huffman tree) on the frame boundary and produce
+        // byte-identical output to the upstream `zstd` crate's
+        // `decode_all` (which handles multi-frame inputs).
+        let payload_a = b"the quick brown fox jumps over the lazy dog".repeat(50);
+        let payload_b = b"abcdefgh".repeat(64);
+        let mut compressed = ::zstd::encode_all(&payload_a[..], 3).expect("encode a");
+        compressed.extend_from_slice(&::zstd::encode_all(&payload_b[..], 3).expect("encode b"));
+
+        let mut decoder = Decoder::new(Box::new(Cursor::new(compressed))).expect("construct");
+        let mut sink = Vec::new();
+        loop {
+            let status = decoder.decode_step(&mut sink).expect("step");
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        let mut expected = payload_a.clone();
+        expected.extend_from_slice(&payload_b);
+        assert_eq!(sink, expected);
     }
 }

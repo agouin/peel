@@ -213,11 +213,11 @@ pub fn parse_frame_header(input: &[u8]) -> Result<FrameHeader, ZstdError> {
         p += 1;
         let exponent = u32::from((wd >> 3) & 0b11111);
         let mantissa = u64::from(wd & 0b111);
-        if exponent < 10 {
-            return Err(ZstdError::MalformedFrameHeader(
-                "Window_Descriptor exponent must be >= 10",
-            ));
-        }
+        // RFC 8478 §3.1.1.1.2: Window_Size = (1 + mantissa/8) *
+        // 2^(10 + exponent). The +10 is structural, so the wire
+        // format cannot encode a window_log below 10. We reject
+        // only the upper-bound case (windowLog > 27) per the
+        // round-one --long-mode policy.
         window_log = 10 + exponent;
         if window_log > MAX_WINDOW_LOG {
             return Err(ZstdError::UnsupportedFrameFeature(
@@ -461,19 +461,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_window_log_below_10() {
+    fn parse_accepts_window_log_minimum_of_10() {
+        // RFC 8478 §3.1.1.1.2: Window_Size = (1 + mantissa/8) *
+        // 2^(10 + exponent), so the smallest valid window_log is
+        // 10 (exponent = 0, mantissa = 0).
         // FHD: fcs_flag=0, single_segment=0, dict_id=0 -> 0x00.
-        // WD: exponent=9 -> 9 << 3 = 0x48.
+        // WD: exponent=0, mantissa=0 -> 0x00.
         let mut hdr = Vec::new();
         hdr.extend_from_slice(&ZSTD_FRAME_MAGIC.to_le_bytes());
         hdr.push(0x00);
-        hdr.push(0x48);
-        match parse_frame_header(&hdr) {
-            Err(ZstdError::MalformedFrameHeader(msg)) => {
-                assert!(msg.contains("exponent"), "msg={msg}");
-            }
-            other => panic!("expected MalformedFrameHeader, got {other:?}"),
-        }
+        hdr.push(0x00);
+        let h = parse_frame_header(&hdr).expect("parse");
+        assert_eq!(h.window_size, 1 << 10);
     }
 
     #[test]
