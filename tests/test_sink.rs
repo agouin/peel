@@ -165,16 +165,14 @@ fn tar_sink_handles_arbitrary_chunk_boundaries() {
     assert!(three.is_empty());
 }
 
-/// Quiescence flips to `false` mid-member and back to `true` between
-/// members. Verified by feeding the archive in two batches and
-/// checking the flag at each handoff.
+/// `is_quiescent` reports `true` at every byte boundary now that
+/// `TarSink::resume` can pick up from any saved parser state.
+/// Poisoning is the only thing that should flip it to `false`.
 #[test]
-fn tar_sink_quiescent_only_between_members() {
+fn tar_sink_is_quiescent_at_every_boundary() {
     let dir = fresh_dir("tar_quiescent");
     let _g = CleanupOnDrop(dir.clone());
 
-    // Build manually so we know the exact byte boundaries of each
-    // member. Header (512) + data (50, padded to 512) per file.
     let mut archive = Vec::new();
     archive.extend_from_slice(&build_header("a.txt", 50, b'0'));
     archive.extend_from_slice(&pad_block(&b"a".repeat(50)));
@@ -183,26 +181,19 @@ fn tar_sink_quiescent_only_between_members() {
     archive.extend_from_slice(&end_of_archive());
 
     let mut sink = TarSink::new(&dir).expect("new");
-    // Initially no bytes seen; the sink is at a clean header
-    // boundary.
     assert!(sink.is_quiescent(), "fresh sink is quiescent");
 
-    // Feed half of the first header — mid-header is non-quiescent.
+    // Mid-header — still quiescent (the resumable contract).
     sink.write(&archive[..256]).expect("partial header");
     assert!(
-        !sink.is_quiescent(),
-        "mid-header reads must report non-quiescent"
+        sink.is_quiescent(),
+        "mid-header reads are now resumable, so quiescent",
     );
 
-    // Finish the first header + first body + padding — exactly one
-    // member completed. Sink is now back to a header boundary.
+    // Finish the first member — quiescent.
     sink.write(&archive[256..BLOCK * 2])
         .expect("rest of member");
-    assert!(
-        sink.is_quiescent(),
-        "between members: must be quiescent (sink={:?})",
-        sink.root(),
-    );
+    assert!(sink.is_quiescent());
 
     // Feed the rest of the archive in one go, finishing cleanly.
     sink.write(&archive[BLOCK * 2..]).expect("tail");

@@ -1,10 +1,15 @@
 //! Streaming tar extractor sink.
 //!
-//! Hand-rolled rather than wrapping the upstream `tar` crate because
-//! the [`Sink::is_quiescent`] contract — true *only* between members —
-//! is part of the checkpoint discipline (`docs/PLAN.md` §7.3) and the
-//! upstream API does not expose it. The format is small and the parser
-//! is the kind of code we want to be able to audit byte-for-byte.
+//! Hand-rolled rather than wrapping the upstream `tar` crate so the
+//! parser state can be (de)serialized into a checkpoint and resumed
+//! from any byte boundary — the v6 [`crate::checkpoint::SinkState::Tar`]
+//! `in_flight` trailer carries the full parser state and
+//! [`TarSink::resume`] reconstructs it. Earlier rounds of the project
+//! relied on the [`Sink::is_quiescent`] contract being "true only
+//! between members"; with mid-member resume support the sink is
+//! resumable from anywhere and `is_quiescent` is `true` whenever the
+//! sink is healthy. The format is small and the parser is the kind
+//! of code we want to be able to audit byte-for-byte.
 //!
 //! # Format support
 //!
@@ -849,19 +854,12 @@ impl Sink for TarSink {
     }
 
     fn is_quiescent(&self) -> bool {
-        if self.poisoned {
-            return false;
-        }
-        match &self.state {
-            State::Header { filled, .. } => {
-                *filled == 0
-                    && self.zero_blocks_seen == 0
-                    && self.pending_path.is_none()
-                    && self.pending_size.is_none()
-            }
-            State::Finished => true,
-            _ => false,
-        }
+        // Every byte boundary is a checkpoint-safe restart point now
+        // that [`Self::sink_state`] captures the live parser state
+        // and [`Self::resume`] consumes it. Poisoned sinks stay
+        // non-quiescent so a checkpoint observed after a sink
+        // failure isn't written.
+        !self.poisoned
     }
 
     fn sink_state(&self) -> crate::checkpoint::SinkState {

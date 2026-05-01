@@ -1193,11 +1193,27 @@ fn build_raw_sink(path: &Path, plan: &ResumePlan) -> Result<RawSink, Coordinator
 
 /// Internal: build the TarSink for either fresh or resumed mode.
 ///
-/// On resume we just construct a fresh sink: the decoded byte stream
-/// picks up at a member boundary (the checkpoint discipline guarantees
-/// that), so the sink starts processing the next member's header
-/// immediately. Already-extracted members on disk are left alone.
-fn build_tar_sink(path: &Path, _plan: &ResumePlan) -> Result<TarSink, CoordinatorError> {
+/// Fresh runs and resumes from a coarser boundary (sink state
+/// without `in_flight`) construct via [`TarSink::new`]: the decoded
+/// byte stream picks up at a member boundary and the parser starts
+/// at a 0-filled header buffer.
+///
+/// Resumes carrying a v6 [`crate::checkpoint::TarSinkState`] —
+/// captured by [`crate::sink::Sink::sink_state`] at any decoder
+/// block boundary, including mid-member ones — go through
+/// [`TarSink::resume`], which reopens the in-flight file at the
+/// already-written offset and seeds the parser state directly.
+fn build_tar_sink(path: &Path, plan: &ResumePlan) -> Result<TarSink, CoordinatorError> {
+    if let ResumePlan::Resume {
+        sink_state: SinkState::Tar {
+            in_flight: Some(state),
+            ..
+        },
+        ..
+    } = plan
+    {
+        return TarSink::resume(path, state).map_err(CoordinatorError::Sink);
+    }
     TarSink::new(path).map_err(CoordinatorError::Sink)
 }
 
