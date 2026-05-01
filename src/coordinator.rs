@@ -529,8 +529,16 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     // `select_backend` is still the single place where the user's
     // --io-backend choice is materialized; logging/warning side
     // effects fire inside it.
-    let io_backend = crate::io_backend::select_backend(config.io_backend, config.workers)
-        .map_err(CoordinatorError::IoBackend)?;
+    let (io_backend, io_backend_label) =
+        crate::io_backend::select_backend(config.io_backend, config.workers)
+            .map_err(CoordinatorError::IoBackend)?;
+    // Forward the resolved IO-backend banner to the progress renderer
+    // so a TTY user — whose tracing-INFO output is suppressed to keep
+    // the in-place block clean — still sees the same configuration line
+    // the non-TTY log path prints.
+    if let Some(state) = progress_state.as_ref() {
+        state.push_banner(io_backend_label);
+    }
 
     // Parse mirror URLs up front so a malformed `--mirror` errors
     // out before any network traffic.
@@ -1188,6 +1196,11 @@ fn run_one<S: Sink>(
         sink,
         puncher,
         |info_cb: CheckpointInfo| -> io::Result<()> {
+            // Plumbed through in this commit but not yet persisted —
+            // the v4 checkpoint format has no slot for it. The next
+            // commit (format v5) wires it into the Checkpoint write.
+            let _ = &info_cb.decoder_state;
+
             // Throttle: write at most once per cadence floor.
             let elapsed = last_write_at.elapsed();
             let progressed = info_cb.source_position.saturating_sub(last_position);

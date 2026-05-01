@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use peel::cli::Cli;
+use peel::cli::{http_version_banner, Cli};
 use peel::coordinator::{run, ProgressEvent, ProgressFn};
 use peel::progress::{spawn_renderer, LogRenderer, ProgressState, TtyRenderer};
 
@@ -36,10 +36,17 @@ fn main() -> Result<()> {
     let stderr_is_tty = std::io::stderr().is_terminal();
     init_tracing(stderr_is_tty);
 
+    // Capture the resolved HTTP version up front so we can seed the
+    // progress renderer's banner with the same string `into_run_args`
+    // logs via `tracing::info!`. On a TTY the subscriber is at WARN
+    // and the info log is suppressed, so without this push the user
+    // would never see which transport was selected.
+    let http_banner = http_version_banner(cli.http_version.into()).to_string();
     let mut args = cli
         .into_run_args()
         .context("constructing the HTTP client")?;
     let state = ProgressState::new();
+    state.push_banner(http_banner);
     args.progress_state = Some(Arc::clone(&state));
     args.progress = Some(make_event_callback());
 

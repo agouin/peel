@@ -161,10 +161,35 @@ pub trait StreamingDecoder: Send {
     ///
     /// Returns `None` until the first frame completes, then transitions
     /// monotonically as later frame boundaries are observed.
-    /// Implementations guarantee that decoding from any returned offset
-    /// produces an output that, when concatenated to the output already
-    /// emitted, equals a fresh decode of the full source.
+    /// Implementations guarantee that decoding from any returned offset,
+    /// **paired with the [`Self::decoder_state`] snapshot taken in the
+    /// same step**, produces an output that, when concatenated to the
+    /// output already emitted, equals a fresh decode of the full
+    /// source. When `decoder_state()` returns `None` at the same step,
+    /// the offset alone is restartable via the format's normal factory
+    /// (this is the contract every in-tree decoder upholds today
+    /// except `lz4`'s mid-frame block boundaries).
     fn frame_boundary(&self) -> Option<ByteOffset>;
+
+    /// Opaque per-decoder state needed to resume from
+    /// [`Self::frame_boundary`] when the offset alone is *not*
+    /// sufficient.
+    ///
+    /// Returns `None` for boundaries where a freshly constructed
+    /// decoder reading the source from `frame_boundary` onward
+    /// produces byte-identical output to a clean run. This is the
+    /// default and is correct for every format whose frame boundaries
+    /// happen at format-level container ends (zstd frame, xz Stream,
+    /// gzip member, lz4 frame EndMark).
+    ///
+    /// Returns `Some(blob)` when the boundary is restart-safe only if
+    /// the resuming decoder is seeded with the captured state. Today
+    /// only `lz4`'s mid-frame block boundaries use this path. The
+    /// blob is opaque to the rest of the crate: only the originating
+    /// decoder module knows the layout.
+    fn decoder_state(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Type-erased function that constructs a decoder from a source.

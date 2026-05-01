@@ -31,7 +31,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -98,6 +98,14 @@ pub struct ProgressState {
     /// dispatch round. The renderer reads this for the bottleneck
     /// indicator.
     disk_bound: AtomicBool,
+    /// One-shot configuration banner lines (e.g. `io_backend=uring
+    /// depth=64`, `http_version=auto …`) that the TTY renderer should
+    /// print as scrollback above its in-place block. Mirrors the
+    /// `tracing::info!` lines the non-TTY [`LogRenderer`] gets via the
+    /// subscriber, since the TTY path suppresses INFO events to keep
+    /// the redraw region clean. Drained by [`spawn_renderer`] each
+    /// tick.
+    info_banner: Mutex<Vec<String>>,
 }
 
 impl ProgressState {
@@ -156,6 +164,33 @@ impl ProgressState {
     /// reached the cap; cleared on the next un-throttled tick.
     pub fn set_disk_bound(&self, on: bool) {
         self.disk_bound.store(on, Ordering::Release);
+    }
+
+    /// Append a configuration-banner line.
+    ///
+    /// Used to surface `tracing::info!` content (HTTP-version choice,
+    /// resolved IO backend) in the TTY progress UI: the subscriber
+    /// suppresses INFO events on a TTY so the in-place redraw isn't
+    /// corrupted, but the user still wants the same one-glance config
+    /// summary the non-TTY path prints. Drained on each render tick by
+    /// [`spawn_renderer`] and handed to [`ProgressRenderer::take_banner`].
+    pub fn push_banner(&self, line: String) {
+        // Mutex poisoning is ignored: a banner line is best-effort
+        // diagnostic output; losing one rather than panicking the
+        // renderer thread is the right trade-off.
+        if let Ok(mut v) = self.info_banner.lock() {
+            v.push(line);
+        }
+    }
+
+    /// Drain pending banner lines. Returns an empty `Vec` if a previous
+    /// thread poisoned the mutex (see [`Self::push_banner`]).
+    #[must_use]
+    pub fn take_banner(&self) -> Vec<String> {
+        self.info_banner
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
     }
 
     /// Compressed bytes downloaded but not yet consumed by the decoder
@@ -373,6 +408,14 @@ pub trait ProgressRenderer: Send {
     /// the next shell prompt starts on a fresh line below the
     /// in-place block).
     fn finish(&mut self);
+    /// Hand the renderer banner lines drained from
+    /// [`ProgressState::take_banner`]. Default no-op: only the
+    /// [`TtyRenderer`] paints them (the non-TTY path's banner equivalents
+    /// already arrive via the `tracing` subscriber's INFO output, so
+    /// surfacing them again here would double-print). Called by
+    /// [`spawn_renderer`] before each render tick when the state had
+    /// pending lines.
+    fn take_banner(&mut self, _lines: Vec<String>) {}
 }
 
 /// Visual style for the progress bar.
@@ -536,6 +579,10 @@ pub struct TtyRenderer<W: Write + Send> {
     bar_max_columns: usize,
     started_render: bool,
     last_lines_emitted: usize,
+    /// Banner lines staged for the next render tick. Printed once,
+    /// above the redraw block, then dropped — they belong to scrollback
+    /// rather than the in-place region.
+    pending_banner: Vec<String>,
 }
 
 impl<W: Write + Send> TtyRenderer<W> {
@@ -551,6 +598,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             bar_max_columns: MAX_BAR_COLUMNS,
             started_render: false,
             last_lines_emitted: 0,
+            pending_banner: Vec::new(),
         }
     }
 
@@ -568,6 +616,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             bar_max_columns: bar,
             started_render: false,
             last_lines_emitted: 0,
+            pending_banner: Vec::new(),
         }
     }
 
@@ -583,6 +632,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             bar_max_columns: MAX_BAR_COLUMNS,
             started_render: false,
             last_lines_emitted: 0,
+            pending_banner: Vec::new(),
         }
     }
 
@@ -655,6 +705,16 @@ impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
             self.started_render = true;
         }
 
+        // Pending banner lines are drained ahead of the body. Each one
+        // overwrites the corresponding row of the previous block (via
+        // the cursor-up above) and is then pushed into scrollback by
+        // the body lines that follow. They are not counted in
+        // `last_lines_emitted` so the next tick's cursor-up doesn't
+        // try to redraw over them.
+        for line in self.pending_banner.drain(..) {
+            let _ = writeln!(self.out, "{line}\x1b[K");
+        }
+
         let _ = writeln!(self.out, "{l1}\x1b[K");
         let _ = writeln!(self.out, "{l2}\x1b[K");
         let _ = writeln!(self.out, "{l3}\x1b[K");
@@ -670,6 +730,10 @@ impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
         // We still flush defensively in case the buffer is holding
         // anything.
         let _ = self.out.flush();
+    }
+
+    fn take_banner(&mut self, lines: Vec<String>) {
+        self.pending_banner.extend(lines);
     }
 }
 
@@ -793,6 +857,12 @@ where
             // extra final render after the done flag flips so the user
             // sees the final counters.
             loop {
+                // Hand any pending banner lines (e.g. `io_backend=…`,
+                // `http_version=…`) to the renderer ahead of the body.
+                let banner = state.take_banner();
+                if !banner.is_empty() {
+                    renderer.take_banner(banner);
+                }
                 let snap = state.snapshot();
                 renderer.render(&snap);
                 if snap.done {
@@ -1631,6 +1701,66 @@ mod tests {
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
         assert!(out.contains("\x1b[3A"));
+    }
+
+    #[test]
+    fn progress_state_banner_round_trip() {
+        let s = ProgressState::new();
+        s.push_banner("io_backend=uring depth=64".into());
+        s.push_banner("http_version=auto (ALPN-negotiated H1/H2)".into());
+        let lines = s.take_banner();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "io_backend=uring depth=64");
+        assert_eq!(lines[1], "http_version=auto (ALPN-negotiated H1/H2)");
+        // A second drain returns nothing — `take_banner` empties the queue.
+        assert!(s.take_banner().is_empty());
+    }
+
+    #[test]
+    fn tty_renderer_take_banner_prints_lines_above_body_once() {
+        let buf: Vec<u8> = Vec::new();
+        let mut r = TtyRenderer::with_bar_width(buf, 12);
+        let snap = ProgressSnapshot {
+            total_size: Some(2000),
+            bytes_downloaded: 100,
+            bytes_extracted: 0,
+            extracted_estimate: None,
+            active_workers: 1,
+            total_workers: 1,
+            started: true,
+            done: false,
+            bytes_decoded_input: 0,
+            max_disk_buffer: None,
+            disk_bound: false,
+        };
+        // First render with two banner lines; the renderer should print
+        // them ahead of the body block.
+        r.take_banner(vec![
+            "io_backend=blocking (forced)".into(),
+            "http_version=h2 (forced; h2c prior-knowledge over plaintext)".into(),
+        ]);
+        r.render(&snap);
+        // Second render with no new banner lines; body redraws via
+        // cursor-up by 3 (NOT 5 — the banner is scrollback now).
+        r.render(&snap);
+        let out = String::from_utf8(r.out).expect("utf-8");
+        // Banner lines appear exactly once.
+        assert_eq!(
+            out.matches("io_backend=blocking (forced)").count(),
+            1,
+            "io_backend banner should print exactly once: {out:?}"
+        );
+        assert_eq!(
+            out.matches("http_version=h2").count(),
+            1,
+            "http_version banner should print exactly once: {out:?}"
+        );
+        // Body redraw moves up 3 lines, never 5.
+        assert!(out.contains("\x1b[3A"), "expected cursor-up by 3: {out:?}");
+        assert!(
+            !out.contains("\x1b[5A"),
+            "must not include banner lines in cursor-up count: {out:?}"
+        );
     }
 
     #[test]

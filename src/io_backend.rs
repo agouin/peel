@@ -232,9 +232,15 @@ pub enum IoBackendChoice {
 /// Resolve the user's [`IoBackendChoice`] into a concrete
 /// [`IoBackend`] for the current platform and kernel.
 ///
-/// `Auto` may downgrade silently (with a `tracing::warn!`) to the
-/// blocking backend; `Uring` errors out cleanly when the kernel does
-/// not support it. `Mmap` is a *file-IO-only* path: the returned
+/// Returns a `(backend, label)` pair: `label` is the short human-readable
+/// summary (e.g. `"io_backend=uring depth=64"`) that selection emits via
+/// `tracing::info!` and that callers may also surface elsewhere (the
+/// `peel` binary forwards it to the TTY progress renderer's banner so
+/// the configuration is visible even with INFO suppressed).
+///
+/// `Auto` may downgrade silently to the blocking backend (the label
+/// records that explicitly); `Uring` errors out cleanly when the kernel
+/// does not support it. `Mmap` is a *file-IO-only* path: the returned
 /// [`IoBackend`] is always the blocking implementation (for the HTTP
 /// client's sockets); the coordinator handles the actual mmap of the
 /// sparse file separately via
@@ -246,11 +252,15 @@ pub enum IoBackendChoice {
 /// Returns an [`io::Error`] when [`IoBackendChoice::Uring`] or
 /// [`IoBackendChoice::Mmap`] is selected on a platform that does not
 /// support it.
-pub fn select_backend(choice: IoBackendChoice, workers: u32) -> io::Result<Arc<dyn IoBackend>> {
+pub fn select_backend(
+    choice: IoBackendChoice,
+    workers: u32,
+) -> io::Result<(Arc<dyn IoBackend>, String)> {
     match choice {
         IoBackendChoice::Blocking => {
-            tracing::info!("io_backend=blocking (forced)");
-            Ok(default_backend())
+            let label = "io_backend=blocking (forced)".to_string();
+            tracing::info!("{label}");
+            Ok((default_backend(), label))
         }
         IoBackendChoice::Auto => Ok(select_auto(workers)),
         IoBackendChoice::Uring => select_uring(),
@@ -259,18 +269,19 @@ pub fn select_backend(choice: IoBackendChoice, workers: u32) -> io::Result<Arc<d
 }
 
 #[cfg(target_os = "linux")]
-fn select_mmap_socket() -> io::Result<Arc<dyn IoBackend>> {
+fn select_mmap_socket() -> io::Result<(Arc<dyn IoBackend>, String)> {
     // The mmap storage backend changes the *file* IO path only. The
     // HTTP client still needs an `IoBackend` for `connect`/`recv`/
     // `send`; the §7b uring backend is overkill for that on its own,
     // so we deliberately pair `mmap` with the always-available
     // blocking socket backend.
-    tracing::info!("io_backend=mmap (file IO via mmap, sockets via blocking)");
-    Ok(default_backend())
+    let label = "io_backend=mmap (file IO via mmap, sockets via blocking)".to_string();
+    tracing::info!("{label}");
+    Ok((default_backend(), label))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn select_mmap_socket() -> io::Result<Arc<dyn IoBackend>> {
+fn select_mmap_socket() -> io::Result<(Arc<dyn IoBackend>, String)> {
     Err(io::Error::other(
         "--io-backend mmap is only supported on Linux \
          (madvise(MADV_REMOVE) is Linux-specific); \
@@ -279,27 +290,31 @@ fn select_mmap_socket() -> io::Result<Arc<dyn IoBackend>> {
 }
 
 #[cfg(target_os = "linux")]
-fn select_auto(workers: u32) -> Arc<dyn IoBackend> {
+fn select_auto(workers: u32) -> (Arc<dyn IoBackend>, String) {
     if let Some(b) = uring::UringBackend::probe(workers) {
-        tracing::info!("io_backend=uring depth={}", b.ring_depth());
-        return Arc::new(b);
+        let label = format!("io_backend=uring depth={}", b.ring_depth());
+        tracing::info!("{label}");
+        return (Arc::new(b), label);
     }
-    tracing::info!("io_backend=blocking (uring unavailable, downgraded)");
-    default_backend()
+    let label = "io_backend=blocking (uring unavailable, downgraded)".to_string();
+    tracing::info!("{label}");
+    (default_backend(), label)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn select_auto(_workers: u32) -> Arc<dyn IoBackend> {
-    tracing::info!("io_backend=blocking (uring is Linux-only)");
-    default_backend()
+fn select_auto(_workers: u32) -> (Arc<dyn IoBackend>, String) {
+    let label = "io_backend=blocking (uring is Linux-only)".to_string();
+    tracing::info!("{label}");
+    (default_backend(), label)
 }
 
 #[cfg(target_os = "linux")]
-fn select_uring() -> io::Result<Arc<dyn IoBackend>> {
+fn select_uring() -> io::Result<(Arc<dyn IoBackend>, String)> {
     match uring::UringBackend::try_new(uring::DEFAULT_RING_DEPTH) {
         Ok(b) => {
-            tracing::info!("io_backend=uring depth={} (forced)", b.ring_depth());
-            Ok(Arc::new(b))
+            let label = format!("io_backend=uring depth={} (forced)", b.ring_depth());
+            tracing::info!("{label}");
+            Ok((Arc::new(b), label))
         }
         Err(e) => Err(io::Error::other(format!(
             "--io-backend uring requested but the kernel does not support it: {}",
@@ -309,7 +324,7 @@ fn select_uring() -> io::Result<Arc<dyn IoBackend>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn select_uring() -> io::Result<Arc<dyn IoBackend>> {
+fn select_uring() -> io::Result<(Arc<dyn IoBackend>, String)> {
     Err(io::Error::other(
         "--io-backend uring is only supported on Linux; \
          use --io-backend blocking or remove the flag",
@@ -496,17 +511,21 @@ mod tests {
 
     #[test]
     fn select_blocking_returns_blocking() {
-        let b = select_backend(IoBackendChoice::Blocking, 4).expect("blocking always works");
+        let (b, label) =
+            select_backend(IoBackendChoice::Blocking, 4).expect("blocking always works");
         assert_eq!(b.name(), "blocking");
+        assert!(label.starts_with("io_backend=blocking"), "{label}");
     }
 
     #[test]
     fn select_auto_yields_a_backend() {
         // Whatever we get back must be functional; on darwin / non-uring
         // Linux we get blocking, on uring-capable Linux we get uring.
-        let b = select_backend(IoBackendChoice::Auto, 4).expect("auto always picks something");
+        let (b, label) =
+            select_backend(IoBackendChoice::Auto, 4).expect("auto always picks something");
         let name = b.name();
         assert!(matches!(name, "blocking" | "uring"));
+        assert!(label.starts_with("io_backend="), "{label}");
     }
 
     #[cfg(not(target_os = "linux"))]

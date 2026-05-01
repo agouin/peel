@@ -119,7 +119,7 @@ fn select_backend_auto_yields_uring_when_kernel_supports() {
     // every Linux runner — kernels in containers may lack support.
     // The test instead verifies that auto returns *some* working
     // backend whose name is one of the two we expect.
-    let backend = select_backend(IoBackendChoice::Auto, 4).expect("auto picks something");
+    let (backend, _label) = select_backend(IoBackendChoice::Auto, 4).expect("auto picks something");
     let name = backend.name();
     assert!(
         matches!(name, "blocking" | "uring"),
@@ -129,8 +129,8 @@ fn select_backend_auto_yields_uring_when_kernel_supports() {
 
 #[test]
 fn select_backend_uring_round_trips_through_sparse_file_when_available() {
-    let backend = match select_backend(IoBackendChoice::Uring, 4) {
-        Ok(b) => b,
+    let (backend, _label) = match select_backend(IoBackendChoice::Uring, 4) {
+        Ok(pair) => pair,
         Err(_) => {
             eprintln!("skipping: --io-backend uring unavailable on this kernel");
             return;

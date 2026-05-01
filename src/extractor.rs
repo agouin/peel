@@ -125,7 +125,7 @@ impl Default for ExtractorConfig {
 /// at exactly the right moment: the decoder has just completed a frame
 /// **and** the sink reports it is at a member boundary, so the source
 /// position recorded here is a restart-safe point for resume.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CheckpointInfo {
     /// Source byte offset immediately past the most recently completed
     /// frame. Resume seeks the decoder back to this offset.
@@ -137,6 +137,14 @@ pub struct CheckpointInfo {
     /// Running count of quiescent checkpoints observed in this run,
     /// inclusive of this one. Useful for throttling cadence.
     pub quiescent_index: u64,
+    /// Opaque per-decoder state captured at the same step the
+    /// boundary advanced, when the decoder needs more than the offset
+    /// alone to resume cleanly. See
+    /// [`StreamingDecoder::decoder_state`]. `None` for decoders whose
+    /// frame boundaries are restartable from the offset alone (the
+    /// historical contract; everything but lz4's mid-frame boundaries
+    /// today).
+    pub decoder_state: Option<Vec<u8>>,
 }
 
 /// Wall-clock and byte-volume statistics for one extraction.
@@ -384,6 +392,7 @@ impl Extractor {
                             bytes_in: stats.bytes_in,
                             bytes_out: adapter.bytes_out,
                             quiescent_index: stats.quiescent_checkpoints,
+                            decoder_state: decoder.decoder_state(),
                         };
                         on_checkpoint(info).map_err(ExtractorError::Observer)?;
                     }

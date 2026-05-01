@@ -247,6 +247,21 @@ impl From<HttpVersionArg> for HttpVersion {
     }
 }
 
+/// One-line summary of the resolved [`HttpVersion`].
+///
+/// Single source of truth for the `http_version=...` banner: emitted
+/// via `tracing::info!` on every run, and surfaced via the progress
+/// renderer's banner so TTY users — whose INFO output is suppressed
+/// to keep the in-place block clean — still see the configuration.
+#[must_use]
+pub fn http_version_banner(v: HttpVersion) -> &'static str {
+    match v {
+        HttpVersion::Auto => "http_version=auto (ALPN-negotiated H1/H2)",
+        HttpVersion::Http1Only => "http_version=h1 (forced)",
+        HttpVersion::Http2Only => "http_version=h2 (forced; h2c prior-knowledge over plaintext)",
+    }
+}
+
 /// Errors produced by [`Cli::into_run_args`].
 ///
 /// Wraps [`crate::http::ClientError`] (HTTP setup) and adds variants
@@ -324,14 +339,10 @@ impl Cli {
         // `io_backend=...` line that `crate::io_backend::select_backend`
         // emits, so the two appear together in the early subscriber
         // output. With `Auto` the actual H1/H2 outcome is per-origin
-        // via ALPN and only known after the first connection.
-        match http_version {
-            HttpVersion::Auto => tracing::info!("http_version=auto (ALPN-negotiated H1/H2)"),
-            HttpVersion::Http1Only => tracing::info!("http_version=h1 (forced)"),
-            HttpVersion::Http2Only => {
-                tracing::info!("http_version=h2 (forced; h2c prior-knowledge over plaintext)")
-            }
-        }
+        // via ALPN and only known after the first connection. The
+        // `peel` binary also forwards this same string to the TTY
+        // progress renderer's banner; see `http_version_banner`.
+        tracing::info!("{}", http_version_banner(http_version));
         let client = Client::with_config(ClientConfig {
             http_version,
             ..ClientConfig::default()
