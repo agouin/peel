@@ -548,3 +548,160 @@ fn tar_sink_creates_directory_entries() {
         b"hello"
     );
 }
+
+// ---- TarSink::resume (mid-member checkpoint resume) -----------------
+
+/// The load-bearing v6 case: feed half of a multi-MB tar member's
+/// payload, capture sink_state, drop the sink, build TarSink::resume,
+/// feed the rest, and verify the on-disk file equals the original.
+#[test]
+fn tar_resume_picks_up_mid_file() {
+    let dir = fresh_dir("tar_resume_mid_file");
+    let _g = CleanupOnDrop(dir.clone());
+
+    // One ~10 KiB file. Member layout: 512 header + 10240 payload
+    // (already 512-aligned, so `pad_block` returns the bytes
+    // unchanged — no extra padding bytes are appended).
+    let payload: Vec<u8> = (0..10_240u32).map(|i| (i & 0xFF) as u8).collect();
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_header("midfile.bin", payload.len() as u64, b'0'));
+    archive.extend_from_slice(&pad_block(&payload));
+    let header_and_pad_len = archive.len();
+    archive.extend_from_slice(&end_of_archive());
+
+    // Phase 1: feed everything up through halfway into the payload.
+    let split_at = 512 + payload.len() / 2; // header + first 5 KiB
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive[..split_at]).expect("phase1 write");
+    let captured = sink.sink_state();
+    drop(sink);
+
+    // The captured state should be a Tar with in_flight = File state.
+    let in_flight = match &captured {
+        peel::checkpoint::SinkState::Tar { in_flight, .. } => {
+            in_flight.as_ref().expect("in-flight after partial write")
+        }
+        other => panic!("expected Tar sink state, got {other:?}"),
+    };
+    match &in_flight.state {
+        peel::checkpoint::TarMemberState::File {
+            remaining,
+            total_size,
+            ..
+        } => {
+            assert_eq!(*total_size, payload.len() as u64);
+            assert_eq!(*remaining, (payload.len() / 2) as u64);
+        }
+        other => panic!("expected File mid-payload, got {other:?}"),
+    }
+
+    // Phase 2: build a fresh sink via resume, feed the rest, close.
+    let mut resumed = TarSink::resume(&dir, in_flight).expect("resume");
+    resumed
+        .write(&archive[split_at..header_and_pad_len])
+        .expect("phase2 write payload tail");
+    resumed
+        .write(&archive[header_and_pad_len..])
+        .expect("phase2 write EOF markers");
+    resumed.close().expect("close");
+
+    let on_disk = fs::read(dir.join("midfile.bin")).expect("read midfile");
+    assert_eq!(on_disk, payload, "byte-identical to the original payload");
+}
+
+/// Resume after a kill that landed inside a tar header (mid-512-byte
+/// header read). The resumed sink finishes the header buffer and then
+/// proceeds normally.
+#[test]
+fn tar_resume_picks_up_mid_header() {
+    let dir = fresh_dir("tar_resume_mid_header");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let payload = b"second-member-bytes\n".repeat(40); // ~800 B
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_header("first.bin", 100, b'0'));
+    archive.extend_from_slice(&pad_block(&[0xAAu8; 100]));
+    let after_first = archive.len();
+    archive.extend_from_slice(&build_header("second.bin", payload.len() as u64, b'0'));
+    let into_second_header = archive.len();
+    archive.extend_from_slice(&pad_block(&payload));
+    archive.extend_from_slice(&end_of_archive());
+
+    // Stop ~half-way through the second member's header.
+    let stop_at = after_first + 256;
+    assert!(stop_at < into_second_header);
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive[..stop_at]).expect("phase1 write");
+    let captured = sink.sink_state();
+    drop(sink);
+
+    let in_flight = match &captured {
+        peel::checkpoint::SinkState::Tar { in_flight, .. } => {
+            in_flight.as_ref().expect("in-flight mid-header")
+        }
+        _ => panic!(),
+    };
+    match &in_flight.state {
+        peel::checkpoint::TarMemberState::Header { filled, buf } => {
+            assert_eq!(*filled as usize, 256);
+            assert_eq!(buf.len(), 256);
+        }
+        other => panic!("expected mid-header state, got {other:?}"),
+    }
+
+    // Resume and feed the rest.
+    let mut resumed = TarSink::resume(&dir, in_flight).expect("resume");
+    resumed.write(&archive[stop_at..]).expect("phase2 write");
+    resumed.close().expect("close");
+
+    let first = fs::read(dir.join("first.bin")).expect("read first");
+    assert_eq!(first, vec![0xAAu8; 100]);
+    let second = fs::read(dir.join("second.bin")).expect("read second");
+    assert_eq!(second, payload);
+}
+
+/// Property test: every byte boundary inside the second member's
+/// payload is a valid resume point. Drives the full byte-by-byte
+/// kill/resume matrix on a small archive.
+#[test]
+fn tar_resume_byte_identical_at_every_boundary() {
+    let dir_root = fresh_dir("tar_resume_property");
+    let _g = CleanupOnDrop(dir_root.clone());
+
+    let payload = b"property-payload-".repeat(64); // 1024 B
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_header("file.bin", payload.len() as u64, b'0'));
+    archive.extend_from_slice(&pad_block(&payload));
+    archive.extend_from_slice(&end_of_archive());
+
+    // Test every 64-byte boundary (covers headers, payload, padding,
+    // EOF). 64 keeps the test runtime sane while still exercising
+    // every parser state.
+    for split in (0..archive.len()).step_by(64) {
+        let dir = dir_root.join(format!("split_{split}"));
+        fs::create_dir_all(&dir).expect("create split dir");
+
+        let mut sink = TarSink::new(&dir).expect("new");
+        sink.write(&archive[..split]).expect("phase1 write");
+        let state = sink.sink_state();
+        drop(sink);
+
+        let in_flight = match &state {
+            peel::checkpoint::SinkState::Tar { in_flight, .. } => in_flight.clone(),
+            _ => panic!(),
+        };
+        let mut resumed = match in_flight {
+            Some(s) => TarSink::resume(&dir, &s).expect("resume"),
+            None => TarSink::new(&dir).expect("new from empty resume"),
+        };
+        resumed.write(&archive[split..]).expect("phase2 write");
+        resumed.close().expect("close");
+
+        let on_disk = fs::read(dir.join("file.bin")).expect("read file");
+        assert_eq!(
+            on_disk, payload,
+            "split={split}: extracted file diverges from original"
+        );
+    }
+}

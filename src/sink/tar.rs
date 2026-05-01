@@ -193,6 +193,162 @@ impl TarSink {
         })
     }
 
+    /// Construct a [`TarSink`] pre-seeded from a previously captured
+    /// [`crate::checkpoint::TarSinkState`].
+    ///
+    /// `state` was produced by [`Sink::sink_state`] on the prior
+    /// (killed) run's sink, and the on-disk extraction is whatever
+    /// the killed run had durably written before the checkpoint
+    /// fired. The resume path:
+    ///
+    /// 1. Canonicalizes `root` (the same way [`Self::new`] does).
+    /// 2. For [`crate::checkpoint::TarMemberState::File`]: opens
+    ///    the recorded path under `root`, truncates it to
+    ///    `total_size - remaining` (so any torn write past the
+    ///    checkpoint is discarded), and seeks to that offset.
+    ///    Restores the live `State::File` ready to receive the
+    ///    payload's continuation.
+    /// 3. For other variants: rebuilds the `State` enum directly
+    ///    from the saved fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Io`] if `root` can't be canonicalized
+    /// or the in-flight file can't be reopened at the recorded
+    /// offset; [`SinkError::PathEscape`] if the recorded file path
+    /// lies outside `root`.
+    pub fn resume<P: AsRef<Path>>(
+        root: P,
+        state: &crate::checkpoint::TarSinkState,
+    ) -> Result<Self, SinkError> {
+        use crate::checkpoint::TarMemberState;
+
+        let root_ref = root.as_ref();
+        let canonical_root = root_ref.canonicalize().map_err(|source| SinkError::Io {
+            path: root_ref.to_path_buf(),
+            source,
+        })?;
+
+        let live_state = match &state.state {
+            TarMemberState::Header { filled, buf: saved } => {
+                if *filled > BLOCK as u32 || saved.len() != *filled as usize {
+                    return Err(SinkError::Io {
+                        path: canonical_root.clone(),
+                        source: std::io::Error::other(format!(
+                            "resume: header filled={filled} buf.len()={}",
+                            saved.len(),
+                        )),
+                    });
+                }
+                let mut buf = Box::new([0u8; BLOCK]);
+                buf[..saved.len()].copy_from_slice(saved);
+                State::Header {
+                    filled: *filled as usize,
+                    buf,
+                }
+            }
+            TarMemberState::File {
+                remaining,
+                padding,
+                path,
+                total_size,
+            } => {
+                if *remaining > *total_size {
+                    return Err(SinkError::Io {
+                        path: canonical_root.clone(),
+                        source: std::io::Error::other(format!(
+                            "resume: file remaining {remaining} > total_size {total_size}",
+                        )),
+                    });
+                }
+                let path_buf = PathBuf::from(path);
+                if !path_buf.starts_with(&canonical_root) {
+                    return Err(SinkError::PathEscape {
+                        entry: path.clone(),
+                        root: canonical_root.clone(),
+                    });
+                }
+                let already_written = total_size.saturating_sub(*remaining);
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&path_buf)
+                    .map_err(|source| SinkError::Io {
+                        path: path_buf.clone(),
+                        source,
+                    })?;
+                // Truncate any tail past the checkpoint, then seek
+                // to the resume position. The truncate-then-seek
+                // shape mirrors `RawSink::resume`.
+                file.set_len(already_written)
+                    .map_err(|source| SinkError::Io {
+                        path: path_buf.clone(),
+                        source,
+                    })?;
+                use std::io::{Seek, SeekFrom};
+                file.seek(SeekFrom::Start(already_written))
+                    .map_err(|source| SinkError::Io {
+                        path: path_buf.clone(),
+                        source,
+                    })?;
+                State::File {
+                    remaining: *remaining,
+                    padding: u16::try_from(*padding).map_err(|_| SinkError::Io {
+                        path: path_buf.clone(),
+                        source: std::io::Error::other(format!(
+                            "resume: file padding {padding} ≥ 65536",
+                        )),
+                    })?,
+                    file,
+                    path: path_buf,
+                    total_size: *total_size,
+                }
+            }
+            TarMemberState::PaxData {
+                remaining,
+                padding,
+                buf,
+            } => State::PaxData {
+                remaining: *remaining,
+                padding: u16::try_from(*padding).map_err(|_| SinkError::Io {
+                    path: canonical_root.clone(),
+                    source: std::io::Error::other(
+                        format!("resume: pax padding {padding} ≥ 65536",),
+                    ),
+                })?,
+                buf: buf.clone(),
+            },
+            TarMemberState::LongName {
+                remaining,
+                padding,
+                buf,
+                is_link,
+            } => State::LongName {
+                remaining: *remaining,
+                padding: u16::try_from(*padding).map_err(|_| SinkError::Io {
+                    path: canonical_root.clone(),
+                    source: std::io::Error::other(format!(
+                        "resume: longname padding {padding} ≥ 65536",
+                    )),
+                })?,
+                buf: buf.clone(),
+                is_link: *is_link,
+            },
+            TarMemberState::Finished => State::Finished,
+        };
+
+        Ok(Self {
+            root: canonical_root,
+            state: live_state,
+            archive_offset: state.archive_offset,
+            zero_blocks_seen: state.zero_blocks_seen,
+            pending_path: state.pending_path.clone(),
+            pending_size: state.pending_size,
+            poisoned: false,
+        })
+    }
+
     /// Borrow the configured extraction root.
     #[must_use]
     pub fn root(&self) -> &Path {
