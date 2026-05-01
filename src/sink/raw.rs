@@ -33,6 +33,12 @@ pub struct RawSink {
     /// The file every byte goes to. `Some` while the sink is live;
     /// taken by [`Sink::close`] to drop and flush the descriptor.
     file: Option<File>,
+    /// Total bytes successfully written through [`Sink::write`] —
+    /// initialized to `0` by [`Self::create`] / [`Self::wrap`] and to
+    /// the existing offset by [`Self::resume`] so a checkpoint
+    /// captured immediately after a resume reflects the correct
+    /// already-on-disk byte count.
+    bytes_written: u64,
 }
 
 impl RawSink {
@@ -60,12 +66,17 @@ impl RawSink {
 
     /// Wrap an already-open [`File`] in a [`RawSink`].
     ///
-    /// `path` is recorded only for diagnostics.
+    /// `path` is recorded only for diagnostics. `bytes_written` is
+    /// seeded to `0` — callers that wrap a partially-written file
+    /// should use [`Self::resume`] (or set the field afterward via
+    /// the resume path) so checkpoint state reflects the on-disk
+    /// length.
     #[must_use]
     pub fn wrap(path: PathBuf, file: File) -> Self {
         Self {
             path,
             file: Some(file),
+            bytes_written: 0,
         }
     }
 
@@ -109,7 +120,9 @@ impl RawSink {
                 path: path.clone(),
                 source,
             })?;
-        Ok(Self::wrap(path, file))
+        let mut sink = Self::wrap(path, file);
+        sink.bytes_written = bytes_written;
+        Ok(sink)
     }
 
     /// Return a borrow of the underlying file. Useful for tests that
@@ -136,11 +149,19 @@ impl Sink for RawSink {
         file.write_all(buf).map_err(|source| SinkError::Io {
             path: path.clone(),
             source,
-        })
+        })?;
+        self.bytes_written = self.bytes_written.saturating_add(buf.len() as u64);
+        Ok(())
     }
 
     fn is_quiescent(&self) -> bool {
         true
+    }
+
+    fn sink_state(&self) -> crate::checkpoint::SinkState {
+        crate::checkpoint::SinkState::Raw {
+            bytes_written: self.bytes_written,
+        }
     }
 
     fn close(mut self) -> Result<(), SinkError> {

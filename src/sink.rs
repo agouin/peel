@@ -54,6 +54,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::checkpoint::SinkState;
+
 /// Errors produced by [`Sink`] implementations.
 ///
 /// Each variant carries enough structured context that the message alone
@@ -195,7 +197,26 @@ pub trait Sink: Send {
     /// observation to decide when to flush a checkpoint. A sink that
     /// reports `false` simply defers the next checkpoint to the next
     /// quiescent moment.
+    ///
+    /// Sinks that support full mid-stream resume (i.e. their
+    /// [`Self::sink_state`] captures enough state to restart from
+    /// any byte position) may return `true` unconditionally.
     fn is_quiescent(&self) -> bool;
+
+    /// Snapshot of the sink's resume state at the current moment.
+    ///
+    /// Called by the coordinator's checkpoint observer at every
+    /// quiescent advance; the returned [`SinkState`] is persisted
+    /// verbatim into the checkpoint file. The companion construction
+    /// path (e.g. `RawSink::resume`, `TarSink::resume`) consumes the
+    /// same shape on the next invocation to pick up where the
+    /// killed run left off.
+    ///
+    /// Implementations must produce a state whose corresponding
+    /// resume constructor reproduces the sink's *exact* on-disk
+    /// effect for any subsequent input bytes — i.e. byte-identical
+    /// extraction across kill-resume boundaries.
+    fn sink_state(&self) -> SinkState;
 
     /// Finalize the sink.
     ///

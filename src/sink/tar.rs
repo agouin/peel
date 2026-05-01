@@ -124,6 +124,11 @@ enum State {
         file: File,
         /// Resolved on-disk path; carried for error context only.
         path: PathBuf,
+        /// Total payload size declared by the tar header. Used by
+        /// the checkpoint snapshotter to derive how many bytes have
+        /// already been written (`total_size - remaining`); not
+        /// otherwise consulted by the live parser.
+        total_size: u64,
     },
     /// Collecting a PAX 'x' extended header's body into a buffer.
     PaxData {
@@ -224,6 +229,7 @@ impl TarSink {
                     padding,
                     file,
                     path,
+                    total_size: _,
                 } => {
                     if *remaining > 0 {
                         let want = usize::try_from(*remaining)
@@ -431,6 +437,7 @@ impl TarSink {
                         padding,
                         file,
                         path,
+                        total_size: entry_size,
                     }
                 };
                 Ok(())
@@ -698,6 +705,60 @@ impl Sink for TarSink {
             }
             State::Finished => true,
             _ => false,
+        }
+    }
+
+    fn sink_state(&self) -> crate::checkpoint::SinkState {
+        use crate::checkpoint::{TarMemberState, TarSinkState};
+        let path_to_string = |p: &Path| p.to_string_lossy().into_owned();
+        let parser_state = match &self.state {
+            State::Header { filled, buf } => TarMemberState::Header {
+                filled: *filled as u32,
+                buf: buf[..*filled].to_vec(),
+            },
+            State::File {
+                remaining,
+                padding,
+                path,
+                total_size,
+                ..
+            } => TarMemberState::File {
+                remaining: *remaining,
+                padding: u32::from(*padding),
+                path: path_to_string(path),
+                total_size: *total_size,
+            },
+            State::PaxData {
+                remaining,
+                padding,
+                buf,
+            } => TarMemberState::PaxData {
+                remaining: *remaining,
+                padding: u32::from(*padding),
+                buf: buf.clone(),
+            },
+            State::LongName {
+                remaining,
+                padding,
+                buf,
+                is_link,
+            } => TarMemberState::LongName {
+                remaining: *remaining,
+                padding: u32::from(*padding),
+                buf: buf.clone(),
+                is_link: *is_link,
+            },
+            State::Finished => TarMemberState::Finished,
+        };
+        crate::checkpoint::SinkState::Tar {
+            members_completed: Vec::new(),
+            in_flight: Some(TarSinkState {
+                archive_offset: self.archive_offset,
+                zero_blocks_seen: self.zero_blocks_seen,
+                pending_path: self.pending_path.clone(),
+                pending_size: self.pending_size,
+                state: parser_state,
+            }),
         }
     }
 

@@ -602,6 +602,11 @@ mod tests {
         fn is_quiescent(&self) -> bool {
             self.is_quiescent
         }
+        fn sink_state(&self) -> crate::checkpoint::SinkState {
+            crate::checkpoint::SinkState::Raw {
+                bytes_written: self.bytes.len() as u64,
+            }
+        }
         fn close(self) -> Result<(), SinkError> {
             Ok(())
         }
@@ -638,6 +643,11 @@ mod tests {
         }
         fn is_quiescent(&self) -> bool {
             self.quiescent
+        }
+        fn sink_state(&self) -> crate::checkpoint::SinkState {
+            crate::checkpoint::SinkState::Raw {
+                bytes_written: self.bytes.len() as u64,
+            }
         }
         fn close(self) -> Result<(), SinkError> {
             Ok(())
