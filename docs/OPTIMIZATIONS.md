@@ -165,31 +165,30 @@ filed below as `O.7b`.
 
 ---
 
-### O.7b lz4 per-block frame boundaries (round-two follow-on)
+### O.7b lz4 per-block frame boundaries
 
-**What**: surface *per-block* frame boundaries inside a single LZ4
-frame, instead of only the end-of-frame boundary `PLAN_v2.md` §4
-settled for. Today a single-frame `.tar.lz4` admits no within-source
-restart point and resumes re-decode the whole frame — for a typical
-single-block-per-tar-member encoding this is fine, but a producer
-that emits one big multi-megablock frame pays the full re-decode cost
-on resume.
+**Status: delivered (2026-04-30).** `frame_boundary()` now advances
+on every successful block decode inside an LZ4 frame, paired with a
+`decoder_state()` blob that carries the per-frame parameters
+([`FrameContext`]: `block_max_size`, checksum flags, optional
+content size, `bytes_decompressed`, and the running XXH32 content
+hasher). The checkpoint format bumped to v5 with an opaque
+[`Checkpoint::decoder_state`] field; older binaries refuse v5 with
+[`CheckpointError::UnsupportedVersion`]. The decoder registry gains
+a parallel `DecoderResumeFactory` hook (registered for `lz4` only);
+the coordinator dispatches via the registry when a checkpoint
+carries a blob, falling through to the regular factory otherwise.
 
-**Why deferred**: round-one would need to extend the [`Checkpoint`]
-format with a serialized [`FrameContext`] (`block_max_size`,
-checksum flags, optional content size, the running content hash, …)
-so a freshly constructed decoder restarted at a mid-frame block
-boundary could continue. That's a `format_version` bump and a wider
-diff than the round-one slot wants. Promote when a real corpus
-exists where the slow-resume cost matters.
-
-**Sketch**: extend `checkpoint::SinkState` (or a new sibling) with
-the per-frame parameters captured by `parse_frame_header`. On resume,
-seed the decoder's `State::InFrame { ctx }` from the checkpoint
-instead of starting in `BetweenFrames`. Surface every post-block
-offset through `frame_boundary` once that contract is genuine.
+A single-frame `.tar.lz4` whose archive has many tar members
+(e.g. Polkachu's chain snapshots) now produces a checkpoint at
+every block-boundary that aligns with a tar-member boundary,
+instead of zero checkpoints across the entire run. A `kill -9`
+mid-extraction loses at most one block's worth of decoded output
+(64 KiB to 4 MiB depending on the producer's block-max-size).
 
 [`Checkpoint`]: ../src/checkpoint.rs
+[`Checkpoint::decoder_state`]: ../src/checkpoint.rs
+[`CheckpointError::UnsupportedVersion`]: ../src/checkpoint.rs
 [`FrameContext`]: ../src/decode/lz4.rs
 
 ---

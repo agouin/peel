@@ -401,7 +401,10 @@ fn registry_factory_decodes_single_frame_lz4() {
         "the final boundary must be the post-EndMark offset"
     );
     for b in &frame_boundaries {
-        assert!(*b <= frame_len, "boundary {b} exceeds frame_len {frame_len}");
+        assert!(
+            *b <= frame_len,
+            "boundary {b} exceeds frame_len {frame_len}"
+        );
     }
     assert_eq!(decoder.bytes_consumed().get(), frame_len);
 }

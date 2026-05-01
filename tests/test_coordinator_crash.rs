@@ -327,6 +327,105 @@ fn encode_lz4_frames(payloads: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Encode the entire `payload` as a *single* uncompressed LZ4 frame
+/// whose body is split into sequential blocks of at most
+/// `block_max` bytes — the worst-case shape `OPTIMIZATIONS.md` §O.7b
+/// targets (one big frame, many blocks). The producer only emits
+/// the four valid spec values for `block_max` (64K, 256K, 1M, 4M);
+/// any other value panics.
+fn encode_lz4_multi_block_single_frame(payload: &[u8], block_max: u32) -> Vec<u8> {
+    use crate::xxh32_nocrate as xxh32_local;
+    let bd_size_code: u8 = match block_max {
+        65_536 => 4,
+        262_144 => 5,
+        1_048_576 => 6,
+        4_194_304 => 7,
+        other => panic!("invalid block_max {other}"),
+    };
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x184D_2204u32.to_le_bytes());
+    let flg: u8 = 0b0110_0000; // version=01, block-independent, no checksums, no content size
+    let bd: u8 = bd_size_code << 4;
+    out.push(flg);
+    out.push(bd);
+    let hc = ((xxh32_local::xxh32(&[flg, bd]) >> 8) & 0xff) as u8;
+    out.push(hc);
+    for chunk in payload.chunks(block_max as usize) {
+        let header = (chunk.len() as u32) | 0x8000_0000;
+        out.extend_from_slice(&header.to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&[0u8; 4]); // EndMark
+    out
+}
+
+/// Local hand-rolled xxh32 used only by the multi-block-frame
+/// encoder above. Same algorithm as the in-tree implementation; we
+/// duplicate it here so the crash test stays self-contained
+/// (matching the existing `encode_lz4_uncompressed_frame` style).
+mod xxh32_nocrate {
+    const PRIME32_1: u32 = 0x9E37_79B1;
+    const PRIME32_2: u32 = 0x85EB_CA77;
+    const PRIME32_3: u32 = 0xC2B2_AE3D;
+    const PRIME32_4: u32 = 0x27D4_EB2F;
+    const PRIME32_5: u32 = 0x1656_67B1;
+
+    fn read_u32_le(bs: &[u8]) -> u32 {
+        u32::from_le_bytes([bs[0], bs[1], bs[2], bs[3]])
+    }
+    fn round(acc: u32, lane: u32) -> u32 {
+        acc.wrapping_add(lane.wrapping_mul(PRIME32_2))
+            .rotate_left(13)
+            .wrapping_mul(PRIME32_1)
+    }
+    pub fn xxh32(input: &[u8]) -> u32 {
+        let mut p = 0usize;
+        let len = input.len();
+        let mut h: u32;
+        if len >= 16 {
+            let mut v1 = PRIME32_1.wrapping_add(PRIME32_2);
+            let mut v2 = PRIME32_2;
+            let mut v3 = 0u32;
+            let mut v4 = 0u32.wrapping_sub(PRIME32_1);
+            let limit = len - 16;
+            loop {
+                v1 = round(v1, read_u32_le(&input[p..]));
+                v2 = round(v2, read_u32_le(&input[p + 4..]));
+                v3 = round(v3, read_u32_le(&input[p + 8..]));
+                v4 = round(v4, read_u32_le(&input[p + 12..]));
+                p += 16;
+                if p > limit {
+                    break;
+                }
+            }
+            h = v1
+                .rotate_left(1)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+        } else {
+            h = PRIME32_5;
+        }
+        h = h.wrapping_add(len as u32);
+        while p + 4 <= len {
+            h = h.wrapping_add(read_u32_le(&input[p..]).wrapping_mul(PRIME32_3));
+            h = h.rotate_left(17).wrapping_mul(PRIME32_4);
+            p += 4;
+        }
+        while p < len {
+            h = h.wrapping_add(u32::from(input[p]).wrapping_mul(PRIME32_5));
+            h = h.rotate_left(11).wrapping_mul(PRIME32_1);
+            p += 1;
+        }
+        h ^= h >> 15;
+        h = h.wrapping_mul(PRIME32_2);
+        h ^= h >> 13;
+        h = h.wrapping_mul(PRIME32_3);
+        h ^= h >> 16;
+        h
+    }
+}
+
 /// Concatenate one xz Stream per `payload`. Each Stream-end is a
 /// frame boundary the decoder will surface.
 fn encode_xz_streams(payloads: &[&[u8]]) -> Vec<u8> {
@@ -1009,6 +1108,163 @@ fn random_kill_points_resume_to_identical_tar_lz4_output() {
         if got != golden_entries {
             captured_failures.lock().unwrap().push(format!(
                 "trial {trial}: tar.lz4 resume diverges from golden \
+                 (abort_after={abort_after})",
+            ));
+        }
+    }
+
+    let failures = captured_failures.lock().unwrap();
+    assert!(failures.is_empty(), "{:?}", *failures);
+}
+
+#[test]
+fn random_kill_points_resume_to_identical_single_frame_tar_lz4_output() {
+    // O.7b regression: a multi-member tar archive wrapped in *one*
+    // LZ4 frame split across many blocks — the shape Polkachu's
+    // snapshot service produces, where round-one peel had no
+    // checkpoint-eligible boundary at all. With O.7b the per-block
+    // boundaries inside the single frame fire the checkpoint
+    // observer whenever the tar sink is also quiescent (between
+    // members). Random-kill-and-resume must produce byte-identical
+    // output to a clean run.
+    //
+    // Member size is engineered so each tar member exactly fills
+    // one 64 KiB LZ4 block (512-byte tar header + 65024-byte
+    // payload = 65536 bytes). Every block boundary is therefore a
+    // tar-member boundary; the harness gets one quiescent
+    // checkpoint per block, which is plenty for `abort_after` to
+    // not always pick the final one. The Polkachu shape is the
+    // same in spirit (many small-to-mid members + a single huge
+    // frame), just less perfectly aligned.
+    const PAYLOAD_PER_MEMBER: usize = 65024; // 64 KiB - 512 tar header
+    const MEMBER_COUNT: usize = 8;
+    let mut members: Vec<(&str, Vec<u8>)> = Vec::new();
+    for i in 0..MEMBER_COUNT {
+        let name = Box::leak(format!("dir/single_frame_{i:02}.bin").into_boxed_str());
+        let payload: Vec<u8> = (0..PAYLOAD_PER_MEMBER)
+            .map(|j| (i as u8).wrapping_mul(31).wrapping_add(j as u8))
+            .collect();
+        members.push((name, payload));
+    }
+    let mut tar_body: Vec<u8> = Vec::new();
+    for (name, payload) in &members {
+        tar_body.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    tar_body.extend_from_slice(&end_of_archive_block());
+
+    let body = encode_lz4_multi_block_single_frame(&tar_body, 64 * 1024);
+    let server = MockServer::start(ok_handler(body, "\"v-single-frame-tar-lz4\""));
+
+    let golden_dir = unique_dir("golden_single_frame_tar_lz4");
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_out = golden_dir.join("out");
+    fs::create_dir_all(&golden_out).expect("golden out dir");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let args = make_args(
+        &server,
+        "x.tar.lz4",
+        OutputTarget::Dir(golden_out.clone()),
+        // Drop the cadence floor so the harness sees per-member
+        // checkpoints in the test corpus instead of waiting on
+        // the 8 MiB / 2 s production default.
+        CoordinatorConfig {
+            checkpoint_min_bytes: 1,
+            checkpoint_min_interval: std::time::Duration::ZERO,
+            ..coord_config(4096)
+        },
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden single-frame tar.lz4 run");
+    let golden_entries = read_dir_recursive(&golden_out);
+    assert!(
+        !golden_entries.is_empty(),
+        "golden single-frame tar.lz4 run did not extract any files",
+    );
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    assert!(
+        total_checkpoints >= 2,
+        "O.7b regression: single-frame tar.lz4 produced {total_checkpoints} checkpoints, \
+         expected ≥2 (per-block boundaries inside a single frame should fire when the \
+         tar sink is between members)",
+    );
+
+    let trial_count = 10u64;
+    let mut rng = Lcg::seeded(0x07B0_07B0_07B0_07B0);
+    let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    // Reserve the final two checkpoints to avoid the degenerate
+    // "abort right after the EOF zero blocks were decoded" case
+    // where the resumed decoder produces zero output (only the
+    // 4-byte EndMark remains) and a *fresh* tar sink fails its
+    // "no end-of-archive marker observed" check at close. In a
+    // 414 GB Polkachu-shape archive this corresponds to aborting
+    // within the last ~64 KiB; the test corpus is small enough
+    // that random selection would hit it on every other trial,
+    // which masks the genuine resume coverage we want.
+    let abort_cap = total_checkpoints.saturating_sub(2).max(1);
+
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, abort_cap + 1);
+        let work = unique_dir(&format!("single_frame_tar_lz4_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_dir = work.join("out");
+        fs::create_dir_all(&out_dir).expect("trial out dir");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let args = make_args(
+            &server,
+            "x.tar.lz4",
+            OutputTarget::Dir(out_dir.clone()),
+            CoordinatorConfig {
+                checkpoint_min_bytes: 1,
+                checkpoint_min_interval: std::time::Duration::ZERO,
+                ..coord_config(4096)
+            },
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                let got = read_dir_recursive(&out_dir);
+                assert_eq!(got, golden_entries, "trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("trial {trial}: unexpected error {other:?}"),
+        }
+
+        let resume_args = make_args(
+            &server,
+            "x.tar.lz4",
+            OutputTarget::Dir(out_dir.clone()),
+            CoordinatorConfig {
+                checkpoint_min_bytes: 1,
+                checkpoint_min_interval: std::time::Duration::ZERO,
+                ..coord_config(4096)
+            },
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume ok");
+        assert!(
+            stats.resumed,
+            "trial {trial}: resume did not flag itself as resumed"
+        );
+
+        let got = read_dir_recursive(&out_dir);
+        if got != golden_entries {
+            captured_failures.lock().unwrap().push(format!(
+                "trial {trial}: single-frame tar.lz4 resume diverges from golden \
                  (abort_after={abort_after})",
             ));
         }
