@@ -11,6 +11,15 @@ readme = "README.md"
 keywords = ["download", "extract", "archive", "streaming", "tar"]
 categories = ["command-line-utilities", "compression", "network-programming"]
 
+[features]
+# In-progress hand-rolled pure-Rust zstd decoder. Off by default so the
+# production zstd path (the upstream `zstd` crate binding) stays the one
+# `cargo test` exercises. Enable with `--features peel_zstd_native` when
+# working on the new decoder. Tracked in `docs/PLAN_zstd_block_decoder.md`;
+# the flag goes away in Phase 8 when the new decoder replaces the
+# wrapper as the production path.
+peel_zstd_native = []
+
 [lib]
 name = "peel"
 path = "src/lib.rs"

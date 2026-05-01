@@ -70,6 +70,8 @@ pub mod identity;
 pub mod lz4;
 pub mod xz;
 pub mod zstd;
+#[cfg(feature = "peel_zstd_native")]
+pub mod zstd_native;
 
 /// Status returned by [`StreamingDecoder::decode_step`].
 ///
