@@ -254,6 +254,37 @@ impl<'a> ReverseBitReader<'a> {
         }
         Ok(out)
     }
+
+    /// Peek the next `n` bits MSB-first without advancing the
+    /// cursor.
+    ///
+    /// Used by the canonical-Huffman decoder, which peeks
+    /// `max_num_bits` to index its decode table, then advances by
+    /// the cell's actual `code_length` (which may be shorter).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::read`].
+    pub fn peek(&mut self, n: u32) -> Result<u32, ZstdError> {
+        let saved = self.consumed_bits;
+        let result = self.read(n);
+        self.consumed_bits = saved;
+        result
+    }
+
+    /// Advance the cursor by `n` bits without producing a value.
+    ///
+    /// Convenience over `read(n).map(|_| ())`. The Huffman decoder
+    /// pairs this with [`Self::peek`] to consume only the
+    /// canonical-code bits a peeked symbol actually used.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::read`].
+    pub fn advance(&mut self, n: u32) -> Result<(), ZstdError> {
+        let _ = self.read(n)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

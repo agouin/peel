@@ -46,6 +46,8 @@ pub mod bitstream;
 pub mod block;
 pub mod error;
 pub mod frame;
+pub mod huffman;
+pub mod literals;
 
 use self::block::{parse_block_header, BlockType, BLOCK_HEADER_LEN, BLOCK_MAX_SIZE};
 use self::error::ZstdError;
