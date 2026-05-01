@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use crate::checkpoint::SinkState;
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
 use crate::progress::ProgressState;
 use crate::punch::{align_down, PunchError, PunchHole};
@@ -145,6 +146,11 @@ pub struct CheckpointInfo {
     /// historical contract; everything but lz4's mid-frame boundaries
     /// today).
     pub decoder_state: Option<Vec<u8>>,
+    /// Live sink state captured at the same step. The coordinator
+    /// persists this verbatim into the checkpoint; the sink's
+    /// resume constructor consumes it to restart from the exact
+    /// position the killed run left off.
+    pub sink_state: SinkState,
 }
 
 /// Wall-clock and byte-volume statistics for one extraction.
@@ -393,6 +399,7 @@ impl Extractor {
                             bytes_out: adapter.bytes_out,
                             quiescent_index: stats.quiescent_checkpoints,
                             decoder_state: decoder.decoder_state(),
+                            sink_state: adapter.sink.sink_state(),
                         };
                         on_checkpoint(info).map_err(ExtractorError::Observer)?;
                     }

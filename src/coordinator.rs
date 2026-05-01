@@ -95,11 +95,6 @@ impl OutputTarget {
             Self::File(p) | Self::Dir(p) => p.as_path(),
         }
     }
-
-    /// `true` when this target is a tar extraction directory.
-    fn is_dir(&self) -> bool {
-        matches!(self, Self::Dir(_))
-    }
 }
 
 /// Tunable knobs for [`run`].
@@ -895,7 +890,6 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &bitmap,
                             &fingerprints,
                             chunk_size,
-                            &output,
                             &config,
                             progress.as_mut(),
                             kill_switch.as_ref(),
@@ -917,7 +911,6 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &bitmap,
                             &fingerprints,
                             chunk_size,
-                            &output,
                             &config,
                             progress.as_mut(),
                             kill_switch.as_ref(),
@@ -1223,7 +1216,6 @@ fn run_one<S: Sink>(
     bitmap: &ChunkBitmap,
     fingerprints: &ChunkFingerprints,
     chunk_size: u64,
-    output: &OutputTarget,
     config: &CoordinatorConfig,
     progress: Option<&mut ProgressFn>,
     kill_switch: Option<&Arc<AtomicBool>>,
@@ -1272,7 +1264,7 @@ fn run_one<S: Sink>(
                 .sync_all()
                 .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
 
-            let sink_state = sink_state_for(output, info_cb.bytes_out);
+            let sink_state = info_cb.sink_state.clone();
             let hash_state = snapshot_hash_state(hasher_for_ckpt);
             let chunk_crc32c = if fingerprints.is_empty() {
                 None
@@ -1786,24 +1778,6 @@ fn snapshot_hash_state(
     // option — a subsequent successful snapshot supersedes it.
     let snapshot = h.lock().ok()?.clone();
     Some(snapshot.serialize())
-}
-
-/// Compute the appropriate [`SinkState`] for the configured output and
-/// the current sink-byte counter. Tar's `members_completed` is left
-/// empty here; we don't track member names through the extractor's
-/// callback in the MVP. The on-disk artifacts are what carry the
-/// resume signal for tar.
-fn sink_state_for(output: &OutputTarget, bytes_out: u64) -> SinkState {
-    if output.is_dir() {
-        SinkState::Tar {
-            members_completed: Vec::new(),
-            in_flight: None,
-        }
-    } else {
-        SinkState::Raw {
-            bytes_written: bytes_out,
-        }
-    }
 }
 
 /// Construct the [`SparseFile`] for this run, picking between the
