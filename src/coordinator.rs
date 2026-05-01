@@ -1061,7 +1061,15 @@ impl Drop for CancelOnDrop<'_> {
 }
 
 /// What [`build_resume_plan`] decides to do with a prior checkpoint.
+///
+/// The `Resume` variant grew larger once `SinkState::Tar` started
+/// carrying in-flight parser state in v6 (a few hundred bytes).
+/// Boxing the variant would force every pattern match to deref the
+/// box; we construct one [`ResumePlan`] per run and match it a
+/// handful of times, so the allocation isn't worth the syntactic
+/// noise. The lint is silenced locally with rationale.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ResumePlan {
     Fresh,
     Resume {
@@ -1789,6 +1797,7 @@ fn sink_state_for(output: &OutputTarget, bytes_out: u64) -> SinkState {
     if output.is_dir() {
         SinkState::Tar {
             members_completed: Vec::new(),
+            in_flight: None,
         }
     } else {
         SinkState::Raw {
@@ -2230,6 +2239,7 @@ mod tests {
             created_at: SystemTime::now(),
             sink_state: SinkState::Tar {
                 members_completed: vec![],
+                in_flight: None,
             },
             hash_state: None,
             chunk_crc32c: None,

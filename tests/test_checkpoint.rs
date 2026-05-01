@@ -55,6 +55,7 @@ fn realistic_tar_checkpoint() -> Checkpoint {
                 "linux-6.10/MAINTAINERS".into(),
                 "linux-6.10/Makefile".into(),
             ],
+            in_flight: None,
         },
         hash_state: None,
         chunk_crc32c: None,
@@ -231,6 +232,7 @@ fn writes_replace_each_other_atomically() {
     ckpt.decoder_position = ByteOffset::new(ckpt.decoder_position.get() + 4 * 1024 * 1024);
     if let SinkState::Tar {
         ref mut members_completed,
+        ..
     } = ckpt.sink_state
     {
         members_completed.push("linux-6.10/scripts/checkpatch.pl".into());
