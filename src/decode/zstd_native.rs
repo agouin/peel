@@ -46,6 +46,7 @@ pub mod bitstream;
 pub mod block;
 pub mod error;
 pub mod frame;
+pub mod fse;
 pub mod huffman;
 pub mod literals;
 
