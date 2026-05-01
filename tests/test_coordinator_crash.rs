@@ -192,6 +192,7 @@ fn make_args(
         progress,
         progress_state: None,
         kill_switch,
+        io_backend: None,
     }
 }
 

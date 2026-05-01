@@ -304,6 +304,16 @@ pub struct RunArgs {
     /// to simulate `kill -9` at random points; production callers
     /// leave it `None`.
     pub kill_switch: Option<Arc<AtomicBool>>,
+    /// Optional pre-resolved IO backend. When `Some`, [`run`] uses it
+    /// directly and skips its own [`crate::io_backend::select_backend`]
+    /// call; when `None`, [`run`] resolves the backend from
+    /// [`CoordinatorConfig::io_backend`].
+    ///
+    /// The `peel` binary pre-resolves in `main` so it can print the
+    /// `io_backend=…` banner as plain stderr scrollback BEFORE the
+    /// TTY progress renderer starts redrawing. Library callers and
+    /// tests typically leave this `None`.
+    pub io_backend: Option<Arc<dyn crate::io_backend::IoBackend>>,
 }
 
 /// Aggregate result of a successful [`run`].
@@ -516,6 +526,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         mut progress,
         progress_state,
         kill_switch,
+        io_backend: pre_resolved_io_backend,
     } = args;
 
     let parsed_url = Url::parse(&url).map_err(|source| CoordinatorError::InvalidUrl {
@@ -526,19 +537,20 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     // Resolve the IO backend up front. With the move to hyper, HTTP
     // sockets are opened by hyper itself; `io_backend` only governs
     // filesystem IO from here on (sparse-file writes / hole punches).
-    // `select_backend` is still the single place where the user's
-    // --io-backend choice is materialized; logging/warning side
-    // effects fire inside it.
-    let (io_backend, io_backend_label) =
-        crate::io_backend::select_backend(config.io_backend, config.workers)
-            .map_err(CoordinatorError::IoBackend)?;
-    // Forward the resolved IO-backend banner to the progress renderer
-    // so a TTY user — whose tracing-INFO output is suppressed to keep
-    // the in-place block clean — still sees the same configuration line
-    // the non-TTY log path prints.
-    if let Some(state) = progress_state.as_ref() {
-        state.push_banner(io_backend_label);
-    }
+    // The `peel` binary pre-resolves in `main` (so it can banner the
+    // choice as plain stderr scrollback BEFORE the TTY renderer starts
+    // redrawing); library callers leave `args.io_backend` unset and
+    // we fall back to `select_backend` here. Either way,
+    // `select_backend` is the single place the choice is materialized
+    // and where the `io_backend=…` `tracing::info!` fires.
+    let io_backend = match pre_resolved_io_backend {
+        Some(b) => b,
+        None => {
+            crate::io_backend::select_backend(config.io_backend, config.workers)
+                .map_err(CoordinatorError::IoBackend)?
+                .0
+        }
+    };
 
     // Parse mirror URLs up front so a malformed `--mirror` errors
     // out before any network traffic.

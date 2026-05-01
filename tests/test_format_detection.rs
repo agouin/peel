@@ -234,6 +234,7 @@ fn make_args(
         progress: None,
         progress_state: None,
         kill_switch: None,
+        io_backend: None,
     }
 }
 

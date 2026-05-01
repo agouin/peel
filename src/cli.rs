@@ -337,11 +337,12 @@ impl Cli {
         let http_version: HttpVersion = self.http_version.into();
         // Log the HTTP version selection at startup. Mirrors the
         // `io_backend=...` line that `crate::io_backend::select_backend`
-        // emits, so the two appear together in the early subscriber
-        // output. With `Auto` the actual H1/H2 outcome is per-origin
-        // via ALPN and only known after the first connection. The
-        // `peel` binary also forwards this same string to the TTY
-        // progress renderer's banner; see `http_version_banner`.
+        // emits, so non-TTY users see the two together in the early
+        // subscriber output. With `Auto` the actual H1/H2 outcome is
+        // per-origin via ALPN and only known after the first connection.
+        // The `peel` binary also surfaces this same string to TTY users
+        // via an `eprintln!` before the progress renderer starts (the
+        // subscriber suppresses INFO on a TTY); see `http_version_banner`.
         tracing::info!("{}", http_version_banner(http_version));
         let client = Client::with_config(ClientConfig {
             http_version,
@@ -373,6 +374,7 @@ impl Cli {
             progress: None,
             progress_state: None,
             kill_switch: None,
+            io_backend: None,
         })
     }
 }

@@ -336,6 +336,7 @@ fn run_peel(server: &MockServer, suffix: &str, output: OutputTarget) -> RunStats
         progress: None,
         progress_state: None,
         kill_switch: None,
+        io_backend: None,
     };
     run(args).expect("peel run succeeds")
 }
@@ -844,6 +845,7 @@ fn diag_plain_tar_breakdown() {
             progress: None,
             progress_state: None,
             kill_switch: None,
+            io_backend: None,
         };
         let stats = run(args).expect("peel run succeeds");
         let chunks = stats.download.chunks_completed;
@@ -937,6 +939,7 @@ fn diag_plain_tar_io_backends() {
             progress: None,
             progress_state: None,
             kill_switch: None,
+            io_backend: None,
         };
         let stats = match run(args) {
             Ok(s) => s,
@@ -1002,6 +1005,7 @@ fn diag_plain_tar_throttled_50mbps() {
         progress: None,
         progress_state: None,
         kill_switch: None,
+        io_backend: None,
     };
     let started = Instant::now();
     let stats = run(args).expect("peel run succeeds");

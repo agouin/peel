@@ -311,6 +311,7 @@ fn make_args(
         progress: None,
         progress_state: None,
         kill_switch: None,
+        io_backend: None,
     }
 }
 
@@ -1369,6 +1370,7 @@ fn zip_resume_skips_already_extracted_entries() {
         }) as ProgressFn),
         progress_state: None,
         kill_switch: Some(Arc::clone(&kill_switch)),
+        io_backend: None,
     };
     let err = run(args1).expect_err("phase1 must abort");
     assert!(matches!(err, CoordinatorError::Aborted { .. }));
@@ -1521,6 +1523,7 @@ fn sha256_resume_with_saved_state_completes_cleanly() {
             progress: Some(progress),
             progress_state: None,
             kill_switch: Some(kill),
+            io_backend: None,
         };
         let err = run(args).expect_err("kill switch must trip");
         match err {
