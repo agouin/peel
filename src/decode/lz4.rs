@@ -101,6 +101,16 @@ pub struct Lz4Decoder {
     /// Latest frame boundary (the offset just after a successfully
     /// processed block, frame header, or end-of-frame marker).
     last_frame_boundary: Option<ByteOffset>,
+    /// `true` when [`Self::last_frame_boundary`] points at a position
+    /// where [`State::InFrame`] is paused between blocks (i.e. the
+    /// boundary is mid-frame and a fresh decoder needs the
+    /// [`Lz4ResumeState`] blob to continue). Set after a successful
+    /// block-decode arm; cleared at the start of every `decode_step`
+    /// of `State::InFrame` before reading the next block-size
+    /// header. Always `false` at end-of-frame, between frames, and
+    /// while skipping skippable frames — those positions are
+    /// restartable from the offset alone.
+    between_blocks: bool,
     /// Reusable scratch buffer for compressed block payloads. Sized
     /// lazily up to [`MAX_BLOCK_SIZE`] when needed.
     input_buf: Vec<u8>,
@@ -193,6 +203,7 @@ impl Lz4Decoder {
             state: State::BetweenFrames { source: src },
             bytes_consumed: 0,
             last_frame_boundary: None,
+            between_blocks: false,
             input_buf: Vec::new(),
             output_buf: Vec::new(),
             skip_buf: [0u8; SKIP_CHUNK],
@@ -221,6 +232,216 @@ impl Lz4Decoder {
         let consumed = self.bytes_consumed;
         self.state = State::Done;
         DecodeError::Read { consumed, source }
+    }
+
+    /// Build a fresh decoder seeded mid-frame from a previously
+    /// captured [`Lz4ResumeState`] blob.
+    ///
+    /// `start_offset` is the source byte offset at which `src` will
+    /// deliver its first byte — i.e. the `decoder_position` saved in
+    /// the checkpoint at the same step the blob was captured.
+    /// `bytes_consumed` is seeded with this value so the decoder
+    /// reports a consistent high-water mark from the first call;
+    /// `last_frame_boundary` is seeded to the same offset so the
+    /// caller observes the resume position as a still-valid frame
+    /// boundary until the decoder advances past it.
+    ///
+    /// On success the decoder sits in [`State::InFrame`] with the
+    /// frame context restored and is ready for [`Self::decode_step`].
+    /// The next bytes pulled from `src` must be a 4-byte block-size
+    /// header — exactly what the original run was about to read when
+    /// it captured the blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::Construct`] if `state_blob` is
+    /// malformed (bad magic, unknown format, length mismatch, or
+    /// internal field disagreement such as `content_checksum` set
+    /// without a `content_hasher`). Resume failures here are not
+    /// fatal — the caller can fall back to a fresh decode from a
+    /// coarser frame boundary if it can find one.
+    pub fn resume(
+        src: Box<dyn Read + Send>,
+        state_blob: &[u8],
+        start_offset: u64,
+    ) -> Result<Self, DecodeError> {
+        let resume = Lz4ResumeState::deserialize(state_blob).map_err(|reason| {
+            DecodeError::Construct(io::Error::other(format!(
+                "lz4 resume blob rejected: {reason}",
+            )))
+        })?;
+        let ctx = FrameContext {
+            block_max_size: resume.block_max_size,
+            block_checksum: resume.block_checksum,
+            content_checksum: resume.content_checksum,
+            content_size: resume.content_size,
+            content_hasher: resume.content_hasher,
+            bytes_decompressed: resume.bytes_decompressed,
+        };
+        // The fresh-construct path (re)sizes `output_buf` after
+        // parsing the frame header; the resume path skips parsing and
+        // must replicate that work itself, otherwise the first block
+        // decompress overruns a zero-length scratch buffer.
+        let output_buf = vec![0u8; ctx.block_max_size as usize];
+        Ok(Self {
+            state: State::InFrame { source: src, ctx },
+            bytes_consumed: start_offset,
+            last_frame_boundary: Some(ByteOffset::new(start_offset)),
+            between_blocks: true,
+            input_buf: Vec::new(),
+            output_buf,
+            skip_buf: [0u8; SKIP_CHUNK],
+        })
+    }
+}
+
+/// Per-frame parameters captured at the moment the decoder reports
+/// [`StreamingDecoder::decoder_state`] as `Some(...)` — i.e. between
+/// two blocks of a single frame.
+///
+/// Serialized as an opaque byte blob and stored in the §9 checkpoint
+/// alongside the decoder offset (`OPTIMIZATIONS.md` §O.7b). The
+/// layout is fixed-width at 74 bytes:
+///
+/// ```text
+///  4 B  magic = b"LZDR"
+///  1 B  format_version (currently 1)
+///  4 B  block_max_size (u32 LE)
+///  1 B  block_checksum (0/1)
+///  1 B  content_checksum (0/1)
+///  1 B  content_size_present (0/1)
+///  8 B  content_size value (u64 LE; 0 when not present)
+///  8 B  bytes_decompressed (u64 LE)
+///  1 B  content_hasher_present (0/1)
+/// 45 B  content_hasher serialized state (zeros when not present)
+/// ```
+///
+/// Always 74 bytes — fixed-width keeps deserialize trivial. The
+/// magic + version prefix lets us reject blobs from unrelated
+/// formats and bump the layout later without ambiguity.
+struct Lz4ResumeState {
+    block_max_size: u32,
+    block_checksum: bool,
+    content_checksum: bool,
+    content_size: Option<u64>,
+    bytes_decompressed: u64,
+    content_hasher: Option<xxh32::Xxh32>,
+}
+
+const RESUME_MAGIC: [u8; 4] = *b"LZDR";
+const RESUME_FORMAT_V1: u8 = 1;
+/// Total length of the [`Lz4ResumeState`] on-disk blob, in bytes.
+const RESUME_BLOB_LEN: usize = 4 + 1 + 4 + 1 + 1 + 1 + 8 + 8 + 1 + xxh32::SERIALIZED_LEN;
+
+impl Lz4ResumeState {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RESUME_BLOB_LEN);
+        out.extend_from_slice(&RESUME_MAGIC);
+        out.push(RESUME_FORMAT_V1);
+        out.extend_from_slice(&self.block_max_size.to_le_bytes());
+        out.push(u8::from(self.block_checksum));
+        out.push(u8::from(self.content_checksum));
+        match self.content_size {
+            Some(v) => {
+                out.push(1);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            None => {
+                out.push(0);
+                out.extend_from_slice(&0u64.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&self.bytes_decompressed.to_le_bytes());
+        match &self.content_hasher {
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(&h.serialize());
+            }
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; xxh32::SERIALIZED_LEN]);
+            }
+        }
+        debug_assert_eq!(out.len(), RESUME_BLOB_LEN);
+        out
+    }
+
+    fn deserialize(blob: &[u8]) -> Result<Self, &'static str> {
+        if blob.len() != RESUME_BLOB_LEN {
+            return Err("blob length mismatch");
+        }
+        if blob[0..4] != RESUME_MAGIC {
+            return Err("bad magic");
+        }
+        if blob[4] != RESUME_FORMAT_V1 {
+            return Err("unknown format version");
+        }
+        let block_max_size = u32::from_le_bytes([blob[5], blob[6], blob[7], blob[8]]);
+        // Mirror the `parse_frame_header` validation: block_max_size
+        // is one of the four valid LZ4-spec values. Reject anything
+        // else defensively rather than trusting the blob.
+        const BMS_64K: u32 = 64 * 1024;
+        const BMS_256K: u32 = 256 * 1024;
+        const BMS_1M: u32 = 1024 * 1024;
+        const BMS_4M: u32 = 4 * 1024 * 1024;
+        match block_max_size {
+            BMS_64K | BMS_256K | BMS_1M | BMS_4M => {}
+            _ => return Err("invalid block_max_size"),
+        }
+        let block_checksum = match blob[9] {
+            0 => false,
+            1 => true,
+            _ => return Err("block_checksum must be 0 or 1"),
+        };
+        let content_checksum = match blob[10] {
+            0 => false,
+            1 => true,
+            _ => return Err("content_checksum must be 0 or 1"),
+        };
+        let content_size_present = match blob[11] {
+            0 => false,
+            1 => true,
+            _ => return Err("content_size_present must be 0 or 1"),
+        };
+        let content_size_value = u64::from_le_bytes([
+            blob[12], blob[13], blob[14], blob[15], blob[16], blob[17], blob[18], blob[19],
+        ]);
+        let content_size = if content_size_present {
+            Some(content_size_value)
+        } else {
+            None
+        };
+        let bytes_decompressed = u64::from_le_bytes([
+            blob[20], blob[21], blob[22], blob[23], blob[24], blob[25], blob[26], blob[27],
+        ]);
+        let hasher_present = match blob[28] {
+            0 => false,
+            1 => true,
+            _ => return Err("content_hasher_present must be 0 or 1"),
+        };
+        // Enforce the `parse_frame_header` invariant that
+        // `content_hasher.is_some() == content_checksum` — disagreement
+        // would crash the EndMark arm's `expect("hasher present when
+        // content_checksum set")`.
+        if hasher_present != content_checksum {
+            return Err("content_checksum and content_hasher presence disagree");
+        }
+        let content_hasher = if hasher_present {
+            let bytes = &blob[29..29 + xxh32::SERIALIZED_LEN];
+            // SAFETY note: bounds checked above by the
+            // `RESUME_BLOB_LEN` length match.
+            Some(xxh32::Xxh32::deserialize(bytes)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            block_max_size,
+            block_checksum,
+            content_checksum,
+            content_size,
+            bytes_decompressed,
+            content_hasher,
+        })
     }
 }
 
@@ -443,6 +664,29 @@ impl StreamingDecoder for Lz4Decoder {
 
     fn frame_boundary(&self) -> Option<ByteOffset> {
         self.last_frame_boundary
+    }
+
+    fn decoder_state(&self) -> Option<Vec<u8>> {
+        // The blob is only meaningful at a position where the
+        // decoder is paused mid-frame, between blocks; resuming from
+        // anywhere else either doesn't need a state seed (between
+        // frames; the factory route works) or isn't a safe restart
+        // point (mid-block, mid-skippable, mid-header).
+        if !self.between_blocks {
+            return None;
+        }
+        let State::InFrame { ctx, .. } = &self.state else {
+            return None;
+        };
+        let resume = Lz4ResumeState {
+            block_max_size: ctx.block_max_size,
+            block_checksum: ctx.block_checksum,
+            content_checksum: ctx.content_checksum,
+            content_size: ctx.content_size,
+            bytes_decompressed: ctx.bytes_decompressed,
+            content_hasher: ctx.content_hasher.clone(),
+        };
+        Some(resume.serialize())
     }
 }
 
@@ -675,9 +919,19 @@ mod xxh32 {
         avalanche(h)
     }
 
+    /// Total bytes the [`Xxh32::serialize`] / [`Xxh32::deserialize`]
+    /// pair occupies. Fixed-width — the on-disk shape is:
+    /// `seed (4) | v1 (4) | v2 (4) | v3 (4) | v4 (4) | total_len (8) | buffer_len (1) | buffer (16)`.
+    /// The `seed` is included even though LZ4 frames always pass 0
+    /// at construction; preserving it keeps the round-trip honest
+    /// for any future caller (and matches the `finalize` short-input
+    /// branch that uses `seed` directly).
+    pub const SERIALIZED_LEN: usize = 4 + 4 + 4 + 4 + 4 + 8 + 1 + 16;
+
     /// Streaming XXH32 state — used for the frame's content checksum,
     /// which must be computed across decompressed bytes from every
     /// block in the frame.
+    #[derive(Clone)]
     pub struct Xxh32 {
         seed: u32,
         v1: u32,
@@ -704,6 +958,74 @@ mod xxh32 {
                 buffer_len: 0,
                 total_len: 0,
             }
+        }
+
+        /// Serialize the streaming hasher into a fixed-width
+        /// [`SERIALIZED_LEN`]-byte blob suitable for embedding in a
+        /// resume blob.
+        ///
+        /// Round-trips with [`Self::deserialize`] across any input
+        /// length: feeding the same bytes through a fresh hasher and
+        /// `update` produces an identical [`Self::finalize`] digest
+        /// before and after the round trip.
+        #[must_use]
+        pub fn serialize(&self) -> [u8; SERIALIZED_LEN] {
+            let mut out = [0u8; SERIALIZED_LEN];
+            out[0..4].copy_from_slice(&self.seed.to_le_bytes());
+            out[4..8].copy_from_slice(&self.v1.to_le_bytes());
+            out[8..12].copy_from_slice(&self.v2.to_le_bytes());
+            out[12..16].copy_from_slice(&self.v3.to_le_bytes());
+            out[16..20].copy_from_slice(&self.v4.to_le_bytes());
+            out[20..28].copy_from_slice(&self.total_len.to_le_bytes());
+            // `buffer_len` is bounded to 0..=15 by the streaming
+            // discipline (`update` consumes a full 16 the moment one
+            // is available) so a 1-byte field is sufficient.
+            out[28] = self.buffer_len as u8;
+            out[29..29 + 16].copy_from_slice(&self.buffer);
+            out
+        }
+
+        /// Reconstruct a streaming hasher from its
+        /// [`Self::serialize`] output.
+        ///
+        /// Validates `buffer_len ∈ 0..=15` defensively — a hostile
+        /// blob could otherwise install an invariant break that
+        /// makes [`Self::finalize`]'s tail loop walk past the
+        /// buffer.
+        ///
+        /// # Errors
+        ///
+        /// Returns the static error message describing the field
+        /// that failed validation.
+        pub fn deserialize(bytes: &[u8]) -> Result<Self, &'static str> {
+            if bytes.len() != SERIALIZED_LEN {
+                return Err("xxh32 blob length mismatch");
+            }
+            let seed = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let v1 = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let v2 = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            let v3 = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+            let v4 = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+            let total_len = u64::from_le_bytes([
+                bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26],
+                bytes[27],
+            ]);
+            let buffer_len = bytes[28];
+            if buffer_len > 15 {
+                return Err("xxh32 buffer_len out of range");
+            }
+            let mut buffer = [0u8; 16];
+            buffer.copy_from_slice(&bytes[29..29 + 16]);
+            Ok(Self {
+                seed,
+                v1,
+                v2,
+                v3,
+                v4,
+                buffer,
+                buffer_len: buffer_len as usize,
+                total_len,
+            })
         }
 
         pub fn update(&mut self, mut input: &[u8]) {
@@ -850,6 +1172,73 @@ mod xxh32 {
             let b = h.finalize();
             assert_eq!(a, b);
         }
+
+        #[test]
+        fn serialize_round_trip_at_buffer_boundaries() {
+            // The streaming hasher's buffered remainder is in
+            // 0..=15. Exercise each remainder shape so the
+            // serialize → deserialize → finalize chain is honest at
+            // every alignment that production code can hit.
+            let payload: Vec<u8> = (0u8..=255u8).cycle().take(10_000).collect();
+            for take in [0usize, 1, 7, 8, 15, 16, 31, 1024, 9_999, 10_000] {
+                let mut h = Xxh32::new(0);
+                h.update(&payload[..take]);
+                let expected = h.finalize();
+
+                let blob = h.serialize();
+                let mut restored = Xxh32::deserialize(&blob).expect("round-trip");
+                assert_eq!(restored.finalize(), expected, "take={take}");
+
+                // The restored hasher must accept additional updates
+                // and produce the same digest as a fresh one fed the
+                // full payload.
+                if take < payload.len() {
+                    restored.update(&payload[take..]);
+                    let mut full = Xxh32::new(0);
+                    full.update(&payload);
+                    assert_eq!(restored.finalize(), full.finalize(), "take={take} suffix");
+                }
+            }
+        }
+
+        #[test]
+        fn serialize_includes_seed_for_short_input_path() {
+            // The < 16-byte finalize branch reads `seed` directly.
+            // A round trip across that branch must preserve seed.
+            let mut h = Xxh32::new(PRIME32_1);
+            h.update(b"abc");
+            let expected = h.finalize();
+            let blob = h.serialize();
+            let restored = Xxh32::deserialize(&blob).expect("round-trip");
+            assert_eq!(restored.finalize(), expected);
+        }
+
+        #[test]
+        fn deserialize_rejects_oversized_buffer_len() {
+            let mut h = Xxh32::new(0);
+            h.update(b"data");
+            let mut blob = h.serialize();
+            blob[28] = 16; // buffer_len must be 0..=15
+            match Xxh32::deserialize(&blob) {
+                Err("xxh32 buffer_len out of range") => {}
+                Ok(_) => panic!("expected reject, got Ok"),
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+
+        #[test]
+        fn deserialize_rejects_wrong_blob_length() {
+            match Xxh32::deserialize(&[0u8; SERIALIZED_LEN - 1]) {
+                Err("xxh32 blob length mismatch") => {}
+                Ok(_) => panic!("expected reject"),
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+            match Xxh32::deserialize(&[0u8; SERIALIZED_LEN + 1]) {
+                Err("xxh32 blob length mismatch") => {}
+                Ok(_) => panic!("expected reject"),
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
     }
 }
 
@@ -934,6 +1323,70 @@ mod tests {
 
     fn drive_to_eof(decoder: &mut dyn StreamingDecoder, sink: &mut Vec<u8>) {
         while decoder.decode_step(sink).expect("decode_step") == DecodeStatus::MoreData {}
+    }
+
+    /// Encode `payload` as a single-frame archive with one block
+    /// every `block_max_size` bytes. All blocks are uncompressed —
+    /// the goal is exercising mid-frame block boundaries, not
+    /// exercising compression. `block_max_size` must be one of the
+    /// LZ4-spec values (64K, 256K, 1M, 4M).
+    fn encode_lz4_multi_block(
+        payload: &[u8],
+        block_max_size: u32,
+        block_checksum: bool,
+        content_checksum: bool,
+        content_size: Option<u64>,
+    ) -> Vec<u8> {
+        let bd_size_code: u8 = match block_max_size {
+            65_536 => 4,
+            262_144 => 5,
+            1_048_576 => 6,
+            4_194_304 => 7,
+            other => panic!("invalid block_max_size {other}"),
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&LZ4_FRAME_MAGIC.to_le_bytes());
+        let mut flg: u8 = 0b0100_0000; // version = 01
+        flg |= 0b0010_0000; // block independence
+        if block_checksum {
+            flg |= 0b0001_0000;
+        }
+        if content_size.is_some() {
+            flg |= 0b0000_1000;
+        }
+        if content_checksum {
+            flg |= 0b0000_0100;
+        }
+        let bd = bd_size_code << 4;
+        out.push(flg);
+        out.push(bd);
+        let mut hashed = vec![flg, bd];
+        if let Some(v) = content_size {
+            let cs = v.to_le_bytes();
+            out.extend_from_slice(&cs);
+            hashed.extend_from_slice(&cs);
+        }
+        let hc = ((xxh32::xxh32(&hashed, 0) >> 8) & 0xff) as u8;
+        out.push(hc);
+
+        for chunk in payload.chunks(block_max_size as usize) {
+            // Uncompressed block: header has the high bit set; the
+            // payload bytes follow verbatim.
+            let header = (chunk.len() as u32) | 0x8000_0000_u32;
+            out.extend_from_slice(&header.to_le_bytes());
+            out.extend_from_slice(chunk);
+            if block_checksum {
+                let bc = xxh32::xxh32(chunk, 0);
+                out.extend_from_slice(&bc.to_le_bytes());
+            }
+        }
+
+        out.extend_from_slice(&[0u8; 4]); // EndMark
+        if content_checksum {
+            let cc = xxh32::xxh32(payload, 0);
+            out.extend_from_slice(&cc.to_le_bytes());
+        }
+        out
     }
 
     /// Minimal happy-path: uncompressed block, no checksums, no size.
@@ -1397,5 +1850,136 @@ mod tests {
         let mut sink = Vec::new();
         drive_to_eof(decoder.as_mut(), &mut sink);
         assert_eq!(sink, payload);
+    }
+
+    // ---- O.7b: mid-frame resume -----------------------------------
+
+    /// Drive the decoder past the first block of a multi-block frame
+    /// and assert `decoder_state()` is `Some(...)` only at the
+    /// resume-eligible position. (commit 5 makes the decoder
+    /// actually report this boundary; commit 3 wires the
+    /// `decoder_state` machinery and validates it via the
+    /// hand-seeded resume path below.)
+    #[test]
+    fn decoder_state_blob_round_trips_via_resume() {
+        let payload: Vec<u8> = (0u8..=255u8).cycle().take(200_000).collect();
+        let frame = encode_lz4_multi_block(&payload, 64 * 1024, false, true, None);
+
+        // Build a fresh decoder and produce the reference output.
+        let mut reference = Vec::with_capacity(payload.len());
+        let mut ref_decoder =
+            Lz4Decoder::new(Box::new(Cursor::new(frame.clone()))).expect("construct");
+        drive_to_eof(&mut ref_decoder, &mut reference);
+        assert_eq!(reference, payload);
+
+        // Drive a second decoder forward, force the
+        // `between_blocks` flag synthetically (commit 5 makes the
+        // decoder set this naturally on every block boundary;
+        // before that the boundary only fires at frame end), and
+        // capture `decoder_state` and `bytes_consumed` mid-frame.
+        let mut decoder = Lz4Decoder::new(Box::new(Cursor::new(frame.clone()))).expect("construct");
+        let mut sink_a = Vec::new();
+        // Step until the decoder has decompressed at least 100 KiB
+        // and is sitting between blocks (i.e., just finished a
+        // block-decode arm). We synthesize the `between_blocks`
+        // flag from outside the decoder by checking the state.
+        let (blob, split_offset) = loop {
+            let status = decoder.decode_step(&mut sink_a).expect("step");
+            // Only the post-block-decode state holds a real
+            // `bytes_decompressed` we want to snapshot. Avoid
+            // capturing during the between-frames magic-read or the
+            // header parse: the simplest tell is "we're in InFrame
+            // and have written ≥100 KiB."
+            if matches!(decoder.state, State::InFrame { .. }) && sink_a.len() >= 100 * 1024 {
+                // Force the flag — production wiring lands in
+                // commit 5; this test only validates the
+                // serialize → resume → decode chain in isolation.
+                decoder.between_blocks = true;
+                let blob = decoder.decoder_state().expect("decoder_state mid-frame");
+                let off = decoder.bytes_consumed().get();
+                break (blob, off);
+            }
+            if status == DecodeStatus::Eof {
+                panic!("hit EOF before reaching mid-frame snapshot point");
+            }
+        };
+        assert_eq!(blob.len(), RESUME_BLOB_LEN);
+
+        // Suffix from `split_offset` onward → resume → decode the
+        // rest. The concatenation of `sink_a` (the prefix already
+        // emitted) and the resume's output must equal `reference`.
+        let suffix = frame[split_offset as usize..].to_vec();
+        let mut resumed =
+            Lz4Decoder::resume(Box::new(Cursor::new(suffix)), &blob, split_offset).expect("resume");
+        let mut sink_b = Vec::new();
+        drive_to_eof(&mut resumed, &mut sink_b);
+
+        let mut combined = sink_a;
+        combined.extend_from_slice(&sink_b);
+        assert_eq!(combined, payload);
+    }
+
+    #[test]
+    fn decoder_state_is_none_between_frames() {
+        // Default Lz4Decoder starts in BetweenFrames; before any
+        // block decode runs, `decoder_state()` must return None
+        // because the resume path doesn't apply there (the factory
+        // route is enough).
+        let frame = encode_lz4(
+            b"between-frames-state",
+            EncoderOpts {
+                block_checksum: false,
+                content_size: false,
+                content_checksum: false,
+                compress_block: false,
+            },
+        );
+        let decoder = Lz4Decoder::new(Box::new(Cursor::new(frame))).expect("construct");
+        assert!(decoder.decoder_state().is_none());
+    }
+
+    #[test]
+    fn resume_rejects_malformed_blob() {
+        // A blob with bad magic must be rejected as a
+        // DecodeError::Construct rather than crashing the decoder.
+        let bad = vec![0u8; RESUME_BLOB_LEN];
+        let src: Box<dyn Read + Send> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let result = Lz4Decoder::resume(src, &bad, 0);
+        match result {
+            Err(DecodeError::Construct(err)) => {
+                let msg = err.to_string();
+                assert!(msg.contains("bad magic"), "msg={msg}");
+            }
+            Ok(_) => panic!("expected Construct, got Ok"),
+            Err(other) => panic!("expected Construct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_rejects_content_checksum_disagreement() {
+        // The blob's `content_checksum` flag and `content_hasher`
+        // presence must agree; a mismatch is a hard reject.
+        let resume = Lz4ResumeState {
+            block_max_size: 64 * 1024,
+            block_checksum: false,
+            content_checksum: true, // says hasher must be present...
+            content_size: None,
+            bytes_decompressed: 0,
+            content_hasher: None, // ...but it isn't
+        };
+        let blob = resume.serialize();
+        let src: Box<dyn Read + Send> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let result = Lz4Decoder::resume(src, &blob, 0);
+        match result {
+            Err(DecodeError::Construct(err)) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("content_checksum and content_hasher"),
+                    "msg={msg}",
+                );
+            }
+            Ok(_) => panic!("expected Construct, got Ok"),
+            Err(other) => panic!("expected Construct, got {other:?}"),
+        }
     }
 }
