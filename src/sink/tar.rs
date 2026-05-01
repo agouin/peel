@@ -22,6 +22,13 @@
 //!   `path` and `size` keys. `path` lifts the 100/255-byte length
 //!   limit; `size` lifts the 8 GiB octal-encoded limit and is the
 //!   mechanism §7.4 names for "ustar size limits" handling.
+//! - **GNU base-256 (binary) numeric encoding** in the size field.
+//!   GNU tar (the default in most distros) switches the size field
+//!   from octal ASCII to a big-endian unsigned integer with the high
+//!   bit of the first byte set whenever the value exceeds the
+//!   8 GiB octal limit, instead of (or in addition to) emitting a
+//!   PAX `size=` record. Chain-state snapshots that contain
+//!   individual files ≥ 8 GiB rely on this.
 //! - **GNU long-name extensions** (typeflag `L`) for entries whose
 //!   path exceeds the 100/255-byte ustar limits. The bytes following
 //!   the `L` header are read as a NUL-terminated path and applied
@@ -1034,9 +1041,14 @@ struct ParsedHeader<'h> {
 impl<'h> ParsedHeader<'h> {
     fn from_bytes(header: &'h [u8; BLOCK], archive_offset: u64) -> Result<Self, SinkError> {
         let name = trim_nul(&header[..100]);
-        let size = parse_octal(&header[124..136]).ok_or_else(|| SinkError::MalformedHeader {
+        // The size field is octal in plain ustar but GNU tar switches
+        // to base-256 binary (high bit of the first byte set) when the
+        // value won't fit the 11 octal digits + terminator — i.e. for
+        // any entry ≥ 8 GiB. Multi-TB chain snapshots routinely hit
+        // this, so we honor both encodings.
+        let size = parse_numeric(&header[124..136]).ok_or_else(|| SinkError::MalformedHeader {
             archive_offset,
-            reason: "size field is not a valid octal value".into(),
+            reason: "size field is not a valid octal or base-256 value".into(),
         })?;
         let type_flag = header[156];
         let prefix = trim_nul(&header[345..500]);
@@ -1163,6 +1175,39 @@ fn trim_nul(field: &[u8]) -> &[u8] {
     match field.iter().position(|&b| b == 0) {
         Some(i) => &field[..i],
         None => field,
+    }
+}
+
+/// Parse a tar header numeric field, honoring the GNU base-256 binary
+/// extension. If the high bit of the first byte is set, the field is
+/// a big-endian unsigned integer (with the flag bit masked off the
+/// first byte) rather than an octal ASCII string. GNU tar emits this
+/// for size/mtime values that don't fit the 11 octal-digit form —
+/// notably any file ≥ 8 GiB. Otherwise we fall through to [`parse_octal`].
+///
+/// Returns `None` if the field is the rare two's-complement-negative
+/// form (first byte `0xff`) — tar size/uid/etc. fields are non-negative
+/// — or if the magnitude overflows `u64`.
+fn parse_numeric(field: &[u8]) -> Option<u64> {
+    match field.first() {
+        Some(&first) if first & 0x80 != 0 => {
+            // 0x40 bit set on top of the flag bit means the value is
+            // two's-complement negative; not used for tar sizes.
+            if first & 0x40 != 0 {
+                return None;
+            }
+            let mut acc: u64 = u64::from(first & 0x7f);
+            for &b in &field[1..] {
+                // If the high byte of `acc` is non-zero we'd lose bits
+                // shifting it up, meaning the value exceeds u64::MAX.
+                if acc & 0xff00_0000_0000_0000 != 0 {
+                    return None;
+                }
+                acc = (acc << 8) | u64::from(b);
+            }
+            Some(acc)
+        }
+        _ => parse_octal(field),
     }
 }
 
@@ -1371,6 +1416,91 @@ mod tests {
     fn parse_octal_rejects_non_digit() {
         assert_eq!(parse_octal(b"08\0"), None);
         assert_eq!(parse_octal(b"abc\0"), None);
+    }
+
+    /// `parse_numeric` falls through to octal parsing for the common
+    /// case so existing fields keep working unchanged.
+    #[test]
+    fn parse_numeric_falls_through_to_octal() {
+        assert_eq!(parse_numeric(b"0000644 \0"), Some(0o644));
+        assert_eq!(parse_numeric(b"\0\0\0\0"), Some(0));
+        assert_eq!(parse_numeric(b"08\0"), None);
+    }
+
+    /// GNU base-256: high bit of the first byte signals binary
+    /// encoding. The remainder is a big-endian u64 — used for sizes
+    /// that can't fit 11 octal digits.
+    #[test]
+    fn parse_numeric_decodes_gnu_base256() {
+        // 12-byte size field encoding 0x0000_0001_0000_0000 (4 GiB)
+        // — picked above the 8-decimal-digit boundary so the bytes
+        // exercise the multi-byte shift loop.
+        let mut field = [0u8; 12];
+        field[0] = 0x80;
+        field[7] = 0x01;
+        assert_eq!(parse_numeric(&field), Some(0x1_0000_0000));
+
+        // 10 GiB — what a "files larger than the octal cap" snapshot
+        // produces in the wild.
+        let mut field = [0u8; 12];
+        field[0] = 0x80;
+        let v: u64 = 10 * 1024 * 1024 * 1024;
+        for (i, b) in v.to_be_bytes().iter().enumerate() {
+            field[4 + i] = *b;
+        }
+        assert_eq!(parse_numeric(&field), Some(v));
+    }
+
+    /// Two's-complement-negative encoding (first byte `0xff`) is not
+    /// used for non-negative tar fields and we explicitly reject it
+    /// rather than silently sign-extending.
+    #[test]
+    fn parse_numeric_rejects_negative_base256() {
+        let mut field = [0u8; 12];
+        field[0] = 0xff;
+        field[11] = 0x01;
+        assert_eq!(parse_numeric(&field), None);
+    }
+
+    /// Values whose magnitude exceeds u64 — the field is 12 bytes so
+    /// it can encode up to 256^11 — surface as `None` rather than
+    /// wrapping silently.
+    #[test]
+    fn parse_numeric_rejects_overflow() {
+        let mut field = [0u8; 12];
+        field[0] = 0x80;
+        field[1] = 0x01; // sets bit 64 of the result; overflows u64.
+        assert_eq!(parse_numeric(&field), None);
+    }
+
+    /// End-to-end: a header whose size field uses GNU base-256
+    /// parses through `ParsedHeader::from_bytes` (with checksum) the
+    /// same way it would if the size were small enough for octal.
+    /// This is the exact regression that surfaced as
+    /// `malformed tar header at archive offset 1536: size field is
+    /// not a valid octal value` on multi-TB chain snapshots.
+    #[test]
+    fn parsed_header_accepts_gnu_base256_size() {
+        let huge: u64 = 12 * 1024 * 1024 * 1024; // 12 GiB > 8 GiB octal cap.
+        let mut h = build_header("big.bin", 0, b'0');
+        // Overwrite the size field with the base-256 form. Every byte
+        // of the field participates in the checksum, so we have to
+        // re-compute it after patching.
+        h[124..136].fill(0);
+        h[124] = 0x80;
+        for (i, b) in huge.to_be_bytes().iter().enumerate() {
+            h[128 + i] = *b;
+        }
+        // Re-run the checksum dance from `build_header`: spaces in the
+        // chksum slot, sum, then write 6 octal digits + NUL + space.
+        h[148..156].fill(b' ');
+        let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+        let chk = format!("{sum:06o}\0 ");
+        h[148..148 + chk.len()].copy_from_slice(chk.as_bytes());
+
+        validate_checksum(&h, 0).expect("checksum must validate");
+        let parsed = ParsedHeader::from_bytes(&h, 0).expect("size must parse");
+        assert_eq!(parsed.size, huge);
     }
 
     #[test]
