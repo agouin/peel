@@ -131,6 +131,17 @@ impl ProgressState {
         self.bytes_downloaded.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Roll back a partial in-flight increment. Used by the ranged
+    /// worker when a body read fails mid-dispatch and the retry will
+    /// re-fetch the same range from byte 0 — without the rollback the
+    /// counter would double-count the partially-received bytes.
+    pub fn sub_downloaded(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.bytes_downloaded.fetch_sub(n, Ordering::Relaxed);
+    }
+
     /// Add bytes to the extracted counter.
     pub fn add_extracted(&self, n: u64) {
         if n == 0 {

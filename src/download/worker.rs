@@ -579,29 +579,77 @@ fn try_once(
     // dispatch loop polls, so a stalled limiter still tears down on
     // shutdown. Refunding tokens on a short read keeps the bucket
     // accurate even when the server hands us a chunked frame.
-    if let Some(limiter) = ctx.rate_limiter {
+    //
+    // We hand-roll the read loop (instead of `read_exact`) so the
+    // shared progress counter is updated *per socket read* rather than
+    // once per whole dispatch. With adaptive chunk sizing growing
+    // dispatches up to 64 MiB, a slow link would otherwise leave the
+    // counter flat for tens of seconds and the renderer's rate window
+    // would read 0 b/s until a chunk landed. `attempt_progress` tracks
+    // what we incremented during *this* attempt so we can roll it back
+    // if the read fails — the retry re-issues the range from byte 0
+    // and the next attempt's increments would otherwise double-count.
+    let mut attempt_progress: u64 = 0;
+    let read_result = if let Some(limiter) = ctx.rate_limiter {
         let mut limited = RateLimitedReader::new(&mut body, Arc::clone(limiter), cancel);
-        limited
-            .read_exact(&mut buf)
-            .map_err(|source| WorkerError::BodyIo { chunk, source })?;
+        read_with_progress(&mut limited, &mut buf, ctx.progress, &mut attempt_progress)
     } else {
-        body.read_exact(&mut buf)
-            .map_err(|source| WorkerError::BodyIo { chunk, source })?;
+        read_with_progress(&mut body, &mut buf, ctx.progress, &mut attempt_progress)
+    };
+    if let Err(source) = read_result {
+        if let Some(p) = ctx.progress {
+            p.sub_downloaded(attempt_progress);
+        }
+        return Err(WorkerError::BodyIo { chunk, source });
     }
 
     ctx.sparse
         .pwrite_at(range.start(), &buf)
         .map_err(|source| WorkerError::SparseFile { chunk, source })?;
 
-    if let Some(p) = ctx.progress {
-        p.add_downloaded(range.len());
-    }
-
     // hyper-util's connection pool reclaims the connection when the
     // body is dropped at end of scope; no explicit release step.
 
     let crcs = compute_chunk_crcs(&buf, dispatch, ctx.chunk_size);
     Ok((range.len(), crcs))
+}
+
+/// Fill `buf` from `reader`, ticking `progress` after each successful
+/// read so the renderer's rate window doesn't stall waiting for a
+/// whole multi-MiB dispatch to land. `attempt_progress` accumulates
+/// what was added *this attempt* so the caller can roll it back if the
+/// read fails partway through.
+///
+/// Mirrors `Read::read_exact` in every other respect: retries on
+/// `Interrupted`, surfaces a short final read as `UnexpectedEof`.
+fn read_with_progress<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    progress: Option<&ProgressState>,
+    attempt_progress: &mut u64,
+) -> io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => {
+                filled += n;
+                let n_u64 = n as u64;
+                *attempt_progress = attempt_progress.saturating_add(n_u64);
+                if let Some(p) = progress {
+                    p.add_downloaded(n_u64);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Slice the dispatch body at bitmap-chunk boundaries and compute

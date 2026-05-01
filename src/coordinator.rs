@@ -644,6 +644,29 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         let resumed_bytes = u64::from(chunks_resumed).saturating_mul(config.chunk_size);
         let resumed_bytes = resumed_bytes.min(info.total_size);
         state.add_downloaded(resumed_bytes);
+        // Pre-credit the resumed *extracted* count too: the sink's
+        // checkpointed state already records what was written through
+        // it, so the renderer should not rewind to 0 just because the
+        // current process hasn't yet decoded anything. Without this,
+        // a resumed run shows a download counter advancing at full
+        // (cumulative) speed against an extract counter that just
+        // restarted, which looks wrong even when nothing is broken.
+        if let ResumePlan::Resume { sink_state, .. } = &resume_plan {
+            let resumed_extracted = match sink_state {
+                SinkState::Raw { bytes_written } => *bytes_written,
+                SinkState::Tar {
+                    in_flight: Some(s), ..
+                } => s.archive_offset,
+                SinkState::Tar {
+                    in_flight: None, ..
+                } => 0,
+                // ZIP entries are byte-counted by the zip pipeline
+                // separately; pre-crediting from here would require
+                // re-reading entry sizes the resume plan doesn't carry.
+                SinkState::Zip { .. } => 0,
+            };
+            state.add_extracted(resumed_extracted);
+        }
         state.mark_started();
     }
 
