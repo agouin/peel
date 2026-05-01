@@ -285,6 +285,65 @@ impl<'a> ReverseBitReader<'a> {
         let _ = self.read(n)?;
         Ok(())
     }
+
+    /// Lenient counterpart to [`Self::read`]: reads the next `n`
+    /// bits MSB-first, but returns `0`-padded values for any bits
+    /// past the end of the stream instead of failing with
+    /// `UnexpectedEof`. The over-read is recorded by advancing
+    /// the internal cursor past `total_bits`; callers can detect
+    /// it with [`Self::has_leftover`] or [`Self::is_overread`].
+    ///
+    /// Used by the sequence decoder, where libzstd-encoded
+    /// streams are allowed to under-write the very last
+    /// sequence's extras and rely on zero-padding for the missing
+    /// LSBs (RFC 8478 §4.2.2 / `BIT_DStream_overflow` semantics).
+    ///
+    /// # Errors
+    ///
+    /// - [`ZstdError::MalformedFrameHeader`] when `n >`
+    ///   [`MAX_BITS_PER_READ`].
+    pub fn read_padded(&mut self, n: u32) -> Result<u32, ZstdError> {
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > MAX_BITS_PER_READ {
+            return Err(ZstdError::MalformedFrameHeader(
+                "reverse bit read > 32 bits",
+            ));
+        }
+        let mut out: u32 = 0;
+        for _ in 0..n {
+            let bit_index = self.consumed_bits;
+            let bit = if bit_index < self.total_bits {
+                let byte_from_end = bit_index / 8;
+                let bit_in_byte_from_msb = (bit_index % 8) as u32;
+                // INVARIANT: bit_index < total_bits, so
+                // byte_from_end < bytes.len() and the subtraction
+                // is safe.
+                let byte_idx = self.bytes.len() - 1 - byte_from_end;
+                (self.bytes[byte_idx] >> (7 - bit_in_byte_from_msb)) & 1
+            } else {
+                // Past the end: zero-pad the bit. Cursor still
+                // advances so leftover-vs-over-read can be
+                // distinguished post-decode.
+                0
+            };
+            out = (out << 1) | u32::from(bit);
+            self.consumed_bits += 1;
+        }
+        Ok(out)
+    }
+
+    /// `true` when the cursor has not yet reached the end of the
+    /// data bits — i.e. there are bits the caller hasn't
+    /// consumed. After a successful decode using
+    /// [`Self::read_padded`] this should be `false`; otherwise
+    /// the bitstream is over-long (extra bits the encoder
+    /// shouldn't have written).
+    #[must_use]
+    pub fn has_leftover(&self) -> bool {
+        self.consumed_bits < self.total_bits
+    }
 }
 
 #[cfg(test)]

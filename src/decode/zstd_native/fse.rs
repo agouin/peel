@@ -433,6 +433,25 @@ impl FseTable {
         Self::build(counts, accuracy_log)
     }
 
+    /// Build a single-cell table for `RLE_Mode` (RFC 8478 §3.1.1.4).
+    ///
+    /// `accuracy_log = 0`, `table_size = 1`. The lone cell holds
+    /// `symbol` with `num_bits = 0` and `base_state = 0`, so every
+    /// state read and transition yields the same symbol without
+    /// consuming bits — the caller bounds the loop by the
+    /// `Number_of_Sequences` field instead.
+    #[must_use]
+    pub fn rle(symbol: u8) -> Self {
+        Self {
+            accuracy_log: 0,
+            cells: vec![FseCell {
+                symbol,
+                num_bits: 0,
+                base_state: 0,
+            }],
+        }
+    }
+
     /// Number of cells in the decode table (`1 << accuracy_log`).
     #[must_use]
     pub fn table_size(&self) -> u32 {
