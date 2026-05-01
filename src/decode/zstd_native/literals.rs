@@ -13,22 +13,18 @@
 //! | Compressed_Literals  | Huffman tree description + 1/4 Huffman streams |
 //! | Treeless_Literals    | 1/4 Huffman streams only (reuse prior tree) |
 //!
-//! Phase 3 implements all four section types end-to-end, with two
-//! caveats per `docs/PLAN_zstd_block_decoder.md`:
+//! Phase 3 + 4b together implement all four section types
+//! end-to-end. Both Huffman tree-description encodings (RFC 8478
+//! §4.2.1.1 direct and §4.2.1.2 FSE-coded) route through
+//! `parse_tree_description` into [`HuffmanTree::from_direct_weights`].
 //!
-//! - **FSE-coded Huffman weight descriptions** (RFC 8478 §4.2.1.2)
-//!   return [`ZstdError::UnsupportedFrameFeature`] until Phase 4.
-//!   Real-world `zstd -3` output uses these for any block with
-//!   more than ~a-handful of unique bytes; the direct-encoding
-//!   path covers small alphabets and our hand-built test
-//!   fixtures.
-//! - **Block_Maximum_Decompressed_Size** is the same 128 KiB cap
-//!   the block layer enforces (RFC §3.1.1.2). Literals
-//!   regenerated_size is also bounded by this.
+//! `Block_Maximum_Decompressed_Size` is the same 128 KiB cap the
+//! block layer enforces (RFC §3.1.1.2); literals
+//! regenerated_size is also bounded by this.
 
 use super::bitstream::ReverseBitReader;
 use super::error::ZstdError;
-use super::huffman::{parse_direct_weights, HuffmanTree};
+use super::huffman::{parse_direct_weights, parse_fse_weights, HuffmanTree};
 
 /// Block-type tag from a literals header (RFC 8478 §3.1.1.3,
 /// 2 bits at the LSB of the first header byte).
@@ -240,34 +236,33 @@ pub fn decode_literals(
 /// start of `bytes`. Returns the tree and the number of bytes
 /// consumed.
 ///
+/// Both encoding flavours from RFC §4.2.1 are supported:
+///
+/// - Header byte ≥ 128: direct-encoded weights (4 bits per weight,
+///   high nibble first). See [`parse_direct_weights`].
+/// - Header byte < 128: FSE-coded weights, where the header byte
+///   itself is the compressed-size of the FSE distribution
+///   description plus weight bitstream. See [`parse_fse_weights`].
+///
 /// # Errors
 ///
 /// - [`ZstdError::UnexpectedEof`] when `bytes` is shorter than the
 ///   description's structural minimum.
-/// - [`ZstdError::UnsupportedFrameFeature`] when the description
-///   uses FSE-coded weights (Phase 4).
+/// - [`ZstdError::MalformedFrameHeader`] when the resulting weight
+///   vector doesn't form a complete Huffman code.
 fn parse_tree_description(bytes: &[u8]) -> Result<(HuffmanTree, usize), ZstdError> {
     if bytes.is_empty() {
         return Err(ZstdError::UnexpectedEof("Huffman tree description"));
     }
     let header_byte = bytes[0];
     if header_byte < 128 {
-        // FSE-coded weights (RFC §4.2.1.2). The function
-        // [`super::huffman::parse_fse_weights`] exists and runs
-        // against real libzstd output, but its 2-state FSE
-        // weight-stream decoder produces weights that don't
-        // satisfy Huffman's complete-code budget on every fixture
-        // we've tried. The bug is somewhere in the state-machine
-        // layer (state-table cell mappings, transition arithmetic,
-        // or termination); see `fse_huffman_weights_decode_against_libzstd_frames`
-        // (currently ignored) in `src/decode/zstd_native.rs` for
-        // a known-failing reproduction. Until that's resolved,
-        // production literals fall back to UnsupportedFrameFeature
-        // so a malformed decode doesn't surface as silently
-        // corrupt output.
-        return Err(ZstdError::UnsupportedFrameFeature(
-            "FSE-coded Huffman weight description (state machine WIP)",
-        ));
+        // FSE-coded weights (RFC §4.2.1.2). `parse_fse_weights`
+        // returns the full weight vector (explicit + implicit) and
+        // the total bytes consumed (1 header byte + the FSE-coded
+        // payload it describes).
+        let (weights, consumed) = parse_fse_weights(bytes)?;
+        let tree = HuffmanTree::from_direct_weights(&weights)?;
+        return Ok((tree, consumed));
     }
     // Direct encoding: header_byte - 127 = total number of
     // symbols, with the last weight implicit. Number of weights
@@ -552,17 +547,12 @@ mod tests {
         assert!(matches!(r, Err(ZstdError::MalformedFrameHeader(_))));
     }
 
+    /// Compressed_Literals_Block with a malformed FSE-coded tree
+    /// description: header byte claims a 50-byte payload but the
+    /// section provides only 3 bytes. End-to-end exercise of the
+    /// FSE-weight branch's truncation handling.
     #[test]
-    fn decode_compressed_fse_weights_returns_unsupported() {
-        // Tree description header_byte < 128 means FSE-coded
-        // weights. The corresponding parse_fse_weights function
-        // exists in huffman.rs but its state-machine decoder is
-        // not yet reliably correct against libzstd output (the
-        // `fse_huffman_weights_decode_against_libzstd_frames`
-        // ignored test reproduces the divergence). Until that's
-        // resolved, the production path returns
-        // UnsupportedFrameFeature so a malformed decode doesn't
-        // surface as silent corruption.
+    fn decode_compressed_fse_weights_truncated_errors() {
         let h = LiteralsHeader {
             block_type: LiteralsBlockType::Compressed,
             regenerated_size: 1,
@@ -573,8 +563,8 @@ mod tests {
         let payload = [50u8, 0xAA, 0xBB];
         let mut prev = None;
         match decode_literals(&h, &payload, &mut prev) {
-            Err(ZstdError::UnsupportedFrameFeature(_)) => {}
-            other => panic!("expected UnsupportedFrameFeature, got {other:?}"),
+            Err(ZstdError::UnexpectedEof(_)) => {}
+            other => panic!("expected UnexpectedEof, got {other:?}"),
         }
     }
 
@@ -587,23 +577,26 @@ mod tests {
         //   explicit weights on wire: [2, 1] (the implicit is 1)
         //   direct-weight bytes: 1 byte (high nibble 2, low nibble 1) = 0x21.
         //
-        // Code map: sym 0 -> '0' (1b), sym 1 -> '10' (2b), sym 2 -> '11' (2b).
-        // Encode literal sequence: 0, 1, 2 -> bits MSB-first: 0  10  11 = 5 bits.
+        // Canonical assignment per RFC 8478 §4.2.1.3 (ascending
+        // weight, then symbol; codes start at 0):
+        //   sym 1 -> '00' (2b), sym 2 -> '01' (2b), sym 0 -> '1' (1b).
+        // Encode literal sequence: 0, 1, 2 -> bits MSB-first:
+        //   1 00 01 = 5 bits.
         //
         // Reverse bitstream layout (one byte):
         //   bit 7 (MSB): 0  (zero pad above sentinel)
         //   bit 6      : 1  (sentinel)
-        //   bit 5      : 0  (sym 0)
-        //   bit 4      : 1  (sym 1, top)
+        //   bit 5      : 1  (sym 0)
+        //   bit 4      : 0  (sym 1, top)
         //   bit 3      : 0  (sym 1, bottom)
-        //   bit 2      : 1  (sym 2, top)
+        //   bit 2      : 0  (sym 2, top)
         //   bit 1      : 1  (sym 2, bottom)
         //   bit 0      : 0  (trailing pad)
-        // = 0b0_1_0_1_0_1_1_0 = 0x56
+        // = 0b0_1_1_0_0_0_1_0 = 0x62
         //
         // Payload = [tree desc header, weight bytes, stream byte]
-        //         = [130, 0x21, 0x56] = 3 bytes total.
-        let payload = [130u8, 0x21, 0x56];
+        //         = [130, 0x21, 0x62] = 3 bytes total.
+        let payload = [130u8, 0x21, 0x62];
         let h = LiteralsHeader {
             block_type: LiteralsBlockType::Compressed,
             regenerated_size: 3,
@@ -635,7 +628,7 @@ mod tests {
             payload_size: 1,
             four_stream: false,
         };
-        let out = decode_literals(&h, &[0x56], &mut prev).expect("decode");
+        let out = decode_literals(&h, &[0x62], &mut prev).expect("decode");
         assert_eq!(out, vec![0u8, 1, 2]);
     }
 

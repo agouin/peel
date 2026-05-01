@@ -958,35 +958,14 @@ mod tests {
         out
     }
 
-    /// **IGNORED** — known-failing reproduction for the Phase 4b
-    /// state-machine bug.
-    ///
-    /// Phase 4a fixed the FSE distribution wire-format parser
-    /// (long-code reconstruction now uses the libzstd-shaped
-    /// `v = full_value − L * extra` rule, validated against real
-    /// frames — the parsed counts land at valid Huffman weight
-    /// indices). The remaining gap is in
-    /// `huffman::parse_fse_weights`'s 2-state FSE weight-stream
-    /// decoder: the weights it produces don't satisfy Huffman's
-    /// complete-code budget (`sum(2^w) != 2^(max_weight + 1)`)
-    /// for any libzstd-produced fixture I've tried.
-    ///
-    /// Suspected sites of the bug: state-table cell-symbol
-    /// placement (position-step permutation), state-transition
-    /// arithmetic (num_bits / base_state derivation), the order
-    /// of the two initial-state reads, or the loop-termination
-    /// rule for the final emission.
-    ///
-    /// Until this is resolved, the production literals path
-    /// returns `UnsupportedFrameFeature` for FSE-coded weight
-    /// descriptions (see `parse_tree_description` in literals.rs)
-    /// so a malformed decode doesn't surface as silent
-    /// corruption.
-    ///
-    /// Run with `cargo test --features peel_zstd_native -- --ignored`
-    /// once the state machine is fixed.
+    /// End-to-end: Compressed_Literals_Block whose Huffman tree
+    /// description uses FSE-coded weights (RFC §4.2.1.2). At
+    /// `zstd -3`, the wide-alphabet fixtures below reliably route
+    /// through this path, so this test exercises the entire
+    /// distribution-parser → table-builder → 2-state weight-stream
+    /// decoder → implicit-weight reconstruction pipeline against
+    /// libzstd ground truth.
     #[test]
-    #[ignore = "Phase 4b state-machine bug — see doc comment"]
     fn fse_huffman_weights_decode_against_libzstd_frames() {
         let mut hit_fse = false;
         for len in [8 * 1024, 32 * 1024, 128 * 1024] {
@@ -999,18 +978,11 @@ mod tests {
         );
     }
 
-    /// Text-payload counterpart to the ignored FSE-Huffman test.
-    /// Locks the literals decoder's regenerated-size contract on
-    /// whatever libzstd happens to emit (Raw / RLE / direct-
-    /// encoded Compressed). Doesn't fail when FSE-coded weights
-    /// would be needed — the production parse_tree_description
-    /// dispatches those to UnsupportedFrameFeature, which the
-    /// helper treats as an error and panics; so this test only
-    /// runs reliably on fixtures that don't trip the FSE path.
-    /// Kept to validate the direct-encoded-weight path
-    /// end-to-end against libzstd output.
+    /// Text-payload counterpart: locks the literals decoder
+    /// against libzstd output for prose-like input. Whether the
+    /// encoder picks direct-mode or FSE-mode weights depends on
+    /// alphabet width; both paths must succeed.
     #[test]
-    #[ignore = "depends on libzstd not emitting FSE-coded weights — flaky"]
     fn literals_decode_against_libzstd_text_frames() {
         let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. \
             pack my box with five dozen liquor jugs. how vexingly quick \

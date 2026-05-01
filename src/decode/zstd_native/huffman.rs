@@ -1,41 +1,47 @@
 //! Canonical-Huffman tree for zstd literal decoding (RFC 8478 §4.2).
 //!
-//! Phase 3 implements only the **direct-encoding** weight description
-//! (header byte ≥ 128, weights packed 4 bits per symbol). The FSE-coded
-//! weight description (header byte < 128) lands in Phase 4 alongside
-//! the rest of the FSE infrastructure — see
-//! `docs/PLAN_zstd_block_decoder.md` for the phasing rationale.
+//! Both encodings of the weight description are supported:
+//!
+//! - **Direct** (header byte ≥ 128): weights are packed 4 bits per
+//!   symbol, high nibble first. See [`parse_direct_weights`].
+//! - **FSE-coded** (header byte < 128): the 1-byte header gives the
+//!   compressed size of an FSE distribution description plus a
+//!   2-state interleaved weight bitstream. See [`parse_fse_weights`].
 //!
 //! # Wire format recap
 //!
 //! For a symbol with weight `w >= 1`:
 //!
 //! ```text
-//! code_length = max_weight + 1 - w
+//! code_length = max_num_bits + 1 - w
 //! cells_in_decode_table = 1 << (w - 1)
 //! ```
 //!
-//! Symbols with `w == 0` are absent from the alphabet. The longest
-//! code length is `max_weight` (for symbols with `w == 1`); the
-//! decode table therefore has `2^max_weight` entries.
+//! Symbols with `w == 0` are absent from the alphabet.
 //!
 //! Sum invariant (RFC 8478 §4.2.1): `sum(2^w for w >= 1) ==
-//! 2^(max_weight + 1)`. The encoder writes `n - 1` weights explicitly
-//! and the decoder computes the implicit n-th weight from this sum.
+//! 2^(max_num_bits + 1)`, where `max_num_bits` is the longest
+//! Huffman code length. The encoder writes `n - 1` weights
+//! explicitly and the decoder computes the implicit n-th weight
+//! from this sum. `max_num_bits` is derived from the *sum*, not
+//! from `max(weights)`: when no symbol carries the longest code
+//! length the implicit weight does, and `max_num_bits` exceeds
+//! every explicit weight (matches libzstd's `HUF_readStats_body`).
 //!
 //! # Decoding
 //!
 //! [`HuffmanTree::decode`] reads one symbol from a [`ReverseBitReader`]
-//! by peeking `max_weight` bits (always exactly that many), looking
-//! up the entry, and advancing by the entry's code length. Per the
-//! plan §Phase 3, we use the straight bit-by-bit table — fast-path
-//! tables (Huffman X2 / X4) are deferred to Phase 11.
+//! by peeking `max_num_bits` bits (always exactly that many),
+//! looking up the entry, and advancing by the entry's code length.
+//! Per the plan §Phase 3, we use the straight bit-by-bit table —
+//! fast-path tables (Huffman X2 / X4) are deferred to Phase 11.
 
 use super::bitstream::{ForwardBitReader, ReverseBitReader};
 use super::error::ZstdError;
 use super::fse::{parse_distribution, FseTable, MAX_FSE_HUFFMAN_ACCURACY_LOG};
 
-/// RFC 8478 caps Huffman code lengths at 11 bits (`max_weight <= 11`).
+/// RFC 8478 caps Huffman code lengths at 11 bits
+/// (`max_num_bits <= 11`).
 ///
 /// Round one validates against this cap at parse time so callers
 /// never over-allocate the decode table beyond `2^11 = 2048` cells.
@@ -78,47 +84,54 @@ impl HuffmanTree {
     /// - [`ZstdError::MalformedFrameHeader`] when the weights
     ///   don't form a complete Huffman code (sum-of-2^w ≠
     ///   power of two), when no symbol has a positive weight, or
-    ///   when `max_weight > MAX_HUFFMAN_CODE_BITS`.
+    ///   when the resulting `max_num_bits > MAX_HUFFMAN_CODE_BITS`.
     pub fn from_direct_weights(weights: &[u8]) -> Result<Self, ZstdError> {
         if weights.is_empty() {
             return Err(ZstdError::MalformedFrameHeader(
                 "Huffman: empty weight vector",
             ));
         }
-        let max_weight = weights.iter().copied().max().unwrap_or(0);
-        if max_weight == 0 {
-            return Err(ZstdError::MalformedFrameHeader(
-                "Huffman: no symbol has a positive weight",
-            ));
-        }
-        let max_num_bits = u32::from(max_weight);
-        if max_num_bits > MAX_HUFFMAN_CODE_BITS {
-            return Err(ZstdError::MalformedFrameHeader(
-                "Huffman: max code length > 11 bits",
-            ));
-        }
-        // Sum invariant: sum(2^w) over present symbols == 2^(max_weight+1).
-        // Compute it as a u64 to keep headroom even though for
-        // max_weight <= 11 a u32 would suffice.
+        // Sum invariant (RFC 8478 §4.2.1): `sum(2^w) over present
+        // symbols == 2^(max_num_bits + 1)`, where `max_num_bits` is
+        // the longest Huffman code length. `max_num_bits` is derived
+        // from the sum, NOT from `max(weights)`: it can exceed every
+        // explicit weight when no symbol has the longest code length
+        // (e.g. an implicit weight of 1 with only `weight ≤ 8`
+        // explicits can still yield `max_num_bits = 9`).
         let mut weight_sum: u64 = 0;
         for &w in weights {
             if w == 0 {
                 continue;
             }
-            if u32::from(w) > max_num_bits {
-                // Should not happen if max_weight is the actual max,
-                // but defend against programmer error in callers.
-                return Err(ZstdError::MalformedFrameHeader(
-                    "Huffman: weight exceeds declared max",
-                ));
+            if u32::from(w) > MAX_HUFFMAN_CODE_BITS {
+                return Err(ZstdError::MalformedFrameHeader("Huffman: weight > 11"));
             }
             weight_sum = weight_sum.saturating_add(1u64 << w);
         }
-        let expected = 1u64 << (max_num_bits + 1);
-        if weight_sum != expected {
+        if weight_sum == 0 {
+            return Err(ZstdError::MalformedFrameHeader(
+                "Huffman: no symbol has a positive weight",
+            ));
+        }
+        if !weight_sum.is_power_of_two() {
             return Err(ZstdError::MalformedFrameHeader(
                 "Huffman: sum-of-2^w not a complete power of two",
             ));
+        }
+        // weight_sum == 2^(max_num_bits + 1), so max_num_bits =
+        // log2(weight_sum) - 1 = trailing_zeros(weight_sum) - 1.
+        let max_num_bits = weight_sum.trailing_zeros() - 1;
+        if max_num_bits > MAX_HUFFMAN_CODE_BITS {
+            return Err(ZstdError::MalformedFrameHeader(
+                "Huffman: max code length > 11 bits",
+            ));
+        }
+        for &w in weights {
+            if u32::from(w) > max_num_bits {
+                return Err(ZstdError::MalformedFrameHeader(
+                    "Huffman: weight exceeds derived max code length",
+                ));
+            }
         }
 
         let table_size = 1usize << max_num_bits;
@@ -130,16 +143,22 @@ impl HuffmanTree {
             table_size
         ];
 
-        // Sort present symbols: descending weight first (= shortest
-        // code first), then ascending symbol index as a tiebreaker.
-        // Canonical-order placement fills cells contiguously.
+        // Canonical-Huffman placement per RFC 8478 §4.2.1.3:
+        // "Symbols are first sorted by Weight, then by natural
+        // sequential order. ... starting from lowest Weight (hence
+        // highest Number_of_Bits), prefix codes are assigned in
+        // ascending order." So we sort ascending by weight, then
+        // ascending by symbol index, and place each symbol's cells
+        // consecutively from cursor 0. This produces a table where
+        // the lowest indices map to the lowest-numbered codes (long
+        // codes), matching libzstd's `HUF_readDTableX1_wksp`.
         let mut sorted: Vec<u32> = (0..weights.len() as u32)
             .filter(|&i| weights[i as usize] > 0)
             .collect();
         sorted.sort_by(|&a, &b| {
             let wa = weights[a as usize];
             let wb = weights[b as usize];
-            wb.cmp(&wa).then(a.cmp(&b))
+            wa.cmp(&wb).then(a.cmp(&b))
         });
 
         let mut cursor = 0usize;
@@ -239,56 +258,66 @@ impl HuffmanTree {
 ///
 /// The wire format elides the last weight; the decoder reconstructs
 /// it from the sum invariant
-/// `sum(2^w for w >= 1) == 2^(max_weight + 1)`.
+/// `sum(2^w for w >= 1) == 2^(max_num_bits + 1)`, where
+/// `max_num_bits` is the longest Huffman code length (the FSE-style
+/// "tableLog"). `max_num_bits` is derived from the *sum* of explicit
+/// weights, not from `max(explicit)`: when no symbol carries the
+/// longest code length, `max_num_bits` can legitimately exceed every
+/// explicit weight (matches libzstd's `HUF_readStats_body`).
 ///
 /// # Errors
 ///
 /// - [`ZstdError::MalformedFrameHeader`] when the partial sum is
-///   already at or above `2^(max_weight + 1)`, when the residual is
-///   not a power of two, or when the resulting weight would exceed
-///   `max_weight`.
+///   zero or non-positive, when the residual is not a power of two,
+///   or when the derived `max_num_bits` exceeds
+///   [`MAX_HUFFMAN_CODE_BITS`].
 pub fn compute_implicit_weight(explicit: &[u8]) -> Result<u8, ZstdError> {
     if explicit.is_empty() {
         return Err(ZstdError::MalformedFrameHeader(
             "Huffman: cannot derive implicit weight from empty list",
         ));
     }
-    let max_weight = explicit.iter().copied().max().unwrap_or(0);
-    if max_weight == 0 {
-        return Err(ZstdError::MalformedFrameHeader(
-            "Huffman: explicit weights all zero",
-        ));
-    }
-    if u32::from(max_weight) > MAX_HUFFMAN_CODE_BITS {
-        return Err(ZstdError::MalformedFrameHeader("Huffman: max weight > 11"));
-    }
-    let mut sum: u64 = 0;
+    // Sum (2^(w-1)) over explicit weights. This is libzstd's
+    // `weightTotal` in `HUF_readStats_body`. Use 2^(w-1) (not 2^w)
+    // so the implicit weight's contribution (also a power of two)
+    // tops up `weightTotal` to the next higher power of two — that
+    // power is `2^max_num_bits`, and the bit count of the residual
+    // gives the implicit weight directly.
+    let mut weight_total: u64 = 0;
     for &w in explicit {
         if w == 0 {
             continue;
         }
-        sum = sum.saturating_add(1u64 << w);
+        if u32::from(w) > MAX_HUFFMAN_CODE_BITS {
+            return Err(ZstdError::MalformedFrameHeader("Huffman: weight > 11"));
+        }
+        // (1 << w) >> 1 == 1 << (w-1) when w >= 1.
+        weight_total = weight_total.saturating_add(1u64 << (u32::from(w) - 1));
     }
-    let target = 1u64 << (u32::from(max_weight) + 1);
-    if sum >= target {
+    if weight_total == 0 {
         return Err(ZstdError::MalformedFrameHeader(
-            "Huffman: explicit weights overflow the complete-code budget",
+            "Huffman: explicit weights all zero",
         ));
     }
-    let residual = target - sum;
-    if !residual.is_power_of_two() {
+    // max_num_bits = floor(log2(weight_total)) + 1 = ceil(log2(weight_total + 1)).
+    // For weight_total in [1, 2047] (cap from MAX_HUFFMAN_CODE_BITS),
+    // 64 - leading_zeros gives floor(log2(x)) + 1 directly.
+    let max_num_bits = 64 - weight_total.leading_zeros();
+    if max_num_bits > MAX_HUFFMAN_CODE_BITS {
+        return Err(ZstdError::MalformedFrameHeader(
+            "Huffman: derived max code length > 11 bits",
+        ));
+    }
+    let target = 1u64 << max_num_bits;
+    let rest = target - weight_total;
+    if rest == 0 || !rest.is_power_of_two() {
         return Err(ZstdError::MalformedFrameHeader(
             "Huffman: implicit residual is not a power of two",
         ));
     }
-    // residual = 2^w_implicit. trailing_zeros gives w_implicit.
-    let w_implicit = residual.trailing_zeros();
-    if w_implicit > u32::from(max_weight) {
-        return Err(ZstdError::MalformedFrameHeader(
-            "Huffman: implicit weight exceeds max weight",
-        ));
-    }
-    // INVARIANT: 0 <= w_implicit <= max_weight <= 11, so the
+    // rest = 2^(w_implicit - 1). trailing_zeros gives w_implicit - 1.
+    let w_implicit = rest.trailing_zeros() + 1;
+    // INVARIANT: 1 <= w_implicit <= max_num_bits <= 11, so the
     // `as u8` cast cannot truncate.
     Ok(w_implicit as u8)
 }
@@ -493,17 +522,18 @@ mod tests {
     fn from_direct_weights_three_symbol_unbalanced_tree() {
         // Symbol 0 weight 2 (code length 1, 1 bit), symbols 1 and 2
         // weight 1 (code length 2, 2 bits each).
-        // sum(2^w) = 4 + 2 + 2 = 8 = 2^(2+1). ✓
-        // Canonical assignment (descending weight, then symbol):
-        //   sym 0: w=2, length=1, 2 cells [0..2)
-        //   sym 1: w=1, length=2, 1 cell [2..3)
-        //   sym 2: w=1, length=2, 1 cell [3..4)
+        // sum(2^w) = 4 + 2 + 2 = 8 = 2^(2+1) -> max_num_bits = 2.
+        // Canonical assignment per RFC 8478 §4.2.1.3 (ascending
+        // weight, then symbol; codes start at 0):
+        //   sym 1: w=1, code=00, 1 cell [0..1)
+        //   sym 2: w=1, code=01, 1 cell [1..2)
+        //   sym 0: w=2, code=1,  2 cells [2..4)
         let tree = HuffmanTree::from_direct_weights(&[2, 1, 1]).expect("build");
         assert_eq!(tree.max_num_bits(), 2);
-        assert_eq!(lookup_via_table(&tree, 0), (0, 1));
-        assert_eq!(lookup_via_table(&tree, 1), (0, 1));
-        assert_eq!(lookup_via_table(&tree, 2), (1, 2));
-        assert_eq!(lookup_via_table(&tree, 3), (2, 2));
+        assert_eq!(lookup_via_table(&tree, 0), (1, 2));
+        assert_eq!(lookup_via_table(&tree, 1), (2, 2));
+        assert_eq!(lookup_via_table(&tree, 2), (0, 1));
+        assert_eq!(lookup_via_table(&tree, 3), (0, 1));
     }
 
     #[test]
@@ -551,26 +581,54 @@ mod tests {
     }
 
     #[test]
-    fn compute_implicit_weight_zero_implicit() {
-        // Explicit [2, 1, 1] sums to 8; target = 8; residual = 0
-        // — implicit weight should be ... well, residual=0 means
-        // no implicit symbol, but the wire format always carries
-        // one. We surface this as malformed because residual 0 is
-        // not a positive power of two.
-        assert!(compute_implicit_weight(&[2, 1, 1]).is_err());
+    fn compute_implicit_weight_can_exceed_max_explicit() {
+        // Explicit [2, 1, 1]: weight_total = sum(2^(w-1)) = 2+1+1
+        // = 4. max_num_bits = floor(log2(4)) + 1 = 3, target = 8,
+        // rest = 4 = 2^2 -> implicit weight = 3, which exceeds
+        // max(explicit) = 2. Per RFC 8478 §4.2.1 / libzstd's
+        // `HUF_readStats_body` this is valid: the implicit symbol
+        // simply carries the longest code length when no explicit
+        // symbol does.
+        assert_eq!(compute_implicit_weight(&[2, 1, 1]).expect("ok"), 3);
     }
 
     #[test]
-    fn compute_implicit_weight_overflow_is_error() {
-        // Explicit weights overshoot the budget.
-        assert!(compute_implicit_weight(&[3, 3]).is_err());
+    fn compute_implicit_weight_powers_of_two_cap_implicit_at_max_num_bits() {
+        // Explicit [3, 3]: weight_total = 4 + 4 = 8 = 2^3.
+        // max_num_bits = floor(log2(8)) + 1 = 4, target = 16,
+        // rest = 8 = 2^3 -> implicit weight = 4. Tree:
+        // [3, 3, 4] with code lengths [2, 2, 1].
+        assert_eq!(compute_implicit_weight(&[3, 3]).expect("ok"), 4);
     }
 
     #[test]
     fn compute_implicit_weight_residual_must_be_power_of_two() {
-        // Sum = 2^3 + 2^1 = 10; max_weight = 3; target = 16;
-        // residual = 6 — not a power of two.
+        // Explicit [3, 1]: weight_total = 4 + 1 = 5.
+        // max_num_bits = floor(log2(5)) + 1 = 3, target = 8,
+        // rest = 3 — not a power of two -> malformed.
         assert!(compute_implicit_weight(&[3, 1]).is_err());
+    }
+
+    #[test]
+    fn compute_implicit_weight_rejects_weight_above_11() {
+        // Any explicit weight > 11 is rejected before any other
+        // arithmetic.
+        assert!(compute_implicit_weight(&[12, 1]).is_err());
+    }
+
+    #[test]
+    fn compute_implicit_weight_real_libzstd_shaped_input() {
+        // Mirrors the failing fixture from the
+        // `fse_huffman_weights_decode_against_libzstd_frames`
+        // validation test: 217 weight-1, 35 weight-2, 1 weight-6,
+        // 1 weight-7, 1 weight-8 — total 255 explicit weights.
+        // weight_total = 217 + 70 + 32 + 64 + 128 = 511.
+        // max_num_bits = floor(log2(511)) + 1 = 9, target = 512,
+        // rest = 1 = 2^0 -> implicit weight = 1.
+        let mut explicit = vec![1u8; 217];
+        explicit.extend(std::iter::repeat_n(2u8, 35));
+        explicit.extend([6u8, 7, 8]);
+        assert_eq!(compute_implicit_weight(&explicit).expect("ok"), 1);
     }
 
     #[test]
@@ -614,50 +672,37 @@ mod tests {
 
     /// Round-trip: encode a known sequence MSB-first into a
     /// reverse bitstream and decode it through the canonical
-    /// table. Locks the bit ordering so a future "cleanup" of
-    /// peek_lookup or the bitstream reader can't silently flip
-    /// it.
+    /// table. Locks the bit ordering and the canonical-Huffman
+    /// code assignment (RFC 8478 §4.2.1.3) so a future "cleanup"
+    /// of peek_lookup, the bitstream reader, or the canonical
+    /// placement direction can't silently flip them.
     #[test]
     fn decode_round_trips_canonical_sequence() {
-        // Tree: sym 0 -> '0' (1 bit), sym 1 -> '10' (2 bits),
-        // sym 2 -> '11' (2 bits). Canonical 3-symbol Huffman.
+        // Tree: weights = [2, 1, 1]. Canonical assignment per RFC
+        // §4.2.1.3 (ascending weight, then symbol; codes start at
+        // 0): sym 1 -> '00' (2 bits), sym 2 -> '01' (2 bits),
+        // sym 0 -> '1' (1 bit). The shortest code goes to the
+        // highest-weight symbol; lower-weight symbols share a
+        // prefix that begins with 0.
         let tree = HuffmanTree::from_direct_weights(&[2, 1, 1]).expect("build");
 
-        // Sequence in stream order: sym 0 (code '0'), sym 1
-        // (code '10'), sym 2 (code '11'). MSB-first bit pattern:
-        //   0  1 0  1 1  = 5 data bits.
-        // Reverse-bitstream layout (one byte): top of byte = sentinel,
-        // then data MSB-first.
-        //   bit 7 (MSB): 0 (zero-pad above sentinel)
-        //   bit 6      : 1 (sentinel)
-        //   bit 5      : 0 (sym 0)
-        //   bit 4      : 1 \
-        //   bit 3      : 0  } sym 1
-        //   bit 2      : 1 \
-        //   bit 1      : 1  } sym 2
-        //   bit 0      : 0 (unused — total 5 data bits but byte has 6 below sentinel)
-        // Wait: with sentinel at bit 6, there are 6 data bits below
-        // (bits 5..0). We have 5 data bits, so bit 0 is "extra" and
-        // would be a 6th data bit at the end.
-        //
-        // To keep the math clean, pad data with one extra leading
-        // 0 (read first, ignored by us before the test). Stream:
-        //   bit 7: 0 (zero pad)
+        // Sequence in stream order: sym 0, sym 1, sym 2.
+        // MSB-first bit pattern: 1 00 01 = 5 data bits.
+        // Reverse-stream layout (one byte): leading-zero pad +
+        // sentinel + data MSB-first + trailing pad.
+        //   bit 7: 0 (zero pad above sentinel)
         //   bit 6: 1 (sentinel)
-        //   bit 5: 0 (sym 0)
-        //   bit 4: 1 (sym 1, top)
+        //   bit 5: 1 (sym 0)
+        //   bit 4: 0 (sym 1, top)
         //   bit 3: 0 (sym 1, bottom)
-        //   bit 2: 1 (sym 2, top)
+        //   bit 2: 0 (sym 2, top)
         //   bit 1: 1 (sym 2, bottom)
         //   bit 0: 0 (trailing pad — never reached)
-        // = 0b0_1_0_1_0_1_1_0 = 0x56.
-        let stream = [0x56u8];
+        // = 0b0_1_1_0_0_0_1_0 = 0x62.
+        let stream = [0x62u8];
         let mut br = ReverseBitReader::new(&stream).expect("ok");
-        // First decode reads 1 bit (sym 0 has code_length 1).
         assert_eq!(tree.decode(&mut br).expect("sym 0"), 0);
-        // Second decode reads 2 bits (sym 1 has code_length 2).
         assert_eq!(tree.decode(&mut br).expect("sym 1"), 1);
-        // Third decode reads 2 bits (sym 2 has code_length 2).
         assert_eq!(tree.decode(&mut br).expect("sym 2"), 2);
         // After three decodes, only the trailing pad bit remains.
         assert_eq!(br.bits_remaining(), 1);
