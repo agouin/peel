@@ -826,7 +826,32 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     )),
                     None => Box::new(reader),
                 };
-                let mut decoder = factory(source).map_err(CoordinatorError::Decode)?;
+                // O.7b resume path: when the prior checkpoint
+                // captured a decoder-private `decoder_state` blob and
+                // the registry knows a resume factory for the
+                // resolved format, build the decoder pre-seeded from
+                // the blob instead of via the generic `factory`.
+                // Falls through to `factory(source)` for
+                // (a) fresh runs, (b) resume from a coarser
+                // boundary where `decoder_state` is `None`, and
+                // (c) formats with no resume hook registered.
+                let resume_blob = match &resume_plan {
+                    ResumePlan::Resume {
+                        decoder_state: Some(blob),
+                        decoder_position,
+                        ..
+                    } => Some((blob.clone(), *decoder_position)),
+                    _ => None,
+                };
+                let resume_factory = format_name
+                    .as_deref()
+                    .and_then(|n| registry.resume_factory_for_name(n));
+                let mut decoder = match (resume_factory, resume_blob) {
+                    (Some(rf), Some((blob, start_offset))) => {
+                        rf(source, &blob, start_offset).map_err(CoordinatorError::Decode)?
+                    }
+                    _ => factory(source).map_err(CoordinatorError::Decode)?,
+                };
 
                 // Run the extractor with a checkpoint observer that
                 // writes a durable checkpoint every time the cadence
@@ -1032,6 +1057,11 @@ enum ResumePlan {
         bitmap_bytes: Vec<u8>,
         sink_state: SinkState,
         chunk_crc32c: Option<Vec<u32>>,
+        /// Decoder-private resume state captured at the same step
+        /// as `decoder_position` (`OPTIMIZATIONS.md` §O.7b). `Some`
+        /// for lz4 mid-frame block boundaries; `None` for every
+        /// other format and for every coarser boundary.
+        decoder_state: Option<Vec<u8>>,
     },
 }
 
@@ -1099,6 +1129,7 @@ fn build_resume_plan(
         bitmap_bytes: prior.bitmap_completed.clone(),
         sink_state: prior.sink_state.clone(),
         chunk_crc32c: prior.chunk_crc32c.clone(),
+        decoder_state: prior.decoder_state.clone(),
     })
 }
 

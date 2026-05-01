@@ -853,6 +853,27 @@ pub fn factory(src: Box<dyn Read + Send>) -> Result<Box<dyn StreamingDecoder>, D
     Ok(Box::new(Lz4Decoder::new(src)?))
 }
 
+/// [`super::DecoderResumeFactory`] adapter for [`Lz4Decoder::resume`].
+///
+/// Registered against the format name `lz4` by
+/// [`super::DecoderRegistry::with_defaults`] (`OPTIMIZATIONS.md`
+/// §O.7b). Coordinator dispatches here when a checkpoint carries a
+/// `decoder_state` blob and the resolved format is `lz4`; otherwise
+/// the regular [`factory`] is used.
+///
+/// # Errors
+///
+/// Forwards [`DecodeError::Construct`] from [`Lz4Decoder::resume`]
+/// when the blob is malformed (bad magic, length mismatch, internal
+/// field disagreement).
+pub fn resume_factory(
+    src: Box<dyn Read + Send>,
+    state_blob: &[u8],
+    start_offset: u64,
+) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+    Ok(Box::new(Lz4Decoder::resume(src, state_blob, start_offset)?))
+}
+
 /// Hand-rolled XXH32 used for the LZ4 frame's header, block, and
 /// content checksums.
 ///

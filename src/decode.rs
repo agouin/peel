@@ -202,6 +202,21 @@ pub trait StreamingDecoder: Send {
 pub type DecoderFactory =
     fn(Box<dyn Read + Send>) -> Result<Box<dyn StreamingDecoder>, DecodeError>;
 
+/// Sibling of [`DecoderFactory`] for the resume path: builds a decoder
+/// pre-seeded from a previously captured [`StreamingDecoder::decoder_state`]
+/// blob.
+///
+/// `start_offset` is the source byte offset at which the source will
+/// deliver its first byte (the saved checkpoint's `decoder_position`).
+/// The resume factory must seed `bytes_consumed` to that offset so the
+/// decoder's high-water mark stays consistent across the boundary.
+///
+/// Only formats whose [`StreamingDecoder::decoder_state`] returns
+/// `Some(...)` need register a resume factory; for the others the
+/// regular [`DecoderFactory`] reading from the saved offset suffices.
+pub type DecoderResumeFactory =
+    fn(Box<dyn Read + Send>, &[u8], u64) -> Result<Box<dyn StreamingDecoder>, DecodeError>;
+
 /// A fixed byte sequence at a known offset that uniquely identifies a
 /// compressed-archive format.
 ///
@@ -263,6 +278,14 @@ pub struct DecoderRegistry {
     /// Each entry is `(lowercased_name, factory)`. Used by the
     /// `--format <name>` CLI override path.
     name_entries: Vec<(String, DecoderFactory)>,
+    /// Optional resume-factory companion to `name_entries`. Only
+    /// populated for formats whose
+    /// [`StreamingDecoder::decoder_state`] returns `Some(...)`
+    /// (today: `lz4`'s mid-frame block boundaries). Coordinator
+    /// looks up the resume factory by format name when a checkpoint
+    /// carries a `decoder_state` blob; absence means the regular
+    /// `factory` is sufficient.
+    name_resume_entries: Vec<(String, DecoderResumeFactory)>,
 }
 
 impl DecoderRegistry {
@@ -343,6 +366,10 @@ impl DecoderRegistry {
             }],
             lz4::factory,
         );
+        // O.7b: lz4 supports mid-frame resume via a per-frame state
+        // blob. Other in-tree formats today restart cleanly from
+        // their `frame_boundary` offset and don't need this hook.
+        r.register_resume_factory("lz4", lz4::resume_factory);
         r.register_format(
             "gzip",
             &[".gz", ".tar.gz"],
@@ -448,6 +475,39 @@ impl DecoderRegistry {
         for m in magics {
             self.register_magic(*m, factory);
         }
+    }
+
+    /// Register `factory` as the resume entry-point for the format
+    /// registered under `name`.
+    ///
+    /// Only required for formats whose
+    /// [`StreamingDecoder::decoder_state`] returns `Some(...)`.
+    /// Coordinator code consults this map when a checkpoint carries
+    /// a `decoder_state` blob and the run is resuming; absence falls
+    /// back to the regular [`Self::factory_for_format_name`] path,
+    /// which is correct for every format whose frame boundaries are
+    /// restartable from the offset alone.
+    ///
+    /// Re-registering the same name (case-insensitively) replaces
+    /// the prior resume factory.
+    pub fn register_resume_factory(&mut self, name: &str, factory: DecoderResumeFactory) {
+        let key = name.to_ascii_lowercase();
+        if let Some(slot) = self.name_resume_entries.iter_mut().find(|(n, _)| *n == key) {
+            slot.1 = factory;
+        } else {
+            self.name_resume_entries.push((key, factory));
+        }
+    }
+
+    /// Look up the resume factory registered against `name`, case-
+    /// insensitively, if any.
+    #[must_use]
+    pub fn resume_factory_for_name(&self, name: &str) -> Option<DecoderResumeFactory> {
+        let lower = name.to_ascii_lowercase();
+        self.name_resume_entries
+            .iter()
+            .find(|(n, _)| n == &lower)
+            .map(|(_, f)| *f)
     }
 
     /// Return the longest-matching factory for `path`'s file name, if any.
@@ -848,6 +908,31 @@ mod tests {
             by_name,
             lz4::factory as DecoderFactory
         ));
+    }
+
+    #[test]
+    fn registry_with_defaults_registers_lz4_resume_factory_and_no_others() {
+        // O.7b: lz4 is the only format whose registry carries a
+        // resume factory today. Other formats fall through to the
+        // generic `factory(source)` path on resume.
+        let r = DecoderRegistry::with_defaults();
+        let lz4_resume = r
+            .resume_factory_for_name("lz4")
+            .expect("lz4 resume registered");
+        assert!(std::ptr::fn_addr_eq(
+            lz4_resume,
+            lz4::resume_factory as DecoderResumeFactory,
+        ));
+        // Case-insensitive lookup matches the rest of the registry.
+        assert!(r.resume_factory_for_name("LZ4").is_some());
+
+        // No other format registers a resume factory yet.
+        for name in ["zstd", "xz", "gzip", "tar", "zip"] {
+            assert!(
+                r.resume_factory_for_name(name).is_none(),
+                "{name} unexpectedly has a resume factory",
+            );
+        }
     }
 
     #[test]
