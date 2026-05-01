@@ -28,7 +28,7 @@
 
 use super::bitstream::ReverseBitReader;
 use super::error::ZstdError;
-use super::huffman::{parse_direct_weights, HuffmanTree};
+use super::huffman::{parse_direct_weights, parse_fse_weights, HuffmanTree};
 
 /// Block-type tag from a literals header (RFC 8478 §3.1.1.3,
 /// 2 bits at the LSB of the first header byte).
@@ -252,13 +252,10 @@ fn parse_tree_description(bytes: &[u8]) -> Result<(HuffmanTree, usize), ZstdErro
     }
     let header_byte = bytes[0];
     if header_byte < 128 {
-        // FSE-coded weights — see Phase 4 in
-        // docs/PLAN_zstd_block_decoder.md. Real-world zstd output
-        // produces these for any block with > ~a-handful of
-        // unique bytes, so this is a meaningful gap.
-        return Err(ZstdError::UnsupportedFrameFeature(
-            "FSE-coded Huffman weight description (Phase 4)",
-        ));
+        // FSE-coded weights (RFC §4.2.1.2). Phase 4b.
+        let (weights, consumed) = parse_fse_weights(bytes)?;
+        let tree = HuffmanTree::from_direct_weights(&weights)?;
+        return Ok((tree, consumed));
     }
     // Direct encoding: header_byte - 127 = total number of
     // symbols, with the last weight implicit. Number of weights
@@ -544,12 +541,12 @@ mod tests {
     }
 
     #[test]
-    fn decode_compressed_fse_weights_returns_unsupported() {
+    fn decode_compressed_truncated_fse_weights_errors_cleanly() {
         // Tree description header_byte < 128 means FSE-coded
-        // weights — Phase 3 surfaces this as
-        // UnsupportedFrameFeature so a real-world frame fails
-        // with a clean diagnosis rather than a silent
-        // mis-decode.
+        // weights — Phase 4b lights this up. Here we ensure a
+        // *malformed* FSE-coded weight description (header
+        // declares 50 bytes but only 2 are present) surfaces
+        // as a typed error rather than a panic.
         let h = LiteralsHeader {
             block_type: LiteralsBlockType::Compressed,
             regenerated_size: 1,
@@ -557,13 +554,11 @@ mod tests {
             payload_size: 3,
             four_stream: false,
         };
-        // Tree description header byte = 50 (< 128), then 2 bytes
-        // we never get to.
         let payload = [50u8, 0xAA, 0xBB];
         let mut prev = None;
         match decode_literals(&h, &payload, &mut prev) {
-            Err(ZstdError::UnsupportedFrameFeature(_)) => {}
-            other => panic!("expected UnsupportedFrameFeature, got {other:?}"),
+            Err(ZstdError::UnexpectedEof(_)) | Err(ZstdError::MalformedFrameHeader(_)) => {}
+            other => panic!("expected typed error, got {other:?}"),
         }
     }
 

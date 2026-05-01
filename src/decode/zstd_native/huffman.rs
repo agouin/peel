@@ -31,8 +31,9 @@
 //! plan §Phase 3, we use the straight bit-by-bit table — fast-path
 //! tables (Huffman X2 / X4) are deferred to Phase 11.
 
-use super::bitstream::ReverseBitReader;
+use super::bitstream::{ForwardBitReader, ReverseBitReader};
 use super::error::ZstdError;
+use super::fse::{parse_distribution, FseTable, MAX_FSE_HUFFMAN_ACCURACY_LOG};
 
 /// RFC 8478 caps Huffman code lengths at 11 bits (`max_weight <= 11`).
 ///
@@ -290,6 +291,116 @@ pub fn compute_implicit_weight(explicit: &[u8]) -> Result<u8, ZstdError> {
     // INVARIANT: 0 <= w_implicit <= max_weight <= 11, so the
     // `as u8` cast cannot truncate.
     Ok(w_implicit as u8)
+}
+
+/// Parse an FSE-coded weight description (RFC 8478 §4.2.1.2) from
+/// `bytes`. The first byte of `bytes` is the on-wire header byte
+/// `< 128`, and `bytes[0]` itself is interpreted as the
+/// **compressed size** of the FSE description plus weight bitstream
+/// — i.e. the number of bytes the parser will consume from
+/// `bytes[1..]`.
+///
+/// Returns the full weight vector (including the implicit final
+/// weight) and the number of bytes consumed from `bytes`
+/// (`1 + bytes[0] as usize`).
+///
+/// # Errors
+///
+/// - [`ZstdError::UnexpectedEof`] when `bytes` is shorter than
+///   `1 + bytes[0]`.
+/// - [`ZstdError::MalformedFrameHeader`] when the FSE distribution
+///   or downstream weight stream is structurally invalid.
+pub fn parse_fse_weights(bytes: &[u8]) -> Result<(Vec<u8>, usize), ZstdError> {
+    if bytes.is_empty() {
+        return Err(ZstdError::UnexpectedEof("Huffman FSE weight description"));
+    }
+    let header_byte = bytes[0];
+    if header_byte >= 128 {
+        return Err(ZstdError::MalformedFrameHeader(
+            "Huffman FSE weights: header byte >= 128 (direct mode)",
+        ));
+    }
+    let compressed_size = usize::from(header_byte);
+    if bytes.len() < 1 + compressed_size {
+        return Err(ZstdError::UnexpectedEof(
+            "Huffman FSE weights: payload truncated",
+        ));
+    }
+    let payload = &bytes[1..1 + compressed_size];
+
+    // Parse the FSE distribution from a forward bitstream over
+    // `payload`. Cap the symbol space at 255 (Huffman alphabet is
+    // bytes), the accuracy_log at the FSE-Huffman cap.
+    let mut fwd = ForwardBitReader::new(payload);
+    let parsed = parse_distribution(&mut fwd, MAX_FSE_HUFFMAN_ACCURACY_LOG, 255)?;
+    let table = FseTable::build(&parsed.counts, parsed.accuracy_log)?;
+
+    // The weight stream is whatever bytes remain after the
+    // distribution description.
+    if parsed.bytes_consumed > payload.len() {
+        return Err(ZstdError::MalformedFrameHeader(
+            "Huffman FSE weights: distribution overran payload",
+        ));
+    }
+    let stream = &payload[parsed.bytes_consumed..];
+    let weights = decode_fse_weight_stream(stream, &table)?;
+
+    if weights.is_empty() {
+        return Err(ZstdError::MalformedFrameHeader(
+            "Huffman FSE weights: zero weights decoded",
+        ));
+    }
+    let mut full = weights;
+    let implicit = compute_implicit_weight(&full)?;
+    full.push(implicit);
+    Ok((full, 1 + compressed_size))
+}
+
+/// Decode a 2-state FSE weight stream from a reverse bitstream.
+///
+/// RFC 8478 §4.2.1.2 specifies that two FSE states alternate, with
+/// state1 emitting the weight at index 0, state2 at index 1, state1
+/// at index 2, and so on. The decoder stops when there aren't
+/// enough bits left to perform a state transition; at that point
+/// both remaining states emit one final symbol each.
+fn decode_fse_weight_stream(stream: &[u8], table: &FseTable) -> Result<Vec<u8>, ZstdError> {
+    let mut br = ReverseBitReader::new(stream)?;
+    let mut state1 = table.read_initial(&mut br)?;
+    let mut state2 = table.read_initial(&mut br)?;
+    let mut weights: Vec<u8> = Vec::new();
+    // Cap the loop so a bug in num_bits accounting can't loop forever.
+    // Huffman alphabet is at most 256 symbols, so weight count <= 255.
+    const MAX_WEIGHTS: usize = 255;
+    loop {
+        let cell1 = *table.cell(state1)?;
+        weights.push(cell1.symbol);
+        if weights.len() >= MAX_WEIGHTS {
+            break;
+        }
+        if br.bits_remaining() < usize::from(cell1.num_bits) {
+            // Cannot transition state1 — emit state2's final
+            // symbol and stop.
+            let cell2 = table.cell(state2)?;
+            weights.push(cell2.symbol);
+            break;
+        }
+        state1 = table.transition(&cell1, &mut br)?;
+
+        let cell2 = *table.cell(state2)?;
+        weights.push(cell2.symbol);
+        if weights.len() >= MAX_WEIGHTS {
+            break;
+        }
+        if br.bits_remaining() < usize::from(cell2.num_bits) {
+            // Cannot transition state2 — emit state1's final
+            // symbol (already updated) and stop.
+            let cell1_final = table.cell(state1)?;
+            weights.push(cell1_final.symbol);
+            break;
+        }
+        state2 = table.transition(&cell2, &mut br)?;
+    }
+    Ok(weights)
 }
 
 /// Parse a direct-encoded weight description (RFC 8478 §4.2.1.1)
