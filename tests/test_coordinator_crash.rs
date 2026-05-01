@@ -1201,19 +1201,8 @@ fn random_kill_points_resume_to_identical_single_frame_tar_lz4_output() {
     let mut rng = Lcg::seeded(0x07B0_07B0_07B0_07B0);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    // Reserve the final two checkpoints to avoid the degenerate
-    // "abort right after the EOF zero blocks were decoded" case
-    // where the resumed decoder produces zero output (only the
-    // 4-byte EndMark remains) and a *fresh* tar sink fails its
-    // "no end-of-archive marker observed" check at close. In a
-    // 414 GB Polkachu-shape archive this corresponds to aborting
-    // within the last ~64 KiB; the test corpus is small enough
-    // that random selection would hit it on every other trial,
-    // which masks the genuine resume coverage we want.
-    let abort_cap = total_checkpoints.saturating_sub(2).max(1);
-
     for trial in 0..trial_count {
-        let abort_after = rng.range(1, abort_cap + 1);
+        let abort_after = rng.range(1, total_checkpoints);
         let work = unique_dir(&format!("single_frame_tar_lz4_trial_{trial}"));
         let _g = CleanupDir(work.clone());
         let out_dir = work.join("out");
@@ -1266,6 +1255,148 @@ fn random_kill_points_resume_to_identical_single_frame_tar_lz4_output() {
         if got != golden_entries {
             captured_failures.lock().unwrap().push(format!(
                 "trial {trial}: single-frame tar.lz4 resume diverges from golden \
+                 (abort_after={abort_after})",
+            ));
+        }
+    }
+
+    let failures = captured_failures.lock().unwrap();
+    assert!(failures.is_empty(), "{:?}", *failures);
+}
+
+#[test]
+fn random_kill_points_resume_mid_member_tar_lz4_misaligned() {
+    // The Polkachu shape: a single LZ4 frame whose tar members do
+    // *not* align with any LZ4 block boundary. Pre-v6 this
+    // produced zero checkpoints across the entire run because the
+    // extractor's quiescent gate required block ends to land on
+    // member boundaries; with the v6 tar in-flight resume support,
+    // every block boundary fires a checkpoint and a kill mid-member
+    // resumes byte-identically.
+    //
+    // Member size 5121 bytes (= 10*512 + 1) makes each member span
+    // 11 tar blocks: 1 header + 10 data + padding. The cumulative
+    // size after each member is `i * (12*512 + 512) = i * 6656`,
+    // which never coincides with a 64-KiB LZ4 block boundary
+    // (gcd(6656, 65536) = 512 — boundaries align only at multiples
+    // of 65536/(6656/512) which doesn't happen in our 30-member
+    // window).
+    let mut members: Vec<(&str, Vec<u8>)> = Vec::new();
+    for i in 0..30 {
+        let name = Box::leak(format!("dir/misaligned_{i:02}.bin").into_boxed_str());
+        let payload: Vec<u8> = (0..5121)
+            .map(|j| (i as u8).wrapping_mul(37).wrapping_add(j as u8))
+            .collect();
+        members.push((name, payload));
+    }
+    let mut tar_body: Vec<u8> = Vec::new();
+    for (name, payload) in &members {
+        tar_body.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    tar_body.extend_from_slice(&end_of_archive_block());
+
+    let body = encode_lz4_multi_block_single_frame(&tar_body, 64 * 1024);
+    let server = MockServer::start(ok_handler(body, "\"v-misaligned-tar-lz4\""));
+
+    let golden_dir = unique_dir("golden_misaligned_tar_lz4");
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_out = golden_dir.join("out");
+    fs::create_dir_all(&golden_out).expect("golden out dir");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let args = make_args(
+        &server,
+        "x.tar.lz4",
+        OutputTarget::Dir(golden_out.clone()),
+        CoordinatorConfig {
+            checkpoint_min_bytes: 1,
+            checkpoint_min_interval: std::time::Duration::ZERO,
+            ..coord_config(4096)
+        },
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden misaligned tar.lz4 run");
+    let golden_entries = read_dir_recursive(&golden_out);
+    assert_eq!(
+        golden_entries.len(),
+        30,
+        "golden run should extract 30 files"
+    );
+
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    assert!(
+        total_checkpoints >= 2,
+        "v6 tar mid-member resume should produce ≥2 checkpoints across this archive; \
+         got {total_checkpoints} — alignment between LZ4 block ends and tar member \
+         boundaries is essentially never satisfied for this corpus, so any non-trivial \
+         count proves the in-flight state plumbing is firing.",
+    );
+
+    let trial_count = 12u64;
+    let mut rng = Lcg::seeded(0xBEEF_BEEF_BEEF_BEEF);
+    let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, total_checkpoints);
+        let work = unique_dir(&format!("misaligned_tar_lz4_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_dir = work.join("out");
+        fs::create_dir_all(&out_dir).expect("trial out dir");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let args = make_args(
+            &server,
+            "x.tar.lz4",
+            OutputTarget::Dir(out_dir.clone()),
+            CoordinatorConfig {
+                checkpoint_min_bytes: 1,
+                checkpoint_min_interval: std::time::Duration::ZERO,
+                ..coord_config(4096)
+            },
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                let got = read_dir_recursive(&out_dir);
+                assert_eq!(got, golden_entries, "trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("trial {trial}: unexpected error {other:?}"),
+        }
+
+        let resume_args = make_args(
+            &server,
+            "x.tar.lz4",
+            OutputTarget::Dir(out_dir.clone()),
+            CoordinatorConfig {
+                checkpoint_min_bytes: 1,
+                checkpoint_min_interval: std::time::Duration::ZERO,
+                ..coord_config(4096)
+            },
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume ok");
+        assert!(
+            stats.resumed,
+            "trial {trial}: resume did not flag itself as resumed"
+        );
+
+        let got = read_dir_recursive(&out_dir);
+        if got != golden_entries {
+            captured_failures.lock().unwrap().push(format!(
+                "trial {trial}: misaligned tar.lz4 resume diverges from golden \
                  (abort_after={abort_after})",
             ));
         }
