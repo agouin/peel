@@ -36,7 +36,7 @@
 #![cfg(unix)]
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -66,6 +66,12 @@ pub const DEFAULT_WORKERS: u32 = 4;
 /// dispatch triggers a re-fetch of an already-complete chunk.
 /// Tunable via [`SchedulerConfig::probe`].
 pub const DEFAULT_PROBE_INTERVAL: u32 = 32;
+/// Cap on how many times the scheduler will respawn a dead worker
+/// before treating the run as unrecoverable. Each respawn is logged
+/// at `WARN`; exceeding the cap surfaces as
+/// [`SchedulerError::WorkersExhausted`] so a pathologically panicking
+/// worker doesn't loop forever.
+const MAX_WORKER_RESPAWNS: u32 = 100;
 
 /// Why a `--mirror` URL was rejected during the agreement check.
 ///
@@ -239,6 +245,16 @@ pub enum SchedulerError {
     /// IO reading the streaming response body.
     #[error("io reading response body")]
     BodyIo(#[source] std::io::Error),
+
+    /// Workers kept dying and the scheduler exceeded
+    /// [`MAX_WORKER_RESPAWNS`] respawns. Surfaces a panic loop or a
+    /// systemic failure (out of file descriptors, OS thread limit
+    /// reached, etc.) instead of looping forever.
+    #[error("download workers kept dying; respawned {respawns} times before giving up")]
+    WorkersExhausted {
+        /// Total respawn attempts before bailing.
+        respawns: u32,
+    },
 }
 
 /// Discovery summary returned by [`discover`].
@@ -688,8 +704,11 @@ fn run_parallel(
 
     // The scheduler-side bookkeeping bitmap. A bit set in `dispatched`
     // means "the scheduler has either handed this chunk off to a worker
-    // OR it was already complete on entry."
-    let dispatched = ChunkBitmap::new(total_chunks);
+    // OR it was already complete on entry." `mut` because the worker
+    // respawn path rebuilds it from the completion `bitmap` when every
+    // worker dies mid-flight: chunks claimed by workers that never
+    // reported back must be re-issued.
+    let mut dispatched = ChunkBitmap::new(total_chunks);
     for i in 0..total_chunks {
         let idx = ChunkIndex::new(i);
         if bitmap.is_complete(idx) {
@@ -719,6 +738,14 @@ fn run_parallel(
         }
     };
 
+    // Tracks how many worker threads are currently inside their
+    // run-loop. Pre-incremented by the scheduler before `spawn_scoped`
+    // so the count is accurate the moment the spawn returns; the
+    // worker decrements via a RAII guard at any exit point (clean
+    // return, mutex poisoning, or caught panic). The scheduler watches
+    // this on every dispatch tick and respawns workers when it dips
+    // below `workers`.
+    let alive_workers = AtomicU32::new(0);
     let scheduler_outcome: Result<DownloadStats, SchedulerError> = thread::scope(|scope| {
         let ctx = ChunkContext {
             client,
@@ -728,28 +755,69 @@ fn run_parallel(
             progress: config.progress.as_deref(),
             rate_limiter: config.rate_limiter.as_ref(),
         };
-        // Spawn workers.
-        for w_id in 0..workers {
-            let task_rx = &task_rx;
-            let done_tx = done_tx.clone();
-            let cancel = &cancel;
+
+        // Spawn one worker. Pre-increments `alive_workers` before
+        // the OS thread is created so a same-tick `load()` from the
+        // scheduler always sees the new worker. If the spawn itself
+        // fails (rare — typically OS thread limit), the increment is
+        // undone before returning. Worker panics are absorbed via
+        // `catch_unwind` so a single bad chunk doesn't unwind the
+        // whole `thread::scope`; the scheduler re-detects the loss
+        // through the alive-counter and respawns.
+        let spawn_one = |w_id: u32| {
+            let task_rx_ref: &Mutex<mpsc::Receiver<Dispatch>> = &task_rx;
+            let cancel_ref: &AtomicBool = &cancel;
+            let alive_ref: &AtomicU32 = &alive_workers;
+            let done_tx_clone = done_tx.clone();
             let retry = config.retry.clone();
-            thread::Builder::new()
+            alive_ref.fetch_add(1, Ordering::AcqRel);
+            let result = thread::Builder::new()
                 .name(format!("peel-download-worker-{w_id}"))
                 .spawn_scoped(scope, move || {
-                    worker_loop(&ctx, &retry, task_rx, done_tx, cancel);
-                })
-                .ok();
+                    struct AliveGuard<'a>(&'a AtomicU32);
+                    impl Drop for AliveGuard<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                    let _alive = AliveGuard(alive_ref);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker_loop(&ctx, &retry, task_rx_ref, done_tx_clone, cancel_ref);
+                    }));
+                });
+            if result.is_err() {
+                alive_ref.fetch_sub(1, Ordering::AcqRel);
+            }
+        };
+
+        // Spawn the initial worker pool. `next_worker_id` keeps
+        // thread names distinct across the lifetime of the run so a
+        // respawned worker doesn't collide with the dead one in
+        // `tracing` output.
+        let mut next_worker_id: u32 = 0;
+        for _ in 0..workers {
+            spawn_one(next_worker_id);
+            next_worker_id = next_worker_id.wrapping_add(1);
         }
-        // Drop the scheduler's clone of the completion sender so the
-        // channel closes once every worker exits.
-        drop(done_tx);
+
+        // NOTE: unlike the pre-respawn version, we keep the
+        // scheduler's `done_tx` clone alive for the entire dispatch
+        // loop. A respawn can't clone from a worker that doesn't
+        // exist yet, so the scheduler must own a clone we can fan
+        // out from. The trade-off: `done_rx.recv_timeout` will never
+        // see `Disconnected` while the loop is running, so loop
+        // termination is gated solely on the explicit
+        // `completed >= total_chunks && in_flight == 0` check below.
 
         // Dispatch + drain loop.
         let mut completed = chunks_resumed;
         let mut in_flight: u32 = 0;
         let mut stats_local = stats.clone();
         let mut shutdown_reason: Option<SchedulerError> = None;
+        // Total respawn attempts across this run, capped by
+        // `MAX_WORKER_RESPAWNS` so a worker that panics on every
+        // chunk doesn't loop forever.
+        let mut total_respawns: u32 = 0;
         // §11 mid-flight verifier state: counts successful Fetch
         // completions and queues a Probe every `probe.interval`
         // completions (when fingerprints are configured).
@@ -771,6 +839,67 @@ fn run_parallel(
                 if flag.load(Ordering::Acquire) {
                     cancel.store(true, Ordering::Relaxed);
                     break 'outer;
+                }
+            }
+
+            // Worker-liveness check. If any workers have died (panic,
+            // mutex poisoning, etc.) and there is still work to do,
+            // respawn enough threads to refill the pool. When *every*
+            // worker has died with chunks still in flight, those
+            // chunks were claimed by dead workers and will never
+            // complete: drain queued-but-unclaimed dispatches and
+            // rebuild `dispatched` from the completion `bitmap` so
+            // the lost chunks get re-issued by the next pass.
+            let alive = alive_workers.load(Ordering::Acquire);
+            if alive < workers && completed < total_chunks {
+                let dead = workers - alive;
+                if alive == 0 {
+                    tracing::warn!(
+                        target: "peel::download",
+                        in_flight,
+                        dead,
+                        total_respawns,
+                        "all download workers died; resetting dispatch state and respawning",
+                    );
+                    // Drain the task channel of dispatches the dead
+                    // workers never picked up. We are the sole sender,
+                    // and with `alive == 0` no peer holds the lock,
+                    // so a poisoned mutex is recovered via `into_inner`.
+                    let drain = |rx: &mpsc::Receiver<Dispatch>| while rx.try_recv().is_ok() {};
+                    match task_rx.lock() {
+                        Ok(rx) => drain(&rx),
+                        Err(poisoned) => drain(&poisoned.into_inner()),
+                    }
+                    // Rebuild `dispatched`: any chunk not already
+                    // marked complete in `bitmap` is fair game for
+                    // the next dispatch pass.
+                    dispatched = ChunkBitmap::new(total_chunks);
+                    for i in 0..total_chunks {
+                        let idx = ChunkIndex::new(i);
+                        if bitmap.is_complete(idx) {
+                            dispatched.mark_complete(idx);
+                        }
+                    }
+                    in_flight = 0;
+                } else {
+                    tracing::warn!(
+                        target: "peel::download",
+                        dead,
+                        total_respawns,
+                        "{dead} download worker(s) died; respawning",
+                    );
+                }
+                if total_respawns.saturating_add(dead) > MAX_WORKER_RESPAWNS {
+                    shutdown_reason.get_or_insert(SchedulerError::WorkersExhausted {
+                        respawns: total_respawns,
+                    });
+                    cancel.store(true, Ordering::Relaxed);
+                    break 'outer;
+                }
+                total_respawns = total_respawns.saturating_add(dead);
+                for _ in 0..dead {
+                    spawn_one(next_worker_id);
+                    next_worker_id = next_worker_id.wrapping_add(1);
                 }
             }
 
@@ -1021,14 +1150,15 @@ fn worker_loop(
             return;
         }
         let dispatch = {
-            // INVARIANT: the only writer to this Mutex is the scheduler
-            // setting it up; if a worker panics holding the lock, all
-            // threads die together inside thread::scope, so a poisoned
-            // mutex is unreachable in practice. Treat poisoning as a
-            // signal to exit cleanly.
+            // A panicking peer worker poisons this mutex via the
+            // MutexGuard drop. The protected `mpsc::Receiver` has no
+            // invariants that a panic could break, so we recover the
+            // inner value and keep going — the scheduler relies on
+            // this so its respawned workers can pick up where the
+            // dead ones left off.
             let rx = match task_rx.lock() {
                 Ok(g) => g,
-                Err(_) => return,
+                Err(poisoned) => poisoned.into_inner(),
             };
             match rx.recv() {
                 Ok(d) => d,
@@ -1421,6 +1551,61 @@ mod tests {
             chunk_count(1, 0),
             Err(SchedulerError::InvalidChunkSize)
         ));
+    }
+
+    // ---- worker respawn ---------------------------------------------------
+
+    #[test]
+    fn workers_exhausted_error_renders_respawn_count() {
+        let err = SchedulerError::WorkersExhausted { respawns: 17 };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("17"),
+            "respawn count missing from {rendered:?}"
+        );
+        assert!(
+            rendered.contains("respawn"),
+            "rendered message missing 'respawn': {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn rebuild_dispatched_recovers_chunks_lost_to_dead_workers() {
+        // Simulates the "all workers died" branch: the scheduler had
+        // marked chunks 0..4 as dispatched but only 0..2 are actually
+        // complete in the shared bitmap. Rebuilding `dispatched` from
+        // `bitmap` must un-dispatch chunks 2 and 3 so the next pass
+        // can re-issue them.
+        let total_chunks = 8;
+        let bitmap = ChunkBitmap::new(total_chunks);
+        bitmap.complete_range(ChunkIndex::ZERO, ChunkIndex::new(2));
+
+        // Pre-respawn `dispatched`: the scheduler optimistically
+        // marked 0..4 because it had handed those tasks to workers.
+        let dispatched_before = ChunkBitmap::new(total_chunks);
+        dispatched_before.complete_range(ChunkIndex::ZERO, ChunkIndex::new(4));
+
+        // Mirror the rebuild loop in `run_parallel`.
+        let dispatched_after = ChunkBitmap::new(total_chunks);
+        for i in 0..total_chunks {
+            let idx = ChunkIndex::new(i);
+            if bitmap.is_complete(idx) {
+                dispatched_after.mark_complete(idx);
+            }
+        }
+
+        // Lost chunks (2, 3) are un-dispatched and the scheduler can
+        // pick them up starting from cursor 0.
+        assert_eq!(
+            pick_next_chunk(&dispatched_after, 0, total_chunks),
+            Some(ChunkIndex::new(2)),
+            "first not-yet-dispatched chunk after rebuild",
+        );
+        // Sanity: pre-rebuild it would have skipped to 4.
+        assert_eq!(
+            pick_next_chunk(&dispatched_before, 0, total_chunks),
+            Some(ChunkIndex::new(4)),
+        );
     }
 
     // ---- is_disk_buffer_full ------------------------------------------
