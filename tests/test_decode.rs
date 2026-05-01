@@ -386,14 +386,23 @@ fn registry_factory_decodes_single_frame_lz4() {
     }
 
     assert_eq!(sink, payload);
-    // §4 round-one only surfaces restart-safe boundaries (those
-    // between LZ4 frames). A single-frame source therefore produces
-    // exactly one boundary, at end-of-frame.
-    assert_eq!(
-        frame_boundaries,
-        vec![frame_len],
-        "expected exactly one end-of-frame boundary, saw {frame_boundaries:?}",
+    // O.7b promoted lz4 to per-block boundaries inside a frame. A
+    // single-frame, single-block source produces two distinct
+    // values: the post-block offset (immediately before the
+    // 4-byte EndMark) and the post-EndMark offset. Both lie inside
+    // `frame_len` and the post-EndMark offset equals `frame_len`.
+    assert!(
+        !frame_boundaries.is_empty(),
+        "expected at least one boundary",
     );
+    let last = *frame_boundaries.last().expect("non-empty");
+    assert_eq!(
+        last, frame_len,
+        "the final boundary must be the post-EndMark offset"
+    );
+    for b in &frame_boundaries {
+        assert!(*b <= frame_len, "boundary {b} exceeds frame_len {frame_len}");
+    }
     assert_eq!(decoder.bytes_consumed().get(), frame_len);
 }
 
