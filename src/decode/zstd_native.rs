@@ -42,6 +42,7 @@ use std::io::{self, Read, Write};
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
 use crate::types::ByteOffset;
 
+pub mod bitstream;
 pub mod block;
 pub mod error;
 pub mod frame;
