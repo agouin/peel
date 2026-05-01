@@ -81,6 +81,7 @@
 //!     sink_state: SinkState::Tar { members_completed: vec!["root/a.txt".into()] },
 //!     hash_state: None,
 //!     chunk_crc32c: None,
+//!     decoder_state: None,
 //! };
 //! ckpt.write(std::path::Path::new("/tmp/peel-demo.ckpt"))?;
 //! # Ok::<(), peel::checkpoint::CheckpointError>(())
@@ -118,7 +119,14 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   per-chunk fingerprint vector for `PLAN_v2.md` §11's mid-flight
 ///   source-change detector. v4 readers parse v1 / v2 / v3 files
 ///   transparently with `chunk_crc32c = None`.
-pub const FORMAT_VERSION: u32 = 4;
+/// - **v5** — appends an optional opaque [`Checkpoint::decoder_state`]
+///   blob for `OPTIMIZATIONS.md` O.7b's mid-frame lz4 resume. The
+///   blob is decoder-private — checkpoint code only carries it
+///   verbatim. Length is capped at [`MAX_DECODER_STATE_LEN`] on
+///   decode to bound allocation. v5 readers parse v1 / v2 / v3 / v4
+///   files transparently with `decoder_state = None`. Older binaries
+///   refuse v5 files with [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -130,6 +138,14 @@ const SINK_TAG_TAR: u8 = 1;
 /// Tag for [`SinkState::Zip`] in the on-disk format. Added in v2 of
 /// the checkpoint layout.
 const SINK_TAG_ZIP: u8 = 2;
+
+/// Maximum length of the v5 [`Checkpoint::decoder_state`] blob.
+///
+/// The lz4 resume blob is on the order of 50 bytes; 4 KiB leaves
+/// generous headroom for any future format that wants to ride this
+/// hook while still bounding the allocation a hostile checkpoint can
+/// trigger before [`Checkpoint::deserialize`] checks the body checksum.
+pub const MAX_DECODER_STATE_LEN: u32 = 4 * 1024;
 
 /// Errors produced by [`Checkpoint::read`] / [`Checkpoint::write`] and
 /// the in-memory [`Checkpoint::deserialize`] / [`Checkpoint::serialize`]
@@ -343,6 +359,15 @@ pub struct Checkpoint {
     /// path uses the populated slots to verify the source has not
     /// changed since the checkpoint was written.
     pub chunk_crc32c: Option<Vec<u32>>,
+    /// Opaque per-decoder resume state captured by the extractor at
+    /// the same step the boundary advanced
+    /// (`docs/OPTIMIZATIONS.md` §O.7b). Today this is populated by
+    /// `lz4` for mid-frame block boundaries; every other in-tree
+    /// decoder reports `None`. The bytes are decoder-private — the
+    /// checkpoint format treats the blob as opaque and only enforces
+    /// the [`MAX_DECODER_STATE_LEN`] length cap on decode. Added in
+    /// checkpoint format v5; older readers see `None`.
+    pub decoder_state: Option<Vec<u8>>,
 }
 
 /// Maximum body length [`Checkpoint::deserialize`] will trust before
@@ -424,6 +449,22 @@ impl Checkpoint {
                 for crc in crcs.iter().take(count as usize) {
                     write_u32(&mut body, *crc);
                 }
+            }
+            None => body.push(0),
+        }
+
+        match &self.decoder_state {
+            Some(blob) => {
+                body.push(1);
+                // The encode side enforces the same cap the decode
+                // side enforces; longer blobs would round-trip but
+                // the cap on read would reject them, which would be
+                // confusing.
+                let len = u32::try_from(blob.len())
+                    .unwrap_or(u32::MAX)
+                    .min(MAX_DECODER_STATE_LEN);
+                write_u32(&mut body, len);
+                body.extend_from_slice(&blob[..len as usize]);
             }
             None => body.push(0),
         }
@@ -512,15 +553,18 @@ impl Checkpoint {
         // v2 adds [`SINK_TAG_ZIP`] as an accepted tag value. v3
         // appends a single trailing `hash_state` field after the
         // sink-state body. v4 appends a `chunk_crc32c` trailer after
-        // that. The `decode_body` helper takes the version so it can
+        // that. v5 appends an opaque `decoder_state` blob after that.
+        // The `decode_body` helper takes the version so it can
         // decide whether to read each trailer; future versions that
         // *change* the layout will branch here.
-        debug_assert!(matches!(format_version, 1..=4));
+        debug_assert!(matches!(format_version, 1..=5));
         Self::decode_body(body, format_version)
     }
 
     /// Decode the body layout. v1 / v2 / v3 share the same prefix;
-    /// v3 appends an optional `hash_state` blob after `sink_state`.
+    /// v3 appends an optional `hash_state` blob after `sink_state`,
+    /// v4 appends a `chunk_crc32c` trailer, v5 appends an opaque
+    /// `decoder_state` blob.
     fn decode_body(body: &[u8], format_version: u32) -> Result<Self, CheckpointError> {
         let mut cursor = Cursor::new(body);
         let url = cursor.read_string("url")?;
@@ -630,6 +674,33 @@ impl Checkpoint {
             None
         };
 
+        let decoder_state = if format_version >= 5 {
+            let presence = cursor.read_u8("decoder_state.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    let len = cursor.read_u32("decoder_state.len")?;
+                    if len > MAX_DECODER_STATE_LEN {
+                        return Err(CheckpointError::Truncated {
+                            reason: format!(
+                                "decoder_state length {len} exceeds cap {MAX_DECODER_STATE_LEN}",
+                            ),
+                        });
+                    }
+                    let bytes = cursor.require(len as usize, "decoder_state.bytes")?;
+                    Some(bytes.to_vec())
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "decoder_state",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         if cursor.remaining() != 0 {
             return Err(CheckpointError::Truncated {
                 reason: format!(
@@ -651,6 +722,7 @@ impl Checkpoint {
             sink_state,
             hash_state,
             chunk_crc32c,
+            decoder_state,
         })
     }
 
@@ -777,6 +849,8 @@ impl Checkpoint {
                 .map_or(0, |_| crate::hash::sha256::SERIALIZED_LEN)
             + 1
             + self.chunk_crc32c.as_ref().map_or(0, |c| 4 + c.len() * 4)
+            + 1
+            + self.decoder_state.as_ref().map_or(0, |b| 4 + b.len())
     }
 }
 
@@ -1038,6 +1112,7 @@ mod tests {
             },
             hash_state: None,
             chunk_crc32c: None,
+            decoder_state: None,
         }
     }
 
@@ -1060,6 +1135,7 @@ mod tests {
             },
             hash_state: None,
             chunk_crc32c: None,
+            decoder_state: None,
         }
     }
 
@@ -1117,6 +1193,7 @@ mod tests {
             },
             hash_state: None,
             chunk_crc32c: None,
+            decoder_state: None,
         }
     }
 
@@ -1152,12 +1229,13 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_four() {
-        // Sanity: PLAN_v2 §10 step 4 (v3) and §11 step 1 (v4) each
-        // bump this when an optional trailer lands. If a future
-        // change resets it, this guards against silently dropping
-        // the upgrade-required signal older readers depend on.
-        assert_eq!(FORMAT_VERSION, 4);
+    fn checkpoint_format_version_is_five() {
+        // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4), and
+        // OPTIMIZATIONS.md §O.7b (v5) each bump this when an
+        // optional trailer lands. If a future change resets it, this
+        // guards against silently dropping the upgrade-required
+        // signal older readers depend on.
+        assert_eq!(FORMAT_VERSION, 5);
     }
 
     fn build_legacy_body_raw_sink() -> Vec<u8> {
@@ -1214,6 +1292,35 @@ mod tests {
     }
 
     #[test]
+    fn v3_checkpoint_bytes_still_parse_after_v5_bump() {
+        // A v3 file (raw sink, hash_state = None) must still load
+        // under the v5 reader with both `chunk_crc32c` and
+        // `decoder_state` defaulted to `None`.
+        let mut body = build_legacy_body_raw_sink();
+        body.push(0); // hash_state = None
+        let bytes = frame_legacy_body(&body, 3);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v3 still parses");
+        assert!(parsed.hash_state.is_none());
+        assert!(parsed.chunk_crc32c.is_none());
+        assert!(parsed.decoder_state.is_none());
+    }
+
+    #[test]
+    fn v4_checkpoint_bytes_still_parse_after_v5_bump() {
+        // A v4 file (raw sink, hash_state and chunk_crc32c both
+        // None) must still load under the v5 reader with
+        // `decoder_state = None`.
+        let mut body = build_legacy_body_raw_sink();
+        body.push(0); // hash_state = None
+        body.push(0); // chunk_crc32c = None
+        let bytes = frame_legacy_body(&body, 4);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v4 still parses");
+        assert!(parsed.hash_state.is_none());
+        assert!(parsed.chunk_crc32c.is_none());
+        assert!(parsed.decoder_state.is_none());
+    }
+
+    #[test]
     fn round_trip_with_hash_state_present() {
         let mut state = crate::hash::sha256::Sha256::new();
         state.update(b"hello world");
@@ -1229,11 +1336,11 @@ mod tests {
 
     #[test]
     fn rejects_invalid_hash_state_presence_byte() {
-        // Build a valid v4 body with both trailing flags absent
-        // (hash_state = None at byte -2, chunk_crc32c = None at
-        // byte -1) and poke the hash_state byte specifically.
+        // Build a valid v5 body with all trailing flags absent
+        // (hash_state at -3, chunk_crc32c at -2, decoder_state at
+        // -1) and poke the hash_state byte specifically.
         let mut bytes = sample_raw().serialize();
-        let hash_state_byte = bytes.len() - 2;
+        let hash_state_byte = bytes.len() - 3;
         bytes[hash_state_byte] = 7;
         // Recompute the body checksum so the integrity check
         // doesn't fire first.
@@ -1252,11 +1359,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_chunk_crc32c_presence_byte() {
-        // Build a valid v4 body and poke the trailing chunk_crc32c
-        // presence byte (offset -1) to an out-of-range value.
+        // Build a valid v5 body and poke the chunk_crc32c presence
+        // byte (offset -2; decoder_state lives at -1) to an
+        // out-of-range value.
         let mut bytes = sample_raw().serialize();
-        let last = bytes.len() - 1;
-        bytes[last] = 5;
+        let crc_byte = bytes.len() - 2;
+        bytes[crc_byte] = 5;
         let body_start = HEADER_LEN;
         let new_checksum = fnv1a64(&bytes[body_start..]);
         bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
@@ -1267,6 +1375,65 @@ mod tests {
                 assert_eq!(field, "chunk_crc32c");
             }
             other => panic!("expected InvalidPresence(chunk_crc32c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_decoder_state_presence_byte() {
+        // Poke the trailing decoder_state presence byte (offset -1)
+        // to an out-of-range value; recompute the checksum so
+        // integrity doesn't fire first.
+        let mut bytes = sample_raw().serialize();
+        let last = bytes.len() - 1;
+        bytes[last] = 9;
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::InvalidPresence { value, field } => {
+                assert_eq!(value, 9);
+                assert_eq!(field, "decoder_state");
+            }
+            other => panic!("expected InvalidPresence(decoder_state), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_with_decoder_state_present() {
+        let mut ckpt = sample_raw();
+        ckpt.decoder_state = Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x00, 0x01]);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn rejects_decoder_state_blob_over_cap() {
+        // Hand-build a v5 body that declares a decoder_state length
+        // exceeding MAX_DECODER_STATE_LEN. The deserializer must
+        // surface a Truncated error before allocating the blob.
+        let mut bytes = sample_raw().serialize();
+        // Strip the trailing `decoder_state = None` byte (0x00) and
+        // replace it with `presence = 1` + `len = MAX + 1`.
+        bytes.truncate(bytes.len() - 1);
+        bytes.push(1u8);
+        let len = MAX_DECODER_STATE_LEN + 1;
+        bytes.extend_from_slice(&len.to_le_bytes());
+        // Update body_len in the header; recompute the checksum.
+        let new_body_len = (bytes.len() - HEADER_LEN) as u64;
+        bytes[12..20].copy_from_slice(&new_body_len.to_le_bytes());
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::Truncated { reason } => {
+                assert!(
+                    reason.contains("decoder_state length"),
+                    "unexpected reason: {reason}",
+                );
+            }
+            other => panic!("expected Truncated, got {other:?}"),
         }
     }
 
@@ -1303,6 +1470,7 @@ mod tests {
             },
             hash_state: None,
             chunk_crc32c: None,
+            decoder_state: None,
         };
         let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
         assert_eq!(parsed, ckpt);
@@ -1687,6 +1855,16 @@ mod tests {
                 None
             };
 
+            // Half the trials carry an opaque v5 `decoder_state`
+            // blob (size up to 64 bytes) to exercise the trailer;
+            // the other half leave it unset.
+            let decoder_state = if rng.next_bool() {
+                let n = (rng.next_u32() as usize) % 64;
+                Some(random_bytes(&mut rng, n))
+            } else {
+                None
+            };
+
             let ckpt = Checkpoint {
                 url,
                 etag,
@@ -1699,6 +1877,7 @@ mod tests {
                 sink_state,
                 hash_state,
                 chunk_crc32c,
+                decoder_state,
             };
             let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
             assert_eq!(parsed, ckpt);

@@ -869,6 +869,7 @@ fn resume_picks_up_from_existing_checkpoint() {
         },
         hash_state: None,
         chunk_crc32c: None,
+        decoder_state: None,
     };
     let ckpt_path = work2.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -919,6 +920,7 @@ fn etag_mismatch_on_resume_aborts_cleanly() {
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: None,
         chunk_crc32c: None,
+        decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -969,6 +971,7 @@ fn url_change_on_resume_aborts_cleanly() {
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: None,
         chunk_crc32c: None,
+        decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1585,6 +1588,7 @@ fn sha256_added_on_resume_without_saved_state_errors() {
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: None,
         chunk_crc32c: None,
+        decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1645,6 +1649,7 @@ fn sha256_dropped_on_resume_with_saved_state_errors() {
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: Some(saved),
         chunk_crc32c: None,
+        decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1754,6 +1759,7 @@ fn source_drift_on_resume_is_caught_by_probe() {
         sink_state: SinkState::Raw { bytes_written: 0 },
         hash_state: None,
         chunk_crc32c: Some(crcs),
+        decoder_state: None,
     };
     let part_path = work.join("out.bin.peel.part");
     let ckpt_path = work.join("out.bin.peel.ckpt");

@@ -1196,11 +1196,6 @@ fn run_one<S: Sink>(
         sink,
         puncher,
         |info_cb: CheckpointInfo| -> io::Result<()> {
-            // Plumbed through in this commit but not yet persisted —
-            // the v4 checkpoint format has no slot for it. The next
-            // commit (format v5) wires it into the Checkpoint write.
-            let _ = &info_cb.decoder_state;
-
             // Throttle: write at most once per cadence floor.
             let elapsed = last_write_at.elapsed();
             let progressed = info_cb.source_position.saturating_sub(last_position);
@@ -1245,6 +1240,7 @@ fn run_one<S: Sink>(
                 sink_state,
                 hash_state,
                 chunk_crc32c,
+                decoder_state: info_cb.decoder_state.clone(),
             };
             ckpt.write(ckpt_path)
                 .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -1445,6 +1441,9 @@ fn run_zip(
                     // unset (`PLAN_v2.md` §10 + §5).
                     hash_state: None,
                     chunk_crc32c,
+                    // ZIP entries don't carry decoder state — they
+                    // resume per-entry via `current_entry`/_offset.
+                    decoder_state: None,
                 };
                 ckpt.write(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -2191,6 +2190,7 @@ mod tests {
             },
             hash_state: None,
             chunk_crc32c: None,
+            decoder_state: None,
         }
     }
 
