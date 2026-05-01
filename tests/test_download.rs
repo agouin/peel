@@ -221,16 +221,104 @@ fn discover_records_no_accept_ranges_when_absent() {
 
 #[test]
 fn discover_errors_when_content_length_missing() {
-    // The mock server's `Reply` helper auto-adds `Content-Length`, so
-    // we hand-roll the wire bytes via `RawBytesThenClose` to send a
-    // response with neither Content-Length nor Transfer-Encoding.
-    // `Connection: close` is required so the body is read-until-EOF
-    // rather than the parser hanging waiting for a length.
-    let raw = b"HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n".to_vec();
-    let server = MockServer::start(move |_req, _n| MockResponse::RawBytesThenClose(raw.clone()));
+    // HEAD returns no Content-Length and the ranged-GET fallback also
+    // fails to surface one (no Content-Range). Discovery must report
+    // `MissingContentLength` rather than silently succeeding.
+    let server = MockServer::start(|req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            // The Reply helper auto-adds Content-Length, so build the
+            // wire bytes directly. Connection: close terminates the
+            // body so hyper doesn't wait on a Content-Length.
+            let raw =
+                b"HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n".to_vec();
+            return MockResponse::RawBytesThenClose(raw);
+        }
+        // 206 with no Content-Range: get_range accepts the status but
+        // the fallback parser refuses without a total.
+        MockResponse::Reply {
+            status: 206,
+            reason: "Partial Content",
+            headers: vec![],
+            body: vec![0],
+        }
+    });
     let client = build_client();
     let err = discover(&client, &url(&server, "/")).expect_err("must error");
     assert!(matches!(err, SchedulerError::MissingContentLength { .. }));
+}
+
+#[test]
+fn discover_falls_back_to_range_probe_when_head_returns_403() {
+    // Mirrors the publicnode/MinIO presigned-URL bug: HEAD redirects
+    // to a URL signed only for GET, which 403s every HEAD with
+    // `content-length: 0`. The fallback ranged GET succeeds and
+    // returns the real total via Content-Range.
+    let body = make_body(8192);
+    let body_clone = body.clone();
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 403,
+                reason: "Forbidden",
+                headers: vec![("Content-Length".into(), "0".into())],
+                body: Vec::new(),
+            };
+        }
+        let range_hdr = req.header("range").expect("worker must send Range");
+        let (a, b) = parse_range(range_hdr).expect("Range parses");
+        let a_us = a as usize;
+        let b_us = b as usize;
+        let slice = body_clone[a_us..=b_us].to_vec();
+        MockResponse::Reply {
+            status: 206,
+            reason: "Partial Content",
+            headers: vec![(
+                "Content-Range".into(),
+                format!("bytes {a}-{b}/{}", body_clone.len()),
+            )],
+            body: slice,
+        }
+    });
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/")).expect("discover via fallback");
+    assert_eq!(info.total_size, body.len() as u64);
+    assert!(info.accept_ranges);
+}
+
+#[test]
+fn discover_falls_back_when_head_2xx_has_zero_content_length() {
+    // CDN edge case: HEAD returns 200 with `Content-Length: 0` (the
+    // edge stripped CL on the redirect response). Fallback recovers
+    // the real total.
+    let body = make_body(4096);
+    let body_clone = body.clone();
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 200,
+                reason: "OK",
+                headers: vec![("Content-Length".into(), "0".into())],
+                body: Vec::new(),
+            };
+        }
+        let range_hdr = req.header("range").expect("worker must send Range");
+        let (a, b) = parse_range(range_hdr).expect("Range parses");
+        let a_us = a as usize;
+        let b_us = b as usize;
+        let slice = body_clone[a_us..=b_us].to_vec();
+        MockResponse::Reply {
+            status: 206,
+            reason: "Partial Content",
+            headers: vec![(
+                "Content-Range".into(),
+                format!("bytes {a}-{b}/{}", body_clone.len()),
+            )],
+            body: slice,
+        }
+    });
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/")).expect("discover via fallback");
+    assert_eq!(info.total_size, body.len() as u64);
 }
 
 // ---- run: parallel happy path -----------------------------------------

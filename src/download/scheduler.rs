@@ -53,6 +53,7 @@ use super::worker::{
     SourceFingerprint, WorkerError,
 };
 use crate::bitmap::ChunkBitmap;
+use crate::http::range::parse_content_range;
 use crate::http::{Client, ClientError, Url};
 use crate::progress::ProgressState;
 use crate::types::{ByteOffset, ByteRange, ChunkIndex};
@@ -431,34 +432,91 @@ pub fn chunk_count(total_size: u64, chunk_size: u64) -> Result<u32, SchedulerErr
 
 /// Issue a `HEAD` and summarize the source.
 ///
+/// When the `HEAD` does not yield a usable `Content-Length` — non-2xx
+/// status (e.g. an S3/MinIO presigned URL signed for `GET` only that
+/// rejects `HEAD` with `403 SignatureDoesNotMatch`), missing header,
+/// or `Content-Length: 0` — a single-byte ranged `GET` is issued as a
+/// fallback and the total is read from `Content-Range`. This is the
+/// only way to discover size for a number of CDN/object-store hosts
+/// that strip `Content-Length` from redirect responses or refuse
+/// `HEAD` outright.
+///
 /// # Errors
 ///
-/// Returns [`SchedulerError::Head`] if the request fails, or
-/// [`SchedulerError::MissingContentLength`] if the server didn't supply
-/// one.
+/// Returns [`SchedulerError::Head`] if the `HEAD` request fails at the
+/// transport layer (the fallback is only attempted when `HEAD`
+/// completed but didn't yield a usable answer), or
+/// [`SchedulerError::MissingContentLength`] if neither the `HEAD` nor
+/// the ranged-`GET` fallback produced a non-zero total.
 pub fn discover(client: &Client, url: &Url) -> Result<DownloadInfo, SchedulerError> {
     let head = client.head(url).map_err(|source| SchedulerError::Head {
         url: url.to_string(),
         source,
     })?;
-    let total_size = head
+    let head_total = head
         .headers
         .get("content-length")
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .ok_or_else(|| SchedulerError::MissingContentLength {
-            url: head.final_url.to_string(),
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if head.status.is_success() {
+        if let Some(total_size) = head_total {
+            if total_size > 0 {
+                let accept_ranges = head
+                    .headers
+                    .get("accept-ranges")
+                    .map(|v| v.eq_ignore_ascii_case("bytes"))
+                    .unwrap_or(false);
+                let fingerprint = SourceFingerprint::from_headers(&head.headers);
+                return Ok(DownloadInfo {
+                    url: head.final_url,
+                    total_size,
+                    fingerprint,
+                    accept_ranges,
+                });
+            }
+        }
+    }
+    discover_via_range_probe(client, url)
+}
+
+/// Fallback discovery path used when `HEAD` cannot tell us the total
+/// size. Issues a `Range: bytes=0-0` GET, drops the body, and reads
+/// the total from the `Content-Range` header. A 206 response
+/// inherently confirms range support, so `accept_ranges = true` is
+/// assumed.
+fn discover_via_range_probe(client: &Client, url: &Url) -> Result<DownloadInfo, SchedulerError> {
+    let probe = match ByteRange::from_start_len(ByteOffset::new(0), 1) {
+        Some(r) => r,
+        // INVARIANT: `ByteRange::from_start_len(0, 1)` only fails if
+        // `0 + 1` overflows `u64`, which it cannot.
+        None => unreachable!("0..1 is always a valid ByteRange"),
+    };
+    let resp = client
+        .get_range(url, probe)
+        .map_err(|source| SchedulerError::Head {
+            url: url.to_string(),
+            source,
         })?;
-    let accept_ranges = head
+    let cr_value = resp
         .headers
-        .get("accept-ranges")
-        .map(|v| v.eq_ignore_ascii_case("bytes"))
-        .unwrap_or(false);
-    let fingerprint = SourceFingerprint::from_headers(&head.headers);
+        .get("content-range")
+        .ok_or_else(|| SchedulerError::MissingContentLength {
+            url: url.to_string(),
+        })?
+        .to_string();
+    let total_size = parse_content_range(&cr_value)
+        .ok()
+        .and_then(|cr| cr.total())
+        .filter(|t| *t > 0)
+        .ok_or_else(|| SchedulerError::MissingContentLength {
+            url: url.to_string(),
+        })?;
+    let fingerprint = SourceFingerprint::from_headers(&resp.headers);
+    drop(resp.body);
     Ok(DownloadInfo {
-        url: head.final_url,
+        url: url.clone(),
         total_size,
         fingerprint,
-        accept_ranges,
+        accept_ranges: true,
     })
 }
 
