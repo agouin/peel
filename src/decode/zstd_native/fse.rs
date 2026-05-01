@@ -39,8 +39,12 @@
 //!   uses `bit_count − 1` bits and is encoded as itself.
 //! - Long:  `v >= L` uses `bit_count` bits, mapped so that the
 //!   decoder reads `bit_count − 1` bits as `low_val`, sees
-//!   `low_val >= L`, reads one more bit as `extra`, and
-//!   reconstructs `v = 2 * low_val − L + extra`.
+//!   `low_val >= L`, reads one more bit as `extra`, treats the
+//!   combined `bit_count`-bit value as `full_value =
+//!   low_val | (extra << (bit_count - 1))`, then reconstructs
+//!   `v = full_value − L * extra`. (The high bit being set means
+//!   the encoder folded the value down by L to keep its low
+//!   `bit_count − 1` bits >= L; the decoder undoes that fold.)
 //!
 //! After a `v == 1` (probability-zero symbol), the encoder writes
 //! a 2-bit RLE count of *additional* zero-probability symbols; if
@@ -193,19 +197,19 @@ pub fn parse_distribution(
             // Short code: bit_count - 1 bits used (already read).
             low_val
         } else {
-            // Long code: read 1 more bit; combine.
-            // v = 2 * low_val - l + extra; see module docs for the
-            // derivation.
+            // Long code: read 1 more bit, treat the resulting
+            // bit_count-bit value as `full_value`. If the high bit
+            // is set (extra == 1), the encoder folded the value
+            // down by L to keep the wire-form's low (bit_count-1)
+            // bits >= L. Reverse that:
+            //   v = full_value - L * extra
+            // For extra==0: v = full_value = low_val (range [L, 2^(bit_count-1)-1]).
+            // For extra==1: v = full_value - L (range [2^(bit_count-1), 2^bit_count - 1 - L]).
+            // This matches the libzstd FSE_readNCount rule
+            // ("if (count >= threshold) count -= max").
             let extra = reader.read(1)?;
-            // INVARIANT: 2 * low_val + 1 fits in u32 because
-            // low_val < (1 << (bit_count - 1)) <= (1 << 12), well
-            // below u32::MAX/2.
-            (low_val * 2)
-                .checked_sub(l)
-                .ok_or(ZstdError::MalformedFrameHeader(
-                    "FSE: long-code reconstruction underflow",
-                ))?
-                + extra
+            let full_value = low_val | (extra << (bit_count - 1));
+            full_value.saturating_sub(l * extra)
         };
         if v as i32 > remaining {
             return Err(ZstdError::MalformedFrameHeader(
@@ -215,14 +219,17 @@ pub fn parse_distribution(
 
         match v {
             0 => {
-                // count = -1 ("less probable")
+                // count = -1 ("less probable") — contributes 1 cell
+                // at the table's high end, so decrement remaining
+                // by 1.
                 counts.push(-1);
                 remaining -= 1;
             }
             1 => {
-                // count = 0 (absent) + RLE for additional zeros.
+                // count = 0 (absent) — contributes 0 cells, so
+                // remaining stays put. RLE follows for additional
+                // zero-probability symbols.
                 counts.push(0);
-                remaining -= 1;
                 loop {
                     let extra = reader.read(2)?;
                     for _ in 0..extra {
@@ -239,7 +246,7 @@ pub fn parse_distribution(
                 }
             }
             _ => {
-                // count = v - 1
+                // count = v - 1, contributes (v - 1) cells.
                 let count: i32 = v as i32 - 1;
                 // INVARIANT: count fits in i16 because count <=
                 // table_size <= 4096 (MAX_FSE_ACCURACY_LOG = 12) and

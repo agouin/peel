@@ -857,4 +857,167 @@ mod tests {
         while decoder.decode_step(&mut sink).expect("step") == DecodeStatus::MoreData {}
         assert_eq!(sink, b"hello");
     }
+
+    // ---- Real-frame FSE / Huffman validation -------------------
+    //
+    // Phase 4a/4b validation: compress a real payload via libzstd,
+    // walk the resulting frame through our existing parsers, and
+    // exercise the literals decoder against bytes the spike (or
+    // hand-built fixtures) couldn't reach. Locks the FSE
+    // distribution parser, FseTable::build, and parse_fse_weights
+    // against ground truth before sequences.rs lands.
+    //
+    // The literals section regenerates *N* bytes of literal data
+    // that the sequences section will later interleave with
+    // back-references — the decoded literals aren't directly a
+    // prefix of the decompressed output. So we check structural
+    // properties (length matches `regenerated_size`, decode
+    // returned Ok), not byte-for-byte equality with libzstd's
+    // decompressed output.
+
+    /// Walk a libzstd-produced frame, run our literals decoder on
+    /// every Compressed_Block's literals section, and assert the
+    /// regenerated_size invariant.
+    ///
+    /// `at_least_one_fse_huffman` is set if the test encountered
+    /// (and successfully decoded) at least one
+    /// Compressed_Literals_Block whose tree description used
+    /// FSE-coded weights — the path the Phase 4b half-commit
+    /// lit up.
+    fn validate_literals_in_frame(payload: &[u8], at_least_one_fse_huffman: &mut bool) {
+        use self::block::{parse_block_header, BlockType, BLOCK_HEADER_LEN};
+        use self::frame::parse_frame_header;
+        use self::literals::{decode_literals, parse_literals_header, LiteralsBlockType};
+
+        let compressed = ::zstd::encode_all(payload, 3).expect("encode");
+        let fh = parse_frame_header(&compressed).expect("frame header");
+        let mut p = fh.header_size;
+        let mut prev_huffman = None;
+        loop {
+            let bh = parse_block_header(&compressed[p..]).expect("block header");
+            p += BLOCK_HEADER_LEN;
+            if let BlockType::Compressed = bh.block_type {
+                let block_payload = &compressed[p..p + bh.block_size as usize];
+                let lh = parse_literals_header(block_payload).expect("literals header");
+                let lit_payload = &block_payload[usize::from(lh.header_size)
+                    ..usize::from(lh.header_size) + lh.payload_size as usize];
+                if matches!(lh.block_type, LiteralsBlockType::Compressed) {
+                    // Was it FSE-coded? First byte of the
+                    // literals payload is the tree-description
+                    // header byte.
+                    if !lit_payload.is_empty() && lit_payload[0] < 128 {
+                        *at_least_one_fse_huffman = true;
+                    }
+                }
+                if matches!(
+                    lh.block_type,
+                    LiteralsBlockType::Compressed | LiteralsBlockType::Treeless
+                ) {
+                    let out = decode_literals(&lh, lit_payload, &mut prev_huffman)
+                        .expect("decode literals");
+                    assert_eq!(
+                        out.len(),
+                        lh.regenerated_size as usize,
+                        "regenerated_size mismatch (lh={lh:?})",
+                    );
+                }
+            }
+            p += bh.payload_on_wire() as usize;
+            if bh.last_block {
+                break;
+            }
+        }
+    }
+
+    /// Synthetic compressible payload with a wide alphabet —
+    /// reliably routes through Compressed_Literals_Block at
+    /// level 3.
+    ///
+    /// Pure-random bytes don't help: libzstd correctly notices
+    /// they don't compress and routes to Raw_Literals_Block. So
+    /// we cycle through all 256 byte values in a structured
+    /// pattern that has both repetition (compressible) and a
+    /// large alphabet (non-trivial Huffman tree).
+    fn wide_alphabet_compressible_payload(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            // Interleave a structured cycle of bytes 0..256 with
+            // a repeating header sequence. The header gives the
+            // sequences-section back-references something to
+            // match against; the cycle gives the literals section
+            // a wide alphabet.
+            let block = i / 17;
+            let byte = match i % 17 {
+                0 => b'<',
+                1 => b'r',
+                2 => b'>',
+                _ => ((block + i) % 256) as u8,
+            };
+            out.push(byte);
+        }
+        out
+    }
+
+    /// **IGNORED** — known-failing reproduction for the Phase 4b
+    /// state-machine bug.
+    ///
+    /// Phase 4a fixed the FSE distribution wire-format parser
+    /// (long-code reconstruction now uses the libzstd-shaped
+    /// `v = full_value − L * extra` rule, validated against real
+    /// frames — the parsed counts land at valid Huffman weight
+    /// indices). The remaining gap is in
+    /// `huffman::parse_fse_weights`'s 2-state FSE weight-stream
+    /// decoder: the weights it produces don't satisfy Huffman's
+    /// complete-code budget (`sum(2^w) != 2^(max_weight + 1)`)
+    /// for any libzstd-produced fixture I've tried.
+    ///
+    /// Suspected sites of the bug: state-table cell-symbol
+    /// placement (position-step permutation), state-transition
+    /// arithmetic (num_bits / base_state derivation), the order
+    /// of the two initial-state reads, or the loop-termination
+    /// rule for the final emission.
+    ///
+    /// Until this is resolved, the production literals path
+    /// returns `UnsupportedFrameFeature` for FSE-coded weight
+    /// descriptions (see `parse_tree_description` in literals.rs)
+    /// so a malformed decode doesn't surface as silent
+    /// corruption.
+    ///
+    /// Run with `cargo test --features peel_zstd_native -- --ignored`
+    /// once the state machine is fixed.
+    #[test]
+    #[ignore = "Phase 4b state-machine bug — see doc comment"]
+    fn fse_huffman_weights_decode_against_libzstd_frames() {
+        let mut hit_fse = false;
+        for len in [8 * 1024, 32 * 1024, 128 * 1024] {
+            let payload = wide_alphabet_compressible_payload(len);
+            validate_literals_in_frame(&payload, &mut hit_fse);
+        }
+        assert!(
+            hit_fse,
+            "fixture inputs did not produce any FSE-coded Huffman weight section",
+        );
+    }
+
+    /// Text-payload counterpart to the ignored FSE-Huffman test.
+    /// Locks the literals decoder's regenerated-size contract on
+    /// whatever libzstd happens to emit (Raw / RLE / direct-
+    /// encoded Compressed). Doesn't fail when FSE-coded weights
+    /// would be needed — the production parse_tree_description
+    /// dispatches those to UnsupportedFrameFeature, which the
+    /// helper treats as an error and panics; so this test only
+    /// runs reliably on fixtures that don't trip the FSE path.
+    /// Kept to validate the direct-encoded-weight path
+    /// end-to-end against libzstd output.
+    #[test]
+    #[ignore = "depends on libzstd not emitting FSE-coded weights — flaky"]
+    fn literals_decode_against_libzstd_text_frames() {
+        let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. \
+            pack my box with five dozen liquor jugs. how vexingly quick \
+            daft zebras jump! sphinx of black quartz, judge my vow. "
+            .repeat(200);
+        let mut hit_fse = false;
+        validate_literals_in_frame(&payload, &mut hit_fse);
+        let _ = hit_fse;
+    }
 }

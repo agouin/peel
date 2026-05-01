@@ -28,7 +28,7 @@
 
 use super::bitstream::ReverseBitReader;
 use super::error::ZstdError;
-use super::huffman::{parse_direct_weights, parse_fse_weights, HuffmanTree};
+use super::huffman::{parse_direct_weights, HuffmanTree};
 
 /// Block-type tag from a literals header (RFC 8478 §3.1.1.3,
 /// 2 bits at the LSB of the first header byte).
@@ -252,10 +252,22 @@ fn parse_tree_description(bytes: &[u8]) -> Result<(HuffmanTree, usize), ZstdErro
     }
     let header_byte = bytes[0];
     if header_byte < 128 {
-        // FSE-coded weights (RFC §4.2.1.2). Phase 4b.
-        let (weights, consumed) = parse_fse_weights(bytes)?;
-        let tree = HuffmanTree::from_direct_weights(&weights)?;
-        return Ok((tree, consumed));
+        // FSE-coded weights (RFC §4.2.1.2). The function
+        // [`super::huffman::parse_fse_weights`] exists and runs
+        // against real libzstd output, but its 2-state FSE
+        // weight-stream decoder produces weights that don't
+        // satisfy Huffman's complete-code budget on every fixture
+        // we've tried. The bug is somewhere in the state-machine
+        // layer (state-table cell mappings, transition arithmetic,
+        // or termination); see `fse_huffman_weights_decode_against_libzstd_frames`
+        // (currently ignored) in `src/decode/zstd_native.rs` for
+        // a known-failing reproduction. Until that's resolved,
+        // production literals fall back to UnsupportedFrameFeature
+        // so a malformed decode doesn't surface as silently
+        // corrupt output.
+        return Err(ZstdError::UnsupportedFrameFeature(
+            "FSE-coded Huffman weight description (state machine WIP)",
+        ));
     }
     // Direct encoding: header_byte - 127 = total number of
     // symbols, with the last weight implicit. Number of weights
@@ -541,12 +553,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_compressed_truncated_fse_weights_errors_cleanly() {
+    fn decode_compressed_fse_weights_returns_unsupported() {
         // Tree description header_byte < 128 means FSE-coded
-        // weights — Phase 4b lights this up. Here we ensure a
-        // *malformed* FSE-coded weight description (header
-        // declares 50 bytes but only 2 are present) surfaces
-        // as a typed error rather than a panic.
+        // weights. The corresponding parse_fse_weights function
+        // exists in huffman.rs but its state-machine decoder is
+        // not yet reliably correct against libzstd output (the
+        // `fse_huffman_weights_decode_against_libzstd_frames`
+        // ignored test reproduces the divergence). Until that's
+        // resolved, the production path returns
+        // UnsupportedFrameFeature so a malformed decode doesn't
+        // surface as silent corruption.
         let h = LiteralsHeader {
             block_type: LiteralsBlockType::Compressed,
             regenerated_size: 1,
@@ -557,8 +573,8 @@ mod tests {
         let payload = [50u8, 0xAA, 0xBB];
         let mut prev = None;
         match decode_literals(&h, &payload, &mut prev) {
-            Err(ZstdError::UnexpectedEof(_)) | Err(ZstdError::MalformedFrameHeader(_)) => {}
-            other => panic!("expected typed error, got {other:?}"),
+            Err(ZstdError::UnsupportedFrameFeature(_)) => {}
+            other => panic!("expected UnsupportedFrameFeature, got {other:?}"),
         }
     }
 
