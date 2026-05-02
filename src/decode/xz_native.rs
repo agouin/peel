@@ -50,13 +50,30 @@
 //!   machine — Phase 4 hooks them up when LZMA chunks become
 //!   first-class.
 //!
+//! # What Phase 4 added
+//!
+//! - [`dict::LzmaDict`]: ring-buffer sliding-window dictionary
+//!   sized to the Block's `dict_size` (capped at 64 MiB). Honors
+//!   the LZMA spec's "before-start byte is 0x00" convention.
+//! - [`lzma2::Lzma2State`]: the LZMA model — dict, probs, state
+//!   machine, reps — that Phase 4's chunk decoder mutates. Reset
+//!   granularity matches the LZMA2 chunk control byte's modes
+//!   (state-only / state+probs / full).
+//! - [`lzma2::Lzma2State::decode_chunk`]: the LZMA inner loop —
+//!   `is_match` → literal-or-non-literal → `is_rep` →
+//!   {fresh / rep0 / rep1 / rep2 / rep3 / short-rep0} → length /
+//!   distance / match-copy. Cross-validates that the range coder
+//!   finishes cleanly and the chunk's declared `Uncompressed_Size`
+//!   matches the bytes actually emitted.
+//! - LZMA chunks (control bytes `0x80..=0xFF`) are now first-class
+//!   in the [`Decoder`] state machine. The
+//!   `LzmaChunkUnimplemented` placeholder error is gone; real
+//!   LZMA chunks decode end-to-end with `xz2`/liblzma-byte-
+//!   identical output (verified by the differential corpus in
+//!   `tests/test_xz_native.rs`).
+//!
 //! # What's deferred
 //!
-//! - LZMA chunks (control bytes `0x80..=0xFF`) surface
-//!   [`error::XzError::LzmaChunkUnimplemented`] (mapped at the
-//!   trait boundary into [`crate::decode::DecodeError::Read`]) per
-//!   the plan; Phases 2–4 implement the range coder, LZMA
-//!   probability tables, and the LZMA2 chunk decoder.
 //! - The Block-trailer Check (CRC32 / CRC64 / SHA-256) is read but
 //!   not yet verified — Phase 5 wires it up. Block Padding is
 //!   consumed and required to be all-zero.
@@ -83,7 +100,9 @@ use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
 use crate::types::ByteOffset;
 
 pub mod block;
+pub mod dict;
 pub mod error;
+pub mod lzma2;
 pub mod lzma_state;
 pub mod probs;
 pub mod range_coder;
@@ -92,8 +111,12 @@ pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use self::block::{parse_block_header, parse_lzma2_chunk_header, BlockHeader, Lzma2ChunkHeader};
+use self::block::{
+    decode_lzma_properties, parse_block_header, parse_lzma2_chunk_header, BlockHeader,
+    Lzma2ChunkHeader,
+};
 use self::error::XzError;
+use self::lzma2::Lzma2State;
 use self::stream::{
     parse_stream_footer, parse_stream_header, read_multibyte, CheckId, StreamFlags,
     STREAM_FOOTER_LEN, STREAM_HEADER_LEN,
@@ -199,8 +222,11 @@ enum State {
         flags: StreamFlags,
         /// Index records accumulated for the surrounding Stream.
         records_seen: u64,
-        /// Per-Block accounting context.
-        ctx: BlockCtx,
+        /// Per-Block accounting context. Boxed so the [`State`]
+        /// enum's other variants don't pay the multi-hundred-byte
+        /// `BlockCtx` size; the box is only allocated when we
+        /// actually enter a Block.
+        ctx: Box<BlockCtx>,
     },
     /// Stream's Index Indicator has been consumed; reading the
     /// `Number_of_Records` field, then the per-Block records.
@@ -240,6 +266,16 @@ struct BlockCtx {
     /// (control byte `0x00`). After that we still owe Block
     /// Padding + Check before returning to `BetweenBlocks`.
     lzma2_finished: bool,
+    /// LZMA2 model state, allocated lazily on the first
+    /// LZMA-compressed chunk in a Block. Uncompressed-only
+    /// Blocks never pay the allocation; mixed Blocks pay it once
+    /// and reuse it across subsequent LZMA chunks (with chunk-
+    /// header `reset_*` flags clearing the relevant pieces).
+    lzma_state: Option<Lzma2State>,
+    /// Reusable scratch for one chunk's compressed payload. Sized
+    /// up to 64 KiB on first use (the LZMA2 chunk format caps
+    /// `Compressed_Size` at `1 << 16`); held thereafter.
+    chunk_payload_buf: Vec<u8>,
 }
 
 /// Streaming pure-Rust .xz decoder.
@@ -372,13 +408,15 @@ impl Decoder {
                 self.state = State::InBlock {
                     flags,
                     records_seen,
-                    ctx: BlockCtx {
+                    ctx: Box::new(BlockCtx {
                         header,
                         lzma2_start_offset,
                         decompressed_so_far: 0,
                         seen_first_chunk: false,
                         lzma2_finished: false,
-                    },
+                        lzma_state: None,
+                        chunk_payload_buf: Vec::new(),
+                    }),
                 };
                 Ok(DecodeStatus::MoreData)
             }
@@ -694,11 +732,21 @@ impl Decoder {
                 Ok(())
             }
             Lzma2ChunkHeader::Uncompressed {
-                uncompressed_size, ..
+                uncompressed_size,
+                reset_dict,
             } => {
-                // Stream the chunk payload straight to the sink
-                // in fixed-size pieces so we don't allocate a
-                // 64 KiB scratch on every chunk.
+                // Apply reset to an existing LZMA state's dict if
+                // one is allocated; the chunk's bytes will then
+                // start populating a fresh ring.
+                if let Some(state) = ctx.lzma_state.as_mut() {
+                    if reset_dict {
+                        state.dict.reset();
+                    }
+                }
+                // Stream the chunk payload to the sink in fixed-
+                // size pieces, mirroring it into the LZMA dict
+                // when one is allocated so subsequent LZMA
+                // chunks can match against these bytes.
                 let mut remaining = uncompressed_size as usize;
                 let mut scratch = [0u8; 4096];
                 while remaining > 0 {
@@ -710,6 +758,11 @@ impl Decoder {
                         "LZMA2 uncompressed chunk payload",
                     )?;
                     sink.write_all(&scratch[..take]).map_err(XzError::SinkIo)?;
+                    if let Some(state) = ctx.lzma_state.as_mut() {
+                        for &b in &scratch[..take] {
+                            state.dict.push(b);
+                        }
+                    }
                     remaining -= take;
                 }
                 ctx.decompressed_so_far = ctx
@@ -717,12 +770,61 @@ impl Decoder {
                     .saturating_add(u64::from(uncompressed_size));
                 Ok(())
             }
-            Lzma2ChunkHeader::Lzma { .. } => {
-                // Phase 4 will replace this with a real LZMA
-                // decoder; until then we surface a clean
-                // "unimplemented" error so callers can fall back
-                // to the wrapper at `src/decode/xz.rs`.
-                Err(XzError::LzmaChunkUnimplemented)
+            Lzma2ChunkHeader::Lzma {
+                reset_state,
+                reset_props,
+                reset_dict,
+                uncompressed_size,
+                compressed_size,
+                properties,
+            } => {
+                // Apply reset semantics. The first LZMA chunk in a
+                // Block (when `lzma_state` is None) must carry
+                // properties — without them the decoder doesn't
+                // know `(lc, lp, pb)` to size its tables.
+                // Subsequent chunks may inherit from the prior
+                // chunk, with `reset_dict`, `reset_props`, or
+                // `reset_state` peeling back state in increasing
+                // order.
+                if let Some(state) = ctx.lzma_state.as_mut() {
+                    if reset_dict {
+                        let props = properties.ok_or(XzError::Lzma2MissingFirstProperties)?;
+                        let (lc, lp, pb) = decode_lzma_properties(props)?;
+                        state.full_reset(lc, lp, pb)?;
+                    } else if reset_props {
+                        let props = properties.ok_or(XzError::Lzma2MissingFirstProperties)?;
+                        let (lc, lp, pb) = decode_lzma_properties(props)?;
+                        state.reset_props_and_state(lc, lp, pb)?;
+                    } else if reset_state {
+                        state.reset_state();
+                    }
+                } else {
+                    let props = properties.ok_or(XzError::Lzma2MissingFirstProperties)?;
+                    let (lc, lp, pb) = decode_lzma_properties(props)?;
+                    ctx.lzma_state = Some(Lzma2State::new(ctx.header.dict_size, lc, lp, pb)?);
+                }
+
+                // Pull `compressed_size` bytes of payload into the
+                // BlockCtx's reusable scratch.
+                ctx.chunk_payload_buf.clear();
+                ctx.chunk_payload_buf.resize(compressed_size as usize, 0);
+                read_exact_into(
+                    source,
+                    bytes_consumed,
+                    &mut ctx.chunk_payload_buf,
+                    "LZMA2 LZMA chunk compressed payload",
+                )?;
+
+                // Decode the chunk. Borrow `lzma_state` and
+                // `chunk_payload_buf` from `ctx` as disjoint
+                // fields — Rust's split-borrow rules allow this
+                // because the access is direct field naming.
+                let state = ctx.lzma_state.as_mut().expect("state present");
+                state.decode_chunk(&ctx.chunk_payload_buf, uncompressed_size, sink)?;
+                ctx.decompressed_so_far = ctx
+                    .decompressed_so_far
+                    .saturating_add(u64::from(uncompressed_size));
+                Ok(())
             }
         }
     }
@@ -1117,23 +1219,22 @@ mod tests {
         assert!(hit_write, "expected a Write error against the failing sink");
     }
 
-    /// LZMA chunks (control bytes 0x80..=0xFF) surface the
-    /// deliberate Phase-1 placeholder error rather than panicking
-    /// or silently producing garbage.
+    /// A truncated LZMA-compressed chunk surfaces a typed
+    /// underflow from the range coder rather than panicking or
+    /// silently producing garbage. Replaces the Phase-1
+    /// placeholder test now that LZMA chunks decode for real.
     #[test]
-    fn lzma_chunk_returns_unimplemented_error() {
-        // Build an .xz file whose LZMA2 stream's first chunk is
-        // an LZMA-compressed chunk (0xE0...) so the parser
-        // dispatches into the Phase-1 stub. We don't need real
-        // compressed data — the dispatch fails before the
-        // payload is touched.
+    fn malformed_lzma_chunk_surfaces_typed_error() {
         let mut lzma2: Vec<u8> = Vec::new();
-        // 0xE0 = full reset + props; needs 6-byte header + 1
-        // props byte. Sizes encode "1": uncompressed_size=1
-        // (high5=0, low16=0), compressed_size=1 (low16=0). The
-        // fake props byte is 0 (lc=0, lp=0, pb=0).
+        // 0xE0 = full reset + props; needs 6-byte header. Sizes
+        // encode "1": uncompressed_size=1 (high5=0, low16=0),
+        // compressed_size=1 (low16=0). Properties byte 0 maps
+        // to (lc=0, lp=0, pb=0). The 1-byte compressed payload
+        // is far too short to satisfy the range coder's 5-byte
+        // init prefix, so decoding surfaces
+        // `RangeCoderUnderflow("init")` cleanly.
         lzma2.extend_from_slice(&[0xE0, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        lzma2.push(0x00); // payload byte (won't be read)
+        lzma2.push(0x00); // single-byte (truncated) compressed payload
         lzma2.push(0x00); // EndOfStream
 
         let flags = StreamFlags {
@@ -1173,7 +1274,7 @@ mod tests {
                 Err(DecodeError::Read { source, .. }) => {
                     let msg = source.to_string();
                     assert!(
-                        msg.contains("LZMA chunk decoding not yet implemented"),
+                        msg.contains("range coder ran past end") || msg.contains("LZMA"),
                         "msg: {msg}"
                     );
                     return;

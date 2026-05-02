@@ -230,6 +230,70 @@ pub enum XzError {
     /// of 4.
     #[error("xz: LZMA pb = {0} exceeds spec max of 4")]
     LzmaPbTooLarge(u32),
+
+    /// LZMA properties byte was outside the legal range (`0..=224`,
+    /// the encoded form of `(pb, lp, lc)` with `lc + lp ≤ 4` and
+    /// `pb ≤ 4`).
+    #[error("xz: LZMA properties byte 0x{0:02X} is out of range")]
+    LzmaInvalidProperties(u8),
+
+    /// LZMA back-reference distance pointed before the start of
+    /// the dictionary's available history. Either the encoder
+    /// emitted an invalid distance or the chunk's `reset_dict`
+    /// flag is wrong.
+    #[error("xz: LZMA match distance {dist} exceeds available history {total} bytes")]
+    LzmaMatchOutOfRange {
+        /// Encoded (0-based) distance from the LZMA stream.
+        dist: u32,
+        /// Bytes accumulated in the dictionary so far.
+        total: u64,
+    },
+
+    /// LZMA encoder emitted a length that, when expanded, would
+    /// overrun the chunk's declared `Uncompressed_Size`. Surfaces
+    /// here as a clean error rather than silently truncating the
+    /// match.
+    #[error("xz: LZMA match length overruns chunk uncompressed_size")]
+    LzmaLengthOverrun,
+
+    /// LZMA legacy "end of payload" distance marker (`u32::MAX`)
+    /// appeared inside an LZMA2 chunk. LZMA2 carries explicit
+    /// chunk sizes, so an EOS marker is never legal inside a
+    /// chunk's compressed payload.
+    #[error("xz: LZMA EOS marker is not legal inside an LZMA2 chunk")]
+    LzmaUnexpectedEos,
+
+    /// LZMA range coder did not finish in the spec's "well-
+    /// terminated" state at chunk end (either `code != 0` or
+    /// compressed bytes were left unconsumed). Surfaces the
+    /// observed state for diagnostics.
+    #[error("xz: LZMA range coder did not finish cleanly: code=0x{code:08X}, leftover={leftover}")]
+    LzmaRangeCoderUnfinished {
+        /// Final `code` value of the range decoder. Should be 0
+        /// for a clean finish.
+        code: u32,
+        /// Bytes of compressed payload not consumed by the range
+        /// decoder.
+        leftover: usize,
+    },
+
+    /// LZMA chunk's declared `Uncompressed_Size` was not produced
+    /// by the time the LZMA inner loop exhausted the compressed
+    /// payload.
+    #[error("xz: LZMA chunk produced {produced} bytes, expected {expected}")]
+    LzmaUncompressedSizeMismatch {
+        /// Bytes the LZMA model actually emitted.
+        produced: u32,
+        /// Bytes the chunk header declared.
+        expected: u32,
+    },
+
+    /// First LZMA chunk in a Block (or after a `reset_dict` /
+    /// `reset_props`) did not carry an LZMA properties byte. The
+    /// decoder needs `(lc, lp, pb)` to size its probability
+    /// tables; without them the chunk cannot be decoded.
+    #[error("xz: first LZMA2 chunk must carry properties (reset_props)")]
+    Lzma2MissingFirstProperties,
 }
 
 impl XzError {

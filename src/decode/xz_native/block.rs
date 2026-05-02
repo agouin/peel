@@ -267,10 +267,7 @@ pub enum Lzma2ChunkHeader {
         /// that follows the control byte (spec stores `size - 1`).
         uncompressed_size: u32,
     },
-    /// `0x80..=0xFF` — LZMA-compressed chunk. Phase 1 surfaces
-    /// the parsed header so callers can advance, but the
-    /// decode-step path returns a clean
-    /// [`XzError::LzmaChunkUnimplemented`].
+    /// `0x80..=0xFF` — LZMA-compressed chunk.
     Lzma {
         /// `true` if the LZMA state machine must be reset to
         /// initial probabilities before this chunk.
@@ -288,6 +285,10 @@ pub enum Lzma2ChunkHeader {
         /// 1..=65536. Decoded from the 16-bit BE length field
         /// that follows `uncompressed_size`.
         compressed_size: u32,
+        /// LZMA properties byte (encoding `(pb, lp, lc)`). `Some`
+        /// only when `reset_props` is set; otherwise the chunk
+        /// inherits the previous chunk's properties.
+        properties: Option<u8>,
     },
 }
 
@@ -379,15 +380,43 @@ pub fn parse_lzma2_chunk_header(input: &[u8]) -> Result<Lzma2ChunkHeader, XzErro
             let uncompressed_size = ((high_5 << 16) | low_16) + 1;
             let comp_low_16 = (u32::from(input[3]) << 8) | u32::from(input[4]);
             let compressed_size = comp_low_16 + 1;
+            let properties = if reset_props { Some(input[5]) } else { None };
             Ok(Lzma2ChunkHeader::Lzma {
                 reset_state,
                 reset_props,
                 reset_dict,
                 uncompressed_size,
                 compressed_size,
+                properties,
             })
         }
     }
+}
+
+/// Decode an LZMA properties byte into `(lc, lp, pb)`.
+///
+/// The encoding is `(pb * 5 + lp) * 9 + lc`, with `lc + lp ≤ 4`,
+/// `lc ≤ 8`, `lp ≤ 4`, `pb ≤ 4` enforced by the spec. The legal
+/// raw range is `0..=224`; bytes ≥ 225 are reserved.
+///
+/// # Errors
+///
+/// - [`XzError::LzmaInvalidProperties`] if `byte >= 225`.
+/// - [`XzError::LzmaLcLpTooLarge`] if the decoded `lc + lp > 4`.
+///   Round-one rejects this per
+///   `docs/PLAN_xz_block_decoder.md` §Scope.
+pub fn decode_lzma_properties(byte: u8) -> Result<(u8, u8, u8), XzError> {
+    if byte >= 9 * 5 * 5 {
+        return Err(XzError::LzmaInvalidProperties(byte));
+    }
+    let pb = byte / 45;
+    let p = byte % 45;
+    let lp = p / 9;
+    let lc = p % 9;
+    if u32::from(lc) + u32::from(lp) > 4 {
+        return Err(XzError::LzmaLcLpTooLarge(u32::from(lc) + u32::from(lp)));
+    }
+    Ok((lc, lp, pb))
 }
 
 #[cfg(test)]
@@ -676,12 +705,14 @@ mod tests {
                 reset_dict,
                 uncompressed_size,
                 compressed_size,
+                properties,
             } => {
                 assert!(reset_state);
                 assert!(reset_props);
                 assert!(reset_dict);
                 assert_eq!(uncompressed_size, 1);
                 assert_eq!(compressed_size, 1);
+                assert_eq!(properties, Some(0x40));
             }
             other => panic!("expected Lzma, got {other:?}"),
         }
@@ -747,5 +778,37 @@ mod tests {
         assert_eq!(CheckId::Crc32.size(), 4);
         assert_eq!(CheckId::Crc64.size(), 8);
         assert_eq!(CheckId::Sha256.size(), 32);
+    }
+
+    /// `decode_lzma_properties` round-trip across the spec's
+    /// representative `(lc, lp, pb)` triples. Default xz preset
+    /// (`lc=3, lp=0, pb=2`) encodes as `0x5D` (= 2*45 + 0*9 + 3).
+    #[test]
+    fn lzma_properties_decode_default_and_corners() {
+        assert_eq!(decode_lzma_properties(0x5D).expect("default"), (3, 0, 2));
+        assert_eq!(decode_lzma_properties(0).expect("zero"), (0, 0, 0));
+        // Maximum legal triple at the lc+lp ≤ 4 ceiling.
+        // pb=4, lp=0, lc=4 -> 4*45 + 4 = 184.
+        assert_eq!(decode_lzma_properties(184).expect("hi"), (4, 0, 4));
+    }
+
+    /// Properties byte ≥ 225 is reserved.
+    #[test]
+    fn lzma_properties_rejects_reserved() {
+        match decode_lzma_properties(225).unwrap_err() {
+            XzError::LzmaInvalidProperties(b) => assert_eq!(b, 225),
+            other => panic!("expected LzmaInvalidProperties, got {other:?}"),
+        }
+    }
+
+    /// `lc + lp > 4` rejected at decode time so the LZMA2 chunk
+    /// dispatcher doesn't allocate a multi-MiB literal table.
+    #[test]
+    fn lzma_properties_rejects_lc_lp_over_four() {
+        // pb=0, lp=3, lc=2 -> 0 + 3*9 + 2 = 29; lc+lp=5.
+        match decode_lzma_properties(29).unwrap_err() {
+            XzError::LzmaLcLpTooLarge(s) => assert_eq!(s, 5),
+            other => panic!("expected LzmaLcLpTooLarge, got {other:?}"),
+        }
     }
 }
