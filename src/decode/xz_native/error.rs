@@ -333,6 +333,43 @@ pub enum XzError {
         /// CRC32 we computed over the Index bytes.
         got: u32,
     },
+
+    /// Phase 6 resume blob ended before all expected fields were
+    /// read. Carries a label naming the field that was being
+    /// pulled when the blob ran out.
+    #[error("xz: resume blob truncated at field {0}")]
+    ResumeBlobTruncated(&'static str),
+
+    /// Phase 6 resume blob's declared field length disagrees with
+    /// the expected value computed from `(lc, lp, pb)` or the
+    /// Stream's Check ID.
+    #[error(
+        "xz: resume blob length mismatch at {field} (declared {declared}, expected {expected})"
+    )]
+    ResumeBlobLength {
+        /// Which field was being checked.
+        field: &'static str,
+        /// Length declared in the blob.
+        declared: u64,
+        /// Length the decoder expected.
+        expected: u64,
+    },
+
+    /// Phase 6 resume blob's leading magic / version did not
+    /// match `b"XDR1"` + version byte 1.
+    #[error("xz: resume blob has bad magic or unsupported format version")]
+    ResumeBlobMagic,
+
+    /// Phase 6 resume blob's trailing CRC32 did not match the
+    /// hash over the rest of the blob — the blob was corrupted
+    /// in storage / transit.
+    #[error("xz: resume blob CRC32 mismatch (expected 0x{expected:08X}, got 0x{got:08X})")]
+    ResumeBlobCrc {
+        /// CRC32 stored in the blob trailer.
+        expected: u32,
+        /// CRC32 we computed over the rest of the blob.
+        got: u32,
+    },
 }
 
 impl XzError {

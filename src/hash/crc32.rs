@@ -99,6 +99,15 @@ impl Crc32 {
     pub fn current(&self) -> u32 {
         !self.state
     }
+
+    /// Restore a hasher to a state that, if [`Self::finalize`]
+    /// were called immediately, would produce `partial_crc`.
+    /// Used by Phase 6 resume after re-reading the already-
+    /// extracted prefix's running Check value out of a checkpoint
+    /// blob.
+    pub fn seed(&mut self, partial_crc: u32) {
+        self.state = !partial_crc;
+    }
 }
 
 /// Convenience: full-buffer CRC-32 in one call.

@@ -73,6 +73,81 @@ impl BlockCheckHasher {
         }
     }
 
+    /// Serialized state length for this hasher variant. Used by
+    /// the Phase 6 resume blob to cross-check the declared
+    /// Check ID against the hasher-state byte payload.
+    #[must_use]
+    pub fn serialized_state_len(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Crc32(_) => 4,
+            Self::Crc64(_) => 8,
+            Self::Sha256(_) => crate::hash::sha256::SERIALIZED_LEN,
+        }
+    }
+
+    /// Append the running hasher state to `out`. Layout per
+    /// variant:
+    ///
+    /// - `None`: 0 bytes.
+    /// - `CRC32`: 4 bytes, the running u32 (after final XOR), LE.
+    /// - `CRC64`: 8 bytes, the running u64 (after final XOR), LE.
+    /// - `SHA-256`: 105 bytes, [`Sha256::serialize`]'s
+    ///   self-describing blob.
+    ///
+    /// Pairs with [`Self::deserialize_state`].
+    pub fn serialize_state(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::None => {}
+            Self::Crc32(h) => out.extend_from_slice(&h.current().to_le_bytes()),
+            Self::Crc64(h) => out.extend_from_slice(&h.current().to_le_bytes()),
+            Self::Sha256(h) => out.extend_from_slice(&h.serialize()),
+        }
+    }
+
+    /// Reconstruct a hasher of the given Check kind from a
+    /// previously [`Self::serialize_state`]-produced byte slice.
+    ///
+    /// # Errors
+    ///
+    /// - [`super::error::XzError::ResumeBlobLength`] if `bytes`
+    ///   length doesn't match the variant's expected size.
+    /// - [`super::error::XzError::ResumeBlobTruncated`] if a
+    ///   variant-internal deserializer (e.g. SHA-256) rejects
+    ///   the slice as malformed.
+    pub fn deserialize_state(check: CheckId, bytes: &[u8]) -> Result<Self, XzError> {
+        let expected = BlockCheckHasher::new(check).serialized_state_len();
+        if bytes.len() != expected {
+            return Err(XzError::ResumeBlobLength {
+                field: "Block Check hasher state",
+                declared: bytes.len() as u64,
+                expected: expected as u64,
+            });
+        }
+        match check {
+            CheckId::None => Ok(Self::None),
+            CheckId::Crc32 => {
+                let partial = u32::from_le_bytes(bytes.try_into().expect("len 4 by check above"));
+                let mut h = Crc32::new();
+                h.seed(partial);
+                Ok(Self::Crc32(h))
+            }
+            CheckId::Crc64 => {
+                let partial = u64::from_le_bytes(bytes.try_into().expect("len 8 by check above"));
+                let mut h = Crc64::new();
+                h.seed(partial);
+                Ok(Self::Crc64(h))
+            }
+            CheckId::Sha256 => {
+                let arr: &[u8; crate::hash::sha256::SERIALIZED_LEN] =
+                    bytes.try_into().expect("len 105 by check above");
+                let h = Sha256::deserialize(arr)
+                    .map_err(|_| XzError::ResumeBlobTruncated("Block Check SHA-256 state"))?;
+                Ok(Self::Sha256(h))
+            }
+        }
+    }
+
     /// Finalize the hash and compare against `expected` (the
     /// bytes read from the Block trailer).
     ///

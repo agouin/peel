@@ -343,6 +343,145 @@ impl LzmaProbs {
         let prev_high = u32::from(prev_byte) >> (8 - u32::from(self.lc));
         ((pos_low << u32::from(self.lc)) | prev_high) as usize
     }
+
+    /// Serialize every probability slot as little-endian `u16`s,
+    /// in the field order the resume blob's deserializer expects.
+    /// `(lc, lp, pb)` are not included — the resume blob carries
+    /// them separately so [`Self::deserialize_into`] can size the
+    /// fresh tables before pulling slot values.
+    pub fn serialize_slots(&self, out: &mut Vec<u8>) {
+        fn push(out: &mut Vec<u8>, slice: &[u16]) {
+            for &v in slice {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        push(out, &self.is_match);
+        push(out, &self.is_rep);
+        push(out, &self.is_rep_g0);
+        push(out, &self.is_rep_g1);
+        push(out, &self.is_rep_g2);
+        push(out, &self.is_rep0_long);
+        push(out, &self.pos_slots);
+        push(out, &self.pos_decoders);
+        push(out, &self.align_decoders);
+        push(out, std::slice::from_ref(&self.match_len.choice));
+        push(out, std::slice::from_ref(&self.match_len.choice2));
+        push(out, &self.match_len.low);
+        push(out, &self.match_len.mid);
+        push(out, &self.match_len.high[..]);
+        push(out, std::slice::from_ref(&self.rep_len.choice));
+        push(out, std::slice::from_ref(&self.rep_len.choice2));
+        push(out, &self.rep_len.low);
+        push(out, &self.rep_len.mid);
+        push(out, &self.rep_len.high[..]);
+        push(out, &self.literal);
+    }
+
+    /// Total bytes [`Self::serialize_slots`] writes for this
+    /// probs allocation. `2 * total_slots` because each slot is
+    /// a little-endian `u16`.
+    #[must_use]
+    pub fn serialized_byte_len(&self) -> usize {
+        let n = self.is_match.len()
+            + self.is_rep.len()
+            + self.is_rep_g0.len()
+            + self.is_rep_g1.len()
+            + self.is_rep_g2.len()
+            + self.is_rep0_long.len()
+            + self.pos_slots.len()
+            + self.pos_decoders.len()
+            + self.align_decoders.len()
+            + 2
+            + self.match_len.low.len()
+            + self.match_len.mid.len()
+            + self.match_len.high.len()
+            + 2
+            + self.rep_len.low.len()
+            + self.rep_len.mid.len()
+            + self.rep_len.high.len()
+            + self.literal.len();
+        n * 2
+    }
+
+    /// Hydrate fresh probs (allocated from `(lc, lp, pb)`) from a
+    /// serialized slot stream.
+    ///
+    /// `bytes.len()` must equal [`Self::serialized_byte_len`] for
+    /// the same `(lc, lp, pb)`. The deserializer trusts the
+    /// caller-supplied properties: a deserializing peer with
+    /// different `(lc, lp, pb)` will produce a differently-sized
+    /// allocation that mismatches `bytes.len()` and surfaces a
+    /// typed error.
+    ///
+    /// # Errors
+    ///
+    /// - [`XzError::MalformedBlockHeader`] / [`XzError::LzmaPbTooLarge`]
+    ///   / [`XzError::LzmaLcLpTooLarge`] from [`Self::new`] when the
+    ///   properties are out of range.
+    /// - [`XzError::ResumeBlobTruncated`] when `bytes.len()` is too
+    ///   short for the declared properties.
+    /// - [`XzError::ResumeBlobLength`] when `bytes.len()` is too
+    ///   long for the declared properties.
+    pub fn deserialize(lc: u8, lp: u8, pb: u8, bytes: &[u8]) -> Result<Self, XzError> {
+        let mut probs = Self::new(lc, lp, pb)?;
+        let expected = probs.serialized_byte_len();
+        if bytes.len() != expected {
+            return Err(if bytes.len() < expected {
+                XzError::ResumeBlobTruncated("LzmaProbs serialized payload")
+            } else {
+                XzError::ResumeBlobLength {
+                    field: "LzmaProbs serialized payload",
+                    declared: bytes.len() as u64,
+                    expected: expected as u64,
+                }
+            });
+        }
+        let mut cursor = 0;
+        fn pull(bytes: &[u8], cursor: &mut usize, slice: &mut [u16]) {
+            for v in slice.iter_mut() {
+                *v = u16::from_le_bytes([bytes[*cursor], bytes[*cursor + 1]]);
+                *cursor += 2;
+            }
+        }
+        pull(bytes, &mut cursor, &mut probs.is_match);
+        pull(bytes, &mut cursor, &mut probs.is_rep);
+        pull(bytes, &mut cursor, &mut probs.is_rep_g0);
+        pull(bytes, &mut cursor, &mut probs.is_rep_g1);
+        pull(bytes, &mut cursor, &mut probs.is_rep_g2);
+        pull(bytes, &mut cursor, &mut probs.is_rep0_long);
+        pull(bytes, &mut cursor, &mut probs.pos_slots);
+        pull(bytes, &mut cursor, &mut probs.pos_decoders);
+        pull(bytes, &mut cursor, &mut probs.align_decoders);
+        pull(
+            bytes,
+            &mut cursor,
+            std::slice::from_mut(&mut probs.match_len.choice),
+        );
+        pull(
+            bytes,
+            &mut cursor,
+            std::slice::from_mut(&mut probs.match_len.choice2),
+        );
+        pull(bytes, &mut cursor, &mut probs.match_len.low);
+        pull(bytes, &mut cursor, &mut probs.match_len.mid);
+        pull(bytes, &mut cursor, &mut probs.match_len.high[..]);
+        pull(
+            bytes,
+            &mut cursor,
+            std::slice::from_mut(&mut probs.rep_len.choice),
+        );
+        pull(
+            bytes,
+            &mut cursor,
+            std::slice::from_mut(&mut probs.rep_len.choice2),
+        );
+        pull(bytes, &mut cursor, &mut probs.rep_len.low);
+        pull(bytes, &mut cursor, &mut probs.rep_len.mid);
+        pull(bytes, &mut cursor, &mut probs.rep_len.high[..]);
+        pull(bytes, &mut cursor, &mut probs.literal);
+        debug_assert_eq!(cursor, expected);
+        Ok(probs)
+    }
 }
 
 /// Decode one LZMA literal byte.

@@ -112,6 +112,35 @@ impl Lzma2State {
         })
     }
 
+    /// Construct an [`Lzma2State`] from already-hydrated pieces.
+    ///
+    /// Used by Phase 6's resume path
+    /// ([`super::resume::XzResumeState::build_lzma2_state`]) to
+    /// reconstitute the model from a serialized blob. The
+    /// caller is trusted to supply pieces that came from a prior
+    /// [`super::resume::XzResumeState::capture`] of a coherent
+    /// state.
+    #[must_use]
+    pub fn from_parts(
+        dict: super::dict::LzmaDict,
+        probs: LzmaProbs,
+        state: u8,
+        rep0: u32,
+        rep1: u32,
+        rep2: u32,
+        rep3: u32,
+    ) -> Self {
+        Self {
+            dict,
+            probs,
+            state,
+            rep0,
+            rep1,
+            rep2,
+            rep3,
+        }
+    }
+
     /// Reset the dictionary cursor + probs + state machine + reps
     /// (mode `0b11` of the LZMA chunk control byte).
     ///

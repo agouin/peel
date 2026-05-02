@@ -91,6 +91,14 @@ impl Crc64 {
     pub fn current(&self) -> u64 {
         !self.state
     }
+
+    /// Restore a hasher to a state that, if [`Self::finalize`]
+    /// were called immediately, would produce `partial_crc`.
+    /// Mirror of [`super::crc32::Crc32::seed`] for the Phase 6
+    /// resume blob.
+    pub fn seed(&mut self, partial_crc: u64) {
+        self.state = !partial_crc;
+    }
 }
 
 /// Convenience: full-buffer CRC-64/XZ in one call.

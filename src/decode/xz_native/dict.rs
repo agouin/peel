@@ -191,6 +191,48 @@ impl LzmaDict {
         Ok(())
     }
 
+    /// Restore the dict from a chronological byte slice and
+    /// declared `total`.
+    ///
+    /// `bytes` is the most recent up-to-`capacity` bytes of
+    /// decompressed output, oldest first; `total` is the absolute
+    /// monotonic byte counter the original dict was at when the
+    /// snapshot was taken (may exceed `capacity`).
+    ///
+    /// Used by Phase 6 resume to reconstitute a dict from its
+    /// checkpoint blob. The LZMA literal-context formula and
+    /// `pos_state` both depend on `total` (not just on the
+    /// recent-bytes slice), so we honor the original `total` even
+    /// when it exceeds `capacity` — the ring's `head` is
+    /// positioned to `total % capacity` and the `bytes` are laid
+    /// down such that subsequent `byte_at(0)` returns the last
+    /// element of `bytes`.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// `bytes.len() <= self.capacity()` and (when `total <
+    /// capacity`) `bytes.len() == total as usize`.
+    pub fn reload(&mut self, bytes: &[u8], total: u64) {
+        debug_assert!(
+            bytes.len() <= self.buf.len(),
+            "reload bytes longer than capacity"
+        );
+        let cap = self.buf.len();
+        self.total = total;
+        self.head = (total % cap as u64) as usize;
+        if bytes.is_empty() {
+            return;
+        }
+        // The cursor sits at slot `head`; the oldest of `bytes`
+        // is at slot `(head - bytes.len()) mod cap`. Walk
+        // forward `bytes.len()` slots from there.
+        let start_slot = (self.head + cap - bytes.len()) % cap;
+        for (k, &b) in bytes.iter().enumerate() {
+            let slot = (start_slot + k) % cap;
+            self.buf[slot] = b;
+        }
+    }
+
     /// Reset the cursor and the byte counter. Used by the LZMA2
     /// chunk dispatcher when a chunk control byte requests a
     /// dictionary reset (mode `0b11`).
@@ -432,5 +474,60 @@ mod tests {
         assert_eq!(d.capacity(), MIN_DICT_SIZE);
         let d = LzmaDict::new(100);
         assert_eq!(d.capacity(), MIN_DICT_SIZE);
+    }
+
+    /// `reload` produces a dict whose `byte_at` and `total`
+    /// match the source dict at every back-position.
+    #[test]
+    fn reload_round_trips_byte_at() {
+        let mut original = LzmaDict::new(MIN_DICT_SIZE as u32);
+        for &b in b"chronological dict contents" {
+            original.push(b);
+        }
+        let total = original.total();
+        let recent = original.recent(total as usize);
+
+        let mut restored = LzmaDict::new(MIN_DICT_SIZE as u32);
+        restored.reload(&recent, total);
+        assert_eq!(restored.total(), total);
+        for n in 0..total as u32 {
+            assert_eq!(
+                restored.byte_at(n),
+                original.byte_at(n),
+                "byte_at({n}) mismatch"
+            );
+        }
+    }
+
+    /// `reload` after wraparound: `total > capacity` is honored
+    /// so subsequent `byte_at` returns 0 for distances beyond the
+    /// ring (matching the original's behavior).
+    #[test]
+    fn reload_after_wraparound_keeps_total() {
+        let mut original = LzmaDict::new(MIN_DICT_SIZE as u32);
+        for i in 0..(MIN_DICT_SIZE as u32 * 2) {
+            original.push((i & 0xFF) as u8);
+        }
+        let total = original.total();
+        assert!(total > original.capacity() as u64);
+        let recent = original.recent(original.capacity());
+
+        let mut restored = LzmaDict::new(MIN_DICT_SIZE as u32);
+        restored.reload(&recent, total);
+        assert_eq!(restored.total(), total);
+        // Back-distances within the ring are valid.
+        for n in 0..original.capacity() as u32 {
+            assert_eq!(
+                restored.byte_at(n),
+                original.byte_at(n),
+                "byte_at({n}) mismatch"
+            );
+        }
+        // Pushing more bytes continues coherently — slot `total
+        // % capacity` is where the next byte lands; reading
+        // back via byte_at(0) should return what we just pushed.
+        restored.push(0xAA);
+        assert_eq!(restored.byte_at(0), 0xAA);
+        assert_eq!(restored.total(), total + 1);
     }
 }

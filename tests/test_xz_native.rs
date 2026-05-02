@@ -25,7 +25,7 @@
 
 use std::io::{Cursor, Read, Write};
 
-use peel::decode::xz_native::Decoder;
+use peel::decode::xz_native::{resume_factory, Decoder};
 use peel::decode::{DecodeStatus, StreamingDecoder};
 
 /// Compress `input` with `xz2` at the given preset and return the
@@ -117,6 +117,39 @@ fn lcg_bytes(seed: u32, n: usize) -> Vec<u8> {
         state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         out.push((state >> 16) as u8);
     }
+    out
+}
+
+/// Generate `n` bytes of LZMA-friendly content: distinct
+/// pseudo-English sentences with light variation. The content
+/// compresses heavily through LZMA's match-finder (so xz picks
+/// LZMA chunks over uncompressed) while the input size
+/// guarantees a bounded number of output bytes per chunk —
+/// we use this to force multi-LZMA-chunk Blocks for the
+/// Phase 6 resume tests.
+fn build_lzma_friendly_input(n: usize) -> Vec<u8> {
+    let lines: &[&[u8]] = &[
+        b"the quick brown fox jumps over the lazy dog ",
+        b"alpha bravo charlie delta echo foxtrot golf ",
+        b"every good boy deserves favor and this is line ",
+        b"the rain in spain falls mainly on the plain ",
+        b"to be or not to be that is the question whether ",
+        b"in the beginning was the word and the word was with ",
+    ];
+    let mut out = Vec::with_capacity(n);
+    let mut state: u32 = 0x1234_5678;
+    while out.len() < n {
+        // Pick a line at LCG-random; append a 6-digit decimal
+        // marker so each emitted chunk is *almost* but not
+        // exactly a copy of an earlier one (LZMA's rep matches
+        // still cover most of the bytes).
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let line = lines[(state >> 24) as usize % lines.len()];
+        out.extend_from_slice(line);
+        let digits = state % 1_000_000;
+        out.extend_from_slice(format!("{digits:06} ").as_bytes());
+    }
+    out.truncate(n);
     out
 }
 
@@ -268,4 +301,198 @@ fn bytes_consumed_lands_at_source_end() {
     assert_eq!(decoder.bytes_consumed().get(), stream_len);
     assert_eq!(out, input);
     assert!(decoder.frame_boundary().is_some());
+}
+
+/// Phase 6: capture `decoder_state` at every LZMA2 chunk
+/// boundary inside a Block, resume from each, and verify the
+/// suffix is byte-identical to a clean run. Mirrors the
+/// `frame_boundary_property_is_a_valid_restart_point` exit
+/// criterion from `docs/PLAN_xz_block_decoder.md`.
+#[test]
+fn resume_at_every_chunk_boundary_yields_identical_suffix() {
+    // ~1 MiB of LCG-pseudo-random bytes forces multiple LZMA2
+    // chunks: a chunk's compressed-size cap is 64 KiB, and
+    // pseudo-random content compresses near 1:1, so 1 MiB
+    // produces ≥16 chunks at preset 6.
+    // ~4 MiB of structured text repeated. xz at preset 6
+    // compresses repeating English-like content as LZMA chunks
+    // (high compressibility); the uncompressed-side cap on a
+    // single LZMA2 chunk is 2 MiB, so a 4 MiB input is
+    // guaranteed to span at least two LZMA chunks regardless
+    // of how favorably the model compresses.
+    let input = build_lzma_friendly_input(4 * 1024 * 1024);
+    let stream = xz2_compress(&input, 6);
+
+    // Walk the clean run, snapshotting (offset, blob, output_len)
+    // at every step where `decoder_state` returns Some.
+    let mut decoder = Decoder::new(Box::new(Cursor::new(stream.clone()))).expect("clean");
+    let mut out = Vec::new();
+    let mut snapshots: Vec<(u64, Vec<u8>, usize)> = Vec::new();
+    loop {
+        let pre_len = out.len();
+        let status = decoder.decode_step(&mut out).expect("step");
+        if let Some(blob) = decoder.decoder_state() {
+            let offset = decoder.bytes_consumed().get();
+            snapshots.push((offset, blob, out.len()));
+            // bytes_consumed at this step is after the chunk's
+            // bytes, so `out.len() >= pre_len`.
+            assert!(out.len() >= pre_len);
+        }
+        if status == DecodeStatus::Eof {
+            break;
+        }
+    }
+    let clean_output = out;
+
+    // We should have hit at least 2 chunk boundaries on a 256 KiB
+    // input.
+    assert!(
+        snapshots.len() >= 2,
+        "expected ≥2 chunk-boundary snapshots, got {}",
+        snapshots.len()
+    );
+
+    // Resume from each snapshot. The decoded suffix must equal
+    // `clean_output[snapshot.output_len..]`.
+    for (idx, (offset, blob, output_len)) in snapshots.iter().enumerate() {
+        let suffix_src: Vec<u8> = stream[*offset as usize..].to_vec();
+        let mut resumed =
+            resume_factory(Box::new(Cursor::new(suffix_src)), blob, *offset).expect("resume");
+        let mut suffix_out = Vec::new();
+        loop {
+            match resumed.decode_step(&mut suffix_out).expect("resumed step") {
+                DecodeStatus::Eof => break,
+                DecodeStatus::MoreData => continue,
+            }
+        }
+        assert_eq!(
+            suffix_out,
+            clean_output[*output_len..],
+            "snapshot {idx} (offset={offset}, output_len={output_len}) suffix mismatch"
+        );
+    }
+}
+
+/// Phase 6 frame_boundary contract: between LZMA2 chunks of a
+/// single Block, `frame_boundary` advances per-chunk (matching
+/// `decoder_state` returning Some). Pin so a regression in the
+/// per-chunk advance fires here.
+#[test]
+fn frame_boundary_advances_per_chunk_inside_block() {
+    let input = build_lzma_friendly_input(4 * 1024 * 1024);
+    let stream = xz2_compress(&input, 6);
+    let mut decoder = Decoder::new(Box::new(Cursor::new(stream))).expect("construct");
+    let mut out = Vec::new();
+    let mut boundaries: Vec<u64> = Vec::new();
+    loop {
+        let prior = decoder.frame_boundary();
+        let status = decoder.decode_step(&mut out).expect("step");
+        let next = decoder.frame_boundary();
+        if next != prior {
+            if let Some(b) = next {
+                boundaries.push(b.get());
+            }
+        }
+        if status == DecodeStatus::Eof {
+            break;
+        }
+    }
+    // Two distinct sources of advance: per-chunk (inside Block)
+    // and the Stream-end advance. Total must be > 2.
+    assert!(
+        boundaries.len() >= 3,
+        "expected at least 3 frame_boundary advances (≥2 chunk + 1 Stream-end), got {boundaries:?}",
+    );
+    // And boundaries must be monotonically increasing.
+    for w in boundaries.windows(2) {
+        assert!(w[0] < w[1], "boundaries regressed: {w:?}");
+    }
+}
+
+/// Phase 6 property test: deterministic-but-varied seeds
+/// produce inputs that span multiple LZMA2 chunks; we resume
+/// from the *kth* chunk boundary (k chosen by a small LCG over
+/// the seed) and verify byte-identical suffix output. Catches
+/// regressions where the resume blob captures one chunk
+/// boundary correctly but drifts at later ones.
+#[test]
+fn resume_property_random_kill_points_across_seeds() {
+    for seed in [0xDEAD_BEEFu32, 0xCAFE_BABE, 0x1234_5678, 0xFEED_FACE] {
+        // Synthesize a per-seed input by perturbing the
+        // LZMA-friendly fixture with the seed's low byte.
+        let mut input = build_lzma_friendly_input(1024 * 1024);
+        let perturb = (seed & 0x1F) as u8;
+        for chunk in input.chunks_mut(64 * 1024) {
+            for b in chunk.iter_mut().step_by(257) {
+                *b = b.wrapping_add(perturb);
+            }
+        }
+        let stream = xz2_compress(&input, 6);
+
+        // Walk to collect snapshots.
+        let mut decoder = Decoder::new(Box::new(Cursor::new(stream.clone()))).expect("clean");
+        let mut out = Vec::new();
+        let mut snapshots: Vec<(u64, Vec<u8>, usize)> = Vec::new();
+        loop {
+            let status = decoder.decode_step(&mut out).expect("step");
+            if let Some(blob) = decoder.decoder_state() {
+                snapshots.push((decoder.bytes_consumed().get(), blob, out.len()));
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        let clean_output = out;
+        assert!(
+            !snapshots.is_empty(),
+            "seed 0x{seed:08X}: no chunk-boundary snapshots"
+        );
+
+        // Pick the kth snapshot by LCG over the seed.
+        let kk = (seed.wrapping_mul(1_664_525) >> 8) as usize % snapshots.len();
+        let (offset, blob, output_len) = &snapshots[kk];
+        let suffix_src: Vec<u8> = stream[*offset as usize..].to_vec();
+        let mut resumed =
+            resume_factory(Box::new(Cursor::new(suffix_src)), blob, *offset).expect("resume");
+        let mut suffix_out = Vec::new();
+        loop {
+            match resumed.decode_step(&mut suffix_out).expect("resumed step") {
+                DecodeStatus::Eof => break,
+                DecodeStatus::MoreData => continue,
+            }
+        }
+        assert_eq!(
+            suffix_out,
+            clean_output[*output_len..],
+            "seed 0x{seed:08X} snapshot {kk}/{}: suffix mismatch",
+            snapshots.len()
+        );
+    }
+}
+
+/// Phase 6: a corrupted resume blob surfaces a typed
+/// `DecodeError::Construct` rather than panicking.
+#[test]
+fn corrupted_resume_blob_surfaces_typed_error() {
+    let input = b"resume-corruption-test".repeat(512);
+    let stream = xz2_compress(&input, 6);
+
+    // Walk to the first chunk boundary, capture the blob.
+    let mut decoder = Decoder::new(Box::new(Cursor::new(stream.clone()))).expect("walk");
+    let mut out = Vec::new();
+    let blob = loop {
+        let _ = decoder.decode_step(&mut out).expect("step");
+        if let Some(b) = decoder.decoder_state() {
+            break b;
+        }
+    };
+
+    // Flip a bit somewhere in the middle of the blob.
+    let mut corrupted = blob.clone();
+    let mid = corrupted.len() / 2;
+    corrupted[mid] ^= 0x42;
+
+    // Resume should fail before the first decode_step.
+    let result = resume_factory(Box::new(Cursor::new(Vec::new())), &corrupted, 0);
+    assert!(result.is_err(), "expected resume rejection on corruption");
 }

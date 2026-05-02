@@ -92,6 +92,25 @@
 //!   typed [`error::XzError::IndexMismatch`] /
 //!   [`error::XzError::IndexCrcMismatch`].
 //!
+//! # What Phase 6 added
+//!
+//! - [`resume::XzResumeState`]: serialized snapshot of every
+//!   piece of decoder state (LZMA model, dict, Block-Check
+//!   hasher, Stream Index records-so-far) needed to resume
+//!   byte-identically at an LZMA2 chunk boundary. Self-
+//!   describing wire format with magic / version / trailing
+//!   CRC32; documented in the module header.
+//! - [`StreamingDecoder::decoder_state`] returns `Some(blob)`
+//!   when paused at an LZMA2 chunk boundary inside a Block
+//!   where the LZMA model is allocated; `None` otherwise.
+//! - [`StreamingDecoder::frame_boundary`] now advances per-
+//!   LZMA2-chunk (when `decoder_state` would return `Some`) in
+//!   addition to its existing per-Stream advance.
+//! - [`Decoder::resume`] / [`resume_factory`]: reconstitute a
+//!   [`Decoder`] from a blob + source byte offset; the next
+//!   `decode_step` reads the next LZMA2 chunk's control byte.
+//!   Mirrors the lz4 / zstd resume contracts.
+//!
 //! # What's deferred
 //!
 //! - Stream Padding (zero alignment between concatenated Streams)
@@ -124,6 +143,7 @@ pub mod lzma2;
 pub mod lzma_state;
 pub mod probs;
 pub mod range_coder;
+pub mod resume;
 pub mod stream;
 
 #[cfg(test)]
@@ -473,6 +493,18 @@ impl Decoder {
                         ctx,
                         sink,
                     )?;
+                    // Phase 6: advance the per-LZMA2-chunk frame
+                    // boundary so the coordinator's
+                    // checkpoint cadence fires at every chunk.
+                    // Only valid when an `lzma_state` is
+                    // allocated and we're not yet past the EOS
+                    // chunk — those are the conditions
+                    // [`Self::decoder_state`] gates `Some(blob)`
+                    // on, and `frame_boundary` must point at the
+                    // same byte offset.
+                    if ctx.lzma_state.is_some() && !ctx.lzma2_finished {
+                        self.last_frame_boundary = Some(ByteOffset::new(self.bytes_consumed));
+                    }
                     return Ok(DecodeStatus::MoreData);
                 }
                 // LZMA2 finished. Validate sizes, consume
@@ -976,6 +1008,103 @@ impl StreamingDecoder for Decoder {
     fn frame_boundary(&self) -> Option<ByteOffset> {
         self.last_frame_boundary
     }
+
+    fn decoder_state(&self) -> Option<Vec<u8>> {
+        // The blob is meaningful only at an LZMA2 chunk boundary
+        // inside a Block where the LZMA model has been
+        // allocated (i.e. at least one LZMA chunk has run) and
+        // the EOS chunk hasn't yet been observed. Any other
+        // position falls back to the regular factory at the
+        // last per-Stream `frame_boundary`.
+        let State::InBlock { flags, ctx, .. } = &self.state else {
+            return None;
+        };
+        let lzma_state = ctx.lzma_state.as_ref()?;
+        if ctx.lzma2_finished {
+            return None;
+        }
+        let blob = self::resume::XzResumeState::capture(self::resume::CaptureArgs {
+            stream_check: flags.check,
+            stream_block_records: &self.stream_block_records,
+            block_header: &ctx.header,
+            block_lzma2_start_offset: ctx.lzma2_start_offset,
+            block_decompressed_so_far: ctx.decompressed_so_far,
+            block_seen_first_chunk: ctx.seen_first_chunk,
+            block_lzma2_finished: ctx.lzma2_finished,
+            lzma_state,
+            check_hasher: &ctx.check_hasher,
+        });
+        Some(blob.serialize())
+    }
+}
+
+impl Decoder {
+    /// Resume decoding mid-Block from a Phase 6 [`resume`] blob
+    /// + the source byte offset the blob describes.
+    ///
+    /// `src` is positioned at `start_offset` — the coordinator
+    /// has already pre-seeked the underlying byte stream there.
+    /// On success the returned [`Decoder`] is in
+    /// `State::InBlock` with a fully reconstituted Lzma2 model;
+    /// the next [`StreamingDecoder::decode_step`] reads the
+    /// next chunk's control byte from `src`.
+    ///
+    /// Mirrors [`crate::decode::lz4::Lz4Decoder::resume`]'s
+    /// shape so the registry's [`super::DecoderRegistry::register_resume_factory`]
+    /// route works identically.
+    ///
+    /// # Errors
+    ///
+    /// - [`DecodeError::Construct`] when the blob is malformed
+    ///   (bad magic / version / CRC, or internal field length
+    ///   disagreement).
+    pub fn resume(
+        src: Box<dyn Read + Send>,
+        state_blob: &[u8],
+        start_offset: u64,
+    ) -> Result<Self, DecodeError> {
+        let captured = self::resume::XzResumeState::deserialize(state_blob).map_err(|err| {
+            DecodeError::Construct(io::Error::other(format!("xz resume blob rejected: {err}")))
+        })?;
+        let lzma_state = captured.build_lzma2_state().map_err(|err| {
+            DecodeError::Construct(io::Error::other(format!(
+                "xz resume blob: build state failed: {err}"
+            )))
+        })?;
+        let check_hasher = captured.build_check_hasher().map_err(|err| {
+            DecodeError::Construct(io::Error::other(format!(
+                "xz resume blob: build check hasher failed: {err}"
+            )))
+        })?;
+        let header = captured.block_header();
+        let flags = StreamFlags {
+            check: captured.stream_check,
+        };
+        let records_seen = captured.stream_block_records.len() as u64;
+        let ctx = Box::new(BlockCtx {
+            header,
+            lzma2_start_offset: captured.block_lzma2_start_offset,
+            decompressed_so_far: captured.block_decompressed_so_far,
+            seen_first_chunk: captured.block_seen_first_chunk,
+            lzma2_finished: captured.block_lzma2_finished,
+            lzma_state: Some(lzma_state),
+            chunk_payload_buf: Vec::new(),
+            check_hasher,
+        });
+        Ok(Self {
+            source: Some(src),
+            state: State::InBlock {
+                flags,
+                records_seen,
+                ctx,
+            },
+            bytes_consumed: start_offset,
+            last_frame_boundary: Some(ByteOffset::new(start_offset)),
+            index_start_offset: 0,
+            block_header_buf: Vec::new(),
+            stream_block_records: captured.stream_block_records,
+        })
+    }
 }
 
 /// [`crate::decode::DecoderFactory`] adapter for [`Decoder`].
@@ -989,6 +1118,22 @@ impl StreamingDecoder for Decoder {
 /// Forwards any error returned by [`Decoder::new`].
 pub fn factory(src: Box<dyn Read + Send>) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
     Ok(Box::new(Decoder::new(src)?))
+}
+
+/// [`crate::decode::DecoderRegistry::register_resume_factory`]
+/// adapter for [`Decoder::resume`]. Phase 7 wires this into
+/// `register_resume_factory("xz", ...)`.
+///
+/// # Errors
+///
+/// Forwards [`DecodeError::Construct`] from
+/// [`Decoder::resume`] when the blob is malformed.
+pub fn resume_factory(
+    src: Box<dyn Read + Send>,
+    state_blob: &[u8],
+    start_offset: u64,
+) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+    Ok(Box::new(Decoder::resume(src, state_blob, start_offset)?))
 }
 
 // Allow inner modules to reach the private helpers used in tests.
