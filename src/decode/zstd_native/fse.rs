@@ -466,6 +466,64 @@ impl FseTable {
         self.accuracy_log
     }
 
+    /// Borrowed view of the table's cells in state-index order.
+    ///
+    /// Used by the Phase-7 resume blob to persist the prior FSE
+    /// tables so a later block's `Repeat_Mode` keeps producing
+    /// byte-identical output across a crash. Round-trip via
+    /// [`Self::from_raw_cells`].
+    #[must_use]
+    pub fn cells_view(&self) -> &[FseCell] {
+        &self.cells
+    }
+
+    /// Reconstruct an [`FseTable`] from a previously captured cell
+    /// array.
+    ///
+    /// `accuracy_log` must satisfy `accuracy_log == 0 && cells.len()
+    /// == 1` (the RLE-mode case) or `accuracy_log >= 1 && cells.len()
+    /// == 1 << accuracy_log`. No further validation is performed —
+    /// the captured cells came from a previously-built table that
+    /// already passed [`Self::build`]'s checks.
+    ///
+    /// # Errors
+    ///
+    /// - [`ZstdError::MalformedFrameHeader`] when the
+    ///   `accuracy_log` / `cells.len()` invariant above is violated,
+    ///   or when `accuracy_log > MAX_FSE_ACCURACY_LOG`.
+    pub fn from_raw_cells(accuracy_log: u32, cells: Vec<FseCell>) -> Result<Self, ZstdError> {
+        if accuracy_log > MAX_FSE_ACCURACY_LOG {
+            return Err(ZstdError::MalformedFrameHeader(
+                "FSE resume: accuracy_log exceeds spec cap",
+            ));
+        }
+        let expected = if accuracy_log == 0 {
+            1
+        } else {
+            1usize << accuracy_log
+        };
+        if cells.len() != expected {
+            return Err(ZstdError::MalformedFrameHeader(
+                "FSE resume: cell count does not match accuracy_log",
+            ));
+        }
+        // Defensive: ensure each cell's base_state stays inside the
+        // table size so a corrupted blob can't trigger an
+        // out-of-range transition.
+        let table_size = expected as u32;
+        for cell in &cells {
+            if u32::from(cell.base_state) >= table_size && table_size > 1 {
+                return Err(ZstdError::MalformedFrameHeader(
+                    "FSE resume: cell base_state out of range",
+                ));
+            }
+        }
+        Ok(Self {
+            accuracy_log,
+            cells,
+        })
+    }
+
     /// Read the cell at `state`. Used for the initial state read
     /// (when the decoder reads `accuracy_log` bits from the
     /// reverse bitstream and looks up the resulting state) and for

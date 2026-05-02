@@ -37,6 +37,11 @@ const PRIME64_5: u64 = 0x27D4_EB2F_1656_67C5;
 /// Stripe size processed by the four-lane main loop (xxhash spec §3.2).
 const STRIPE_BYTES: usize = 32;
 
+/// Length, in bytes, of [`Xxh64::serialize`] / [`Xxh64::deserialize`]
+/// blobs. `4 lanes × 8 bytes (v) + 32 bytes (buffer) + 1 byte
+/// (buffer_len) + 8 bytes (bytes_processed) = 73`.
+pub const SERIALIZED_LEN: usize = 4 * 8 + STRIPE_BYTES + 1 + 8;
+
 /// Single 64-bit "round" mix (xxhash spec §3.3).
 #[inline]
 fn round(acc: u64, lane: u64) -> u64 {
@@ -122,6 +127,77 @@ impl Xxh64 {
     #[must_use]
     pub fn bytes_processed(&self) -> u64 {
         self.bytes_processed
+    }
+
+    /// Serialize the streaming hasher's full internal state.
+    ///
+    /// Used by the zstd `decode/zstd_native` Phase-7 resume blob so a
+    /// crash mid-frame can resume the content-checksum computation
+    /// from the last block boundary. The byte layout is:
+    ///
+    /// - `4 × 8 B` — four lane accumulators `v[0..4]`, each u64 LE.
+    /// - `32 B` — `buffer` (full stripe-sized scratch; only the
+    ///   first `buffer_len` bytes are meaningful, the rest is
+    ///   preserved verbatim).
+    /// - `1 B` — `buffer_len` (always `< 32`).
+    /// - `8 B` — `bytes_processed`, u64 LE.
+    ///
+    /// Total: [`SERIALIZED_LEN`] bytes. Round-trips bit-exactly via
+    /// [`Self::deserialize`].
+    #[must_use]
+    pub fn serialize(&self) -> [u8; SERIALIZED_LEN] {
+        let mut out = [0u8; SERIALIZED_LEN];
+        let mut p = 0;
+        for lane in self.v {
+            out[p..p + 8].copy_from_slice(&lane.to_le_bytes());
+            p += 8;
+        }
+        out[p..p + STRIPE_BYTES].copy_from_slice(&self.buffer);
+        p += STRIPE_BYTES;
+        out[p] = self.buffer_len;
+        p += 1;
+        out[p..p + 8].copy_from_slice(&self.bytes_processed.to_le_bytes());
+        debug_assert_eq!(p + 8, SERIALIZED_LEN);
+        out
+    }
+
+    /// Reconstruct a hasher from a [`Self::serialize`] blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if `bytes` is not exactly
+    /// [`SERIALIZED_LEN`] bytes, or if the encoded `buffer_len`
+    /// is `>= 32` (the streaming invariant requires
+    /// `buffer_len < STRIPE_BYTES`).
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() != SERIALIZED_LEN {
+            return Err("xxh64: serialized length mismatch");
+        }
+        let mut v = [0u64; 4];
+        let mut p = 0;
+        for lane in &mut v {
+            // INVARIANT: bytes.len() == SERIALIZED_LEN ≥ 4*8, so the
+            // 8-byte slice is in bounds.
+            let arr: [u8; 8] = bytes[p..p + 8].try_into().expect("8 bytes");
+            *lane = u64::from_le_bytes(arr);
+            p += 8;
+        }
+        let mut buffer = [0u8; STRIPE_BYTES];
+        buffer.copy_from_slice(&bytes[p..p + STRIPE_BYTES]);
+        p += STRIPE_BYTES;
+        let buffer_len = bytes[p];
+        p += 1;
+        if usize::from(buffer_len) >= STRIPE_BYTES {
+            return Err("xxh64: buffer_len out of range");
+        }
+        let arr: [u8; 8] = bytes[p..p + 8].try_into().expect("8 bytes");
+        let bytes_processed = u64::from_le_bytes(arr);
+        Ok(Self {
+            v,
+            buffer,
+            buffer_len,
+            bytes_processed,
+        })
     }
 
     /// Feed `input` into the hasher.
@@ -374,5 +450,65 @@ mod tests {
         h.update(&[]);
         let empty = h.finalize();
         assert_eq!(empty, Xxh64::new().finalize());
+    }
+
+    /// `serialize` then `deserialize` produces a hasher equivalent
+    /// to the original — finalizing both yields the same digest, and
+    /// continuing both with the same suffix yields the same digest.
+    /// Used by the zstd Phase-7 resume blob to persist mid-frame
+    /// content-checksum state.
+    #[test]
+    fn serialize_round_trips_at_various_input_sizes() {
+        // Cover sub-stripe (short path), exact-stripe boundary,
+        // multi-stripe, and large multi-stripe inputs.
+        for prefix_len in [0usize, 1, 31, 32, 33, 100, 1024, 32 * 1024 + 7] {
+            let prefix: Vec<u8> = (0..prefix_len).map(|i| (i * 13 + 5) as u8).collect();
+            let mut original = Xxh64::new();
+            original.update(&prefix);
+
+            let blob = original.serialize();
+            let restored = Xxh64::deserialize(&blob).expect("round-trip");
+
+            // (1) Both finalize to the same digest immediately.
+            assert_eq!(
+                original.clone().finalize(),
+                restored.clone().finalize(),
+                "prefix_len={prefix_len}: finalize disagrees",
+            );
+
+            // (2) Continuing with the same suffix yields the same
+            // digest — the streaming invariant the resume path
+            // relies on.
+            let suffix = b"and a suffix tail of bytes";
+            let mut a = original;
+            let mut b = restored;
+            a.update(suffix);
+            b.update(suffix);
+            assert_eq!(
+                a.finalize(),
+                b.finalize(),
+                "prefix_len={prefix_len}: continuation digest disagrees",
+            );
+        }
+    }
+
+    /// Wrong-length blobs are rejected without panicking.
+    #[test]
+    fn deserialize_rejects_wrong_length() {
+        assert!(Xxh64::deserialize(&[]).is_err());
+        assert!(Xxh64::deserialize(&[0u8; SERIALIZED_LEN - 1]).is_err());
+        assert!(Xxh64::deserialize(&[0u8; SERIALIZED_LEN + 1]).is_err());
+    }
+
+    /// A blob whose `buffer_len` byte is out of range is rejected.
+    #[test]
+    fn deserialize_rejects_oversized_buffer_len() {
+        let mut blob = [0u8; SERIALIZED_LEN];
+        // buffer_len position: after 4*8 lane bytes + 32 buffer bytes.
+        let pos = 4 * 8 + STRIPE_BYTES;
+        blob[pos] = 32;
+        assert!(Xxh64::deserialize(&blob).is_err());
+        blob[pos] = 200;
+        assert!(Xxh64::deserialize(&blob).is_err());
     }
 }

@@ -433,6 +433,14 @@ impl RepeatOffsets {
         self.slots
     }
 
+    /// Reconstruct from a `(R1, R2, R3)` triple — the inverse of
+    /// [`Self::slots`]. Used by the Phase-7 resume blob to seed the
+    /// repeat-offset state when restarting mid-frame.
+    #[must_use]
+    pub fn from_slots(slots: [u32; 3]) -> Self {
+        Self { slots }
+    }
+
     /// Resolve a sequence's `Offset_Value` to the actual offset
     /// (the value passed to [`SlidingWindow::match_copy`]) and
     /// update the slots in place per the spec table in

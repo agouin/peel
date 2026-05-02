@@ -96,6 +96,81 @@ impl SlidingWindow {
         self.total_written
     }
 
+    /// Snapshot the most-recent `min(capacity, total_written)` bytes
+    /// of the window in chronological order (oldest first, newest
+    /// last).
+    ///
+    /// Used by the Phase-7 resume blob: the saved bytes are exactly
+    /// what a fresh window needs `append`-ed to it to recover the
+    /// same logical contents.
+    #[must_use]
+    pub fn recent_in_order(&self) -> Vec<u8> {
+        let len = (self.total_written.min(self.capacity as u64)) as usize;
+        let mut out = Vec::with_capacity(len);
+        if len == 0 {
+            return out;
+        }
+        // The most-recent `len` bytes end at `head` (exclusive).
+        // Compute the start by going `len` bytes back from `head`,
+        // wrapping at the buffer's end.
+        let start = if len <= self.head {
+            self.head - len
+        } else {
+            self.capacity - (len - self.head)
+        };
+        if start + len <= self.capacity {
+            out.extend_from_slice(&self.buf[start..start + len]);
+        } else {
+            // Wraps the ring: tail then head segment.
+            let tail = self.capacity - start;
+            out.extend_from_slice(&self.buf[start..]);
+            out.extend_from_slice(&self.buf[..len - tail]);
+        }
+        out
+    }
+
+    /// Reconstruct a sliding window from a previously captured
+    /// snapshot.
+    ///
+    /// `window_size` is the frame's declared window capacity.
+    /// `total_written` is the cumulative byte count the original
+    /// window had reached when the snapshot was taken (used only
+    /// for match-offset bounds checking after resume — must be
+    /// `>= recent.len()`). `recent` is the chronological tail of
+    /// the window — the bytes returned by [`Self::recent_in_order`]
+    /// — and must be `≤ window_size` bytes long.
+    ///
+    /// # Errors
+    ///
+    /// - [`ZstdError::MalformedFrameHeader`] if `window_size` is
+    ///   out of range (delegated to [`Self::new`]), if
+    ///   `recent.len() > window_size`, or if
+    ///   `total_written < recent.len()` (the snapshot can't carry
+    ///   more bytes than the window has ever seen).
+    pub fn from_snapshot(
+        window_size: u64,
+        total_written: u64,
+        recent: &[u8],
+    ) -> Result<Self, ZstdError> {
+        let mut window = Self::new(window_size)?;
+        if recent.len() as u64 > window_size {
+            return Err(ZstdError::MalformedFrameHeader(
+                "sliding window resume: snapshot longer than window_size",
+            ));
+        }
+        if total_written < recent.len() as u64 {
+            return Err(ZstdError::MalformedFrameHeader(
+                "sliding window resume: total_written < snapshot length",
+            ));
+        }
+        window.append(recent);
+        // `append` advanced `total_written` by `recent.len()`. Restore
+        // the original counter so subsequent match-offset bounds
+        // checks reflect the full pre-resume history.
+        window.total_written = total_written;
+        Ok(window)
+    }
+
     /// Append `bytes` to the window, advancing the head.
     ///
     /// When the slice would wrap past the buffer's end, the write
@@ -326,5 +401,62 @@ mod tests {
         let mut out = Vec::new();
         w.match_copy(4, 4, &mut out).expect("match");
         assert_eq!(out, b"GHIJ");
+    }
+
+    /// `recent_in_order` returns the chronological tail of the
+    /// window, including across a wrap.
+    #[test]
+    fn recent_in_order_returns_chronological_tail() {
+        let mut w = SlidingWindow::new(4).expect("new");
+        w.append(b"AB");
+        // Sub-capacity: tail is exactly what was appended.
+        assert_eq!(w.recent_in_order(), b"AB");
+        w.append(b"CDEF"); // total_written = 6 -> wraps once
+                           // The most-recent 4 bytes in chronological order are "CDEF".
+        assert_eq!(w.recent_in_order(), b"CDEF");
+        w.append(b"G");
+        // Most-recent 4: "DEFG".
+        assert_eq!(w.recent_in_order(), b"DEFG");
+    }
+
+    /// Empty window: snapshot is empty.
+    #[test]
+    fn recent_in_order_on_empty_window() {
+        let w = SlidingWindow::new(4).expect("new");
+        assert!(w.recent_in_order().is_empty());
+    }
+
+    /// `from_snapshot` round-trips: any window can be captured and
+    /// rebuilt to one whose `match_copy` outputs match the original's.
+    #[test]
+    fn from_snapshot_round_trips_match_copy_outputs() {
+        let mut original = SlidingWindow::new(8).expect("new");
+        original.append(b"ABCDEFGHIJKLMN"); // wraps; total_written = 14
+        let recent = original.recent_in_order();
+        let total = original.total_written();
+        let mut restored = SlidingWindow::from_snapshot(8, total, &recent).expect("restore");
+        // Expected bytes: most-recent 8 are "GHIJKLMN".
+        let mut expected = Vec::new();
+        original
+            .match_copy(8, 8, &mut expected)
+            .expect("orig match");
+        let mut got = Vec::new();
+        restored.match_copy(8, 8, &mut got).expect("restored match");
+        assert_eq!(got, expected);
+    }
+
+    /// `from_snapshot` rejects total_written smaller than the
+    /// snapshot length.
+    #[test]
+    fn from_snapshot_rejects_inconsistent_total_written() {
+        let r = SlidingWindow::from_snapshot(8, 1, b"AB");
+        assert!(matches!(r, Err(ZstdError::MalformedFrameHeader(_))));
+    }
+
+    /// `from_snapshot` rejects snapshot longer than window_size.
+    #[test]
+    fn from_snapshot_rejects_oversized_snapshot() {
+        let r = SlidingWindow::from_snapshot(4, 100, b"ABCDE");
+        assert!(matches!(r, Err(ZstdError::MalformedFrameHeader(_))));
     }
 }

@@ -251,6 +251,47 @@ impl HuffmanTree {
     pub fn max_num_bits(&self) -> u32 {
         self.max_num_bits
     }
+
+    /// Derive the weight vector that built this tree.
+    ///
+    /// The Phase-7 resume blob saves trees as their weight vector
+    /// (compact and re-buildable via [`Self::from_direct_weights`]).
+    /// `weight = max_num_bits + 1 - code_length` for every cell that
+    /// references a present symbol; absent symbols carry weight 0.
+    /// The returned vector is `1 + max(symbol present in table)`
+    /// long — sufficient to round-trip through
+    /// [`Self::from_direct_weights`].
+    #[must_use]
+    pub fn derive_weights(&self) -> Vec<u8> {
+        let mut max_sym: i32 = -1;
+        // First pass: find the largest symbol index present.
+        for cell in &self.table {
+            if cell.code_length > 0 {
+                max_sym = max_sym.max(i32::from(cell.symbol));
+            }
+        }
+        if max_sym < 0 {
+            // INVARIANT: from_direct_weights rejects empty/all-zero
+            // input, so every constructed tree has at least one
+            // present symbol. Defensive return.
+            return Vec::new();
+        }
+        // INVARIANT: max_sym <= 255 because `cell.symbol: u8`.
+        let len = (max_sym as usize) + 1;
+        let mut weights = vec![0u8; len];
+        for cell in &self.table {
+            if cell.code_length == 0 {
+                continue;
+            }
+            // INVARIANT: code_length <= max_num_bits (checked at
+            // build time), so the subtraction never underflows.
+            let w = self.max_num_bits + 1 - u32::from(cell.code_length);
+            // INVARIANT: w >= 1 (code_length <= max_num_bits) and
+            // w <= max_num_bits <= MAX_HUFFMAN_CODE_BITS = 11.
+            weights[cell.symbol as usize] = w as u8;
+        }
+        weights
+    }
 }
 
 /// Compute the implicit final weight from a vector of `n - 1`
@@ -668,6 +709,35 @@ mod tests {
         let bytes = [0xCC];
         let r = parse_direct_weights(&bytes, 1);
         assert!(matches!(r, Err(ZstdError::MalformedFrameHeader(_))));
+    }
+
+    /// `derive_weights` round-trips: a tree built from a weight
+    /// vector exposes the same vector back. Used by the Phase-7
+    /// resume blob to persist the prior Huffman tree.
+    #[test]
+    fn derive_weights_round_trips_through_from_direct_weights() {
+        for weights in [
+            vec![1u8, 1],
+            vec![2, 1, 1],
+            vec![0, 1, 0, 1],
+            vec![3, 1, 1, 2],
+            // Sparse alphabet with a high-symbol-index present.
+            {
+                let mut w = vec![0u8; 16];
+                w[1] = 2;
+                w[7] = 1;
+                w[15] = 1;
+                w
+            },
+        ] {
+            let tree = HuffmanTree::from_direct_weights(&weights).expect("build");
+            let derived = tree.derive_weights();
+            let rebuilt = HuffmanTree::from_direct_weights(&derived).expect("rebuild");
+            // Trees compare equal via their internal table — same
+            // canonical placement.
+            assert_eq!(tree.max_num_bits, rebuilt.max_num_bits);
+            assert_eq!(tree.table, rebuilt.table);
+        }
     }
 
     /// Round-trip: encode a known sequence MSB-first into a

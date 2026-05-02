@@ -23,10 +23,13 @@
 //!
 //! # What's deferred
 //!
-//! - Decoder-state serialization for crash-resume — Phase 7.
 //! - Registry / extractor wiring — Phase 8.
 //! - Custom dictionaries and `windowLog > 27` are rejected at
 //!   frame-header parse time.
+//!
+//! Phase 7 wired up [`Decoder::decoder_state`] / [`resume::resume`]
+//! so the extractor can checkpoint and restart at every block
+//! boundary inside a frame; see [`resume`] for the wire format.
 //!
 //! # Source consumption accounting
 //!
@@ -52,8 +55,11 @@ pub mod frame;
 pub mod fse;
 pub mod huffman;
 pub mod literals;
+pub mod resume;
 pub mod sequences;
 pub mod window;
+
+pub use resume::{resume, resume_factory};
 
 use self::block::{parse_block_header, BlockType, BLOCK_HEADER_LEN, BLOCK_MAX_SIZE};
 use self::error::ZstdError;
@@ -81,35 +87,43 @@ const SKIP_CHUNK: usize = 1 << 16;
 pub struct Decoder {
     /// Wrapped source, dropped on terminal error or clean EOF so
     /// further `decode_step` calls cheaply short-circuit.
-    source: Option<Box<dyn Read + Send>>,
+    pub(crate) source: Option<Box<dyn Read + Send>>,
     /// State machine; see [`State`].
-    state: State,
+    pub(crate) state: State,
     /// High-water source-byte counter — what
     /// [`StreamingDecoder::bytes_consumed`] returns. Advanced only
     /// after a successful read; partial reads advance only by
     /// what was actually delivered.
-    bytes_consumed: u64,
+    pub(crate) bytes_consumed: u64,
     /// Latest frame boundary observed, or `None` if no frame has
-    /// completed yet. Updated atomically with the
-    /// `EndOfFrame` -> `BetweenFrames` transition.
-    last_frame_boundary: Option<ByteOffset>,
+    /// completed yet. Updated atomically with each block-boundary
+    /// stop (mid-frame) and end-of-frame transition.
+    pub(crate) last_frame_boundary: Option<ByteOffset>,
+    /// `true` between two consecutive blocks of the same frame —
+    /// the only point at which a [`StreamingDecoder::decoder_state`]
+    /// blob is meaningful. Cleared when entering or leaving a frame
+    /// and at the top of each block read; set true after a block's
+    /// payload has been fully consumed, written to the sink, and
+    /// folded into the per-frame state. Mirrors `Lz4Decoder`'s
+    /// `between_blocks` flag (`src/decode/lz4.rs`).
+    pub(crate) between_blocks: bool,
     /// Reusable scratch for block payloads. Sized to the RFC's
     /// 128 KiB cap on first use; held thereafter to avoid per-block
     /// allocation in the hot loop.
-    payload_buf: Vec<u8>,
+    pub(crate) payload_buf: Vec<u8>,
     /// Reusable scratch for skippable-frame data so we don't
     /// allocate a fresh buffer on every step.
-    skip_buf: Vec<u8>,
+    pub(crate) skip_buf: Vec<u8>,
     /// Reusable scratch for one Compressed_Block's decompressed
     /// output. Sized lazily up to the per-frame
     /// `Block_Maximum_Decompressed_Size` cap and reused across
     /// blocks; we `clear()` it at the top of each block.
-    block_out: Vec<u8>,
+    pub(crate) block_out: Vec<u8>,
     /// Per-frame state — only set while decoding inside a
     /// regular frame. The contents reset when entering a new
     /// frame (`AwaitingMagic` → `InFrame`) and clear on
     /// `finish_frame`. See [`FrameDecodeState`].
-    frame_state: Option<FrameDecodeState>,
+    pub(crate) frame_state: Option<FrameDecodeState>,
 }
 
 /// Per-frame decoding state lifted out of the [`State`] enum so
@@ -117,20 +131,20 @@ pub struct Decoder {
 /// matching on the state every step. Initialized when entering
 /// `InFrame` from `AwaitingMagic`; cleared on `finish_frame`.
 #[derive(Debug)]
-struct FrameDecodeState {
+pub(crate) struct FrameDecodeState {
     /// Sliding ring buffer for back-references (RFC 8478
     /// §3.1.1.1.4 + §4.1.3). Sized to the frame's `window_size`,
     /// capped at 128 MiB.
-    window: window::SlidingWindow,
+    pub(crate) window: window::SlidingWindow,
     /// Three repeat-offset slots (RFC 8478 §3.1.1.5). Reset to
     /// the spec defaults `(1, 4, 8)` per frame.
-    repeats: sequences::RepeatOffsets,
+    pub(crate) repeats: sequences::RepeatOffsets,
     /// Last Huffman tree decoded by a `Compressed_Literals_Block`,
     /// reused by `Treeless_Literals_Block`s in the same frame.
-    prev_huffman: Option<huffman::HuffmanTree>,
+    pub(crate) prev_huffman: Option<huffman::HuffmanTree>,
     /// Last LL/OF/ML FSE tables, reused by sequence-section
     /// `Repeat_Mode` declarations in subsequent blocks.
-    prev_seq_tables: sequences::PrevSequenceTables,
+    pub(crate) prev_seq_tables: sequences::PrevSequenceTables,
     /// Streaming XXH64 (seed = 0) over the *decompressed* bytes
     /// emitted from this frame. The trailing 4-byte checksum is
     /// verified against `xxh64.finalize() as u32` when
@@ -138,17 +152,22 @@ struct FrameDecodeState {
     /// updated but never observed (its cost is a single
     /// `wrapping_mul` + `xor` per stripe — negligible compared to
     /// the per-byte sequence executor work).
-    xxh64: Xxh64,
+    pub(crate) xxh64: Xxh64,
+    /// Source-byte offset of this frame's leading magic. Diagnostic
+    /// only — the resume blob carries it through round-trip but no
+    /// decode logic depends on the value.
+    pub(crate) frame_start_offset: u64,
 }
 
 impl FrameDecodeState {
-    fn new(window_size: u64) -> Result<Self, ZstdError> {
+    fn new(window_size: u64, frame_start_offset: u64) -> Result<Self, ZstdError> {
         Ok(Self {
             window: window::SlidingWindow::new(window_size)?,
             repeats: sequences::RepeatOffsets::default(),
             prev_huffman: None,
             prev_seq_tables: sequences::PrevSequenceTables::default(),
             xxh64: Xxh64::new(),
+            frame_start_offset,
         })
     }
 }
@@ -218,7 +237,7 @@ fn read_magic_or_eof(
 /// transition between frames — before returning so the extractor
 /// can interleave punching and checkpointing.
 #[derive(Debug)]
-enum State {
+pub(crate) enum State {
     /// Need to read the next 4-byte magic. EOF at this state is a
     /// clean stream end; EOF mid-magic is a truncation error.
     AwaitingMagic,
@@ -266,6 +285,7 @@ impl Decoder {
             state: State::AwaitingMagic,
             bytes_consumed: 0,
             last_frame_boundary: None,
+            between_blocks: false,
             payload_buf: Vec::new(),
             skip_buf: Vec::new(),
             block_out: Vec::new(),
@@ -286,6 +306,10 @@ impl Decoder {
     fn finish_frame(&mut self) {
         self.last_frame_boundary = Some(ByteOffset::new(self.bytes_consumed));
         self.state = State::AwaitingMagic;
+        // End-of-frame is reachable via the regular factory at the
+        // boundary offset — no decoder_state blob is needed past
+        // this point.
+        self.between_blocks = false;
         // Per-frame state (window, repeat slots, prior FSE/Huffman
         // tables) is scoped to a single frame: a `Repeat_Mode`
         // sequences-section in a *later* frame must not see the
@@ -316,6 +340,11 @@ impl Decoder {
                         }
                         Some(magic) => match classify_magic(magic) {
                             Some(FrameMagic::Regular) => {
+                                // The 4-byte magic was consumed by
+                                // `read_magic_or_eof` above; the
+                                // frame's first source byte sat at
+                                // `bytes_consumed - 4`.
+                                let frame_start_offset = self.bytes_consumed.saturating_sub(4);
                                 // Read the rest of the header. First the
                                 // FHD byte to learn the tail length.
                                 let mut fhd = [0u8; 1];
@@ -352,11 +381,19 @@ impl Decoder {
                                 // such a frame, so the extra byte
                                 // is allocated but never touched.
                                 let window_capacity = header.window_size.max(1);
-                                self.frame_state = Some(FrameDecodeState::new(window_capacity)?);
+                                self.frame_state = Some(FrameDecodeState::new(
+                                    window_capacity,
+                                    frame_start_offset,
+                                )?);
                                 self.state = State::InFrame {
                                     header,
                                     decoded_in_frame: 0,
                                 };
+                                // We're inside a frame now, but
+                                // before the first block has been
+                                // decoded — not a checkpointable
+                                // restart point.
+                                self.between_blocks = false;
                                 // Loop again so the caller observes
                                 // actual decode progress on this step.
                             }
@@ -422,6 +459,11 @@ impl Decoder {
                 } => {
                     let frame_header = *header;
                     let mut decoded = *decoded_in_frame;
+                    // We're about to read the next block's header —
+                    // any prior block's "between blocks" anchor is
+                    // no longer the truth. Clear before any failure
+                    // path can return without resetting it.
+                    self.between_blocks = false;
                     let Some(source) = self.source.as_mut() else {
                         return Err(ZstdError::UnexpectedEof("block header"));
                     };
@@ -599,6 +641,11 @@ impl Decoder {
                             }
                         }
                         if frame_header.has_checksum {
+                            // The 4-byte trailer is still owed; this
+                            // is not a clean restart point. Defer
+                            // last_frame_boundary advance until
+                            // `finish_frame` runs after the trailer
+                            // verifies.
                             self.state = State::AwaitingContentChecksum {
                                 decoded_in_frame: decoded,
                             };
@@ -606,6 +653,20 @@ impl Decoder {
                             self.finish_frame();
                         }
                     } else {
+                        // Mid-frame block boundary: this is a
+                        // restart-eligible point as long as the
+                        // resume blob is paired with the offset.
+                        // Mirror lz4's discipline (`src/decode/lz4.rs`):
+                        // stamp `last_frame_boundary` *after* every
+                        // byte of the block has been consumed and
+                        // every per-frame side-effect (window,
+                        // repeat slots, prior FSE/Huffman tables,
+                        // XXH64) has been applied. The
+                        // `between_blocks` flag is what gates
+                        // [`Self::decoder_state`] returning
+                        // `Some(blob)` for this checkpoint.
+                        self.last_frame_boundary = Some(ByteOffset::new(self.bytes_consumed));
+                        self.between_blocks = true;
                         self.state = State::InFrame {
                             header: frame_header,
                             decoded_in_frame: decoded,
@@ -677,6 +738,17 @@ impl StreamingDecoder for Decoder {
 
     fn frame_boundary(&self) -> Option<ByteOffset> {
         self.last_frame_boundary
+    }
+
+    fn decoder_state(&self) -> Option<Vec<u8>> {
+        // The blob is meaningful only when paused at a block
+        // boundary inside a regular frame. Between frames the
+        // regular factory works (no state needed); mid-block /
+        // mid-header / mid-skippable have no clean restart point.
+        // The `between_blocks` flag, set just after a block's
+        // payload has been consumed and committed, is the gate.
+        let state = resume::capture(self)?;
+        Some(state.serialize())
     }
 }
 
@@ -1472,6 +1544,243 @@ mod tests {
             }
             other => panic!("expected unsupported-feature error, got {other:?}"),
         }
+    }
+
+    // ---- Phase 7 decoder_state / resume ------------------------
+    //
+    // The Phase-7 wire format and `resume` constructor are
+    // exercised here at the StreamingDecoder boundary: a clean run
+    // emits a stream of mid-frame `decoder_state` blobs, each of
+    // which must reconstruct a decoder that produces the suffix of
+    // the plaintext byte-identically.
+
+    /// Helper: drive the decoder through the bytes after `start`,
+    /// resumed from `blob`, and collect the suffix. Any error
+    /// surfaces as a panic — the test bodies want a single failure
+    /// point per assertion.
+    fn drive_resume(combined: &[u8], start: u64, blob: &[u8]) -> Vec<u8> {
+        let suffix = combined[start as usize..].to_vec();
+        let mut decoder =
+            resume::resume(Box::new(Cursor::new(suffix)), blob, start).expect("resume constructs");
+        let mut out = Vec::new();
+        loop {
+            let status = decoder.decode_step(&mut out).expect("resume step");
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Decode-state is `None` at every step *before* the first block
+    /// has been consumed (and at end-of-frame, where the regular
+    /// factory works).
+    #[test]
+    fn decoder_state_is_none_between_frames_and_pre_block() {
+        let payload = b"frame contents".repeat(8); // small enough to fit in a single block
+        let frame = ::zstd::encode_all(payload.as_slice(), 3).expect("encode");
+        let mut decoder = Decoder::new(Box::new(Cursor::new(frame))).expect("construct");
+        let mut sink = Vec::new();
+        // First step pulls the frame magic + header — still pre-block.
+        let status = decoder.decode_step(&mut sink).expect("step 1");
+        assert_eq!(status, DecodeStatus::MoreData);
+        assert!(
+            decoder.decoder_state().is_none(),
+            "pre-block in-frame state must not be checkpointable",
+        );
+        // Drain to EOF and confirm the post-EOF state is also None.
+        loop {
+            if decoder.decode_step(&mut sink).expect("drain") == DecodeStatus::Eof {
+                break;
+            }
+        }
+        assert!(decoder.decoder_state().is_none(), "post-EOF state is None");
+    }
+
+    /// Round-trip a multi-block frame's resume blobs: every mid-frame
+    /// boundary is a valid restart point, byte-identical.
+    #[test]
+    fn decoder_state_blob_resumes_byte_identically_at_every_block() {
+        // Generate a payload large enough to force several blocks.
+        let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. \
+            pack my box with five dozen liquor jugs. how vexingly quick \
+            daft zebras jump! sphinx of black quartz, judge my vow. "
+            .repeat(2000); // ~290 KiB — at level 3 yields multiple blocks
+        let combined = ::zstd::encode_all(payload.as_slice(), 3).expect("encode");
+
+        // Walk a clean run, capturing (offset, blob, decoded_so_far)
+        // at every step where decoder_state() is Some.
+        let mut decoder = Decoder::new(Box::new(Cursor::new(combined.clone()))).expect("construct");
+        let mut clean_sink = Vec::new();
+        let mut checkpoints: Vec<(u64, Vec<u8>, usize)> = Vec::new();
+        loop {
+            let status = decoder.decode_step(&mut clean_sink).expect("clean step");
+            if let Some(blob) = decoder.decoder_state() {
+                let offset = decoder
+                    .frame_boundary()
+                    .expect("frame_boundary set with state")
+                    .get();
+                checkpoints.push((offset, blob, clean_sink.len()));
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        assert_eq!(clean_sink, payload);
+        assert!(
+            checkpoints.len() >= 2,
+            "expected several mid-frame checkpoints, got {}",
+            checkpoints.len(),
+        );
+
+        // For each checkpoint: resume from the suffix and the blob,
+        // and verify the output equals the plaintext suffix from
+        // `decoded_so_far`.
+        for (i, (offset, blob, decoded_so_far)) in checkpoints.iter().enumerate() {
+            let got = drive_resume(&combined, *offset, blob);
+            let expected = &payload[*decoded_so_far..];
+            assert_eq!(
+                got.as_slice(),
+                expected,
+                "checkpoint #{i} (offset {offset}, decoded_so_far {decoded_so_far}) \
+                 resume produced {} bytes vs expected {}",
+                got.len(),
+                expected.len(),
+            );
+        }
+    }
+
+    /// Phase-7 exit criterion: the lz4-style restart-point property
+    /// holds for the new decoder. Mirrors
+    /// `decode::zstd::tests::frame_boundary_property_is_a_valid_restart_point`
+    /// but exercises mid-frame boundaries too — every observed
+    /// `frame_boundary` paired with its `decoder_state` blob (or
+    /// the regular factory if `decoder_state` is `None`) reconstructs
+    /// a decoder that produces the plaintext suffix byte-identically.
+    #[test]
+    fn frame_boundary_property_is_a_valid_restart_point() {
+        let mut state: u64 = 0x00C0_FFEE_BEEF;
+        for trial in 0..6u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1442695040888963407 ^ trial);
+            // Vary length to mix single-block and multi-block frames.
+            let len = (state as usize) & 0x3FFFF; // up to ~256 KiB
+            let mut payload = vec![0u8; len];
+            for byte in payload.iter_mut() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1442695040888963407);
+                *byte = (state >> 33) as u8;
+            }
+            let combined = ::zstd::encode_all(payload.as_slice(), 3).expect("encode");
+
+            let mut decoder =
+                Decoder::new(Box::new(Cursor::new(combined.clone()))).expect("construct");
+            let mut clean_sink = Vec::new();
+            let mut prior_boundary = decoder.frame_boundary();
+            let mut boundaries: Vec<(u64, Option<Vec<u8>>, usize)> = Vec::new();
+            loop {
+                let status = decoder.decode_step(&mut clean_sink).expect("step");
+                let now = decoder.frame_boundary();
+                if now != prior_boundary {
+                    boundaries.push((
+                        now.expect("just observed").get(),
+                        decoder.decoder_state(),
+                        clean_sink.len(),
+                    ));
+                    prior_boundary = now;
+                }
+                if status == DecodeStatus::Eof {
+                    break;
+                }
+            }
+            assert_eq!(clean_sink, payload, "trial {trial}: clean run mismatch");
+
+            for (i, (offset, blob, decoded_so_far)) in boundaries.iter().enumerate() {
+                let suffix_compressed = combined[*offset as usize..].to_vec();
+                let expected = &payload[*decoded_so_far..];
+                let got: Vec<u8> = match blob {
+                    Some(b) => drive_resume(&combined, *offset, b),
+                    None => {
+                        // End-of-frame boundary: regular factory works.
+                        if suffix_compressed.is_empty() {
+                            assert_eq!(*decoded_so_far, payload.len());
+                            continue;
+                        }
+                        let mut d = Decoder::new(Box::new(Cursor::new(suffix_compressed)))
+                            .expect("restart construct");
+                        let mut out = Vec::new();
+                        loop {
+                            if d.decode_step(&mut out).expect("restart step") == DecodeStatus::Eof {
+                                break;
+                            }
+                        }
+                        out
+                    }
+                };
+                assert_eq!(
+                    got.as_slice(),
+                    expected,
+                    "trial {trial} boundary #{i} (offset {offset}, decoded_so_far {decoded_so_far})",
+                );
+            }
+        }
+    }
+
+    /// A blob whose bytes are obviously not a Phase-7 envelope is
+    /// rejected via [`DecodeError::Construct`] without panic.
+    #[test]
+    fn resume_rejects_malformed_blob() {
+        let combined = ::zstd::encode_all(&b"abcdefg"[..], 3).expect("encode");
+        // Bogus blob.
+        let r = resume::resume(Box::new(Cursor::new(combined)), &[0u8; 4], 0);
+        match r {
+            Err(DecodeError::Construct(e)) => {
+                assert!(e.to_string().contains("zstd resume"), "msg: {e}");
+            }
+            Err(other) => panic!("expected Construct error, got {other:?}"),
+            Ok(_) => panic!("expected Construct error, got Ok(decoder)"),
+        }
+    }
+
+    /// A frame with a content checksum: the XXH64 hasher state is
+    /// captured by the blob, so resuming continues hashing from the
+    /// last block boundary and the trailer still verifies.
+    #[test]
+    fn resume_preserves_content_checksum_state() {
+        use std::io::Write as _;
+        let payload: Vec<u8> = b"checksum check ".repeat(20_000);
+        let mut frame = Vec::new();
+        {
+            let mut enc = ::zstd::Encoder::new(&mut frame, 3).expect("encoder");
+            enc.include_checksum(true).expect("checksum on");
+            enc.write_all(&payload).expect("write");
+            enc.finish().expect("finish");
+        }
+
+        // Capture the first mid-frame blob.
+        let mut decoder = Decoder::new(Box::new(Cursor::new(frame.clone()))).expect("construct");
+        let mut sink = Vec::new();
+        let (offset, blob, decoded_so_far) = loop {
+            let status = decoder.decode_step(&mut sink).expect("step");
+            if let Some(blob) = decoder.decoder_state() {
+                break (
+                    decoder.frame_boundary().expect("boundary").get(),
+                    blob,
+                    sink.len(),
+                );
+            }
+            if status == DecodeStatus::Eof {
+                panic!("expected at least one mid-frame checkpoint");
+            }
+        };
+
+        // Resume with that blob and verify both: (a) suffix
+        // produces the right plaintext, and (b) the checksum
+        // trailer at end-of-frame is accepted (no error).
+        let got = drive_resume(&frame, offset, &blob);
+        assert_eq!(got, payload[decoded_so_far..]);
     }
 
     /// 500-fixture differential against `::zstd::encode_all` — Phase 6
