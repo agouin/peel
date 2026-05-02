@@ -300,6 +300,86 @@ fn truncated_body_during_read_errors() {
     assert!(body.starts_with(b"hello"));
 }
 
+// ---- Body-idle timeout ------------------------------------------------
+
+#[test]
+fn body_idle_timeout_surfaces_as_io_error() {
+    // Server sends headers + 5 bytes of body, then sleeps for several
+    // seconds without sending the rest. With a sub-second
+    // `body_idle_timeout` the client must raise a body-IO error
+    // instead of waiting for the stalled stream.
+    let server = MockServer::start(|_req, _n| MockResponse::StallAfterPartialBody {
+        status: 200,
+        reason: "OK",
+        headers: vec![],
+        partial_body: b"hello".to_vec(),
+        remaining: 95,
+        stall: Duration::from_secs(5),
+    });
+    let cfg = ClientConfig {
+        body_idle_timeout: Duration::from_millis(200),
+        timeout: Duration::from_secs(5),
+        ..ClientConfig::default()
+    };
+    let client = Client::with_config(cfg).expect("client");
+    let started = std::time::Instant::now();
+    let mut resp = client.get_full(&url(&server, "/")).expect("headers ok");
+    let mut body = Vec::new();
+    // The first read returns the partial body (5 bytes); subsequent
+    // reads block on `body.frame()` until the idle deadline trips and
+    // surfaces as `io::Error`. `read_to_end` propagates the error.
+    let err = resp
+        .body
+        .read_to_end(&mut body)
+        .expect_err("stalled body must error");
+    let elapsed = started.elapsed();
+    assert!(body.starts_with(b"hello"), "partial body lost: {body:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "client waited {elapsed:?}, did not honor idle deadline",
+    );
+    // The synthesized error is plain io; just sanity-check it surfaced.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stalled") || msg.contains("idle") || msg.contains("frame"),
+        "expected stall-flavored message, got {msg:?}",
+    );
+}
+
+#[test]
+fn body_idle_timeout_zero_disables_deadline() {
+    // Setting `body_idle_timeout` to zero opts back into the
+    // pre-fix behaviour: the read does *not* time out client-side and
+    // unblocks only when the connection drops or the stall completes.
+    // The mock's stall is short so the test still finishes promptly.
+    let server = MockServer::start(|_req, _n| MockResponse::StallAfterPartialBody {
+        status: 200,
+        reason: "OK",
+        headers: vec![],
+        partial_body: b"hi".to_vec(),
+        remaining: 10,
+        stall: Duration::from_millis(300),
+    });
+    let cfg = ClientConfig {
+        body_idle_timeout: Duration::ZERO,
+        timeout: Duration::from_secs(5),
+        ..ClientConfig::default()
+    };
+    let client = Client::with_config(cfg).expect("client");
+    let started = std::time::Instant::now();
+    let mut resp = client.get_full(&url(&server, "/")).expect("headers ok");
+    let mut body = Vec::new();
+    // Eventually errors when the mock drops the connection, but
+    // *only* after the stall elapsed.
+    let _ = resp.body.read_to_end(&mut body);
+    let elapsed = started.elapsed();
+    assert!(body.starts_with(b"hi"));
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "with timeout disabled the client should have waited for the mock stall, got {elapsed:?}",
+    );
+}
+
 // ---- Connection pool ---------------------------------------------------
 
 #[test]

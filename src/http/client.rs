@@ -62,6 +62,17 @@ pub const DEFAULT_MAX_REDIRECTS: u8 = 5;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Default connect / request timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default per-frame idle timeout for response bodies. Only the
+/// initial connect-and-headers phase is bounded by [`DEFAULT_TIMEOUT`];
+/// once the response starts streaming, hyper's `Incoming::frame()`
+/// will park indefinitely waiting on the next data frame. A wedged
+/// origin or middlebox that holds the TCP connection open without
+/// sending bytes would otherwise leave a download worker stuck —
+/// it is alive, holds a chunk, and reports no error. The body pump
+/// wraps each `frame()` await in this deadline so a stalled stream
+/// surfaces as an IO error and the worker's retry path opens a fresh
+/// connection.
+pub const DEFAULT_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default upper bound on cached idle connections per host.
 pub const DEFAULT_POOL_CAPACITY: usize = 16;
 /// Default capacity of the per-connection read buffer, in bytes.
@@ -199,6 +210,12 @@ pub struct ClientConfig {
     pub max_header_bytes: usize,
     /// Connect / request timeout. Defaults to [`DEFAULT_TIMEOUT`].
     pub timeout: Duration,
+    /// Per-frame idle timeout while reading a response body. Defaults
+    /// to [`DEFAULT_BODY_IDLE_TIMEOUT`]. See that constant for the
+    /// rationale; a value of `Duration::ZERO` disables the deadline
+    /// (the pre-fix behaviour, only useful for tests that intentionally
+    /// drive a slow stream).
+    pub body_idle_timeout: Duration,
     /// Maximum idle connections cached per host. Defaults to
     /// [`DEFAULT_POOL_CAPACITY`].
     pub pool_capacity: usize,
@@ -218,6 +235,7 @@ impl Default for ClientConfig {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             timeout: DEFAULT_TIMEOUT,
+            body_idle_timeout: DEFAULT_BODY_IDLE_TIMEOUT,
             pool_capacity: DEFAULT_POOL_CAPACITY,
             read_buffer_bytes: DEFAULT_READ_BUFFER_BYTES,
             user_agent: None,
@@ -536,6 +554,7 @@ fn spawn_runtime_thread(
     let read_buffer_bytes = config.read_buffer_bytes;
     let max_header_bytes = config.max_header_bytes;
     let timeout = config.timeout;
+    let body_idle_timeout = config.body_idle_timeout;
     let http_version = config.http_version;
 
     thread::Builder::new()
@@ -600,8 +619,9 @@ fn spawn_runtime_thread(
                 while let Some(envelope) = request_rx.recv().await {
                     let client = hyper_client.clone();
                     let timeout_dur = timeout;
+                    let body_idle = body_idle_timeout;
                     tokio::spawn(async move {
-                        handle_request(client, envelope, timeout_dur).await;
+                        handle_request(client, envelope, timeout_dur, body_idle).await;
                     });
                 }
             });
@@ -613,6 +633,7 @@ async fn handle_request(
     client: LegacyClient<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>,
     envelope: RequestEnvelope,
     timeout: Duration,
+    body_idle_timeout: Duration,
 ) {
     let RequestEnvelope {
         request,
@@ -654,7 +675,7 @@ async fn handle_request(
         && !(100..200).contains(&status.code)
     {
         let (body_tx, body_rx) = mpsc::unbounded_channel::<BodyCommand>();
-        tokio::spawn(body_pump(body, body_rx));
+        tokio::spawn(body_pump(body, body_rx, body_idle_timeout));
         BodyReader::streaming(body_tx)
     } else {
         BodyReader::empty()
@@ -663,11 +684,36 @@ async fn handle_request(
     let _ = reply.send(Ok((status, headers, body_reader)));
 }
 
-async fn body_pump(mut body: Incoming, mut rx: mpsc::UnboundedReceiver<BodyCommand>) {
+async fn body_pump(
+    mut body: Incoming,
+    mut rx: mpsc::UnboundedReceiver<BodyCommand>,
+    idle_timeout: Duration,
+) {
     while let Some(cmd) = rx.recv().await {
         let BodyCommand::NextFrame { reply } = cmd;
         loop {
-            match body.frame().await {
+            // Bound each `frame()` await with the idle deadline so a
+            // wedged origin/middlebox can't park a worker indefinitely.
+            // `Duration::ZERO` opts out (used by tests that intentionally
+            // drive a slow stream against a stub server).
+            let next = if idle_timeout.is_zero() {
+                body.frame().await
+            } else {
+                match tokio::time::timeout(idle_timeout, body.frame()).await {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        let _ = reply.send(Err(format!(
+                            "body read stalled: no frame for {idle_timeout:?}",
+                        )));
+                        // Drop `body` by returning so hyper closes the
+                        // connection rather than returning it to the
+                        // idle pool — the next attempt opens a fresh
+                        // socket instead of inheriting the wedged one.
+                        return;
+                    }
+                }
+            };
+            match next {
                 None => {
                     let _ = reply.send(Ok(None));
                     return;

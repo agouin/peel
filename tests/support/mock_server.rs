@@ -52,6 +52,20 @@ pub enum MockResponse {
     /// Read the request, then close the connection without sending
     /// anything (simulates a server that disconnects mid-flight).
     DropConnection,
+    /// Send headers + a partial body, then sleep `stall` without
+    /// sending the rest. Used to simulate a wedged origin / middlebox
+    /// that holds the TCP socket open after streaming has started.
+    /// The advertised `Content-Length` is `partial_body.len() +
+    /// remaining`, so the client thinks more bytes are coming. After
+    /// `stall` elapses the mock just drops the connection.
+    StallAfterPartialBody {
+        status: u16,
+        reason: &'static str,
+        headers: Vec<(String, String)>,
+        partial_body: Vec<u8>,
+        remaining: u64,
+        stall: Duration,
+    },
 }
 
 impl MockResponse {
@@ -232,6 +246,32 @@ fn handle_connection(
                 return;
             }
             MockResponse::DropConnection => return,
+            MockResponse::StallAfterPartialBody {
+                status,
+                reason,
+                ref headers,
+                ref partial_body,
+                remaining,
+                stall,
+            } => {
+                let total_len = partial_body.len() as u64 + remaining;
+                let mut hdrs = headers.clone();
+                if !hdrs
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                {
+                    hdrs.push(("Content-Length".into(), total_len.to_string()));
+                }
+                if write_reply(&mut writer, status, reason, &hdrs, partial_body).is_err() {
+                    return;
+                }
+                // Hold the socket open without sending anything else.
+                // After the stall elapses, returning drops the
+                // connection, surfacing a clean read EOF for the
+                // client (in lieu of timing out first).
+                thread::sleep(stall);
+                return;
+            }
         };
 
         if close_after {
