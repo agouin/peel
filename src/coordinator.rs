@@ -320,6 +320,23 @@ pub struct RunStats {
     pub total_size: u64,
     /// Whether the run resumed an existing checkpoint.
     pub resumed: bool,
+    /// Source byte offset the *decoder* picked up at on resume.
+    /// `None` for fresh runs; `Some(offset)` when [`Self::resumed`]
+    /// is `true`. `Some(0)` is possible (and harmless) if the
+    /// prior run aborted before the first frame-boundary advance.
+    /// Crash-resume tests use this to confirm the resume actually
+    /// picked up mid-stream rather than re-running from byte 0.
+    pub resume_decoder_position: Option<u64>,
+    /// Whether the resume path used the format's
+    /// [`crate::decode::DecoderResumeFactory`] — i.e. the prior
+    /// checkpoint captured a `decoder_state` blob and the
+    /// registry knows a resume hook for the format. `false` for
+    /// fresh runs and for resumes from coarser frame boundaries
+    /// where `decoder_state` was not captured (e.g. gzip, identity
+    /// tar, zip). Crash-resume tests use this to confirm the
+    /// per-block / per-chunk mid-frame restart path actually
+    /// fired for formats that depend on it (lz4, zstd, xz).
+    pub resume_used_decoder_state: bool,
     /// Aggregated download statistics.
     pub download: DownloadStats,
     /// Aggregated extraction statistics.
@@ -585,6 +602,12 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     let prior = Checkpoint::read(&ckpt_path).map_err(CoordinatorError::Checkpoint)?;
     let resume_plan = build_resume_plan(prior.as_ref(), &info, &url, &config, &output)?;
     let resuming = matches!(resume_plan, ResumePlan::Resume { .. });
+    let resume_decoder_position = match &resume_plan {
+        ResumePlan::Fresh => None,
+        ResumePlan::Resume {
+            decoder_position, ..
+        } => Some(*decoder_position),
+    };
 
     let total_chunks = chunk_count(info.total_size, config.chunk_size).map_err(|e| match e {
         SchedulerError::TooManyChunks { chunks, .. } => CoordinatorError::TooManyChunks { chunks },
@@ -727,8 +750,16 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     let total_size = info.total_size;
     let chunk_size = config.chunk_size;
 
+    // Set inside the scoped thread when the decoder dispatch
+    // picks the resume_factory branch (a `decoder_state` blob was
+    // captured by the prior run AND a registered format hook
+    // accepts it). Read after the thread joins so
+    // [`RunStats::resume_used_decoder_state`] is populated.
+    let used_decoder_state_flag = Arc::new(AtomicBool::new(false));
+
     let extraction_outcome =
         thread::scope(|scope| -> Result<ExtractionOutcome, CoordinatorError> {
+            let used_decoder_state_flag = Arc::clone(&used_decoder_state_flag);
             // Drop guard: any path out of this closure that does not
             // explicitly disarm the guard (notably every `?` that
             // propagates an error from extraction or format detection)
@@ -876,12 +907,14 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 let resume_factory = format_name
                     .as_deref()
                     .and_then(|n| registry.resume_factory_for_name(n));
-                let mut decoder = match (resume_factory, resume_blob) {
-                    (Some(rf), Some((blob, start_offset))) => {
-                        rf(source, &blob, start_offset).map_err(CoordinatorError::Decode)?
-                    }
-                    _ => factory(source).map_err(CoordinatorError::Decode)?,
+                let (mut decoder, used_decoder_state) = match (resume_factory, resume_blob) {
+                    (Some(rf), Some((blob, start_offset))) => (
+                        rf(source, &blob, start_offset).map_err(CoordinatorError::Decode)?,
+                        true,
+                    ),
+                    _ => (factory(source).map_err(CoordinatorError::Decode)?, false),
                 };
+                used_decoder_state_flag.store(used_decoder_state, Ordering::Relaxed);
 
                 // Run the extractor with a checkpoint observer that
                 // writes a durable checkpoint every time the cadence
@@ -1008,6 +1041,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             Ok(ExtractionOutcome {
                 extraction: extraction_stats,
                 download: download_stats,
+                used_decoder_state: used_decoder_state_flag.load(Ordering::Relaxed),
             })
         })?;
 
@@ -1022,6 +1056,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         final_url: info.url,
         total_size: info.total_size,
         resumed: resuming,
+        resume_decoder_position,
+        resume_used_decoder_state: extraction_outcome.used_decoder_state,
         download: extraction_outcome.download.clone(),
         extraction: extraction_outcome.extraction,
         elapsed: started.elapsed(),
@@ -1041,6 +1077,12 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 struct ExtractionOutcome {
     extraction: ExtractionStats,
     download: DownloadStats,
+    /// `true` if the decoder dispatch picked the resume_factory
+    /// branch (a `decoder_state` blob was both captured by the
+    /// prior run AND consumable by a registered format hook).
+    /// Ferried through so [`RunStats::resume_used_decoder_state`]
+    /// can be populated.
+    used_decoder_state: bool,
 }
 
 /// Drop guard that flips an [`AtomicBool`] to `true` on drop unless

@@ -38,6 +38,7 @@ use std::time::{Duration, SystemTime};
 
 use peel::coordinator::{
     run, CoordinatorConfig, CoordinatorError, OutputTarget, ProgressEvent, ProgressFn, RunArgs,
+    RunStats,
 };
 use peel::decode::DecoderRegistry;
 use peel::download::RetryConfig;
@@ -266,6 +267,102 @@ fn build_misaligned_tar_zst_body(
 ///
 /// `seed` is the LCG seed used to randomize abort points; `etag` must
 /// be a `'static` literal because [`MockServer`]'s handler is `'static`.
+/// What the per-format crash-resume tests expect to see in
+/// [`RunStats::resume_used_decoder_state`] across N randomized
+/// kill-and-resume trials.
+///
+/// "Properly resuming from the checkpoint" means more than
+/// "the output matches the golden run" — a format that
+/// silently re-decodes from byte 0 on every resume would also
+/// produce byte-identical output, but would fail the §"What
+/// this project is" load-bearing claim ("survive `kill -9`
+/// from where you left off"). These modes pin the test to the
+/// right resume path.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names, dead_code)]
+enum ExpectedResumeMode {
+    /// Every trial must take the resume_factory path. Used by
+    /// formats whose only resume points are mid-frame —
+    /// single-Block xz, single-frame zstd, single-frame lz4 —
+    /// where the regular factory cannot pick up at the
+    /// checkpoint's source offset because it would land
+    /// mid-Stream.
+    AllDecoderState,
+    /// At least one trial across the run must take the
+    /// resume_factory path. Used by multi-frame formats whose
+    /// per-block / per-chunk frame boundaries fire alongside
+    /// the per-frame ones; randomized kill points should hit
+    /// both kinds across N trials. Multi-Stream `.tar.xz`,
+    /// multi-frame `.tar.zst`, multi-block `.tar.lz4`.
+    SomeDecoderState,
+    /// No trials should take the resume_factory path. Used by
+    /// formats whose frame boundaries are all positions the
+    /// regular factory can pick up cleanly — gzip, zip,
+    /// uncompressed `.tar`, identity. Asserts the absence so a
+    /// future format-mis-registration doesn't silently fall
+    /// through to the resume_factory path.
+    NeverDecoderState,
+}
+
+/// Per-trial assertion: the resume's `RunStats` shape is
+/// consistent with the coordinator detecting and using a prior
+/// checkpoint. Independent of [`ExpectedResumeMode`] — the mode
+/// gates the aggregate, this helper gates the per-trial.
+///
+/// We check `resumed` and that `resume_decoder_position` is
+/// `Some(_)`. We don't strictly require `position > 0` because:
+///
+/// - The zip pipeline carries no decoder-position concept — its
+///   resume state lives in the bitmap of completed download
+///   chunks plus the sink's per-entry state, not a single
+///   monotonic decoder offset.
+/// - Some streaming formats can legitimately hit a checkpoint
+///   at position 0 if every prior frame_boundary captured during
+///   the abort window happened to be at offset 0 (rare in
+///   practice but not a protocol violation).
+///
+/// The aggregate [`assert_resume_mode`] is the load-bearing
+/// "the right resume path actually fired" assertion; this
+/// helper is just the per-trial sanity check.
+fn assert_real_resume(label: &str, trial: u64, stats: &RunStats) {
+    assert!(
+        stats.resumed,
+        "{label} trial {trial}: resume did not flag itself as resumed"
+    );
+    assert!(
+        stats.resume_decoder_position.is_some(),
+        "{label} trial {trial}: resume_decoder_position should be Some on resume"
+    );
+}
+
+/// Aggregate assertion across N trials: the format's
+/// `resume_used_decoder_state` distribution matches the
+/// expected mode.
+fn assert_resume_mode(
+    label: &str,
+    decoder_state_count: u64,
+    trial_count: u64,
+    mode: ExpectedResumeMode,
+) {
+    match mode {
+        ExpectedResumeMode::AllDecoderState => assert_eq!(
+            decoder_state_count, trial_count,
+            "{label}: every trial must use the decoder_state resume path \
+             (got {decoder_state_count}/{trial_count})"
+        ),
+        ExpectedResumeMode::SomeDecoderState => assert!(
+            decoder_state_count >= 1,
+            "{label}: at least one trial must use the decoder_state resume \
+             path (got 0/{trial_count})"
+        ),
+        ExpectedResumeMode::NeverDecoderState => assert_eq!(
+            decoder_state_count, 0,
+            "{label}: no trials should use the decoder_state path \
+             (got {decoder_state_count}/{trial_count})"
+        ),
+    }
+}
+
 fn run_dir_kill_resume_trials(
     label: &str,
     suffix: &str,
@@ -273,6 +370,7 @@ fn run_dir_kill_resume_trials(
     etag: &'static str,
     seed: u64,
     trial_count: u64,
+    resume_mode: ExpectedResumeMode,
 ) {
     let cfg = || CoordinatorConfig {
         checkpoint_min_bytes: 1,
@@ -317,6 +415,8 @@ fn run_dir_kill_resume_trials(
 
     let mut rng = Lcg::seeded(seed);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
         let work = unique_dir(&format!("{label}_trial_{trial}"));
@@ -354,10 +454,11 @@ fn run_dir_kill_resume_trials(
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "{label} trial {trial}: resume did not flag itself as resumed",
-        );
+        assert_real_resume(label, trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -369,6 +470,10 @@ fn run_dir_kill_resume_trials(
     }
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // `real_trial_count` excludes trials where the abort fired
+    // after the run had already finished — those are no-op
+    // resumes that don't exercise the resume path at all.
+    assert_resume_mode(label, decoder_state_count, real_trial_count, resume_mode);
 }
 
 /// Encode `payload` as a single-Stream xz blob using liblzma's easy
@@ -592,6 +697,54 @@ mod xxh32_nocrate {
     }
 }
 
+/// Encode `payload` as a single xz Stream / single Block at the
+/// given preset. Matches the shape of what `xz` CLI emits by
+/// default — one Stream and one Block for any input that fits in
+/// the dictionary. Phase 9 of `docs/PLAN_xz_block_decoder.md`
+/// uses this to drive crash-resume tests across the per-LZMA2-
+/// chunk frame_boundary cadence; pre-Phase-7 the wrapper crate
+/// would have collapsed every checkpoint to end-of-Stream and
+/// every kill -9 mid-extraction would lose all decoder progress.
+fn encode_xz_single_block(payload: &[u8], preset: u32) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut compressed = Vec::new();
+    let mut encoder = xz2::write::XzEncoder::new(&mut compressed, preset);
+    encoder.write_all(payload).expect("xz2 encode");
+    encoder.finish().expect("xz2 finish");
+    compressed
+}
+
+/// Generate `len` bytes of LZMA-friendly content: pseudo-random
+/// pseudo-English sentences with mild variation. Compressible
+/// enough to defeat xz's "switch to uncompressed chunks for
+/// incompressible input" heuristic (which would leave the LZMA
+/// model un-allocated and silence per-chunk `frame_boundary`
+/// advances), varied enough that the compressed-side byte count
+/// scales with `len` and hits the 64 KiB LZMA2-chunk
+/// compressed-size cap multiple times. Mirrors the analogous
+/// helper in `tests/test_xz_native.rs`.
+fn build_lzma_friendly_input(len: usize, seed: u32) -> Vec<u8> {
+    let lines: &[&[u8]] = &[
+        b"the quick brown fox jumps over the lazy dog ",
+        b"alpha bravo charlie delta echo foxtrot golf ",
+        b"every good boy deserves favor and this is line ",
+        b"the rain in spain falls mainly on the plain ",
+        b"to be or not to be that is the question whether ",
+        b"in the beginning was the word and the word was with ",
+    ];
+    let mut out = Vec::with_capacity(len);
+    let mut state = seed;
+    while out.len() < len {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let line = lines[(state >> 24) as usize % lines.len()];
+        out.extend_from_slice(line);
+        let digits = state % 1_000_000;
+        out.extend_from_slice(format!("{digits:06} ").as_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
 /// Concatenate one xz Stream per `payload`. Each Stream-end is a
 /// frame boundary the decoder will surface.
 fn encode_xz_streams(payloads: &[&[u8]]) -> Vec<u8> {
@@ -734,6 +887,8 @@ fn random_kill_points_resume_to_identical_raw_output() {
     // Drive trials.
     let trial_count = 20u64;
     let mut rng = Lcg::seeded(0xC4A5_F00D_F00D);
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
         let work = unique_dir(&format!("trial_{trial}"));
@@ -793,10 +948,11 @@ fn random_kill_points_resume_to_identical_raw_output() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("raw_zst", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = fs::read(&out_path).expect("trial output");
         assert_eq!(
@@ -804,6 +960,20 @@ fn random_kill_points_resume_to_identical_raw_output() {
             "trial {trial}: resumed output diverges from golden (abort_after={abort_after})",
         );
     }
+    // Multi-frame zstd raw with small (~3 KiB) per-frame
+    // payloads: each frame is a single zstd block, so every
+    // frame_boundary advance lands at end-of-frame where the
+    // hand-rolled decoder reports `decoder_state = None`. The
+    // regular factory handles the source seek cleanly and the
+    // resume_factory path is never taken. (Multi-block frames
+    // would land in `SomeDecoderState`; single-frame fixtures
+    // would land in `AllDecoderState`.)
+    assert_resume_mode(
+        "raw_zst",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::NeverDecoderState,
+    );
 }
 
 // ---- harness: tar output ----------------------------------------------
@@ -873,6 +1043,8 @@ fn random_kill_points_resume_to_identical_tar_output() {
     let trial_count = 10u64;
     let mut rng = Lcg::seeded(0x0013_579A_CEBD_2468);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
 
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
@@ -912,10 +1084,11 @@ fn random_kill_points_resume_to_identical_tar_output() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("tar_zst_multi_frame", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -927,6 +1100,17 @@ fn random_kill_points_resume_to_identical_tar_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // Multi-frame zstd-wrapped tar with small (~few-KiB)
+    // per-frame payloads: frames are single-block, so all
+    // checkpoints fall at end-of-frame where
+    // `decoder_state = None`. Resume happens via the regular
+    // factory at the frame-boundary offset.
+    assert_resume_mode(
+        "tar_zst_multi_frame",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::NeverDecoderState,
+    );
 }
 
 // ---- harness: single-frame `.tar.zst` (Phase 10) ----------------------
@@ -956,6 +1140,10 @@ fn random_kill_points_resume_mid_member_tar_zst_misaligned() {
         "\"v-misaligned-tar-zst\"",
         0xCAFE_BABE_F00D_BEEF,
         25,
+        // Single-frame zstd: every checkpoint fires mid-frame
+        // and captures a `decoder_state` blob; resume must
+        // always take the resume_factory path.
+        ExpectedResumeMode::AllDecoderState,
     );
 }
 
@@ -1011,7 +1199,18 @@ fn random_kill_points_resume_single_frame_tar_zst_property() {
         ),
     ] {
         let body = build_misaligned_tar_zst_body(count, size, level, seed_arch);
-        run_dir_kill_resume_trials(label, "x.tar.zst", body, etag, seed_trials, 20);
+        run_dir_kill_resume_trials(
+            label,
+            "x.tar.zst",
+            body,
+            etag,
+            seed_trials,
+            20,
+            // Single-frame zstd: every checkpoint captures a
+            // `decoder_state` blob; resume must always take
+            // the resume_factory path.
+            ExpectedResumeMode::AllDecoderState,
+        );
     }
 }
 
@@ -1075,6 +1274,8 @@ fn random_kill_points_resume_to_identical_plain_tar_output() {
     let trial_count = 10u64;
     let mut rng = Lcg::seeded(0x1357_2468_BD9A_CE13);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
 
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
@@ -1113,10 +1314,11 @@ fn random_kill_points_resume_to_identical_plain_tar_output() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("plain_tar", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -1129,6 +1331,15 @@ fn random_kill_points_resume_to_identical_plain_tar_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // Plain (uncompressed) tar: there's no decoder state to
+    // capture, only per-source-byte-chunk frame boundaries that
+    // the regular `factory` resumes from cleanly.
+    assert_resume_mode(
+        "plain_tar",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::NeverDecoderState,
+    );
 }
 
 // ---- harness: `.tar.xz` (PLAN_v2 §3, per-Stream frame granularity) ----
@@ -1194,6 +1405,8 @@ fn random_kill_points_resume_to_identical_tar_xz_output() {
     let trial_count = 10u64;
     let mut rng = Lcg::seeded(0xACE0_F1B7_2486_BD13);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
 
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
@@ -1232,10 +1445,11 @@ fn random_kill_points_resume_to_identical_tar_xz_output() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("tar_xz_multi_stream", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -1248,6 +1462,19 @@ fn random_kill_points_resume_to_identical_tar_xz_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // Multi-Stream xz with small per-Stream payloads: the
+    // hand-rolled decoder advances `frame_boundary` per LZMA2
+    // chunk inside each Block (Phase 6 of
+    // `PLAN_xz_block_decoder.md`) AND at end-of-Stream where
+    // `decoder_state = None`. Randomized kill points hit both
+    // kinds across 10 trials, so at least one trial takes the
+    // `resume_factory` (decoder_state) path.
+    assert_resume_mode(
+        "tar_xz_multi_stream",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::SomeDecoderState,
+    );
 }
 
 // ---- harness: `.tar.lz4` (PLAN_v2 §4) ---------------------------------
@@ -1313,6 +1540,8 @@ fn random_kill_points_resume_to_identical_tar_lz4_output() {
     let trial_count = 10u64;
     let mut rng = Lcg::seeded(0x5BEE_F00D_DECA_F2EE);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
 
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
@@ -1351,10 +1580,11 @@ fn random_kill_points_resume_to_identical_tar_lz4_output() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("tar_lz4_multi_frame", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -1367,6 +1597,17 @@ fn random_kill_points_resume_to_identical_tar_lz4_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // Multi-frame lz4 with one frame per tar member: lz4's
+    // per-block `frame_boundary` advances inside each frame
+    // (`docs/OPTIMIZATIONS.md` §O.7b) AND at end-of-frame where
+    // `decoder_state = None`. Randomized kill points hit both
+    // kinds across 10 trials.
+    assert_resume_mode(
+        "tar_lz4_multi_frame",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::SomeDecoderState,
+    );
 }
 
 #[test]
@@ -1451,6 +1692,8 @@ fn random_kill_points_resume_to_identical_single_frame_tar_lz4_output() {
     let trial_count = 10u64;
     let mut rng = Lcg::seeded(0x07B0_07B0_07B0_07B0);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
 
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
@@ -1497,10 +1740,11 @@ fn random_kill_points_resume_to_identical_single_frame_tar_lz4_output() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("single_frame_tar_lz4", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -1513,6 +1757,15 @@ fn random_kill_points_resume_to_identical_single_frame_tar_lz4_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // Single-frame lz4: every checkpoint inside the lone frame
+    // captures a `decoder_state` blob; resume must always take
+    // the resume_factory path.
+    assert_resume_mode(
+        "single_frame_tar_lz4",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::AllDecoderState,
+    );
 }
 
 #[test]
@@ -1593,6 +1846,8 @@ fn random_kill_points_resume_mid_member_tar_lz4_misaligned() {
     let trial_count = 12u64;
     let mut rng = Lcg::seeded(0xBEEF_BEEF_BEEF_BEEF);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
 
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
@@ -1639,10 +1894,11 @@ fn random_kill_points_resume_mid_member_tar_lz4_misaligned() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("misaligned_tar_lz4", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -1655,6 +1911,15 @@ fn random_kill_points_resume_mid_member_tar_lz4_misaligned() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // Single-frame lz4 with mid-member kill points: every
+    // checkpoint inside the frame captures a `decoder_state`
+    // blob.
+    assert_resume_mode(
+        "misaligned_tar_lz4",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::AllDecoderState,
+    );
 }
 
 // ---- harness: zip output (PLAN_v2 §5) -------------------------------
@@ -1723,6 +1988,8 @@ fn random_kill_points_resume_to_identical_zip_output() {
     let trial_count = 10u64;
     let mut rng = Lcg::seeded(0xCAFE_F00D_DEAD_BEEF);
     let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
 
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
@@ -1761,10 +2028,11 @@ fn random_kill_points_resume_to_identical_zip_output() {
             None,
         );
         let stats = run(resume_args).expect("resume ok");
-        assert!(
-            stats.resumed,
-            "trial {trial}: resume did not flag itself as resumed"
-        );
+        assert_real_resume("zip", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = read_dir_recursive(&out_dir);
         if got != golden_entries {
@@ -1777,6 +2045,15 @@ fn random_kill_points_resume_to_identical_zip_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+    // Zip: per-entry pipeline; each entry has its own decoder
+    // and resume happens at entry boundaries via the regular
+    // factory path (no `decoder_state` blob captured).
+    assert_resume_mode(
+        "zip",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::NeverDecoderState,
+    );
 }
 
 // ---- harness: sha256 integrity verification across resume ------------
@@ -1843,6 +2120,8 @@ fn sha256_match_after_random_kill_points_resume() {
 
     let trial_count = 10u64;
     let mut rng = Lcg::seeded(0x5_F00D_BEEF_5E55);
+    let mut decoder_state_count: u64 = 0;
+    let mut real_trial_count: u64 = 0;
     for trial in 0..trial_count {
         let abort_after = rng.range(1, total_checkpoints);
         let work = unique_dir(&format!("sha256_trial_{trial}"));
@@ -1891,12 +2170,159 @@ fn sha256_match_after_random_kill_points_resume() {
             None,
         );
         let stats = run(resume_args).expect("resume with --sha256 ok");
-        assert!(stats.resumed, "trial {trial}: resume not flagged");
+        assert_real_resume("sha256_zst", trial, &stats);
+        if stats.resume_used_decoder_state {
+            decoder_state_count += 1;
+        }
+        real_trial_count += 1;
 
         let got = fs::read(&out_path).expect("trial output");
         assert_eq!(
             got, golden_bytes,
             "trial {trial}: resumed output diverges from golden (abort_after={abort_after})",
+        );
+    }
+    // Multi-frame zstd raw archive (same fixture shape as
+    // `random_kill_points_resume_to_identical_raw_output`):
+    // small single-block frames, all checkpoints at end-of-
+    // frame, no `decoder_state` blob captured.
+    assert_resume_mode(
+        "sha256_zst",
+        decoder_state_count,
+        real_trial_count,
+        ExpectedResumeMode::NeverDecoderState,
+    );
+}
+
+// ---- harness: single-Block `.tar.xz` (PLAN_xz_block_decoder.md §9) ----
+
+#[test]
+fn random_kill_points_resume_single_block_tar_xz_byte_identical() {
+    // Phase 9 of `docs/PLAN_xz_block_decoder.md`: a single-Block
+    // `.tar.xz` is the dominant production shape (`xz` CLI's
+    // default emits one Block per file). Pre-Phase-7 the wrapper
+    // exposed only end-of-Stream `frame_boundary` advances, so
+    // every kill -9 mid-extraction lost all decoder progress and
+    // resumed from byte 0. Phase 6 added per-LZMA2-chunk
+    // boundaries with a captured `decoder_state` blob; this test
+    // pins the user-visible win.
+    //
+    // The plan calls for "several tar members of awkward sizes
+    // so LZMA2 chunk boundaries and tar-member boundaries rarely
+    // coincide." Member sizes use prime numbers so the cumulative
+    // offsets after each member are pairwise distinct mod any
+    // plausible LZMA2-chunk size. Total payload is large enough
+    // that the compressed Block spans many LZMA2 chunks (~64 KiB
+    // compressed-size cap each).
+    let mut members: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    let primes = [13_001usize, 17_393, 20_011, 23_581, 28_751, 31_517];
+    for i in 0..8 {
+        let name = Box::leak(format!("dir/single_block_xz_{i:02}.bin").into_boxed_str());
+        let payload = build_lzma_friendly_input(primes[i % primes.len()], 0xFEED_FACE ^ i as u32);
+        members.push((name, payload));
+    }
+    let mut archive = Vec::new();
+    for (name, payload) in &members {
+        archive.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    archive.extend_from_slice(&end_of_archive_block());
+
+    let body = encode_xz_single_block(&archive, 6);
+    let trial_count = 12u64;
+    run_dir_kill_resume_trials(
+        "single_block_tar_xz",
+        "x.tar.xz",
+        body,
+        "\"v-single-block-tar-xz\"",
+        0xC0FF_EE77_DEAD_F00D,
+        trial_count,
+        // Single-Block xz: every checkpoint inside the Block
+        // captures a `decoder_state` blob (per-LZMA2-chunk
+        // `frame_boundary` advances, never end-of-Stream
+        // because the Block doesn't end until decode is
+        // complete). Resume must always take the
+        // `resume_factory` path. This is the user-visible
+        // Phase 6 + Phase 9 win.
+        ExpectedResumeMode::AllDecoderState,
+    );
+}
+
+#[test]
+fn random_kill_points_resume_single_block_tar_xz_property() {
+    // Phase 9 property bar: vary preset, member sizes, and
+    // kill points across a small matrix; every (preset, sizes)
+    // configuration must produce byte-identical resumes via
+    // the decoder_state path.
+    //
+    // Aggregate trial count: 4 configs × 8 trials = 32
+    // single-Block xz crash-resume runs. Plus the 12 from
+    // `..._byte_identical` above (= 44 here) and the 12 from
+    // `..._tar_xz_output` multi-Stream test = 56 xz crash-
+    // resume runs total. Together with the 105 zstd runs and
+    // 32 lz4 runs the suite already has, the project is well
+    // past the plan's "100 randomized crash-resume runs"
+    // exit criterion across all formats.
+    for &(preset, member_count, member_size, label, etag, seed_arch, seed_trials) in &[
+        (
+            0u32,
+            6usize,
+            12_007usize,
+            "prop_xz_p0",
+            "\"v-prop-xz-p0\"",
+            0x1111_2222_3333_4444u64,
+            0xAAAA_BBBB_CCCC_DDDDu64,
+        ),
+        (
+            3,
+            8,
+            17_393,
+            "prop_xz_p3",
+            "\"v-prop-xz-p3\"",
+            0x5555_6666_7777_8888,
+            0xEEEE_FFFF_0000_1111,
+        ),
+        (
+            6,
+            10,
+            20_011,
+            "prop_xz_p6",
+            "\"v-prop-xz-p6\"",
+            0x9999_AAAA_BBBB_CCCC,
+            0x2222_3333_4444_5555,
+        ),
+        (
+            9,
+            6,
+            23_581,
+            "prop_xz_p9",
+            "\"v-prop-xz-p9\"",
+            0xDDDD_EEEE_FFFF_0000,
+            0x6666_7777_8888_9999,
+        ),
+    ] {
+        // Build a fresh archive per config so the seeds for
+        // member content are config-distinct.
+        let mut members: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        for i in 0..member_count {
+            let name = Box::leak(format!("{label}/member_{i:02}.bin").into_boxed_str());
+            let seed = seed_arch.rotate_left(i as u32 * 5) as u32;
+            members.push((name, build_lzma_friendly_input(member_size, seed)));
+        }
+        let mut archive = Vec::new();
+        for (name, payload) in &members {
+            archive.extend_from_slice(&member_archive_bytes(name, payload));
+        }
+        archive.extend_from_slice(&end_of_archive_block());
+
+        let body = encode_xz_single_block(&archive, preset);
+        run_dir_kill_resume_trials(
+            label,
+            "x.tar.xz",
+            body,
+            etag,
+            seed_trials,
+            8,
+            ExpectedResumeMode::AllDecoderState,
         );
     }
 }
