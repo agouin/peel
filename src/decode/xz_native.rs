@@ -1,9 +1,10 @@
 //! Hand-rolled, pure-Rust .xz / LZMA streaming decoder.
 //!
-//! Phase 1 of `docs/PLAN_xz_block_decoder.md`. Lives here behind the
-//! cargo feature flag `peel_xz_native` so production paths still
-//! route through [`crate::decode::xz::XzDecoder`] (the upstream
-//! `xz2` / liblzma binding) until Phase 7 swaps the implementations.
+//! Phase 1 of `docs/PLAN_xz_block_decoder.md` started this module
+//! behind the cargo feature flag `peel_xz_native`; Phase 7
+//! removed the feature flag and swapped this module in as the
+//! production path. [`crate::decode::xz`] is now a thin re-export
+//! of this module's `factory` / `resume_factory` / `Decoder`.
 //!
 //! # What's working in Phase 1
 //!

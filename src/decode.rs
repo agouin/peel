@@ -27,9 +27,12 @@
 //!   restart points.
 //! - [`identity`] — passthrough decoder for archive formats that have
 //!   no compression layer (uncompressed `.tar`).
-//! - [`xz`] — wraps `xz2`'s raw [`xz2::stream::Stream`] in single-Stream
-//!   mode and exposes per-`Stream` boundaries (round-one MVP per
-//!   `docs/PLAN_v2.md` §3; per-Block granularity is filed as `O.6b`).
+//! - [`xz`] — re-export of [`xz_native`], the hand-rolled pure-
+//!   Rust xz / LZMA decoder (`docs/PLAN_xz_block_decoder.md`)
+//!   with per-LZMA2-chunk mid-Block restart points.
+//! - [`xz_native`] — implementation of the hand-rolled xz
+//!   decoder. The `xz` re-export is the public surface; only
+//!   tests reach into `xz_native::*` directly.
 //! - [`lz4`] — hand-rolls the LZ4 Frame Format around `lz4_flex`'s
 //!   block-layer API and exposes per-block frame boundaries
 //!   (round-one MVP per `docs/PLAN_v2.md` §4).
@@ -68,7 +71,6 @@ pub mod gzip;
 pub mod identity;
 pub mod lz4;
 pub mod xz;
-#[cfg(feature = "peel_xz_native")]
 pub mod xz_native;
 pub mod zstd;
 
@@ -368,16 +370,20 @@ impl DecoderRegistry {
             }],
             lz4::factory,
         );
-        // Mid-frame resume hook: lz4 (per-block) and zstd (per-block
-        // inside a frame) both stamp `frame_boundary` at points where
-        // a fresh decoder cannot pick up from the source offset alone
-        // — the captured `decoder_state` blob carries the
-        // sliding-window / repeat-offset / FSE-table state needed to
-        // produce byte-identical output past the boundary. xz, gzip,
-        // identity (tar) restart cleanly from `frame_boundary` and so
-        // do not need this hook.
+        // Mid-frame resume hook: lz4 (per-block), zstd (per-block
+        // inside a frame), and xz (per-LZMA2-chunk inside a Block,
+        // since Phase 7 of `docs/PLAN_xz_block_decoder.md` swapped
+        // the wrapper out for the hand-rolled decoder) all stamp
+        // `frame_boundary` at points where a fresh decoder cannot
+        // pick up from the source offset alone — the captured
+        // `decoder_state` blob carries the sliding-window /
+        // repeat-offset / probability-table state needed to
+        // produce byte-identical output past the boundary. gzip
+        // and identity (tar) restart cleanly from `frame_boundary`
+        // and so do not need this hook.
         r.register_resume_factory("lz4", lz4::resume_factory);
         r.register_resume_factory("zstd", zstd::resume_factory);
+        r.register_resume_factory("xz", xz::resume_factory);
         r.register_format(
             "gzip",
             &[".gz", ".tar.gz"],
@@ -919,10 +925,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_with_defaults_registers_resume_factories_for_lz4_and_zstd() {
-        // lz4 (per-block mid-frame) and zstd (per-block mid-frame)
-        // both stamp `frame_boundary` at points whose `decoder_state`
-        // blob is required to resume byte-identically. Other formats
+    fn registry_with_defaults_registers_resume_factories_for_lz4_zstd_and_xz() {
+        // lz4 (per-block mid-frame), zstd (per-block mid-frame),
+        // and xz (per-LZMA2-chunk inside a Block, since Phase 7
+        // of `docs/PLAN_xz_block_decoder.md` swapped the wrapper
+        // out for the hand-rolled decoder) all stamp
+        // `frame_boundary` at points whose `decoder_state` blob
+        // is required to resume byte-identically. Other formats
         // fall through to the generic `factory(source)` path.
         let r = DecoderRegistry::with_defaults();
         let lz4_resume = r
@@ -939,12 +948,20 @@ mod tests {
             zstd_resume,
             zstd::resume_factory as DecoderResumeFactory,
         ));
+        let xz_resume = r
+            .resume_factory_for_name("xz")
+            .expect("xz resume registered");
+        assert!(std::ptr::fn_addr_eq(
+            xz_resume,
+            xz::resume_factory as DecoderResumeFactory,
+        ));
         // Case-insensitive lookup matches the rest of the registry.
         assert!(r.resume_factory_for_name("LZ4").is_some());
         assert!(r.resume_factory_for_name("ZSTD").is_some());
+        assert!(r.resume_factory_for_name("XZ").is_some());
 
         // No other format registers a resume factory yet.
-        for name in ["xz", "gzip", "tar", "zip"] {
+        for name in ["gzip", "tar", "zip"] {
             assert!(
                 r.resume_factory_for_name(name).is_none(),
                 "{name} unexpectedly has a resume factory",

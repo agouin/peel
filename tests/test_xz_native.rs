@@ -17,11 +17,8 @@
 //!    `reset_state` / `reset_props` / `reset_dict` decode paths
 //!    are all exercised at integration scale.
 //!
-//! These tests are gated on `#[cfg(feature = "peel_xz_native")]`
-//! because the hand-rolled module itself is feature-gated until
-//! Phase 7 swaps it in as the production path.
-
-#![cfg(feature = "peel_xz_native")]
+//! Phase 7 swapped the hand-rolled decoder in as the production
+//! path; these tests no longer need a feature gate.
 
 use std::io::{Cursor, Read, Write};
 
