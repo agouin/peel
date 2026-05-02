@@ -80,6 +80,50 @@ fn encode_frames(payloads: &[&[u8]]) -> Vec<u8> {
     combined
 }
 
+/// Encode `payload` as a single xz Stream / single Block at the
+/// given preset. Used by the Phase 8 hole-punching tests so the
+/// archive shape matches what `xz` CLI produces by default — one
+/// monolithic Block whose only restart points are the
+/// per-LZMA2-chunk boundaries the hand-rolled decoder exposes.
+fn xz2_encode_single_block(payload: &[u8], preset: u32) -> Vec<u8> {
+    use std::io::Write;
+    let mut compressed = Vec::new();
+    let mut encoder = xz2::write::XzEncoder::new(&mut compressed, preset);
+    encoder.write_all(payload).expect("xz2 encode");
+    encoder.finish().expect("xz2 finish");
+    compressed
+}
+
+/// Build LZMA-friendly content of `len` bytes: pseudo-random
+/// pseudo-English sentences, varied enough that the decoder
+/// cannot collapse the whole input into a single rep match,
+/// compressible enough that xz emits real LZMA chunks (not the
+/// uncompressed-passthrough chunks it picks for incompressible
+/// data — those leave the LZMA model un-allocated, which means
+/// the per-LZMA2-chunk `frame_boundary` advance never fires).
+/// Mirrors `tests/test_xz_native.rs::build_lzma_friendly_input`.
+fn build_lzma_friendly_input(len: usize) -> Vec<u8> {
+    let lines: &[&[u8]] = &[
+        b"the quick brown fox jumps over the lazy dog ",
+        b"alpha bravo charlie delta echo foxtrot golf ",
+        b"every good boy deserves favor and this is line ",
+        b"the rain in spain falls mainly on the plain ",
+        b"to be or not to be that is the question whether ",
+        b"in the beginning was the word and the word was with ",
+    ];
+    let mut out = Vec::with_capacity(len);
+    let mut state: u32 = 0x1234_5678;
+    while out.len() < len {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let line = lines[(state >> 24) as usize % lines.len()];
+        out.extend_from_slice(line);
+        let digits = state % 1_000_000;
+        out.extend_from_slice(format!("{digits:06} ").as_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
 /// Build a tar archive carrying `files`, then split it across
 /// `frame_count` zstd frames so the extractor observes a real
 /// frame-boundary checkpoint discipline rather than just a single
@@ -603,4 +647,201 @@ fn fatal_punch_error_aborts_extraction() {
         Err(peel::extractor::ExtractorError::Punch { .. }) => {}
         other => panic!("expected ExtractorError::Punch, got {other:?}"),
     }
+}
+
+/// Single-Block xz sibling of
+/// [`extracts_single_frame_zstd_tar_into_directory`]. `xz` CLI
+/// at default settings emits a single Block (and a single
+/// Stream) for any input that fits in dict_size; per
+/// `docs/PLAN_xz_block_decoder.md` Phase 8, this is the shape
+/// where the wrapper used to expose only end-of-Stream
+/// `frame_boundary` advances and never punch the source mid-
+/// extraction. The hand-rolled decoder advances per LZMA2 chunk
+/// so the extractor sees multiple quiescent checkpoints inside
+/// the single Block.
+#[test]
+fn extracts_single_block_xz_tar_into_directory() {
+    let files: &[(&str, &[u8])] = &[
+        ("alpha.txt", b"alpha contents\n"),
+        ("nested/beta.bin", &[0u8, 1, 2, 3, 4, 5, 6, 7]),
+        ("nested/deeper/gamma.dat", &b"gamma payload".repeat(513)[..]),
+    ];
+    let archive = build_simple_archive(files);
+    let combined = xz2_encode_single_block(&archive, 6);
+
+    let src = fresh_path("single_block_xz_src.tar.xz");
+    let dst = fresh_path("single_block_xz_dst");
+    let _g_src = CleanupOnDrop(src.clone());
+    let _g_dst = CleanupOnDrop(dst.clone());
+    fs::write(&src, &combined).expect("write src");
+    fs::create_dir_all(&dst).expect("create dst");
+
+    let read_handle = fs::File::open(&src).expect("ro");
+    let rw_handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&src)
+        .expect("rw");
+
+    let registry = DecoderRegistry::with_defaults();
+    let factory = registry.factory_for_path(&src).expect(".xz registered");
+    let mut decoder: Box<dyn StreamingDecoder> = factory(Box::new(read_handle)).expect("decoder");
+    let sink = TarSink::new(&dst).expect("tar sink");
+    let stats = Extractor::with_defaults()
+        .extract(rw_handle.as_fd(), &mut *decoder, sink, &NoopPuncher::new())
+        .expect("extract");
+
+    for (name, expected) in files {
+        let path = dst.join(name);
+        let got = fs::read(&path).expect("read extracted file");
+        assert_eq!(&got, expected, "contents mismatch for {name}");
+    }
+    assert_eq!(stats.bytes_in, combined.len() as u64);
+    assert!(stats.bytes_out > 0);
+    // Single-Block streams stamp at least the end-of-Stream
+    // frame boundary; the per-LZMA2-chunk-bounded test below
+    // pins the multi-chunk case directly.
+    assert!(stats.frame_boundaries_observed >= 1);
+    assert!(stats.quiescent_checkpoints >= 1);
+}
+
+/// A single-Block `.tar.xz` carrying many MiB of LZMA-friendly
+/// content must:
+///
+///   1. drive the puncher (`punch_calls` ≥ 2, `bytes_punched > 0`),
+///   2. release most of the compressed source by end-of-extraction,
+///   3. show a steady release cadence — the resident-block count
+///      strictly decreases across successive punch calls.
+///
+/// Phase 8 of `docs/PLAN_xz_block_decoder.md` calls this out as
+/// the user-visible win: before the hand-rolled decoder, this
+/// shape skipped per-block boundaries entirely and the puncher
+/// never advanced. Mirrors the zstd analog
+/// [`single_frame_zstd_punches_per_block_bounded_peak`] above
+/// — same input class (LZMA-friendly text, ~16 MiB), same
+/// invariants (`punch_calls`, monotonic-decrease across
+/// samples, bounded `bytes_per_call`).
+///
+/// Note on "peak" framing: the source file is fully written to
+/// disk up front (we don't simulate the streaming-download path
+/// here), so the resident byte count equals
+/// `EOF - last_punched`; the *peak* of that quantity is
+/// trivially the file size. The interesting invariant is the
+/// *slope* — that `last_punched` keeps pace with
+/// `bytes_consumed` — which is what (3) measures.
+#[test]
+fn single_block_xz_punches_per_chunk_bounded_peak() {
+    // ~16 MiB LZMA-friendly content packed into a tar archive.
+    // Compressible enough that xz picks LZMA chunks (not the
+    // uncompressed-passthrough chunks that would leave the
+    // LZMA model un-allocated and silence per-chunk
+    // `frame_boundary` advances), big enough that the
+    // compressed source is many MiB and the puncher fires
+    // multiple times within the single Block.
+    let payload = build_lzma_friendly_input(16 * 1024 * 1024);
+    let files: &[(&str, &[u8])] = &[("blob.txt", &payload[..])];
+    let archive = build_simple_archive(files);
+    let combined = xz2_encode_single_block(&archive, 6);
+    let combined_len = combined.len() as u64;
+    assert!(
+        combined_len >= 1024 * 1024,
+        "compressed source needs to be many MiB to make the bounded-peak \
+         claim meaningful (got {combined_len})",
+    );
+
+    let src = fresh_path("single_block_xz_punch_src.tar.xz");
+    let dst = fresh_path("single_block_xz_punch_dst");
+    let _g_src = CleanupOnDrop(src.clone());
+    let _g_dst = CleanupOnDrop(dst.clone());
+    fs::write(&src, &combined).expect("write src");
+    fs::create_dir_all(&dst).expect("create dst");
+
+    let read_handle = fs::File::open(&src).expect("ro");
+    let rw_handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&src)
+        .expect("rw");
+    let blocks_before = rw_handle.metadata().expect("meta").blocks();
+
+    let registry = DecoderRegistry::with_defaults();
+    let factory = registry.factory_for_path(&src).expect(".xz registered");
+    let mut decoder: Box<dyn StreamingDecoder> = factory(Box::new(read_handle)).expect("decoder");
+    let sink = TarSink::new(&dst).expect("tar sink");
+
+    const PUNCH_THRESHOLD: u64 = 256 * 1024;
+    let cfg = ExtractorConfig {
+        punch_threshold: PUNCH_THRESHOLD,
+    };
+    let puncher = PeakSamplingPuncher::new(default_puncher(), &src);
+
+    let stats = Extractor::new(cfg)
+        .extract(rw_handle.as_fd(), &mut *decoder, sink, &puncher)
+        .expect("extract");
+
+    let extracted = fs::read(dst.join("blob.txt")).expect("read extracted blob");
+    assert_eq!(extracted, payload, "extracted payload must match input");
+
+    if stats.punch_unsupported {
+        return;
+    }
+
+    // (1) Puncher fired and released bytes.
+    assert!(
+        stats.punch_calls >= 2,
+        "single-Block xz archive must trigger multiple per-chunk punches \
+         (calls={}, threshold={PUNCH_THRESHOLD})",
+        stats.punch_calls,
+    );
+    assert!(
+        stats.bytes_punched > 0,
+        "single-Block xz archive should have released compressed-side \
+         blocks; got bytes_punched=0",
+    );
+    assert!(stats.frame_boundaries_observed >= 2);
+
+    // (2) End-state: most of the source has been freed.
+    let blocks_after = rw_handle.metadata().expect("meta").blocks();
+    assert!(
+        blocks_after < blocks_before / 4,
+        "extraction left {blocks_after} blocks resident (was {blocks_before}); \
+         expected the per-chunk puncher to have freed >75%",
+    );
+
+    // (3) Resident-block count strictly decreases across punch
+    //     samples — guards against a regression where the
+    //     puncher fires but `last_punched` stops advancing as
+    //     `bytes_consumed` keeps moving.
+    let samples = puncher.samples();
+    assert!(
+        samples.len() >= 2,
+        "need at least two punch samples to verify cadence (got {})",
+        samples.len(),
+    );
+    for w in samples.windows(2) {
+        assert!(
+            w[1] < w[0],
+            "resident-block count must strictly decrease across punch \
+             calls (saw {} -> {} in samples={samples:?})",
+            w[0],
+            w[1],
+        );
+    }
+
+    // Average bytes per call within the same band the zstd
+    // analog asserts. Tighter on the upper bound here because
+    // xz's LZMA2 chunks are smaller than zstd's blocks at the
+    // same compression preset, so each punch covers a smaller
+    // span — but it should still be at least the threshold.
+    let bytes_per_call = stats.bytes_punched / stats.punch_calls;
+    assert!(
+        bytes_per_call >= PUNCH_THRESHOLD / 2,
+        "puncher fired too eagerly: bytes_per_call={bytes_per_call}, \
+         threshold={PUNCH_THRESHOLD}",
+    );
+    assert!(
+        bytes_per_call <= 8 * PUNCH_THRESHOLD,
+        "puncher fell behind the decoder: bytes_per_call={bytes_per_call}, \
+         threshold={PUNCH_THRESHOLD}",
+    );
 }
