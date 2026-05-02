@@ -933,14 +933,28 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         .max_bandwidth_bps
         .map(|bps| Arc::new(crate::download::RateLimiter::new(bps)));
 
-    // External abort signal handed to the scheduler. Flipped to `true`
-    // by the `cancel_download_on_drop` guard below if the extraction
-    // closure exits via an error path; the scheduler's dispatch loop
-    // and worker threads observe this and unwind promptly. Without it,
-    // `thread::scope`'s implicit join would block until the download
-    // finished naturally — a 444 GiB archive on a 1 MB/s connection
-    // would look like a hang for several days.
-    let download_abort = Arc::new(AtomicBool::new(false));
+    // External abort signal handed to the scheduler. Two callers
+    // flip it: (a) the `CancelOnDrop` guard below, when the extraction
+    // closure exits via an error path; (b) the run-wide kill switch
+    // wired by `main` (SIGINT / SIGTERM). Wiring both into the same
+    // `Arc` means a kubelet SIGTERM aborts download workers in
+    // parallel with the extraction unwind — without it, the scheduler
+    // would only stop after the reader returned the kill sentinel,
+    // the extractor propagated it, and `CancelOnDrop` flipped a
+    // separate flag. The previous arrangement turned a "stop now"
+    // signal into a multi-stage relay race that could still leave
+    // workers chugging on in-flight chunks well into the pod's
+    // grace period.
+    //
+    // CancelOnDrop on a non-kill-switch failure path now also flips
+    // the user-supplied kill_switch by virtue of sharing the Arc.
+    // That is harmless: by the time CancelOnDrop fires the run is
+    // already returning Err; the only kill_switch readers
+    // (BlockingSparseReader, sniff_prefix, the extractor inner loop)
+    // have either already returned or will not be called again.
+    let download_abort = kill_switch
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     let scheduler_cfg = SchedulerConfig {
         chunk_size: config.chunk_size,

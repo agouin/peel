@@ -73,26 +73,32 @@ extern "C" {
 /// `STDERR_FILENO` — fixed by POSIX to be `2`.
 const STDERR_FD: i32 = 2;
 
-/// First-signal notice for SIGINT (interactive Ctrl-C). The leading
-/// `\r\x1b[K` returns to column 0 and clears the current line so the
-/// message lands cleanly even if the TTY progress renderer has just
-/// drawn there; the trailing newline pushes the renderer's next tick
-/// down by one row instead of overwriting our text in place.
-const SIGINT_GRACEFUL_MSG: &[u8] =
-    b"\r\x1b[K[abort] SIGINT received, initiating graceful shutdown \
-      (press Ctrl+C again for forceful shutdown)\n";
-/// First-signal notice for SIGTERM. Same shape as `SIGINT_GRACEFUL_MSG`
-/// but worded for non-interactive contexts (kubelet, `kill <pid>`),
-/// where "Ctrl+C again" doesn't apply.
-const SIGTERM_GRACEFUL_MSG: &[u8] =
-    b"\r\x1b[K[abort] SIGTERM received, initiating graceful shutdown \
-      (send another signal for forceful shutdown)\n";
-/// Second-signal notice. Printed immediately before `_exit`.
-const FORCEFUL_MSG: &[u8] = b"\r\x1b[K[abort] second signal received, forcing immediate exit\n";
-/// Watchdog-fired notice. Printed immediately before the watchdog
-/// thread `_exit`s once `GRACEFUL_DEADLINE` elapses without `run`
-/// returning.
-const WATCHDOG_MSG: &[u8] = b"\r\x1b[K[abort] graceful deadline elapsed, forcing immediate exit\n";
+/// First-signal notice (TTY variant). The leading `\r\x1b[K` returns
+/// to column 0 and clears the current line so the message lands cleanly
+/// even if the TTY progress renderer has just drawn there; the trailing
+/// newline pushes the renderer's next tick down by one row instead of
+/// overwriting our text in place.
+const SHUTDOWN_GRACEFUL_MSG_TTY: &[u8] =
+    b"\r\x1b[KShutdown request received, performing graceful shutdown...\n";
+/// First-signal notice (non-TTY variant). No ANSI escapes — kubelet's
+/// log capture stores them verbatim and downstream log viewers (Loki,
+/// Stackdriver, plain `kubectl logs -f`) display them as garbage. This
+/// is the form an operator sees in `kubectl logs` after `kubectl delete
+/// pod`.
+const SHUTDOWN_GRACEFUL_MSG_PLAIN: &[u8] =
+    b"Shutdown request received, performing graceful shutdown...\n";
+/// Second-signal notice (TTY variant). Printed immediately before `_exit`.
+const FORCEFUL_MSG_TTY: &[u8] =
+    b"\r\x1b[KSecond shutdown signal received, forcing immediate exit\n";
+/// Second-signal notice (non-TTY variant).
+const FORCEFUL_MSG_PLAIN: &[u8] = b"Second shutdown signal received, forcing immediate exit\n";
+/// Watchdog-fired notice (TTY variant). Printed immediately before the
+/// watchdog thread `_exit`s once `GRACEFUL_DEADLINE` elapses without
+/// `run` returning.
+const WATCHDOG_MSG_TTY: &[u8] =
+    b"\r\x1b[KGraceful shutdown deadline elapsed, forcing immediate exit\n";
+/// Watchdog-fired notice (non-TTY variant).
+const WATCHDOG_MSG_PLAIN: &[u8] = b"Graceful shutdown deadline elapsed, forcing immediate exit\n";
 
 /// Hard upper bound on the wait between the first shutdown signal and
 /// the process exiting. Belt-and-suspenders for any kill-switch poll
@@ -111,6 +117,11 @@ const DEFAULT_GRACEFUL_DEADLINE: Duration = Duration::from_secs(30);
 /// [`Arc`] alive until process exit so the dereference is always
 /// valid.
 static SHUTDOWN_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(ptr::null_mut());
+
+/// Set by `main` before installing handlers so the signal handler can
+/// pick the TTY-vs-non-TTY message variant. Reading an `AtomicBool`
+/// is async-signal-safe.
+static STDERR_IS_TTY: AtomicBool = AtomicBool::new(false);
 
 /// Number of shutdown signals delivered so far. The first delivery
 /// flips the kill switch (graceful: finish or skip the current
@@ -154,10 +165,10 @@ extern "C" fn shutdown_handler(sig: i32) {
             unsafe { (*ptr).store(true, Ordering::Release) };
         }
 
-        let msg: &[u8] = if sig == SIGINT {
-            SIGINT_GRACEFUL_MSG
+        let msg: &[u8] = if STDERR_IS_TTY.load(Ordering::Acquire) {
+            SHUTDOWN_GRACEFUL_MSG_TTY
         } else {
-            SIGTERM_GRACEFUL_MSG
+            SHUTDOWN_GRACEFUL_MSG_PLAIN
         };
         // SAFETY: `write(2)` with a `'static` byte slice is
         // async-signal-safe. We discard the return value because there
@@ -167,8 +178,13 @@ extern "C" fn shutdown_handler(sig: i32) {
     } else {
         // Second (or later) delivery: drop the polite path. Best-effort
         // notice, then immediate exit.
+        let msg: &[u8] = if STDERR_IS_TTY.load(Ordering::Acquire) {
+            FORCEFUL_MSG_TTY
+        } else {
+            FORCEFUL_MSG_PLAIN
+        };
         // SAFETY: same reasoning as the graceful-path `write` above.
-        unsafe { write(STDERR_FD, FORCEFUL_MSG.as_ptr(), FORCEFUL_MSG.len()) };
+        unsafe { write(STDERR_FD, msg.as_ptr(), msg.len()) };
         // SAFETY: `_exit(2)` is the textbook async-signal-safe exit
         // call; calling it from a signal handler is its intended use.
         unsafe { _exit(128 + sig) };
@@ -263,13 +279,18 @@ fn install_graceful_watchdog(deadline: Duration, cleanup_done: Arc<AtomicBool>) 
             }
             // Phase 3: deadline elapsed. The run is genuinely stuck.
             let sig = FIRST_SIGNAL.load(Ordering::Acquire);
+            let msg: &[u8] = if STDERR_IS_TTY.load(Ordering::Acquire) {
+                WATCHDOG_MSG_TTY
+            } else {
+                WATCHDOG_MSG_PLAIN
+            };
             // Best-effort notice, then unconditional exit. Same
             // async-signal-safe shape as the in-handler `_exit` path
             // (we are not inside a signal handler here, but reusing
             // the same primitives keeps the abort line consistent).
             // SAFETY: `write(2)` with a `'static` byte slice is
             // safe; we discard the return value.
-            unsafe { write(STDERR_FD, WATCHDOG_MSG.as_ptr(), WATCHDOG_MSG.len()) };
+            unsafe { write(STDERR_FD, msg.as_ptr(), msg.len()) };
             // SAFETY: `_exit(2)` is unconditional — the watchdog has
             // exhausted the operator's patience for a clean shutdown.
             unsafe { _exit(128 + sig) };
@@ -285,6 +306,10 @@ fn main() -> Result<()> {
     // emits `tracing::info!` events that the subscriber below routes
     // back to stderr in human-readable form.
     let stderr_is_tty = std::io::stderr().is_terminal();
+    // Publish the TTY status so the signal handler picks the right
+    // message variant — kubelet log capture stores ANSI escapes
+    // verbatim, so the non-TTY path needs a clean message.
+    STDERR_IS_TTY.store(stderr_is_tty, Ordering::Release);
     init_tracing(stderr_is_tty);
 
     // Install SIGINT/SIGTERM handlers as early as possible — before

@@ -332,8 +332,7 @@ pub struct SchedulerConfig {
     /// scheduler has no way to read the decoder cursor and the field
     /// is ignored.
     pub max_disk_buffer: Option<u64>,
-    /// External abort signal. When the flag flips to `true` (typically
-    /// because the extractor errored out on the coordinator side), the
+    /// External abort signal. When the flag flips to `true`, the
     /// dispatch loop stops handing out new tasks and the workers
     /// observe the same flag on their next iteration so they exit as
     /// soon as their current chunk completes. Without this signal
@@ -341,6 +340,14 @@ pub struct SchedulerConfig {
     /// [`crate::coordinator::run`] would block until the entire
     /// download completed naturally — turning any extractor error into
     /// an apparent hang for the user.
+    ///
+    /// Two callers flip this flag: the coordinator's `CancelOnDrop`
+    /// guard (extractor errored on the consumer side) and the run-wide
+    /// kill switch wired by `main` (SIGINT / SIGTERM). The coordinator
+    /// merges the latter into this same `Arc` so download workers
+    /// stop on a kubelet SIGTERM in parallel with the extraction
+    /// unwind, rather than waiting for the reader → extractor →
+    /// `CancelOnDrop` chain.
     pub abort: Option<Arc<AtomicBool>>,
 }
 
@@ -887,12 +894,15 @@ fn run_parallel(
 
         'outer: loop {
             // External abort signal (extractor errored on the
-            // coordinator side). Mirror it into the local `cancel` so
-            // workers exit as soon as their current chunk completes,
-            // and stop dispatching new ones. We do not produce a
+            // coordinator side, or the run-wide kill switch tripped —
+            // the coordinator merges both into the same `Arc`).
+            // Mirror it into the local `cancel` so workers exit as
+            // soon as their current chunk completes, and stop
+            // dispatching new ones. We do not produce a
             // `shutdown_reason` here because the failure already
-            // surfaced via the extraction path; any synthetic error
-            // would just race with it.
+            // surfaced via the extraction path (or as
+            // `CoordinatorError::Aborted` for the kill-switch case);
+            // a synthetic error would just race with it.
             if let Some(flag) = config.abort.as_ref() {
                 if flag.load(Ordering::Acquire) {
                     cancel.store(true, Ordering::Relaxed);
