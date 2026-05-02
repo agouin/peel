@@ -11,6 +11,15 @@ readme = "README.md"
 keywords = ["download", "extract", "archive", "streaming", "tar"]
 categories = ["command-line-utilities", "compression", "network-programming"]
 
+[features]
+# In-progress hand-rolled pure-Rust xz / LZMA decoder. Off by default so
+# the production xz path (the upstream `xz2`/liblzma binding) stays the
+# one `cargo test` exercises. Enable with `--features peel_xz_native`
+# when working on the new decoder. Tracked in
+# `docs/PLAN_xz_block_decoder.md`; the flag goes away in Phase 7 when
+# the new decoder replaces the wrapper as the production path.
+peel_xz_native = []
+
 [lib]
 name = "peel"
 path = "src/lib.rs"
