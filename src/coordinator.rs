@@ -67,7 +67,7 @@ use crate::download::{
     ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 use crate::extractor::{
-    CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
+    CheckpointAck, CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
     DEFAULT_PUNCH_THRESHOLD,
 };
 use crate::http::{Client, ClientError, Url, UrlError};
@@ -1378,13 +1378,19 @@ fn run_one<S: Sink>(
         decoder,
         sink,
         puncher,
-        |info_cb: CheckpointInfo| -> io::Result<()> {
-            // Throttle: write at most once per cadence floor.
+        |info_cb: CheckpointInfo| -> io::Result<CheckpointAck> {
+            // Throttle: write at most once per cadence floor. A
+            // throttled call is reported back to the extractor as
+            // `Throttled` so it does not advance hole-punching past
+            // the most recently *persisted* position — punching past
+            // a non-persisted boundary would otherwise zero the
+            // bytes the still-current durable checkpoint references
+            // and break resume.
             let elapsed = last_write_at.elapsed();
             let progressed = info_cb.source_position.saturating_sub(last_position);
             if progressed < config.checkpoint_min_bytes && elapsed < config.checkpoint_min_interval
             {
-                return Ok(());
+                return Ok(CheckpointAck::Throttled);
             }
 
             // Crash-test hook. We test the kill switch *before*
@@ -1438,7 +1444,7 @@ fn run_one<S: Sink>(
                     bytes_out: info_cb.bytes_out,
                 });
             }
-            Ok(())
+            Ok(CheckpointAck::Persisted)
         },
     );
 

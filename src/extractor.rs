@@ -119,6 +119,29 @@ impl Default for ExtractorConfig {
     }
 }
 
+/// Acknowledgement returned by the [`Extractor::extract_with_callback`]
+/// observer.
+///
+/// The extractor must not punch source bytes past a position the
+/// coordinator has not durably persisted: a crash between the punch
+/// and the next persisted checkpoint would otherwise leave the
+/// resumed run reading zeroed bytes from the offset its own
+/// checkpoint points at. The observer signals back which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointAck {
+    /// The position has been durably persisted (or the caller has no
+    /// resume contract — `Extractor::extract`'s no-op observer
+    /// returns this). The extractor may advance hole-punching up to
+    /// this position.
+    Persisted,
+    /// The observer chose not to persist this position — typically
+    /// because a cadence throttle skipped the write. The extractor
+    /// must continue to bound hole-punching at the most recent
+    /// `Persisted` position so a crash before the next persisted
+    /// write can resume cleanly from there.
+    Throttled,
+}
+
 /// Snapshot passed to the [`Extractor::extract_with_callback`]
 /// observer on every quiescent advance.
 ///
@@ -271,19 +294,24 @@ impl Extractor {
         sink: S,
         puncher: &dyn PunchHole,
     ) -> Result<ExtractionStats, ExtractorError> {
-        self.extract_with_callback(source_fd, decoder, sink, puncher, |_| Ok(()))
+        self.extract_with_callback(source_fd, decoder, sink, puncher, |_| {
+            Ok(CheckpointAck::Persisted)
+        })
     }
 
     /// Like [`Self::extract`] but invokes `on_checkpoint` whenever the
     /// extractor advances its quiescent-checkpoint position.
     ///
-    /// The callback fires *before* the in-loop punch for that
-    /// position, so a coordinator using it to write a durable
-    /// checkpoint sees the discipline:
+    /// The callback returns a [`CheckpointAck`] reporting whether it
+    /// durably persisted the position. The extractor only advances
+    /// hole-punching up to the most recently-persisted position, so a
+    /// throttled write does not orphan the bytes the still-current
+    /// durable checkpoint points at:
     ///
     /// 1. Decoder + sink report a quiescent boundary.
-    /// 2. Coordinator writes its checkpoint.
-    /// 3. Extractor punches the source up to the boundary.
+    /// 2. Coordinator chooses to persist (or throttle) the checkpoint.
+    /// 3. Extractor punches the source up to the **last persisted**
+    ///    boundary.
     ///
     /// If the callback returns `Err`, the extractor stops and surfaces
     /// the failure as [`ExtractorError::Observer`]; no further bytes
@@ -303,7 +331,7 @@ impl Extractor {
     ) -> Result<ExtractionStats, ExtractorError>
     where
         S: Sink,
-        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
+        F: FnMut(CheckpointInfo) -> std::io::Result<CheckpointAck>,
     {
         let stats = self.run_loop(source_fd, decoder, &mut sink, puncher, on_checkpoint)?;
         sink.close().map_err(ExtractorError::Sink)?;
@@ -323,7 +351,7 @@ impl Extractor {
     ) -> Result<ExtractionStats, ExtractorError>
     where
         S: Sink,
-        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
+        F: FnMut(CheckpointInfo) -> std::io::Result<CheckpointAck>,
     {
         // Align to the puncher's preferred block boundary or 4 KiB,
         // whichever is larger. Misaligned tails are silently retained
@@ -334,6 +362,15 @@ impl Extractor {
         let mut stats = ExtractionStats::default();
         let mut last_punched: u64 = 0;
         let mut last_quiescent_at: u64 = 0;
+        // Highest boundary the observer has reported as durably
+        // persisted. Hole-punching is bounded by this — never by
+        // `last_quiescent_at` — so a throttled (non-persisted)
+        // observer call cannot orphan the bytes the still-current
+        // durable checkpoint references. A crash between a
+        // throttled write and the next persisted one resumes from
+        // `last_persisted_quiescent_at` with all bytes from there
+        // onward intact.
+        let mut last_persisted_quiescent_at: u64 = 0;
         let mut last_observed_boundary: Option<u64> = None;
         let mut punch_disabled = false;
 
@@ -401,22 +438,26 @@ impl Extractor {
                             decoder_state: decoder.decoder_state(),
                             sink_state: adapter.sink.sink_state(),
                         };
-                        on_checkpoint(info).map_err(ExtractorError::Observer)?;
+                        let ack = on_checkpoint(info).map_err(ExtractorError::Observer)?;
+                        if ack == CheckpointAck::Persisted {
+                            last_persisted_quiescent_at = b;
+                        }
                     }
                 }
             }
 
-            // Punch behind last_quiescent_at, aligned to filesystem
-            // blocks. We never punch past the most recent
-            // checkpoint-safe position even though more bytes have
-            // technically been consumed; that discipline is what makes
-            // a crash here recoverable.
+            // Punch behind the last *persisted* boundary, aligned to
+            // filesystem blocks. Bounding by the persisted (rather
+            // than the latest-observed) position is what guarantees
+            // that a crash before the next persisted write resumes
+            // cleanly: the durable checkpoint's `decoder_position`
+            // always points at bytes the punch has not touched.
             if !punch_disabled {
                 self.maybe_punch(
                     source_fd,
                     puncher,
                     block,
-                    last_quiescent_at,
+                    last_persisted_quiescent_at,
                     &mut last_punched,
                     &mut stats,
                     &mut punch_disabled,
@@ -429,15 +470,20 @@ impl Extractor {
             }
         }
 
-        // Final sweep: release every block up to the last checkpoint,
-        // ignoring the punch_threshold so even a small tail gets
-        // freed.
+        // Final sweep: release every block up to the last persisted
+        // checkpoint, ignoring the punch_threshold so even a small
+        // tail gets freed. The successful EOF path means the
+        // extraction is complete and no resume will be attempted, so
+        // bounding by `last_persisted_quiescent_at` here is purely
+        // defensive — but it preserves the `maybe_punch` contract
+        // ("never punch past a position the observer hasn't
+        // acknowledged as durable") in one place.
         if !punch_disabled {
             self.maybe_punch(
                 source_fd,
                 puncher,
                 block,
-                last_quiescent_at,
+                last_persisted_quiescent_at,
                 &mut last_punched,
                 &mut stats,
                 &mut punch_disabled,
@@ -1066,6 +1112,110 @@ mod tests {
             }
             other => panic!("expected ExtractorError::Punch, got {other:?}"),
         }
+    }
+
+    /// Regression test for the throttle/punch race that broke
+    /// mid-frame lz4 resume: a checkpoint observer that throttles
+    /// (returns `CheckpointAck::Throttled`) must NOT cause the
+    /// extractor to advance hole-punching past the boundary the
+    /// previous *persisted* observer call recorded. If it does, a
+    /// crash before the next persisted write leaves the durable
+    /// checkpoint pointing at zeroed bytes and resume cannot
+    /// continue.
+    #[test]
+    fn throttled_observer_does_not_advance_punch_past_persisted_position() {
+        // Three frames so we get at least three quiescent boundaries
+        // through the loop (post-frame-A, post-frame-B, post-frame-C).
+        // Random-ish payloads keep them incompressible enough that
+        // each compressed frame straddles multiple block alignments.
+        let frame_a = random_bytes(0xA1, 16 * 1024);
+        let frame_b = random_bytes(0xB2, 16 * 1024);
+        let frame_c = random_bytes(0xC3, 16 * 1024);
+        let (compressed, _ends) = encode_frames(&[&frame_a, &frame_b, &frame_c]);
+
+        let path = unique_temp("throttle-punch");
+        let _g = CleanupOnDrop(path.clone());
+        std::fs::write(&path, &compressed).expect("write source");
+        let punch_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open rw");
+        let mut decoder =
+            ZstdDecoder::new(Box::new(std::fs::File::open(&path).expect("ro"))).expect("ctor");
+
+        // Records the offset/length of every `punch` call so the
+        // assertion can check none reached past the most recently
+        // persisted position.
+        struct RecordingPuncher {
+            calls: std::sync::Mutex<Vec<(u64, u64)>>,
+        }
+        impl PunchHole for RecordingPuncher {
+            fn punch(
+                &self,
+                _fd: BorrowedFd<'_>,
+                offset: ByteOffset,
+                length: u64,
+            ) -> Result<(), PunchError> {
+                self.calls.lock().unwrap().push((offset.get(), length));
+                Ok(())
+            }
+            fn block_size_hint(&self) -> u64 {
+                4096
+            }
+        }
+        let puncher = RecordingPuncher {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let sink = VecSink {
+            bytes: Vec::new(),
+            fail_at: None,
+            is_quiescent: true,
+        };
+
+        // Observer policy: persist the *first* call, throttle every
+        // call after it. Records the persisted source_position so
+        // the assertion can check no punch reached past it.
+        let persisted = std::cell::Cell::new(None::<u64>);
+        let throttle_after_first = std::cell::Cell::new(false);
+
+        let cfg = ExtractorConfig {
+            // Small enough to fire mid-loop. Without the bug fix,
+            // throttled calls would still advance the punch past
+            // the first persisted boundary.
+            punch_threshold: 4096,
+        };
+        let stats = Extractor::new(cfg)
+            .extract_with_callback(punch_handle.as_fd(), &mut decoder, sink, &puncher, |info| {
+                if throttle_after_first.get() {
+                    return Ok(CheckpointAck::Throttled);
+                }
+                throttle_after_first.set(true);
+                persisted.set(Some(info.source_position));
+                Ok(CheckpointAck::Persisted)
+            })
+            .expect("extract");
+
+        let durable = persisted.get().expect("at least one persisted call");
+        let calls = puncher.calls.lock().unwrap().clone();
+        assert!(
+            !calls.is_empty(),
+            "expected at least one in-loop punch with the small threshold",
+        );
+        for (offset, length) in &calls {
+            let end = offset.saturating_add(*length);
+            assert!(
+                end <= durable,
+                "punch [{offset}, {end}) reached past last-persisted position {durable}; \
+                 a crash here would leave the durable checkpoint pointing at zeroed bytes",
+            );
+        }
+        // Sanity: the run still completed and produced the right output.
+        assert_eq!(
+            stats.bytes_out,
+            (frame_a.len() + frame_b.len() + frame_c.len()) as u64,
+        );
     }
 
     /// `RawSink` round-trip: extract a single-frame zstd into a file
