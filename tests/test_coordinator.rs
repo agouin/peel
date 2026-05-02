@@ -1812,6 +1812,132 @@ fn source_drift_on_resume_is_caught_by_probe() {
     assert!(ckpt_path.exists(), "checkpoint should remain after error");
 }
 
+// ---- PLAN_responsiveness.md §3.1: cursor-chunk integrity audit ------
+
+/// Demo from §3.1: force-corrupt one byte in the resume chunk of a
+/// fixture `.peel.part` and confirm the new audit rejects with
+/// [`CoordinatorError::PartFileCorrupted`] within the first second of
+/// the run — *before* the decoder gets to read garbage and surface a
+/// distant malformed-block error from inside the codec.
+#[test]
+fn cursor_chunk_audit_rejects_corrupted_part_file_on_resume() {
+    // Random-ish payload so zstd can't compress it down below the
+    // chunk count we need to exercise the cursor-chunk picker.
+    let mut payload = Vec::with_capacity(64 * 1024);
+    let mut rng: u64 = 0x00C0_FFEE_BEEF;
+    while payload.len() < 64 * 1024 {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        payload.extend_from_slice(&rng.to_le_bytes());
+    }
+    let body = encode_zstd(&payload);
+    assert!(
+        body.len() > 8 * 1024,
+        "test fixture must span several chunks; got {} bytes",
+        body.len(),
+    );
+
+    let server = MockServer::start({
+        let body_clone = body.clone();
+        move |req, _n| serve(req, &body_clone, Some("\"v1\"".into()))
+    });
+
+    let work = unique_dir("cursor_audit");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+    let chunk_size = 1024u64;
+    let mut config = coord_config_for_test(chunk_size);
+    config.checkpoint_min_bytes = 1;
+    config.checkpoint_min_interval = Duration::from_millis(0);
+
+    // Run 1: full download against the unmodified body, populating
+    // the .peel.part with the genuine bytes and the .peel.ckpt with
+    // the matching CRC fingerprints.
+    let args1 = make_args(
+        &server,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        config.clone(),
+    );
+    run(args1).expect("first run");
+    fs::remove_file(&out_path).ok();
+
+    // Build a checkpoint whose decoder_position lands inside chunk 2.
+    // Chunks 0..N are all marked complete and fingerprinted with the
+    // CRC of the genuine body bytes.
+    let total_chunks = (body.len() as u64).div_ceil(chunk_size) as u32;
+    let bitmap = peel::bitmap::ChunkBitmap::new(total_chunks);
+    for i in 0..total_chunks {
+        bitmap.mark_complete(peel::types::ChunkIndex::new(i));
+    }
+    let mut crcs = Vec::with_capacity(total_chunks as usize);
+    for i in 0..total_chunks {
+        let lo = (i as u64 * chunk_size) as usize;
+        let hi = ((i as u64 + 1) * chunk_size).min(body.len() as u64) as usize;
+        crcs.push(peel::hash::crc32c::castagnoli(&body[lo..hi]));
+    }
+    // Pick a cursor that lands inside chunk index 2 (the audit
+    // inspects exactly the chunk holding decoder_position).
+    let cursor_chunk: u32 = 2;
+    let cursor = u64::from(cursor_chunk) * chunk_size + 17;
+    let ckpt = Checkpoint {
+        url: format!("{}/data.zst", server.base_url()),
+        etag: Some("\"v1\"".into()),
+        last_modified: None,
+        total_size: body.len() as u64,
+        chunk_size,
+        decoder_position: ByteOffset::new(cursor),
+        bitmap_completed: bitmap.to_bytes(),
+        created_at: SystemTime::now(),
+        sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: None,
+        chunk_crc32c: Some(crcs),
+        decoder_state: None,
+    };
+    let part_path = work.join("out.bin.peel.part");
+    let ckpt_path = work.join("out.bin.peel.ckpt");
+    ckpt.write(&ckpt_path).expect("ckpt write");
+    // Run 1 succeeded, so peel cleaned up its sidecars. Recreate the
+    // part file from scratch with the genuine bytes, then flip a
+    // single bit inside the cursor chunk so the cursor-chunk audit
+    // sees a mismatch.
+    let mut part_bytes = body.clone();
+    let target = (cursor_chunk as usize) * (chunk_size as usize) + 5;
+    part_bytes[target] ^= 0x01;
+    fs::write(&part_path, &part_bytes).expect("write corrupted part");
+
+    let args2 = make_args(
+        &server,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        config,
+    );
+    let started = std::time::Instant::now();
+    let err = run(args2).expect_err("must detect part-file corruption");
+    let elapsed = started.elapsed();
+    match err {
+        CoordinatorError::PartFileCorrupted {
+            chunk,
+            expected,
+            actual,
+        } => {
+            assert_eq!(chunk.get(), cursor_chunk);
+            assert_ne!(expected, actual);
+        }
+        other => panic!("expected PartFileCorrupted, got {other:?}"),
+    }
+    // The audit must surface the error before the decoder has a
+    // chance to read garbage. One second is plenty of headroom.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "audit should fail fast; took {elapsed:?}",
+    );
+    // .peel.part / .peel.ckpt left on disk so the user can decide.
+    assert!(ckpt_path.exists(), "checkpoint should remain after error");
+    assert!(part_path.exists(), "part file should remain after error");
+}
+
 #[test]
 fn worker_probe_detects_source_drift() {
     // Unit-level demo of PLAN_v2 §11: when a probe re-fetches a

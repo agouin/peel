@@ -36,6 +36,7 @@ use crate::hash::crc32c::Crc32c;
 use crate::http::range::{parse_content_range, RangeError};
 use crate::http::{Client, ClientError, Headers};
 use crate::progress::ProgressState;
+use crate::types::ByteOffset;
 use crate::types::{ByteRange, ChunkIndex};
 
 /// Errors a worker can raise for one chunk attempt.
@@ -155,6 +156,26 @@ pub enum WorkerError {
         source: SparseFileError,
     },
 
+    /// `PEEL_VERIFY_CHUNKS=1` is set and a post-write re-read of the
+    /// chunk produced a CRC-32C that did not match the value we just
+    /// computed from the in-memory body. Indicates the page-cache /
+    /// io-backend write path is silently dropping or reordering bytes
+    /// (the §3.3 hypothesis the env switch exists to falsify).
+    #[error(
+        "PEEL_VERIFY_CHUNKS: chunk {chunk} on-disk CRC32C \
+         (expected {expected:#010x}, observed {actual:#010x}) — \
+         in-memory body did not match what the sparse file holds"
+    )]
+    ChunkVerifyMismatch {
+        /// Chunk that failed verification.
+        chunk: ChunkIndex,
+        /// CRC-32C computed from the in-memory body just written.
+        expected: u32,
+        /// CRC-32C computed by reading the same range back from the
+        /// sparse file.
+        actual: u32,
+    },
+
     /// The scheduler asked the worker to stop. Returned in place of
     /// continuing a backoff sleep.
     #[error("download cancelled before chunk {chunk} completed")]
@@ -198,6 +219,7 @@ impl WorkerError {
             Self::ContentRangeMismatch { .. } => false,
             Self::ContentRangeMalformed { .. } => false,
             Self::SparseFile { .. } => false,
+            Self::ChunkVerifyMismatch { .. } => false,
             Self::Cancelled { .. } => false,
             Self::NoLiveMirror { .. } => false,
         }
@@ -611,7 +633,84 @@ fn try_once(
     // body is dropped at end of scope; no explicit release step.
 
     let crcs = compute_chunk_crcs(&buf, dispatch, ctx.chunk_size);
+
+    // §3.3 (PLAN_responsiveness.md): when `PEEL_VERIFY_CHUNKS=1` is
+    // set, re-read every chunk we just wrote and confirm the on-disk
+    // CRC-32C matches what we computed in memory. Off by default
+    // because the extra read roughly doubles the cost of every
+    // dispatch; on by demand for the next pod incident. Catches
+    // page-cache / io-backend hazards (the §3.3 hypothesis) and
+    // would have caught the corruption in the snapshot-restore pod
+    // *during the original download* rather than only at decode
+    // time on the next resume.
+    if verify_chunks_enabled() {
+        verify_on_disk_chunks(ctx.sparse, dispatch, ctx.chunk_size, &buf, &crcs)?;
+    }
+
     Ok((range.len(), crcs))
+}
+
+/// Read the env once per process (the value is set before any
+/// download starts, so re-checking each call is wasted work). Done
+/// inside a function so tests can flip the var if needed.
+fn verify_chunks_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    // States: 0 = unset, 1 = false, 2 = true.
+    match CACHE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("PEEL_VERIFY_CHUNKS")
+                .ok()
+                .map(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
+                .unwrap_or(false);
+            CACHE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Re-read each chunk slice we just wrote and compare its CRC-32C
+/// against the in-memory value. Surfaces a mismatch as
+/// [`WorkerError::ChunkVerifyMismatch`] with the chunk-level detail.
+fn verify_on_disk_chunks(
+    sparse: &SparseFile,
+    dispatch: &Dispatch,
+    chunk_size: u64,
+    buf: &[u8],
+    crcs: &[u32],
+) -> Result<(), WorkerError> {
+    let chunk_size_usize = usize::try_from(chunk_size).unwrap_or(usize::MAX);
+    let range_start = dispatch.range.start().get();
+    for (i, expected) in crcs.iter().copied().enumerate() {
+        // Reconstruct the offset/length of this slice from the same
+        // arithmetic `compute_chunk_crcs` uses, so the boundaries
+        // line up byte-for-byte.
+        let in_buf_start = i.saturating_mul(chunk_size_usize);
+        let in_buf_end = in_buf_start.saturating_add(chunk_size_usize).min(buf.len());
+        if in_buf_start >= in_buf_end {
+            break;
+        }
+        let len = in_buf_end - in_buf_start;
+        let on_disk_offset = range_start.saturating_add(in_buf_start as u64);
+        let mut readback = vec![0u8; len];
+        sparse
+            .read_exact_at(ByteOffset::new(on_disk_offset), &mut readback)
+            .map_err(|source| WorkerError::SparseFile {
+                chunk: ChunkIndex::new(dispatch.first.get().saturating_add(i as u32)),
+                source,
+            })?;
+        let actual = crate::hash::crc32c::castagnoli(&readback);
+        if actual != expected {
+            return Err(WorkerError::ChunkVerifyMismatch {
+                chunk: ChunkIndex::new(dispatch.first.get().saturating_add(i as u32)),
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Fill `buf` from `reader`, ticking `progress` after each successful
@@ -1019,6 +1118,118 @@ mod tests {
         assert!(etag_is_weak("w/\"abc\""));
         assert!(!etag_is_weak("\"abc\""));
         assert!(!etag_is_weak(""));
+    }
+
+    // ---- §3.3 PEEL_VERIFY_CHUNKS post-write audit ---------------------
+
+    /// Hand-rolled drop-on-end file cleanup so we don't need the
+    /// `scopeguard` crate (not on the dependency allowlist).
+    struct TmpFileGuard(std::path::PathBuf);
+    impl Drop for TmpFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn unique_tmp(label: &str) -> std::path::PathBuf {
+        // Avoid timer collisions across rapid-fire tests on the same
+        // tick by mixing in a process-local counter.
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, O::Relaxed);
+        std::env::temp_dir().join(format!(
+            "peel_worker_verify_{label}_{}_{seq}_{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos(),
+        ))
+    }
+
+    /// Demo from §3.3: simulate "pwrite reports success but the bytes
+    /// on disk disagree with what we wrote" by handing
+    /// `verify_on_disk_chunks` an in-memory CRC slice that doesn't
+    /// match the on-disk content. The function must surface
+    /// [`WorkerError::ChunkVerifyMismatch`] with the offending chunk
+    /// index — i.e., the audit catches it before the chunk is marked
+    /// complete in the bitmap.
+    #[test]
+    fn verify_on_disk_chunks_flags_mismatch_with_chunk_index() {
+        let path = unique_tmp("mismatch");
+        let _g = TmpFileGuard(path.clone());
+        let total_size: u64 = 4096;
+        let chunk_size: u64 = 1024;
+        let sparse = SparseFile::open_or_create(&path, total_size).expect("sparse");
+
+        // Write some "genuine" bytes to disk at offset 0..2048.
+        let on_disk: Vec<u8> = (0..2048u32).map(|i| (i & 0xFF) as u8).collect();
+        sparse
+            .pwrite_at(ByteOffset::ZERO, &on_disk)
+            .expect("pwrite");
+
+        // Pretend we *thought* we'd just written `claimed_buf` —
+        // identical for chunk 0 but with one byte flipped in chunk 1.
+        let mut claimed_buf = on_disk.clone();
+        claimed_buf[1024 + 5] ^= 0x01;
+
+        // The CRCs the worker would have computed against
+        // `claimed_buf`. We feed these to `verify_on_disk_chunks`
+        // along with the *real* on-disk bytes, simulating a write
+        // path that succeeded in our buffer but lost a byte before
+        // hitting the platter.
+        let dispatch = Dispatch {
+            first: ChunkIndex::ZERO,
+            count: 2,
+            range: ByteRange::new(ByteOffset::ZERO, ByteOffset::new(2048)).expect("range"),
+            kind: DispatchKind::Fetch,
+        };
+        let crcs = compute_chunk_crcs(&claimed_buf, &dispatch, chunk_size);
+
+        // Verify against the on-disk bytes (`sparse`'s contents).
+        let result = verify_on_disk_chunks(&sparse, &dispatch, chunk_size, &claimed_buf, &crcs);
+        match result {
+            Err(WorkerError::ChunkVerifyMismatch {
+                chunk,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(chunk.get(), 1, "mismatch belongs to chunk 1");
+                assert_ne!(expected, actual);
+            }
+            other => panic!("expected ChunkVerifyMismatch, got {other:?}"),
+        }
+    }
+
+    /// Sanity: when the on-disk bytes match what we wrote, the audit
+    /// is a no-op.
+    #[test]
+    fn verify_on_disk_chunks_passes_when_bytes_match() {
+        let path = unique_tmp("ok");
+        let _g = TmpFileGuard(path.clone());
+        let total_size: u64 = 2048;
+        let chunk_size: u64 = 1024;
+        let sparse = SparseFile::open_or_create(&path, total_size).expect("sparse");
+        let buf: Vec<u8> = (0..2048u32).map(|i| (i & 0xFF) as u8).collect();
+        sparse.pwrite_at(ByteOffset::ZERO, &buf).expect("pwrite");
+
+        let dispatch = Dispatch {
+            first: ChunkIndex::ZERO,
+            count: 2,
+            range: ByteRange::new(ByteOffset::ZERO, ByteOffset::new(2048)).expect("range"),
+            kind: DispatchKind::Fetch,
+        };
+        let crcs = compute_chunk_crcs(&buf, &dispatch, chunk_size);
+        verify_on_disk_chunks(&sparse, &dispatch, chunk_size, &buf, &crcs).expect("ok");
+    }
+
+    /// `ChunkVerifyMismatch` is terminal: there's no point retrying a
+    /// dispatch whose body the kernel mangled on the way to disk.
+    #[test]
+    fn chunk_verify_mismatch_is_terminal() {
+        let e = WorkerError::ChunkVerifyMismatch {
+            chunk: ChunkIndex::ZERO,
+            expected: 0xAAAA_AAAA,
+            actual: 0xBBBB_BBBB,
+        };
+        assert!(!e.is_retryable());
     }
 
     // ---- sleep_with_cancel --------------------------------------------

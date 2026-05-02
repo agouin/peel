@@ -125,6 +125,26 @@ pub enum DecodeError {
     /// indistinguishable from a corrupt first frame.
     #[error("decoder construction failed")]
     Construct(#[source] std::io::Error),
+
+    /// `PLAN_responsiveness.md` §3.2: a saved decoder-state blob was
+    /// supplied with a `start_offset` that disagrees with the source
+    /// cursor the blob captured. Surfacing this as its own variant
+    /// (rather than as a downstream `block size too large` /
+    /// `bad magic` error from the codec internals) gives the
+    /// coordinator a clean signal that the failure is at the resume
+    /// seam itself: either the saved cursor was wrong when the blob
+    /// was written, the source bytes shifted between runs, or the
+    /// caller seeded the wrong offset.
+    #[error(
+        "decoder resume seam mismatch: blob captured cursor {expected} \
+         but resume() was seeded with cursor {actual}"
+    )]
+    ResumeMismatch {
+        /// Cursor the saved blob says it was captured at.
+        expected: u64,
+        /// Cursor the caller seeded the resumed decoder with.
+        actual: u64,
+    },
 }
 
 /// A forward-only decoder over a compressed byte stream.

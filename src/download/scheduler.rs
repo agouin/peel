@@ -1040,15 +1040,21 @@ fn run_parallel(
                 Ok(()) => match msg.kind {
                     DispatchKind::Fetch => {
                         let end = msg.first.get().saturating_add(msg.count);
-                        bitmap.complete_range(msg.first, ChunkIndex::new(end));
-                        stats_local.bytes_downloaded =
-                            stats_local.bytes_downloaded.saturating_add(msg.bytes);
-                        stats_local.chunks_completed =
-                            stats_local.chunks_completed.saturating_add(msg.count);
-                        completed = completed.saturating_add(msg.count);
-                        // Record per-chunk CRC-32C fingerprints for
-                        // §11's drift detector. The CRCs come back
-                        // in chunk order; pad / trim defensively.
+                        // §3.3 (PLAN_responsiveness.md): record the
+                        // per-chunk CRC-32C fingerprints **before**
+                        // marking the bitmap. The
+                        // [`ChunkFingerprints`] module documents
+                        // exactly this ordering ("a worker records
+                        // the CRC-32C with `Ordering::Release`
+                        // before its `ChunkBitmap` mark"); the prior
+                        // arrangement (bitmap-first) opened a window
+                        // where a reader could observe a chunk
+                        // marked complete but with `fingerprints.get
+                        // == 0`, which the §3.1 cursor audit would
+                        // misinterpret as "no fingerprint to compare
+                        // against" and silently skip. Recording
+                        // first preserves the documented happens-
+                        // before edge.
                         if let Some(fps) = config.fingerprints.as_deref() {
                             for (i, crc) in msg.crcs.iter().enumerate().take(msg.count as usize) {
                                 let idx = msg.first.get().saturating_add(i as u32);
@@ -1057,6 +1063,12 @@ fn run_parallel(
                                 }
                             }
                         }
+                        bitmap.complete_range(msg.first, ChunkIndex::new(end));
+                        stats_local.bytes_downloaded =
+                            stats_local.bytes_downloaded.saturating_add(msg.bytes);
+                        stats_local.chunks_completed =
+                            stats_local.chunks_completed.saturating_add(msg.count);
+                        completed = completed.saturating_add(msg.count);
                         if let Some(policy) = config.policy.as_deref() {
                             policy.record(Sample {
                                 at: Instant::now(),

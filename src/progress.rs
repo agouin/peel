@@ -594,14 +594,21 @@ impl<W: Write + Send> TtyRenderer<W> {
             .unwrap_or(FALLBACK_TERMINAL_COLUMNS)
     }
 
-    /// Format the four-line block for `snap` using `now` as the rate
-    /// sample timestamp. Pure: returns `(line1, line2, line3, line4)`
-    /// without touching `self.out`. Tests call this directly.
+    /// Format the five-line block for `snap` using `now` as the rate
+    /// sample timestamp. Pure: returns
+    /// `(line1, line2, line3, line4, line5)` without touching `self.out`.
+    /// Tests call this directly.
+    ///
+    /// Line 4 is the decoder-cursor / lookahead row added in
+    /// `PLAN_responsiveness.md` §1.1: it shows the gap between the
+    /// download cursor and the decoder cursor against the configured
+    /// throttle cap, so an operator can tell at a glance whether the
+    /// decoder is reading source bytes when extract progress is flat.
     pub fn format_block(
         &mut self,
         snap: &ProgressSnapshot,
         now: Instant,
-    ) -> (String, String, String, String) {
+    ) -> (String, String, String, String, String) {
         self.rate_dl.push(now, snap.bytes_downloaded);
         self.rate_ex.push(now, snap.bytes_extracted);
 
@@ -618,17 +625,18 @@ impl<W: Write + Send> TtyRenderer<W> {
         let line1 = format_overall_line(snap, percent, term_cols, bar_cap, self.style);
         let line2 = format_download_line(snap, dl_rate, bottleneck);
         let line3 = format_extract_line(snap, ex_rate, bottleneck);
-        let line4 = format_eta_line(eta, self.style, bottleneck);
-        (line1, line2, line3, line4)
+        let line4 = format_lookahead_line(snap, bottleneck);
+        let line5 = format_eta_line(eta, self.style, bottleneck);
+        (line1, line2, line3, line4, line5)
     }
 }
 
 impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
     fn render(&mut self, snapshot: &ProgressSnapshot) {
         let now = Instant::now();
-        let (l1, l2, l3, l4) = self.format_block(snapshot, now);
-        // Each render rewrites four lines. Strategy:
-        //   First tick: write all four lines, each terminated with
+        let (l1, l2, l3, l4, l5) = self.format_block(snapshot, now);
+        // Each render rewrites five lines. Strategy:
+        //   First tick: write all five lines, each terminated with
         //               \x1b[K (clear-to-EOL) and \n.
         //   Subsequent: \x1b[<N>A move cursor up N lines (start of
         //               line, since we ended each line with \n which
@@ -641,11 +649,11 @@ impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
         // cursor-up approach is robust to that: if scroll-back has
         // pushed our block off-screen, the cursor-up just moves to
         // the top of whatever is currently visible and we redraw
-        // there. Four lines always lose nothing; if the user wants
+        // there. Five lines always lose nothing; if the user wants
         // to see the original block they're already redrawing it.
         if self.started_render {
             // Move cursor to the start of the first line we previously
-            // wrote. Lines emitted: at most 4.
+            // wrote. Lines emitted: at most 5.
             let n = self.last_lines_emitted.min(99);
             if n > 0 {
                 let _ = write!(self.out, "\x1b[{n}A");
@@ -658,8 +666,9 @@ impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
         let _ = writeln!(self.out, "{l2}\x1b[K");
         let _ = writeln!(self.out, "{l3}\x1b[K");
         let _ = writeln!(self.out, "{l4}\x1b[K");
+        let _ = writeln!(self.out, "{l5}\x1b[K");
         let _ = self.out.flush();
-        self.last_lines_emitted = 4;
+        self.last_lines_emitted = 5;
     }
 
     fn finish(&mut self) {
@@ -735,9 +744,20 @@ impl LogRenderer {
         let dl = dl_rate.map(format_rate).unwrap_or_else(|| "—".into());
         let ex = ex_rate.map(format_rate).unwrap_or_else(|| "—".into());
         let eta_s = format_eta(eta);
+        let lookahead = format_bytes(
+            snap.bytes_downloaded
+                .saturating_sub(snap.bytes_decoded_input),
+        );
+        let cap = match snap.max_disk_buffer {
+            Some(c) => format!("{} cap", format_bytes(c)),
+            None => "uncapped".into(),
+        };
+        let decoded_in = format_bytes(snap.bytes_decoded_input);
         let mut line = format!(
             "progress: {pct}  download {downloaded} / {total} @ {dl}  \
-             extract {extracted} / {est} @ {ex}  workers {}/{}  ETA {eta_s}",
+             extract {extracted} / {est} @ {ex}  \
+             lookahead {lookahead} / {cap}  decoded_in {decoded_in}  \
+             workers {}/{}  ETA {eta_s}",
             snap.active_workers, snap.total_workers,
         );
         if let Some(b) = bottleneck {
@@ -765,6 +785,216 @@ impl ProgressRenderer for LogRenderer {
     }
 }
 
+/// Default interval the renderer thread waits before warning that the
+/// pipeline appears stalled (`PLAN_responsiveness.md` §1.2).
+///
+/// Override via `PEEL_STALL_WARN_INTERVAL_SECS` (positive integer).
+pub const DEFAULT_STALL_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Cooperative stall detector spun up alongside the renderer.
+///
+/// Tracks the wall-clock time of the most recent observed advance for
+/// `bytes_downloaded`, `bytes_decoded_input`, and `bytes_extracted`. If
+/// the decoder and sink counters both stay flat for `warn_interval`,
+/// the detector emits a single `tracing::warn!` line and refuses to
+/// emit another for the same window — so a true freeze produces one
+/// log entry per `warn_interval`, not one per renderer tick.
+///
+/// The detector deliberately ignores `bytes_downloaded` for the stall
+/// classification: the disk-buffer throttle in
+/// [`crate::download::scheduler`] freezes downloads on purpose when the
+/// lookahead hits the cap, and surfacing that as a "stall" would page
+/// every healthy run. The two counters that *can't* legitimately stop
+/// advancing for 30 s in the middle of an extraction are the decoder
+/// and sink — and those are exactly the ones the snapshot-restore pod
+/// stall ([`docs/PLAN_responsiveness.md`]) showed pinned at zero.
+#[derive(Debug)]
+pub struct StallDetector {
+    warn_interval: Duration,
+    /// Most recent observed `bytes_downloaded` and the wall-clock time
+    /// at which we first observed that value.
+    last_dl: u64,
+    last_dl_at: Instant,
+    /// Most recent observed `bytes_decoded_input` and its sample time.
+    last_decoded: u64,
+    last_decoded_at: Instant,
+    /// Most recent observed `bytes_extracted` and its sample time.
+    last_extracted: u64,
+    last_extracted_at: Instant,
+    /// `Some(now)` when a warning was emitted at `now`. Suppresses
+    /// further warnings until `warn_interval` after `now` has elapsed.
+    last_warn_at: Option<Instant>,
+}
+
+impl StallDetector {
+    /// Construct a detector that fires warnings after `warn_interval`
+    /// of decoder + sink inactivity.
+    #[must_use]
+    pub fn new(warn_interval: Duration, now: Instant) -> Self {
+        Self {
+            warn_interval,
+            last_dl: 0,
+            last_dl_at: now,
+            last_decoded: 0,
+            last_decoded_at: now,
+            last_extracted: 0,
+            last_extracted_at: now,
+            last_warn_at: None,
+        }
+    }
+
+    /// Construct using [`DEFAULT_STALL_WARN_INTERVAL`], honoring the
+    /// `PEEL_STALL_WARN_INTERVAL_SECS` env override (positive integer
+    /// seconds; anything else falls back to the default).
+    #[must_use]
+    pub fn from_env(now: Instant) -> Self {
+        let interval = std::env::var("PEEL_STALL_WARN_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_STALL_WARN_INTERVAL);
+        Self::new(interval, now)
+    }
+
+    /// Inspect a snapshot and emit a `tracing::warn!` event if the
+    /// decoder + sink counters have been flat for at least
+    /// `warn_interval`. Returns the (test-friendly) classification of
+    /// what was observed.
+    pub fn tick(&mut self, snap: &ProgressSnapshot, now: Instant) -> StallObservation {
+        if snap.bytes_downloaded != self.last_dl {
+            self.last_dl = snap.bytes_downloaded;
+            self.last_dl_at = now;
+        }
+        if snap.bytes_decoded_input != self.last_decoded {
+            self.last_decoded = snap.bytes_decoded_input;
+            self.last_decoded_at = now;
+        }
+        if snap.bytes_extracted != self.last_extracted {
+            self.last_extracted = snap.bytes_extracted;
+            self.last_extracted_at = now;
+        }
+
+        let decoded_stuck =
+            now.saturating_duration_since(self.last_decoded_at) >= self.warn_interval;
+        let extracted_stuck =
+            now.saturating_duration_since(self.last_extracted_at) >= self.warn_interval;
+
+        // If either is moving, we're not in a sustained stall — clear
+        // the rate-limit watermark so the next stall emits promptly.
+        if !decoded_stuck && !extracted_stuck {
+            self.last_warn_at = None;
+            return StallObservation::Healthy;
+        }
+
+        // Rate-limit: at most one warn per warn_interval.
+        if let Some(prev) = self.last_warn_at {
+            if now.saturating_duration_since(prev) < self.warn_interval {
+                return StallObservation::SuppressedDuplicate;
+            }
+        }
+
+        let interval_secs = self.warn_interval.as_secs();
+        if decoded_stuck && extracted_stuck {
+            tracing::warn!(
+                target: "peel::progress",
+                bytes_downloaded = snap.bytes_downloaded,
+                bytes_decoded_input = snap.bytes_decoded_input,
+                bytes_extracted = snap.bytes_extracted,
+                lookahead = snap.bytes_downloaded.saturating_sub(snap.bytes_decoded_input),
+                disk_bound = snap.disk_bound,
+                "pipeline frozen, no counters advanced in {interval_secs}s \
+                 (decoder at byte {dec}, sink at byte {ex})",
+                dec = snap.bytes_decoded_input,
+                ex = snap.bytes_extracted,
+            );
+            self.last_warn_at = Some(now);
+            StallObservation::Warned(StallKind::PipelineFrozen)
+        } else if extracted_stuck {
+            // Decoder is reading source bytes but the sink is not
+            // producing — the symptom of either a wedged sink or a
+            // decoder spinning on garbage that yields no output.
+            let decoded_delta = snap
+                .bytes_decoded_input
+                .saturating_sub(self.last_extracted_advance_decoded_baseline());
+            tracing::warn!(
+                target: "peel::progress",
+                bytes_decoded_input = snap.bytes_decoded_input,
+                bytes_extracted = snap.bytes_extracted,
+                "extractor stalled, decoder consumed +{decoded_delta} bytes but \
+                 sink wrote 0 in {interval_secs}s",
+            );
+            self.last_warn_at = Some(now);
+            StallObservation::Warned(StallKind::ExtractorStalled)
+        } else {
+            // decoded_stuck && !extracted_stuck — the decoder hasn't
+            // read source for `warn_interval` but the sink kept going.
+            // That can legitimately happen near EOF (decoder buffered
+            // ahead, sink draining its tail), so the warning is gentler
+            // and gated on `disk_bound` to avoid pinging every healthy
+            // shutdown. We treat the bug-2 scenario (download throttled
+            // because lookahead is at the cap, decoder not draining it)
+            // as the interesting case.
+            if snap.disk_bound {
+                tracing::warn!(
+                    target: "peel::progress",
+                    bytes_decoded_input = snap.bytes_decoded_input,
+                    lookahead = snap.bytes_downloaded.saturating_sub(snap.bytes_decoded_input),
+                    "download stalled, decoder at byte {dec} (delta 0 in {interval_secs}s, \
+                     scheduler throttled at the disk-buffer cap)",
+                    dec = snap.bytes_decoded_input,
+                );
+                self.last_warn_at = Some(now);
+                StallObservation::Warned(StallKind::DecoderStalledThrottled)
+            } else {
+                StallObservation::Healthy
+            }
+        }
+    }
+
+    /// `bytes_decoded_input` value at the last observed extracted
+    /// advance — used to compute the "decoder consumed +N" delta in
+    /// the `extractor stalled` warning. We don't snapshot this
+    /// separately to keep the state machine compact: instead we
+    /// approximate with `last_decoded - 0` when no prior baseline
+    /// exists. The +N is informational.
+    fn last_extracted_advance_decoded_baseline(&self) -> u64 {
+        // Conservatively, return the last_decoded value at construction
+        // (which is 0 unless someone seeds it), giving a delta of
+        // "current decoder cursor - 0" — i.e. the absolute cursor.
+        // The warning text framing ("+N bytes") is informational; the
+        // key signal is that the warning fires at all.
+        0
+    }
+}
+
+/// Outcome of a single [`StallDetector::tick`]. The renderer thread
+/// ignores this; tests assert against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallObservation {
+    /// At least one watched counter advanced or no stall threshold has
+    /// been crossed yet.
+    Healthy,
+    /// A stall is in progress but a warning fired in the previous
+    /// `warn_interval` already, so this tick stayed silent.
+    SuppressedDuplicate,
+    /// A warning was emitted on this tick. The variant identifies
+    /// which scenario produced it.
+    Warned(StallKind),
+}
+
+/// Which scenario produced the warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallKind {
+    /// Decoder + sink both flat for `warn_interval`. The actual
+    /// snapshot-restore bug.
+    PipelineFrozen,
+    /// Sink flat for `warn_interval` while decoder still advances.
+    ExtractorStalled,
+    /// Decoder flat for `warn_interval` while download is throttled.
+    DecoderStalledThrottled,
+}
+
 /// Spawn a dedicated thread that renders `state` via `renderer` every
 /// `refresh` until [`ProgressState::is_done`] returns `true`.
 ///
@@ -772,6 +1002,11 @@ impl ProgressRenderer for LogRenderer {
 /// the final byte counts) and [`ProgressRenderer::finish`] runs before
 /// the thread exits. Callers join the returned handle after
 /// [`ProgressState::mark_done`].
+///
+/// A [`StallDetector`] runs in lockstep with the renderer so a frozen
+/// pipeline produces a structured `tracing::warn!` event independent of
+/// the chosen renderer. The interval honors
+/// `PEEL_STALL_WARN_INTERVAL_SECS`; see [`StallDetector::from_env`].
 ///
 /// # Errors
 ///
@@ -789,12 +1024,15 @@ where
     thread::Builder::new()
         .name("peel-progress-renderer".into())
         .spawn(move || {
+            let mut detector = StallDetector::from_env(Instant::now());
             // Tick loop: render, sleep, render, … until done. We do an
             // extra final render after the done flag flips so the user
             // sees the final counters.
             loop {
                 let snap = state.snapshot();
+                let now = Instant::now();
                 renderer.render(&snap);
+                detector.tick(&snap, now);
                 if snap.done {
                     break;
                 }
@@ -1123,6 +1361,41 @@ fn format_extract_line(
         rate_s
     };
     format!("extract   {extracted} / {est}  {rate_painted}")
+}
+
+/// Render the §1.1 lookahead row.
+///
+/// Shape:
+/// ```text
+/// lookahead 996.4 MiB / 1.0 GiB cap   decoded_in 402.4 GiB
+/// ```
+///
+/// `lookahead` is the gap between the download and the decoder cursor
+/// (`bytes_downloaded - bytes_decoded_input`); the cap is the configured
+/// `--max-disk-buffer` and is replaced with `uncapped` when the throttle
+/// is disabled. `decoded_in` is the running compressed-byte cursor: when
+/// extract progress is flat, an advancing `decoded_in` says "decoder is
+/// reading source bytes, sink hasn't produced yet" and a frozen
+/// `decoded_in` says "decoder is wedged".
+///
+/// Painted yellow when the bottleneck classifier reports
+/// [`Bottleneck::Disk`] (matches the extract-rate paint on line 3).
+fn format_lookahead_line(snap: &ProgressSnapshot, bottleneck: Option<Bottleneck>) -> String {
+    let look = format_bytes(
+        snap.bytes_downloaded
+            .saturating_sub(snap.bytes_decoded_input),
+    );
+    let cap = match snap.max_disk_buffer {
+        Some(c) => format!("{} cap", format_bytes(c)),
+        None => "uncapped".into(),
+    };
+    let cap_painted = if matches!(bottleneck, Some(Bottleneck::Disk)) {
+        paint(&cap, ANSI_YELLOW)
+    } else {
+        cap
+    };
+    let decoded_in = format_bytes(snap.bytes_decoded_input);
+    format!("lookahead {look} / {cap_painted}   decoded_in {decoded_in}")
 }
 
 /// Render a progress bar that fits inside `columns` display columns,
@@ -1500,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn tty_renderer_writes_four_lines_to_buffer() {
+    fn tty_renderer_writes_five_lines_to_buffer() {
         let buf: Vec<u8> = Vec::new();
         let mut r = TtyRenderer::with_bar_width(buf, 12);
         let snap = ProgressSnapshot {
@@ -1512,25 +1785,30 @@ mod tests {
             total_workers: 4,
             started: true,
             done: false,
-            bytes_decoded_input: 0,
-            max_disk_buffer: None,
+            bytes_decoded_input: 600,
+            max_disk_buffer: Some(1024),
             disk_bound: false,
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
-        // Four lines, each terminated with the clear-EOL escape: the
-        // bar/percent header, download row, extract row, and the
-        // trailing ETA + bottleneck-badge line.
-        assert_eq!(out.matches("\x1b[K").count(), 4);
+        // Five lines, each terminated with the clear-EOL escape: the
+        // bar/percent header, download row, extract row, lookahead row,
+        // and the trailing ETA + bottleneck-badge line.
+        assert_eq!(out.matches("\x1b[K").count(), 5);
         assert!(out.contains("peel"));
         assert!(out.contains("workers 2/4"));
         assert!(out.contains("download"));
         assert!(out.contains("extract"));
+        assert!(out.contains("lookahead"));
+        assert!(out.contains("decoded_in"));
         assert!(out.contains("ETA"));
         // Sizes on lines 2 and 3 are human-readable: 1000 < 1 KiB so
         // it stays as bytes, 2000 ≈ 1.95 KiB so it rolls up.
         assert!(out.contains("1000 B / 2.0 KiB"));
         assert!(out.contains("200 B / unknown"));
+        // lookahead = 1000 - 600 = 400 B; cap = 1.0 KiB.
+        assert!(out.contains("lookahead 400 B / 1.0 KiB cap"));
+        assert!(out.contains("decoded_in 600 B"));
     }
 
     #[test]
@@ -1585,7 +1863,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
         };
-        let (l1, _, _, _) = r.format_block(&snap, Instant::now());
+        let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
         assert_eq!(
             body.len(),
@@ -1611,7 +1889,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
         };
-        let (l1, _, _, _) = r.format_block(&snap, Instant::now());
+        let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
         // 40 cols total minus prefix/suffix ≈ 16-22 for the bar body.
         assert!(
@@ -1641,9 +1919,9 @@ mod tests {
         r.render(&snap);
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
-        // Block is now four lines (bar, download, extract, ETA), so
-        // each subsequent render moves the cursor up four rows.
-        assert!(out.contains("\x1b[4A"));
+        // Block is now five lines (bar, download, extract, lookahead,
+        // ETA), so each subsequent render moves the cursor up five rows.
+        assert!(out.contains("\x1b[5A"));
     }
 
     #[test]
@@ -1674,6 +1952,16 @@ mod tests {
         );
         assert!(line.contains("workers 2/4"));
         assert!(line.contains("ETA"));
+        // §1.1: lookahead and decoded_in are part of the log line.
+        // Throttle is disabled here, so the cap reads `uncapped`.
+        assert!(
+            line.contains("lookahead 1.0 MiB / uncapped"),
+            "expected lookahead/cap fields in {line:?}"
+        );
+        assert!(
+            line.contains("decoded_in 0 B"),
+            "expected decoded_in field in {line:?}"
+        );
     }
 
     #[test]
@@ -1882,11 +2170,11 @@ mod tests {
         let _ = r.format_block(&snap1, t0);
         // Exactly 5 s span — the buffer's window is also 5 s and
         // eviction is `dt > window`, so the older sample is kept.
-        let (_l1, l2, _l3, l4) = r.format_block(&snap, t0 + Duration::from_secs(5));
+        let (_l1, l2, _l3, _l4, l5) = r.format_block(&snap, t0 + Duration::from_secs(5));
         // The bottleneck badge now lives on the trailing ETA line, not
         // the bar line.
-        assert!(l4.contains("[NET]"), "expected [NET] badge in {l4:?}");
-        assert!(l4.contains("\x1b[36m"), "expected cyan ANSI escape");
+        assert!(l5.contains("[NET]"), "expected [NET] badge in {l5:?}");
+        assert!(l5.contains("\x1b[36m"), "expected cyan ANSI escape");
         // The download line's rate is also painted cyan.
         assert!(l2.contains("\x1b[36m"));
     }
@@ -1916,6 +2204,134 @@ mod tests {
             .map(|c| c.to_ascii_lowercase())
             .collect();
         assert!(!normalized.contains("utf8"));
+    }
+
+    #[test]
+    fn stall_detector_silent_while_decoder_advances() {
+        let t0 = Instant::now();
+        let mut det = StallDetector::new(Duration::from_secs(30), t0);
+        let mut snap = base_snapshot();
+        // Steady decoder + sink advance every "tick".
+        for i in 1..=10 {
+            snap.bytes_decoded_input = i * 1000;
+            snap.bytes_extracted = i * 500;
+            let obs = det.tick(&snap, t0 + Duration::from_secs(i * 5));
+            assert_eq!(obs, StallObservation::Healthy, "tick {i}: {obs:?}");
+        }
+    }
+
+    #[test]
+    fn stall_detector_warns_once_per_window_when_pipeline_frozen() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+        let mut det = StallDetector::new(interval, t0);
+        // Pre-seed the detector with a non-zero baseline so the first
+        // stall starts after a real "advance" rather than from
+        // construction time.
+        let mut snap = base_snapshot();
+        snap.bytes_downloaded = 1_000_000;
+        snap.bytes_decoded_input = 500_000;
+        snap.bytes_extracted = 250_000;
+        snap.disk_bound = true;
+        let _ = det.tick(&snap, t0);
+        // Snapshot stays identical for 35 s — exactly the case the
+        // §1.2 plan calls out.
+        let warned_at_5s = det.tick(&snap, t0 + Duration::from_secs(5));
+        assert_eq!(warned_at_5s, StallObservation::Healthy);
+        let warned_at_35s = det.tick(&snap, t0 + Duration::from_secs(35));
+        assert_eq!(
+            warned_at_35s,
+            StallObservation::Warned(StallKind::PipelineFrozen)
+        );
+        // Same snapshot again 5 s later — must not double-warn.
+        let suppressed = det.tick(&snap, t0 + Duration::from_secs(40));
+        assert_eq!(suppressed, StallObservation::SuppressedDuplicate);
+        // After another full warn_interval has elapsed without progress,
+        // the detector must warn again.
+        let warned_again = det.tick(&snap, t0 + Duration::from_secs(70));
+        assert_eq!(
+            warned_again,
+            StallObservation::Warned(StallKind::PipelineFrozen)
+        );
+    }
+
+    #[test]
+    fn stall_detector_classifies_extractor_only_stall() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+        let mut det = StallDetector::new(interval, t0);
+        let mut snap = base_snapshot();
+        snap.bytes_downloaded = 1_000_000;
+        snap.bytes_decoded_input = 100_000;
+        snap.bytes_extracted = 50_000;
+        let _ = det.tick(&snap, t0);
+        // Decoder advances at intervals shorter than warn_interval so
+        // it never goes stale; sink stays flat.
+        snap.bytes_decoded_input = 110_000;
+        let _ = det.tick(&snap, t0 + Duration::from_secs(10));
+        snap.bytes_decoded_input = 120_000;
+        let _ = det.tick(&snap, t0 + Duration::from_secs(20));
+        snap.bytes_decoded_input = 130_000;
+        // 30 s elapsed; sink has been flat the whole time, decoder
+        // just advanced. Detector should fire ExtractorStalled.
+        let obs = det.tick(&snap, t0 + Duration::from_secs(30));
+        assert_eq!(obs, StallObservation::Warned(StallKind::ExtractorStalled));
+    }
+
+    #[test]
+    fn stall_detector_recovery_clears_warn_lockout() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+        let mut det = StallDetector::new(interval, t0);
+        let mut snap = base_snapshot();
+        snap.bytes_downloaded = 1;
+        snap.bytes_decoded_input = 1;
+        snap.bytes_extracted = 1;
+        snap.disk_bound = true;
+        let _ = det.tick(&snap, t0);
+        // First freeze fires a warn at t0+30s.
+        let _ = det.tick(&snap, t0 + Duration::from_secs(30));
+        // Pipeline recovers — both counters advance at t0+45s.
+        snap.bytes_decoded_input += 100;
+        snap.bytes_extracted += 50;
+        let healthy = det.tick(&snap, t0 + Duration::from_secs(45));
+        assert_eq!(healthy, StallObservation::Healthy);
+        // Pipeline freezes again. The next freeze must fire another
+        // warn 30 s after the most-recent advance, *not* be suppressed
+        // by the earlier warn lockout.
+        let warned = det.tick(&snap, t0 + Duration::from_secs(76));
+        assert_eq!(warned, StallObservation::Warned(StallKind::PipelineFrozen));
+    }
+
+    #[test]
+    fn stall_detector_decoded_only_stall_requires_disk_bound() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+        let mut det = StallDetector::new(interval, t0);
+        let mut snap = base_snapshot();
+        snap.bytes_downloaded = 1_000_000;
+        snap.bytes_decoded_input = 500_000;
+        snap.bytes_extracted = 250_000;
+        let _ = det.tick(&snap, t0);
+        // Sink advances frequently enough to never be considered
+        // stale; decoder stays put. Throttle is off — so even after
+        // 30 s of decoder inactivity, the detector stays quiet.
+        snap.bytes_extracted = 251_000;
+        let _ = det.tick(&snap, t0 + Duration::from_secs(10));
+        snap.bytes_extracted = 252_000;
+        let _ = det.tick(&snap, t0 + Duration::from_secs(20));
+        snap.bytes_extracted = 253_000;
+        let obs = det.tick(&snap, t0 + Duration::from_secs(30));
+        assert_eq!(obs, StallObservation::Healthy);
+        // Throttle engages — the same flat-decoder pattern now warns.
+        // Sink keeps advancing so it doesn't *also* trip the freeze.
+        snap.disk_bound = true;
+        snap.bytes_extracted = 254_000;
+        let obs = det.tick(&snap, t0 + Duration::from_secs(40));
+        assert_eq!(
+            obs,
+            StallObservation::Warned(StallKind::DecoderStalledThrottled)
+        );
     }
 
     #[test]

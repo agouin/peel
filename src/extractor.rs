@@ -34,6 +34,7 @@
 
 use std::io::Write;
 use std::os::fd::BorrowedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -236,6 +237,9 @@ pub struct ExtractionStats {
 pub struct Extractor {
     config: ExtractorConfig,
     progress: Option<Arc<ProgressState>>,
+    /// Optional run-wide kill switch, polled once per `decode_step`
+    /// iteration of the inner loop. See [`Self::with_kill_switch`].
+    kill_switch: Option<Arc<AtomicBool>>,
 }
 
 impl Extractor {
@@ -245,6 +249,7 @@ impl Extractor {
         Self {
             config,
             progress: None,
+            kill_switch: None,
         }
     }
 
@@ -261,6 +266,22 @@ impl Extractor {
     #[must_use]
     pub fn with_progress(mut self, progress: Arc<ProgressState>) -> Self {
         self.progress = Some(progress);
+        self
+    }
+
+    /// Attach the run-wide kill switch (`PLAN_responsiveness.md`
+    /// §2.3). The inner loop polls the flag once per iteration —
+    /// before each `decode_step` call — so a CPU-bound decoder that
+    /// never reads source bytes (e.g., a zstd block whose literals
+    /// fit entirely in the window) still notices a SIGTERM within one
+    /// step. Tripping returns
+    /// [`ExtractorError::Observer`] carrying the
+    /// `peel:kill-switch-tripped` sentinel; the coordinator's
+    /// `run_one` matcher recognizes it and surfaces
+    /// `CoordinatorError::Aborted`.
+    #[must_use]
+    pub fn with_kill_switch(mut self, kill: Arc<AtomicBool>) -> Self {
+        self.kill_switch = Some(kill);
         self
     }
 
@@ -383,12 +404,38 @@ impl Extractor {
         };
 
         loop {
+            // §2.3: poll the kill switch at the top of every loop
+            // iteration — independent of the source-read poll, since a
+            // CPU-bound decoder may not read source bytes between work
+            // units. Tripping surfaces as `Observer` carrying the
+            // shared `peel:kill-switch-tripped` sentinel so the
+            // coordinator's `run_one` matcher maps it to `Aborted`.
+            if let Some(flag) = self.kill_switch.as_ref() {
+                if flag.load(Ordering::Acquire) {
+                    return Err(ExtractorError::Observer(std::io::Error::other(
+                        "peel:kill-switch-tripped",
+                    )));
+                }
+            }
             // Time the decode_step call as a whole, then subtract out
             // any time the inner sink.write spent — that becomes
             // stats.write_time, and the rest is decode-only time.
             let pre_write = adapter.write_time;
             let t_decode = Instant::now();
-            let step = decoder.decode_step(&mut adapter);
+            // §1.3: span carries the decoder's source cursor so a wedge
+            // here (e.g., a decoder spinning without producing) is
+            // visible under `RUST_LOG=peel=debug`.
+            let bytes_consumed = decoder.bytes_consumed().get();
+            let step = {
+                let span = tracing::debug_span!(
+                    target: "peel::extractor",
+                    "decode_step",
+                    bytes_consumed,
+                    bytes_out = adapter.bytes_out,
+                );
+                let _enter = span.enter();
+                decoder.decode_step(&mut adapter)
+            };
             let total = t_decode.elapsed();
             let write_delta = adapter.write_time.saturating_sub(pre_write);
             stats.decode_time = stats
@@ -523,6 +570,16 @@ impl Extractor {
             return Ok(());
         }
 
+        // §1.3: span around the punch syscall — slow filesystems
+        // (network mounts, congested NVMe) sometimes show up here.
+        let span = tracing::debug_span!(
+            target: "peel::punch",
+            "maybe_punch",
+            offset = *last_punched,
+            length = gap,
+            final_sweep,
+        );
+        let _enter = span.enter();
         let t = Instant::now();
         let result = puncher.punch(source_fd, ByteOffset::new(*last_punched), gap);
         stats.punch_time = stats.punch_time.saturating_add(t.elapsed());
@@ -563,6 +620,16 @@ struct SinkAdapter<'a, S: Sink> {
 
 impl<S: Sink> Write for SinkAdapter<'_, S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // §1.3: span around the sink write — when extract progress is
+        // flat, this span (vs the surrounding decode_step span) shows
+        // whether the wedge is in the decoder or the sink.
+        let span = tracing::debug_span!(
+            target: "peel::sink",
+            "sink_write",
+            buf_len = buf.len(),
+            bytes_out = self.bytes_out,
+        );
+        let _enter = span.enter();
         let t = Instant::now();
         let result = self.sink.write(buf);
         self.write_time = self.write_time.saturating_add(t.elapsed());
@@ -849,6 +916,77 @@ mod tests {
             }
             other => panic!("expected ExtractorError::Sink, got {other:?}"),
         }
+    }
+
+    /// §2.3: a decoder that returns `MoreData` indefinitely without
+    /// reading source must still observe the kill switch within a
+    /// bounded number of iterations, so a SIGTERM during such a spin
+    /// is not a hang.
+    #[test]
+    fn kill_switch_aborts_cpu_bound_decoder_within_one_iteration() {
+        use crate::types::ByteOffset;
+
+        struct SpinningDecoder {
+            iterations: std::sync::atomic::AtomicU64,
+        }
+        impl StreamingDecoder for SpinningDecoder {
+            fn decode_step(&mut self, _sink: &mut dyn Write) -> Result<DecodeStatus, DecodeError> {
+                self.iterations.fetch_add(1, Ordering::Relaxed);
+                Ok(DecodeStatus::MoreData)
+            }
+            fn bytes_consumed(&self) -> ByteOffset {
+                ByteOffset::ZERO
+            }
+            fn frame_boundary(&self) -> Option<ByteOffset> {
+                None
+            }
+        }
+
+        let kill = Arc::new(AtomicBool::new(false));
+        // Pre-trip the kill switch so the very next loop iteration
+        // observes it. With the §2.3 poll, the test returns within
+        // one decode_step. Without the poll, the spinning decoder
+        // would loop forever and the test would time out below.
+        kill.store(true, Ordering::Release);
+
+        let mut decoder = SpinningDecoder {
+            iterations: std::sync::atomic::AtomicU64::new(0),
+        };
+        let sink = VecSink {
+            bytes: Vec::new(),
+            fail_at: None,
+            is_quiescent: true,
+        };
+        let extractor = Extractor::with_defaults().with_kill_switch(Arc::clone(&kill));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // stdout fd is fine — the NoopPuncher never touches it.
+            let result = extractor.extract(
+                std::io::stdout().as_fd(),
+                &mut decoder,
+                sink,
+                &NoopPuncher::new(),
+            );
+            let _ = tx.send((result, decoder.iterations.load(Ordering::Relaxed)));
+        });
+
+        let (result, iters) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("kill switch should abort the spin within 2s");
+        match result {
+            Err(ExtractorError::Observer(e)) => {
+                assert_eq!(e.to_string(), "peel:kill-switch-tripped");
+            }
+            other => panic!("expected Observer(KILL_SENTINEL), got {other:?}"),
+        }
+        // The pre-tripped switch lands on the first iteration, before
+        // any decode_step runs. Allow a tiny upper bound to avoid
+        // false positives if the loop layout changes.
+        assert!(
+            iters <= 1,
+            "expected ≤1 decode_step call before abort, got {iters}",
+        );
     }
 
     /// Garbage source bytes: the decoder rejects them and we surface

@@ -10,7 +10,14 @@
 //! checkpointed offset, and the decoded output continues
 //! byte-identically.
 //!
-//! # Wire layout (round one — `format_version = 1`)
+//! # Wire layouts
+//!
+//! Format version 1 (the original round-one layout) is still
+//! accepted for backward compatibility; new captures emit version 2,
+//! which appends an explicit captured-cursor field used by the
+//! `PLAN_responsiveness.md` §3.2 resume-seam assertion.
+//!
+//! ## V1 — `format_version = 1`
 //!
 //! ```text
 //!  4 B  magic = b"ZDR1"
@@ -50,6 +57,17 @@
 //!  73 B  serialized hasher state (see hash::xxh64::SERIALIZED_LEN)
 //! ```
 //!
+//! ## V2 — `format_version = 2`
+//!
+//! Identical to V1 except that the frame-header block grows an
+//! 8-byte `bytes_consumed_at_capture` field immediately after
+//! `frame_start_offset`. This is the source-byte cursor at the
+//! moment the blob was captured (= the value [`super::Decoder::bytes_consumed`]
+//! returned at the same step). [`resume`] asserts the caller's
+//! `start_offset` matches this value and rejects with
+//! [`crate::decode::DecodeError::ResumeMismatch`] otherwise. V1
+//! blobs do not carry the field and skip the assertion.
+//!
 //! Total size is bounded by `window_size + ~10 KiB`. At
 //! `windowLog = 27` (128 MiB cap, see `frame.rs::MAX_WINDOW_LOG`)
 //! that puts the worst-case blob at 128 MiB plus change; smaller
@@ -69,13 +87,24 @@ use super::sequences::{PrevSequenceTables, RepeatOffsets};
 use super::window::{SlidingWindow, MAX_WINDOW_SIZE};
 use super::{Decoder, FrameDecodeState, State};
 
-/// Magic prefix identifying a Phase-7 zstd resume blob.
+/// Magic prefix identifying a Phase-7 zstd resume blob. The codec
+/// identifier is stable across format-version bumps; only the
+/// version byte changes when the layout grows.
 pub const RESUME_MAGIC: [u8; 4] = *b"ZDR1";
 
-/// Current resume-blob format version. Bump on any layout change so
-/// stale blobs surface a clean rejection instead of silently
-/// corrupting decode.
+/// Round-one resume-blob layout. Still accepted for backward
+/// compatibility with checkpoints written before
+/// `PLAN_responsiveness.md` §3.2 landed.
 pub const RESUME_FORMAT_V1: u8 = 1;
+
+/// Round-two resume-blob layout. Adds an explicit
+/// `bytes_consumed_at_capture: u64` field immediately after
+/// `frame_start_offset` so [`resume`] can assert the caller's
+/// `start_offset` matches the cursor the blob was captured at and
+/// reject mismatches as
+/// [`crate::decode::DecodeError::ResumeMismatch`] before the codec
+/// reads garbage.
+pub const RESUME_FORMAT_V2: u8 = 2;
 
 /// All the fields the Phase-7 resume blob captures, in a flat struct
 /// the serializer/deserializer can crunch without poking through the
@@ -86,6 +115,12 @@ pub(super) struct ZstdResumeState {
     pub fcs: Option<u64>,
     pub decoded_in_frame: u64,
     pub frame_start_offset: u64,
+    /// Source-byte cursor at the moment the blob was captured (=
+    /// `Decoder::bytes_consumed` at the capture step). `None` for
+    /// V1 blobs, which did not carry this field; `Some(_)` for V2+.
+    /// [`resume`] uses this to assert the caller's `start_offset`
+    /// matches the cursor the blob was captured at.
+    pub bytes_consumed_at_capture: Option<u64>,
     pub window_total_written: u64,
     pub window_recent: Vec<u8>,
     pub repeats: [u32; 3],
@@ -105,11 +140,11 @@ pub(super) struct SerializedFseTable {
 
 impl ZstdResumeState {
     /// Encode the state into the wire format documented at the top
-    /// of this module.
+    /// of this module. Always emits V2; V1 is read-only legacy.
     pub(super) fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&RESUME_MAGIC);
-        out.push(RESUME_FORMAT_V1);
+        out.push(RESUME_FORMAT_V2);
 
         // Frame-header restoration block.
         out.extend_from_slice(&self.window_size.to_le_bytes());
@@ -118,6 +153,10 @@ impl ZstdResumeState {
         out.extend_from_slice(&self.fcs.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.decoded_in_frame.to_le_bytes());
         out.extend_from_slice(&self.frame_start_offset.to_le_bytes());
+        // V2: explicit captured-cursor field used by `resume()` to
+        // assert the seed offset is consistent. `unwrap_or(0)` is
+        // defensive — `capture()` always supplies a value.
+        out.extend_from_slice(&self.bytes_consumed_at_capture.unwrap_or(0).to_le_bytes());
 
         // Sliding window.
         out.extend_from_slice(&self.window_total_written.to_le_bytes());
@@ -154,6 +193,9 @@ impl ZstdResumeState {
     }
 
     /// Decode a wire-format blob produced by [`Self::serialize`].
+    /// Accepts both V1 (without an explicit captured-cursor field)
+    /// and V2 (with one); the caller distinguishes via
+    /// `bytes_consumed_at_capture.is_some()` if it cares.
     pub(super) fn deserialize(bytes: &[u8]) -> Result<Self, &'static str> {
         let mut r = ByteReader::new(bytes);
         let magic = r.read_array::<4>()?;
@@ -161,7 +203,7 @@ impl ZstdResumeState {
             return Err("zstd resume: bad magic");
         }
         let version = r.read_u8()?;
-        if version != RESUME_FORMAT_V1 {
+        if version != RESUME_FORMAT_V1 && version != RESUME_FORMAT_V2 {
             return Err("zstd resume: unknown format version");
         }
 
@@ -175,6 +217,11 @@ impl ZstdResumeState {
         let fcs = if has_fcs { Some(fcs_value) } else { None };
         let decoded_in_frame = r.read_u64()?;
         let frame_start_offset = r.read_u64()?;
+        let bytes_consumed_at_capture = if version >= RESUME_FORMAT_V2 {
+            Some(r.read_u64()?)
+        } else {
+            None
+        };
 
         let window_total_written = r.read_u64()?;
         let window_data_len = r.read_u32()? as usize;
@@ -215,6 +262,7 @@ impl ZstdResumeState {
             fcs,
             decoded_in_frame,
             frame_start_offset,
+            bytes_consumed_at_capture,
             window_total_written,
             window_recent,
             repeats,
@@ -318,6 +366,10 @@ pub(super) fn capture(decoder: &Decoder) -> Option<ZstdResumeState> {
         fcs: header.fcs,
         decoded_in_frame: *decoded_in_frame,
         frame_start_offset: frame_state.frame_start_offset,
+        // §3.2: snapshot the source cursor at capture time so
+        // `resume()` can detect a seam mismatch before the codec
+        // reads garbage from a wrong offset.
+        bytes_consumed_at_capture: Some(decoder.bytes_consumed),
         window_total_written: frame_state.window.total_written(),
         window_recent: frame_state.window.recent_in_order(),
         repeats: frame_state.repeats.slots(),
@@ -375,6 +427,22 @@ pub fn resume(
         return Err(DecodeError::Construct(std::io::Error::other(
             "zstd resume blob rejected: windowLog > 27",
         )));
+    }
+
+    // §3.2: explicit resume-seam check. V2 blobs carry the source
+    // cursor that was current at capture time; if the caller seeded
+    // a different `start_offset`, the very next block-header parse
+    // would read garbage and surface as a `block size too large`
+    // error from the block parser thousands of bytes later. Surface
+    // the misalignment as `ResumeMismatch` instead. V1 blobs have
+    // no captured cursor and skip the check.
+    if let Some(expected) = resume.bytes_consumed_at_capture {
+        if expected != start_offset {
+            return Err(DecodeError::ResumeMismatch {
+                expected,
+                actual: start_offset,
+            });
+        }
     }
 
     rebuild(src, resume, start_offset).map_err(|err| {
@@ -568,6 +636,7 @@ mod tests {
             fcs: Some(42),
             decoded_in_frame: 1000,
             frame_start_offset: 256,
+            bytes_consumed_at_capture: Some(384),
             window_total_written: 5000,
             window_recent: (0..1024).map(|i| (i & 0xFF) as u8).collect(),
             repeats: [1, 4, 8],
@@ -665,6 +734,50 @@ mod tests {
         state.window_size = 0;
         let blob = state.serialize();
         assert!(ZstdResumeState::deserialize(&blob).is_err());
+    }
+
+    #[test]
+    fn round_trip_preserves_captured_cursor() {
+        let mut state = small_state();
+        state.bytes_consumed_at_capture = Some(0xDEAD_BEEF);
+        let blob = state.serialize();
+        let back = ZstdResumeState::deserialize(&blob).expect("deserialize");
+        assert_eq!(back.bytes_consumed_at_capture, Some(0xDEAD_BEEF));
+    }
+
+    /// V1 blobs (no captured cursor) deserialize cleanly with
+    /// `bytes_consumed_at_capture = None` — preserves backward
+    /// compatibility for in-flight resumes from before §3.2 landed.
+    #[test]
+    fn deserialize_accepts_legacy_v1_blob() {
+        // Hand-emit a V1 blob: the V2 layout differs only by the
+        // 8-byte captured-cursor field after `frame_start_offset`.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&RESUME_MAGIC);
+        blob.push(RESUME_FORMAT_V1);
+        blob.extend_from_slice(&1024u64.to_le_bytes()); // window_size
+        blob.push(1); // has_checksum
+        blob.push(1); // has_fcs
+        blob.extend_from_slice(&42u64.to_le_bytes()); // fcs
+        blob.extend_from_slice(&1000u64.to_le_bytes()); // decoded_in_frame
+        blob.extend_from_slice(&256u64.to_le_bytes()); // frame_start_offset
+                                                       // V1 STOPS HERE — no captured-cursor field.
+        blob.extend_from_slice(&5000u64.to_le_bytes()); // window_total_written
+        blob.extend_from_slice(&0u32.to_le_bytes()); // window_data_len = 0
+        for _ in 0..3 {
+            blob.extend_from_slice(&0u32.to_le_bytes()); // repeats
+        }
+        blob.push(0); // has_prev_huffman = false
+        // Three FSE tables (LL, OF, ML), each absent.
+        blob.extend(std::iter::repeat_n(0u8, 3));
+        blob.extend_from_slice(&Xxh64::new().serialize());
+
+        let back = ZstdResumeState::deserialize(&blob).expect("V1 should still decode");
+        assert!(
+            back.bytes_consumed_at_capture.is_none(),
+            "V1 blob must surface `None` for captured-cursor",
+        );
+        assert_eq!(back.decoded_in_frame, 1000);
     }
 
     #[test]

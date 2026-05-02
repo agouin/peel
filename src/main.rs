@@ -89,6 +89,20 @@ const SIGTERM_GRACEFUL_MSG: &[u8] =
       (send another signal for forceful shutdown)\n";
 /// Second-signal notice. Printed immediately before `_exit`.
 const FORCEFUL_MSG: &[u8] = b"\r\x1b[K[abort] second signal received, forcing immediate exit\n";
+/// Watchdog-fired notice. Printed immediately before the watchdog
+/// thread `_exit`s once `GRACEFUL_DEADLINE` elapses without `run`
+/// returning.
+const WATCHDOG_MSG: &[u8] = b"\r\x1b[K[abort] graceful deadline elapsed, forcing immediate exit\n";
+
+/// Hard upper bound on the wait between the first shutdown signal and
+/// the process exiting. Belt-and-suspenders for any kill-switch poll
+/// site we missed: even if the run is fully stuck and never observes
+/// the flag, the watchdog `_exit`s at the deadline. 30 s is well under
+/// the typical Kubernetes `terminationGracePeriodSeconds` (60–120 s),
+/// so a checkpoint-during-graceful path that *is* making progress
+/// still has time to land. Override via
+/// `PEEL_GRACEFUL_DEADLINE_SECS` (positive integer).
+const DEFAULT_GRACEFUL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Pointer to the kill-switch [`AtomicBool`] handed to
 /// [`peel::coordinator::run`] via [`peel::coordinator::RunArgs::kill_switch`].
@@ -194,6 +208,75 @@ fn signal_name(sig: i32) -> &'static str {
     }
 }
 
+/// Read `PEEL_GRACEFUL_DEADLINE_SECS` (positive integer) and fall back
+/// to [`DEFAULT_GRACEFUL_DEADLINE`] otherwise.
+fn graceful_deadline_from_env() -> Duration {
+    std::env::var("PEEL_GRACEFUL_DEADLINE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_GRACEFUL_DEADLINE)
+}
+
+/// Spawn the graceful-deadline watchdog (`PLAN_responsiveness.md`
+/// §2.4).
+///
+/// The thread polls [`SIGNAL_COUNT`] every 100 ms while the run is
+/// healthy. Once a shutdown signal lands, it sleeps `deadline` and —
+/// if `cleanup_done` is still `false` — emits an `[abort]` line and
+/// `_exit`s the process. `main` flips `cleanup_done` immediately
+/// before returning so a clean exit before the deadline cancels the
+/// watchdog. The thread is detached: there is no join path.
+///
+/// This guards against any kill-switch poll site we missed (or that
+/// hangs in non-cooperative work like a CPU-bound third-party
+/// codec). Pods that take >30 s to terminate are themselves a
+/// production problem in Kubernetes, so capping the graceful path is
+/// healthy.
+fn install_graceful_watchdog(deadline: Duration, cleanup_done: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new()
+        .name("peel-graceful-watchdog".into())
+        .spawn(move || {
+            // Phase 1: idle until either cleanup signals "we're done"
+            // (no signal arrived; the run finished cleanly) or a
+            // shutdown signal lands.
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if cleanup_done.load(Ordering::Acquire) {
+                    return;
+                }
+                if SIGNAL_COUNT.load(Ordering::Acquire) > 0 {
+                    break;
+                }
+            }
+            // Phase 2: graceful deadline. The signal handler has
+            // already flipped the kill switch and printed the
+            // "initiating graceful shutdown" notice; we wait the
+            // configured deadline for the run to wind down.
+            let started = std::time::Instant::now();
+            while started.elapsed() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+                if cleanup_done.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+            // Phase 3: deadline elapsed. The run is genuinely stuck.
+            let sig = FIRST_SIGNAL.load(Ordering::Acquire);
+            // Best-effort notice, then unconditional exit. Same
+            // async-signal-safe shape as the in-handler `_exit` path
+            // (we are not inside a signal handler here, but reusing
+            // the same primitives keeps the abort line consistent).
+            // SAFETY: `write(2)` with a `'static` byte slice is
+            // safe; we discard the return value.
+            unsafe { write(STDERR_FD, WATCHDOG_MSG.as_ptr(), WATCHDOG_MSG.len()) };
+            // SAFETY: `_exit(2)` is unconditional — the watchdog has
+            // exhausted the operator's patience for a clean shutdown.
+            unsafe { _exit(128 + sig) };
+        })
+        .expect("spawn graceful watchdog");
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -213,6 +296,14 @@ fn main() -> Result<()> {
     // kubelet's escalation to SIGKILL after the grace period elapses.
     let kill_switch = Arc::new(AtomicBool::new(false));
     install_signal_handlers(&kill_switch).context("installing signal handlers")?;
+
+    // §2.4: arm the graceful watchdog. The thread is detached and
+    // cancels itself when `cleanup_done` flips to `true` (set right
+    // before `main` returns); if the deadline elapses first, it
+    // `_exit`s with the conventional `128 + signum` code so an
+    // unresponsive graceful path can't hold the pod hostage.
+    let cleanup_done = Arc::new(AtomicBool::new(false));
+    install_graceful_watchdog(graceful_deadline_from_env(), Arc::clone(&cleanup_done));
 
     // Capture the http_version label before consuming `cli`. Both
     // banners (http_version and io_backend) are printed below as plain
@@ -272,6 +363,12 @@ fn main() -> Result<()> {
     // or errored, so we can join it before exiting `main`.
     state.mark_done();
     let _ = render_handle.join();
+
+    // §2.4: stand down the graceful watchdog now that the run is fully
+    // wrapped up — including the renderer thread join. If a SIGTERM
+    // arrives between this store and process exit it has nothing left
+    // to interrupt; the watchdog is no longer needed.
+    cleanup_done.store(true, Ordering::Release);
 
     let stats = match result {
         Ok(stats) => stats,

@@ -44,6 +44,101 @@
 //! resumes. The output (the extracted directory or the raw output file)
 //! is never deleted on failure — partial extraction state is the user's
 //! to inspect.
+//!
+//! # Integrity invariants
+//!
+//! These are the durable facts every other module in the pipeline
+//! relies on. They are stated here, in one place, because no single
+//! file enforces all of them and the `PLAN_responsiveness.md` §3
+//! audit was made harder by their being scattered across comments.
+//!
+//! ### What "chunk N is in the bitmap" means
+//!
+//! When [`ChunkBitmap::is_complete`] returns `true` for chunk `N`,
+//! every byte covered by `[N * chunk_size, min((N+1) * chunk_size,
+//! total_size))` is durable on disk *as of the most recent
+//! [`SparseFile::sync_all`]*, and matches the CRC-32C recorded at
+//! [`ChunkFingerprints::get(N)`] (when fingerprints are enabled).
+//!
+//! The happens-before edge is: a worker's
+//! [`SparseFile::pwrite_at`] returns successfully → the scheduler
+//! records [`ChunkFingerprints::record(N, crc)`] → the scheduler
+//! calls [`ChunkBitmap::complete_range`] (this ordering is enforced
+//! at [`crate::download::scheduler`]). Readers do the inverse: they
+//! `Acquire`-load the bitmap bit, and only after observing it set
+//! do they trust the matching fingerprint. The §11 source-drift
+//! probe and the §3.1 cursor audit (see [`run_cursor_chunk_audit`])
+//! both depend on this ordering.
+//!
+//! Bytes are *not* durable across a SIGKILL until either
+//! [`SparseFile::sync_all`] runs (the checkpoint observer calls it
+//! before persisting the `.peel.ckpt`) or the OS flushes the page
+//! cache asynchronously. The bitmap-in-memory may therefore claim a
+//! chunk complete that, after a crash, the kernel never wrote to
+//! disk. The next run's resume loads only the **persisted**
+//! checkpoint's bitmap, which is `sync_all`-clean by construction;
+//! any chunk that was complete in memory but missed the
+//! `sync_all` reverts to "not complete" on resume and is re-fetched
+//! cleanly. The `.peel.part` file's bytes for those chunks are
+//! either the genuine bytes (if they raced past the cache before
+//! the crash) or zero (if not) — and the fresh fetch overwrites
+//! either case.
+//!
+//! ### What `decoder_position` guarantees
+//!
+//! The [`Checkpoint::decoder_position`] is the source-byte offset
+//! the streaming decoder will read first on resume. Two things
+//! must be true at that offset:
+//!
+//! - Chunk `decoder_position / chunk_size` is in the resumed
+//!   bitmap with bytes matching its fingerprint (the §3.1 cursor
+//!   audit re-CRCs to confirm before letting the decoder run).
+//! - Either (a) the decoder is mid-frame and the saved
+//!   [`Checkpoint::decoder_state`] blob captures every piece of
+//!   in-frame state needed to continue, with
+//!   `bytes_consumed_at_capture == decoder_position` (V2 zstd blobs
+//!   assert this; the typed
+//!   [`crate::decode::DecodeError::ResumeMismatch`] is what fires
+//!   if it doesn't hold); or (b) the decoder is at a frame
+//!   boundary and `decoder_state` is `None`, in which case a
+//!   freshly-constructed decoder reading from `decoder_position`
+//!   onward produces byte-identical output.
+//!
+//! ### What `max_disk_buffer` measures
+//!
+//! `bytes_downloaded - bytes_decoded_input` is the on-disk
+//! footprint of bytes downloaded but not yet read by the decoder
+//! (= the lookahead). The scheduler's disk-buffer throttle stops
+//! dispatching when this gap reaches `max_disk_buffer`, so under
+//! steady state the gap oscillates around the cap. Two
+//! transients break that intuition:
+//!
+//! - On resume, [`run`] pre-credits `bytes_downloaded` with the
+//!   bytes for already-complete chunks (so the renderer doesn't
+//!   snap from 0%) but `bytes_decoded_input` starts at the
+//!   resumed `decoder_position`. The lookahead therefore reads
+//!   `(resumed_dl_bytes − decoder_position)` immediately at
+//!   startup, which can briefly exceed the cap until the decoder
+//!   draws it down. This is benign and handled by the throttle's
+//!   "stop dispatching" rule (= already at cap, nothing further
+//!   to do).
+//! - When the decoder hits source bytes it can't make progress on
+//!   (the §3 corruption hypothesis), `bytes_decoded_input`
+//!   freezes while `bytes_downloaded` continues until the cap is
+//!   hit; the pipeline then deadlocks. The §1.2 stall heartbeat
+//!   surfaces this within `STALL_WARN_INTERVAL`.
+//!
+//! ### Behavior under SIGKILL
+//!
+//! After a `kill -9`, the most recently-persisted `.peel.ckpt`
+//! and `.peel.part` are durable. The next invocation re-loads
+//! the checkpoint, runs the §11 server-side drift probe and the
+//! §3.1 cursor-chunk local audit, and proceeds from
+//! `decoder_position`. There is no "garbage collection" of the
+//! sparse file: bytes for chunks that *were* written before the
+//! kill but never persisted into the bitmap stay on disk and are
+//! either overwritten by the resumed download (if the resumed
+//! bitmap doesn't have them) or harmlessly ignored.
 
 #![cfg(unix)]
 
@@ -76,6 +171,14 @@ use crate::punch::{default_puncher, NoopPuncher, PunchHole};
 use crate::sink::{RawSink, Sink, SinkError, TarSink, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
 use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
+
+/// Sentinel `io::Error` message used to thread kill-switch trips
+/// through a layer (decoder, extractor observer, ZIP pipeline) that
+/// only speaks `io::Error`. The outer `run_one` / `run_zip` matchers
+/// recognize this string and translate it into a typed
+/// [`CoordinatorError::Aborted`]; everything else surfaces as an
+/// extractor / pipeline failure.
+const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
 
 /// What kind of output the coordinator should produce.
 #[derive(Debug, Clone)]
@@ -499,6 +602,35 @@ pub enum CoordinatorError {
         actual: u32,
     },
 
+    /// The on-disk bytes for the chunk holding the resume cursor
+    /// don't match the CRC-32C the prior run recorded for that
+    /// chunk. Distinct from
+    /// [`Self::SourceChangedSinceCheckpoint`]: the upstream source
+    /// is fine, but the bytes in the local `.peel.part` were either
+    /// damaged at rest or were never the bytes the bitmap claimed.
+    /// The decoder was about to read garbage from this region, so
+    /// refusing to start beats producing a malformed-block error
+    /// thousands of bytes later.
+    ///
+    /// Surfaced by the `PLAN_responsiveness.md` §3.1 local re-CRC
+    /// audit: on resume, the chunk containing `decoder_position` is
+    /// re-checksummed against the stored fingerprint. The user must
+    /// either repair the part file or delete both sidecars and
+    /// restart fresh.
+    #[error(
+        "part file corrupted at the resume cursor: chunk {chunk} on-disk CRC32C \
+         (expected {expected:#010x}, observed {actual:#010x}). \
+         Delete .peel.part / .peel.ckpt and re-run."
+    )]
+    PartFileCorrupted {
+        /// Chunk that holds `decoder_position`.
+        chunk: ChunkIndex,
+        /// CRC-32C the prior run recorded into the checkpoint.
+        expected: u32,
+        /// CRC-32C re-computed from the on-disk bytes.
+        actual: u32,
+    },
+
     /// The configured chunk count overflowed `u32`.
     #[error("source too large for the configured chunk size: {chunks} chunks")]
     TooManyChunks {
@@ -712,6 +844,28 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         )?;
     }
 
+    // §3.1 (PLAN_responsiveness.md): local re-CRC audit of the chunk
+    // holding the resume cursor. Distinct from the §11 server-side
+    // probe above: this catches *on-disk* corruption (bit flips at
+    // rest, a stray write that landed in the part file, an io_uring
+    // reorder hazard) that the server probe would silently miss.
+    // The chunk containing `decoder_position` is the one the decoder
+    // is about to read, so it's the one whose corruption would
+    // manifest as the malformed-block error documented in the plan.
+    if let ResumePlan::Resume {
+        decoder_position, ..
+    } = &resume_plan
+    {
+        run_cursor_chunk_audit(
+            &sparse,
+            &bitmap,
+            &fingerprints,
+            config.chunk_size,
+            info.total_size,
+            *decoder_position,
+        )?;
+    }
+
     let cursor = Arc::new(AtomicU64::new(match &resume_plan {
         ResumePlan::Fresh => 0,
         ResumePlan::Resume {
@@ -866,6 +1020,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 &bitmap,
                 &download_done,
                 &download_outcome,
+                kill_switch.as_ref(),
             )?;
 
             // Look up the resolved factory's name to decide which
@@ -935,6 +1090,12 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     Some(state) => reader.with_progress(state),
                     None => reader,
                 };
+                // §2.1: thread the run-wide kill switch into the reader
+                // so a tripped flag short-circuits the source-read poll.
+                let reader = match kill_switch.clone() {
+                    Some(flag) => reader.with_kill_switch(flag),
+                    None => reader,
+                };
 
                 // Interpose a HashingReader between the source and
                 // the decoder when integrity tracking is on.
@@ -982,8 +1143,15 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     let base = Extractor::new(ExtractorConfig {
                         punch_threshold: config.punch_threshold,
                     });
-                    match progress_state.clone() {
+                    let base = match progress_state.clone() {
                         Some(state) => base.with_progress(state),
+                        None => base,
+                    };
+                    // §2.3: attach the kill switch so the extractor
+                    // polls it once per decode_step iteration even when
+                    // the decoder isn't reading source.
+                    match kill_switch.clone() {
+                        Some(flag) => base.with_kill_switch(flag),
                         None => base,
                     }
                 };
@@ -1367,11 +1535,6 @@ fn run_one<S: Sink>(
     let mut last_position: u64 = 0;
     let mut progress_inner = progress;
     let mut checkpoints_written: u64 = 0;
-    // Sentinel io::Error message used when the kill switch fires; the
-    // caller pattern-matches on this to surface a typed
-    // `CoordinatorError::Aborted` rather than a generic Extractor
-    // failure.
-    const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
 
     let result = extractor.extract_with_callback(
         sparse.as_fd(),
@@ -1453,6 +1616,18 @@ fn run_one<S: Sink>(
     match result {
         Ok(stats) => Ok(stats),
         Err(ExtractorError::Observer(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        // §2.1: a kill-switch trip inside `BlockingSparseReader::read`
+        // (or anywhere else inside the decoder's source-read path)
+        // surfaces as `DecodeError::Read` carrying our sentinel. Match
+        // it so the operator gets `Aborted` instead of an apparent
+        // decode failure.
+        Err(ExtractorError::Decode(DecodeError::Read { source, .. }))
+            if source.to_string() == KILL_SENTINEL =>
+        {
             Err(CoordinatorError::Aborted {
                 checkpoints_written,
             })
@@ -1557,7 +1732,6 @@ fn run_zip(
     let mut entries_completed: Vec<u32> = resume.entries_completed.clone();
     let mut entries_extracted_this_run: u64 = 0;
     let mut checkpoints_written: u64 = 0;
-    const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
 
     let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
         // Kill-switch fires before any state mutation so the
@@ -1826,6 +2000,90 @@ fn run_resume_probe(
     }
 }
 
+/// `PLAN_responsiveness.md` §3.1: re-CRC the on-disk bytes for the
+/// chunk that contains `decoder_position` and compare against the
+/// fingerprint persisted in the prior checkpoint.
+///
+/// This is the local twin of [`run_resume_probe`]: the latter
+/// re-fetches a random already-complete chunk from the server to
+/// catch upstream drift; this one reads back the bytes peel itself
+/// most recently wrote, to catch corruption in the part file. The
+/// cursor chunk is the most likely suspect — it's the one the
+/// decoder is about to read — so we always inspect it on resume.
+///
+/// Behaviour:
+/// - No fingerprints recorded (resume from a pre-§11 checkpoint) ⇒
+///   no-op.
+/// - Cursor past EOF (degenerate; should not happen but the
+///   resume path tolerates it) ⇒ no-op.
+/// - Cursor chunk not marked complete in the bitmap ⇒ no-op: the
+///   download path itself will block until the chunk lands, and the
+///   reader's normal logic surfaces a clearer error if it never does.
+/// - Cursor chunk fingerprint is `0` (unset) ⇒ no-op (an unset
+///   fingerprint is indistinguishable from a genuine zero CRC, but
+///   bitmap chunks are non-empty so the latter cannot arise in
+///   practice — a `0` here means "not recorded yet").
+/// - Otherwise: re-checksum the on-disk bytes; mismatch ⇒
+///   [`CoordinatorError::PartFileCorrupted`].
+fn run_cursor_chunk_audit(
+    sparse: &SparseFile,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    chunk_size: u64,
+    total_size: u64,
+    decoder_position: u64,
+) -> Result<(), CoordinatorError> {
+    if chunk_size == 0 || total_size == 0 || fingerprints.is_empty() {
+        return Ok(());
+    }
+    if decoder_position >= total_size {
+        return Ok(());
+    }
+    let cursor_chunk_idx = decoder_position / chunk_size;
+    let total_chunks = u64::from(bitmap.len());
+    if cursor_chunk_idx >= total_chunks {
+        return Ok(());
+    }
+    // INVARIANT: cursor_chunk_idx < total_chunks (≤ u32::MAX), so
+    // the cast is lossless.
+    let chunk = ChunkIndex::new(cursor_chunk_idx as u32);
+    if !bitmap.is_complete(chunk) {
+        // The reader will block on this chunk normally; no value in
+        // a separate error here.
+        return Ok(());
+    }
+    let expected = fingerprints.get(chunk);
+    if expected == 0 {
+        // Fingerprint not recorded — pre-§11 resume, or a slot the
+        // worker never wrote. Nothing to compare against.
+        return Ok(());
+    }
+
+    let start_byte = cursor_chunk_idx.saturating_mul(chunk_size);
+    let end_byte = start_byte.saturating_add(chunk_size).min(total_size);
+    let len = end_byte.saturating_sub(start_byte);
+    // INVARIANT: len ≤ chunk_size which fits in usize on every
+    // 64-bit target peel runs on. Defensive cast guards 32-bit
+    // hosts (where chunk_size could in principle exceed usize).
+    let len_usize = match usize::try_from(len) {
+        Ok(n) => n,
+        Err(_) => return Ok(()),
+    };
+    let mut buf = vec![0u8; len_usize];
+    sparse
+        .read_exact_at(ByteOffset::new(start_byte), &mut buf)
+        .map_err(CoordinatorError::SparseFile)?;
+    let actual = crate::hash::crc32c::castagnoli(&buf);
+    if actual != expected {
+        return Err(CoordinatorError::PartFileCorrupted {
+            chunk,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 /// Combined SharedHasher + initial skip count returned by
 /// [`build_integrity_hasher`] when integrity tracking is enabled.
 struct IntegrityHasherSetup {
@@ -2087,6 +2345,12 @@ pub struct BlockingSparseReader {
     /// `bytes_decoded_input`, so the scheduler's disk-buffer throttle
     /// (and the renderer's lookahead indicator) can read it.
     progress_state: Option<Arc<ProgressState>>,
+    /// Optional kill-switch the read loop polls between sleeps. When
+    /// set, a tripped flag surfaces as
+    /// `io::Error::other(KILL_SENTINEL)` so the outer `run_one`
+    /// matcher maps it to [`CoordinatorError::Aborted`]
+    /// (`PLAN_responsiveness.md` §2.1).
+    kill_switch: Option<Arc<AtomicBool>>,
 }
 
 impl BlockingSparseReader {
@@ -2115,6 +2379,7 @@ impl BlockingSparseReader {
             download_outcome,
             poll_interval,
             progress_state: None,
+            kill_switch: None,
         }
     }
 
@@ -2130,10 +2395,46 @@ impl BlockingSparseReader {
         self.progress_state = Some(state);
         self
     }
+
+    /// Hook the reader up to the run-wide kill switch. When the flag
+    /// flips, the next iteration of the read poll loop returns the
+    /// kill sentinel `io::Error` so the outer `run_one` matcher
+    /// surfaces a typed [`CoordinatorError::Aborted`]
+    /// (`PLAN_responsiveness.md` §2.1).
+    #[must_use]
+    fn with_kill_switch(mut self, kill: Arc<AtomicBool>) -> Self {
+        self.kill_switch = Some(kill);
+        self
+    }
 }
 
 impl Read for BlockingSparseReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // §1.3: enter a debug-level span around the source-read poll
+        // loop so a stuck decoder shows up in the per-component
+        // breakdown when the operator runs with `RUST_LOG=peel=debug`.
+        // The span itself is filtered at default INFO and costs an
+        // atomic-load + branch per `read`.
+        let initial_pos = self.cursor.load(Ordering::Acquire);
+        let span = tracing::debug_span!(
+            target: "peel::reader",
+            "blocking_sparse_read",
+            cursor = initial_pos,
+            buf_len = buf.len(),
+        );
+        let _enter = span.enter();
+        // §2.1: poll the kill switch immediately on entry — the most
+        // common stall site for the snapshot-restore bug was a decoder
+        // that called into this read repeatedly without the surrounding
+        // checkpoint observer ever firing, so SIGTERM had nowhere else
+        // to land. Returning the kill sentinel here propagates as
+        // `DecodeError::Read` and the outer `run_one` matcher maps it
+        // to `CoordinatorError::Aborted`.
+        if let Some(flag) = self.kill_switch.as_ref() {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
         loop {
             let pos = self.cursor.load(Ordering::Acquire);
             if pos >= self.total_size {
@@ -2161,6 +2462,15 @@ impl Read for BlockingSparseReader {
                              complete"
                         ),
                     ));
+                }
+                // §2.1: a decoder waiting for the next chunk to arrive
+                // can sit here indefinitely on a slow network. Polling
+                // before sleeping bounds the kill-switch latency to one
+                // `poll_interval` (default 5 ms).
+                if let Some(flag) = self.kill_switch.as_ref() {
+                    if flag.load(Ordering::Acquire) {
+                        return Err(io::Error::other(KILL_SENTINEL));
+                    }
                 }
                 thread::sleep(self.poll_interval);
                 continue;
@@ -2224,6 +2534,7 @@ fn select_decoder_factory(
     bitmap: &ChunkBitmap,
     download_done: &Arc<AtomicBool>,
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    kill_switch: Option<&Arc<AtomicBool>>,
 ) -> Result<DecoderFactory, CoordinatorError> {
     if let Some(name) = config.forced_format.as_deref() {
         return registry.factory_for_format_name(name).ok_or_else(|| {
@@ -2261,6 +2572,7 @@ fn select_decoder_factory(
             download_done,
             download_outcome,
             config.reader_poll_interval,
+            kill_switch,
         )?
     };
     let magic_factory = registry.factory_for_prefix(&prefix);
@@ -2318,11 +2630,16 @@ fn sniff_prefix(
     download_done: &Arc<AtomicBool>,
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     poll_interval: Duration,
+    kill_switch: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<u8>, CoordinatorError> {
     if max_window == 0 || total_size == 0 || chunk_size == 0 {
         return Ok(Vec::new());
     }
     let want = (max_window as u64).min(total_size);
+    // §1.3: span around the sniff-prefix poll so a slow first chunk is
+    // visible in the per-component breakdown.
+    let span = tracing::debug_span!(target: "peel::sniff", "sniff_prefix", want);
+    let _enter = span.enter();
     // Number of chunks required to cover offset 0..want. For typical
     // configs this is exactly 1 (chunk_size ≫ max_window).
     // INVARIANT: chunk_size > 0 (checked above) so div_ceil is sound.
@@ -2330,6 +2647,18 @@ fn sniff_prefix(
     for i in 0..chunks_needed {
         let idx = ChunkIndex::new(i);
         loop {
+            // §2.2: a SIGTERM during sniff (slow connect / TLS / DNS)
+            // would otherwise hang until the chunk arrives. Surface
+            // the kill switch as a typed `Aborted` with zero
+            // checkpoints written, since nothing has been persisted
+            // at this point in the run.
+            if let Some(flag) = kill_switch {
+                if flag.load(Ordering::Acquire) {
+                    return Err(CoordinatorError::Aborted {
+                        checkpoints_written: 0,
+                    });
+                }
+            }
             if bitmap.is_complete(idx) {
                 break;
             }
@@ -2710,6 +3039,55 @@ mod tests {
         let mut buf = [0u8; 32];
         let err = reader.read(&mut buf).expect_err("must error");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// §2.1: a [`BlockingSparseReader`] waiting for the next chunk to
+    /// arrive must observe the kill switch within one `poll_interval`
+    /// — otherwise SIGTERM hangs the pod through the full grace period.
+    #[test]
+    fn blocking_reader_returns_kill_sentinel_when_switch_trips() {
+        let path = unique_temp("kill-poll");
+        let _g = TmpFile(path.clone());
+        // 32-byte file split into two 16-byte chunks. Chunk 0 is not
+        // marked complete, so the reader will spin in the poll loop.
+        let sparse = Arc::new(SparseFile::open_or_create(&path, 32).expect("sparse"));
+        let bitmap = Arc::new(ChunkBitmap::new(2));
+        let download_done = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let kill = Arc::new(AtomicBool::new(false));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            16,
+            32,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(5),
+        )
+        .with_kill_switch(Arc::clone(&kill));
+
+        // Spawn the read on a worker so the main thread can flip the
+        // kill switch after the reader has started polling. A 1 s
+        // sleep gives the reader several poll iterations before the
+        // switch flips, so we exercise the in-loop poll site (not just
+        // the entry-point check).
+        let kill_for_worker = Arc::clone(&kill);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = kill_for_worker; // captured by reader.kill_switch
+            let mut buf = [0u8; 32];
+            let result = reader.read(&mut buf);
+            let _ = tx.send(result);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        kill.store(true, Ordering::Release);
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("kill switch should abort the read within 2s");
+        let err = result.expect_err("must surface kill sentinel");
+        assert_eq!(err.to_string(), "peel:kill-switch-tripped");
+        handle.join().expect("worker join");
     }
 
     struct TmpFile(PathBuf);
