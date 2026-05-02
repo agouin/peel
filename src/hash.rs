@@ -23,6 +23,7 @@
 
 pub mod crc32c;
 pub mod sha256;
+pub mod xxh64;
 
 use std::io::Read;
 use std::sync::{Arc, Mutex};

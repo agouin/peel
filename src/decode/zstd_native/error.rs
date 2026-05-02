@@ -85,6 +85,32 @@ pub enum ZstdError {
     /// Phase 5 once sequence execution lands.
     #[error("zstd: compressed block decoding not yet implemented")]
     CompressedBlockUnimplemented,
+
+    /// The frame's trailing 4-byte content checksum did not match
+    /// the low 32 bits of the XXH64 we computed over the
+    /// decompressed output (RFC 8478 §3.1.1.1.1, `Content_Checksum_Flag`).
+    /// Indicates either source corruption or a decoder bug — either
+    /// way the output is not safe to consume.
+    #[error("zstd: content-checksum mismatch (expected 0x{expected:08X}, got 0x{got:08X})")]
+    ChecksumMismatch {
+        /// Low 32 bits of the trailer the producer wrote.
+        expected: u32,
+        /// Low 32 bits of the XXH64 we computed.
+        got: u32,
+    },
+
+    /// The frame declared a `Frame_Content_Size` in its header but
+    /// the actual byte count we decoded didn't match it
+    /// (RFC 8478 §3.1.1.1.4). Distinct from `ChecksumMismatch`
+    /// because it surfaces even on frames without a checksum, and
+    /// can be diagnosed independently of the XXH64 verifier.
+    #[error("zstd: Frame_Content_Size mismatch (declared {declared}, decoded {actual})")]
+    FrameContentSizeMismatch {
+        /// Bytes the header promised would emerge from the frame.
+        declared: u64,
+        /// Bytes our sequence executor actually wrote.
+        actual: u64,
+    },
 }
 
 impl ZstdError {
