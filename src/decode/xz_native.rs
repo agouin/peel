@@ -24,6 +24,17 @@
 //!   at `src/decode/xz.rs`. Per-LZMA2-chunk granularity arrives in
 //!   Phases 6–7.
 //!
+//! # What Phase 2 added
+//!
+//! - [`range_coder::RangeDecoder`]: slice-based LZMA range-coder
+//!   reader (the foundation for Phases 3 and 4). Exposes
+//!   `decode_bit`, `decode_direct_bits`, and the
+//!   [`range_coder::bit_tree_decode`] /
+//!   [`range_coder::bit_tree_reverse_decode`] glue used by the
+//!   LZMA literal/length/distance code in Phase 3. Not yet wired
+//!   into the [`Decoder`] state machine — that happens in Phase 4
+//!   when LZMA chunks become first-class.
+//!
 //! # What's deferred
 //!
 //! - LZMA chunks (control bytes `0x80..=0xFF`) surface
@@ -58,6 +69,7 @@ use crate::types::ByteOffset;
 
 pub mod block;
 pub mod error;
+pub mod range_coder;
 pub mod stream;
 
 use self::block::{parse_block_header, parse_lzma2_chunk_header, BlockHeader, Lzma2ChunkHeader};

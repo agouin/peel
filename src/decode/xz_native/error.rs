@@ -201,6 +201,22 @@ pub enum XzError {
     /// `docs/PLAN_xz_block_decoder.md` §Scope.
     #[error("xz: Stream Padding between concatenated streams is not supported")]
     StreamPaddingUnsupported,
+
+    /// LZMA range decoder's leading marker byte was non-zero. The
+    /// LZMA spec mandates a `0x00` byte at the head of every
+    /// range-coded payload as an early corruption check; surfaces
+    /// here when an LZMA2 chunk's compressed payload doesn't start
+    /// with one.
+    #[error("xz: LZMA range coder init marker byte was 0x{0:02X} (expected 0x00)")]
+    RangeCoderInitMarker(u8),
+
+    /// LZMA range decoder asked for more compressed bytes than the
+    /// LZMA2 chunk's buffered payload contains. Either the chunk's
+    /// declared `Compressed_Size` was wrong or the LZMA stream
+    /// itself is truncated. The label names which range-coder
+    /// state surfaced the underflow (e.g. `"normalize"`).
+    #[error("xz: LZMA range coder ran past end of compressed payload at {0}")]
+    RangeCoderUnderflow(&'static str),
 }
 
 impl XzError {
