@@ -152,11 +152,15 @@ const SINK_TAG_ZIP: u8 = 2;
 
 /// Maximum length of the v5 [`Checkpoint::decoder_state`] blob.
 ///
-/// The lz4 resume blob is on the order of 50 bytes; 4 KiB leaves
-/// generous headroom for any future format that wants to ride this
-/// hook while still bounding the allocation a hostile checkpoint can
-/// trigger before [`Checkpoint::deserialize`] checks the body checksum.
-pub const MAX_DECODER_STATE_LEN: u32 = 4 * 1024;
+/// Sized to accommodate the hand-rolled zstd decoder's resume blob
+/// (`docs/PLAN_zstd_block_decoder.md` Phase 7), which carries a
+/// sliding-window snapshot of up to `MAX_WINDOW_SIZE` (128 MiB at
+/// `windowLog = 27`) plus ~10 KiB of metadata. The lz4 blob is on
+/// the order of 50 bytes; the upper bound is a zstd-only concern.
+/// [`MAX_BODY_LEN`] (1 GiB) still bounds the worst-case allocation
+/// a hostile checkpoint can trigger before
+/// [`Checkpoint::deserialize`] checks the body checksum.
+pub const MAX_DECODER_STATE_LEN: u32 = (1 << 27) + 32 * 1024;
 
 /// Errors produced by [`Checkpoint::read`] / [`Checkpoint::write`] and
 /// the in-memory [`Checkpoint::deserialize`] / [`Checkpoint::serialize`]

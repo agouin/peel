@@ -206,6 +206,171 @@ fn encode_zstd_frames(payloads: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Encode `payload` as a *single* zstd frame at the given level. This
+/// matches what the default `zstd` CLI emits — one frame for the whole
+/// input, regardless of size. Phase 10's harness needs this shape
+/// because the production failure that motivated the hand-rolled
+/// decoder (3.7 TiB single-frame `tar.zst` with no checkpoints) was
+/// specifically the single-frame case.
+fn encode_zstd_single_frame(payload: &[u8], level: i32) -> Vec<u8> {
+    zstd::encode_all(payload, level).expect("encode single-frame zstd")
+}
+
+/// LCG-generated pseudo-random bytes. The single-frame `.tar.zst`
+/// harness needs payloads with enough entropy that zstd emits multiple
+/// compressed blocks per frame (rather than collapsing to a single
+/// huge RLE block), so the harness has many in-frame block boundaries
+/// to abort between.
+fn random_payload(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Build a single-frame `.tar.zst` whose tar members are sized
+/// awkwardly (a prime byte count) so member boundaries do not align
+/// with zstd block boundaries — the Phase 10 worst-case shape that
+/// pre-hand-rolled-decoder peel could not checkpoint inside.
+fn build_misaligned_tar_zst_body(
+    member_count: usize,
+    payload_per_member: usize,
+    zstd_level: i32,
+    seed: u64,
+) -> Vec<u8> {
+    let mut tar_body: Vec<u8> = Vec::new();
+    for i in 0..member_count {
+        let name = format!("dir/zst_member_{i:03}.bin");
+        let payload = random_payload(
+            seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            payload_per_member,
+        );
+        tar_body.extend_from_slice(&member_archive_bytes(&name, &payload));
+    }
+    tar_body.extend_from_slice(&end_of_archive_block());
+    encode_zstd_single_frame(&tar_body, zstd_level)
+}
+
+/// Run a golden-then-trials pass against `body`, asserting every
+/// abort-and-resume produces directory output byte-identical to the
+/// golden run. Used by the Phase 10 single-frame `.tar.zst` tests
+/// below; factored out because the loop body is almost identical
+/// across compression-level variations and the older inline copies
+/// already span ~100 lines each.
+///
+/// `seed` is the LCG seed used to randomize abort points; `etag` must
+/// be a `'static` literal because [`MockServer`]'s handler is `'static`.
+fn run_dir_kill_resume_trials(
+    label: &str,
+    suffix: &str,
+    body: Vec<u8>,
+    etag: &'static str,
+    seed: u64,
+    trial_count: u64,
+) {
+    let cfg = || CoordinatorConfig {
+        checkpoint_min_bytes: 1,
+        checkpoint_min_interval: Duration::ZERO,
+        ..coord_config(4096)
+    };
+    let server = MockServer::start(ok_handler(body, etag));
+
+    let golden_dir = unique_dir(&format!("golden_{label}"));
+    let _g_golden = CleanupDir(golden_dir.clone());
+    let golden_out = golden_dir.join("out");
+    fs::create_dir_all(&golden_out).expect("golden out dir");
+
+    let golden_count = Arc::new(AtomicU64::new(0));
+    let counter_for_golden = Arc::clone(&golden_count);
+    let progress: ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            counter_for_golden.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let args = make_args(
+        &server,
+        suffix,
+        OutputTarget::Dir(golden_out.clone()),
+        cfg(),
+        None,
+        Some(progress),
+    );
+    run(args).expect("golden run");
+    let golden_entries = read_dir_recursive(&golden_out);
+    assert!(
+        !golden_entries.is_empty(),
+        "{label}: golden run produced no files",
+    );
+    let total_checkpoints = golden_count.load(Ordering::Relaxed);
+    assert!(
+        total_checkpoints >= 2,
+        "{label}: golden run produced {total_checkpoints} checkpoints, need ≥2 to randomize. \
+         For a single-frame `.tar.zst` ≥2 proves the hand-rolled decoder is firing per-block \
+         frame_boundary advances — pre-Phase-8 the wrapper crate produced 0 here.",
+    );
+
+    let mut rng = Lcg::seeded(seed);
+    let captured_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    for trial in 0..trial_count {
+        let abort_after = rng.range(1, total_checkpoints);
+        let work = unique_dir(&format!("{label}_trial_{trial}"));
+        let _g = CleanupDir(work.clone());
+        let out_dir = work.join("out");
+        fs::create_dir_all(&out_dir).expect("trial out dir");
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
+        let args = make_args(
+            &server,
+            suffix,
+            OutputTarget::Dir(out_dir.clone()),
+            cfg(),
+            Some(Arc::clone(&kill)),
+            Some(progress),
+        );
+        match run(args) {
+            Err(CoordinatorError::Aborted { .. }) => {}
+            Ok(_) => {
+                let got = read_dir_recursive(&out_dir);
+                assert_eq!(got, golden_entries, "{label} trial {trial} (no abort)");
+                continue;
+            }
+            Err(other) => panic!("{label} trial {trial}: unexpected error {other:?}"),
+        }
+
+        let resume_args = make_args(
+            &server,
+            suffix,
+            OutputTarget::Dir(out_dir.clone()),
+            cfg(),
+            None,
+            None,
+        );
+        let stats = run(resume_args).expect("resume ok");
+        assert!(
+            stats.resumed,
+            "{label} trial {trial}: resume did not flag itself as resumed",
+        );
+
+        let got = read_dir_recursive(&out_dir);
+        if got != golden_entries {
+            captured_failures.lock().unwrap().push(format!(
+                "{label} trial {trial}: resume diverges from golden \
+                 (abort_after={abort_after})",
+            ));
+        }
+    }
+    let failures = captured_failures.lock().unwrap();
+    assert!(failures.is_empty(), "{:?}", *failures);
+}
+
 /// Encode `payload` as a single-Stream xz blob using liblzma's easy
 /// encoder at preset 6 (matching `xz`'s default).
 fn encode_xz_stream(payload: &[u8]) -> Vec<u8> {
@@ -762,6 +927,92 @@ fn random_kill_points_resume_to_identical_tar_output() {
 
     let failures = captured_failures.lock().unwrap();
     assert!(failures.is_empty(), "{:?}", *failures);
+}
+
+// ---- harness: single-frame `.tar.zst` (Phase 10) ----------------------
+
+#[test]
+fn random_kill_points_resume_mid_member_tar_zst_misaligned() {
+    // The production shape that motivated `docs/PLAN_zstd_block_decoder.md`:
+    // a single zstd frame wrapping a multi-member tar archive whose
+    // member boundaries do not align with the zstd block grid. Pre-
+    // Phase-8 the upstream `zstd` crate's `frame_boundary` only fired
+    // at end-of-frame, so checkpoint discipline collapsed to one
+    // checkpoint per *whole archive* — a `kill -9` at any point lost
+    // every byte the decoder had produced. With the hand-rolled
+    // decoder advancing per block, every block boundary fires the
+    // checkpoint observer and resume is byte-identical.
+    //
+    // Member size 20_011 is prime, so the cumulative offsets after
+    // each tar member are pairwise distinct mod any plausible zstd
+    // block size; member boundaries effectively never coincide with
+    // block boundaries on this corpus. With v6 in-flight tar resume
+    // every block boundary still fires a checkpoint, even mid-member.
+    let body = build_misaligned_tar_zst_body(16, 20_011, 3, 0xA5A5_5A5A_DEAD_F00D);
+    run_dir_kill_resume_trials(
+        "misaligned_tar_zst",
+        "x.tar.zst",
+        body,
+        "\"v-misaligned-tar-zst\"",
+        0xCAFE_BABE_F00D_BEEF,
+        25,
+    );
+}
+
+#[test]
+fn random_kill_points_resume_single_frame_tar_zst_property() {
+    // Property bar from `PLAN_zstd_block_decoder.md` Phase 10: vary
+    // compression level and member sizes; every (level, size) shape
+    // must produce byte-identical resumes. Levels span zstd's
+    // recommended range (fast=1, default=3, mid=9, ultra=19); sizes
+    // are all prime so member boundaries mis-align with block
+    // boundaries differently for each config.
+    //
+    // Aggregate trial count: 4 configs × 20 trials = 80 single-frame
+    // crash-resume runs, plus the 25 from
+    // `..._misaligned` above = 105 — comfortably past the plan's
+    // "100 randomized crash-resume runs" exit criterion.
+    for &(level, count, size, label, etag, seed_arch, seed_trials) in &[
+        (
+            1i32,
+            12usize,
+            17_389usize,
+            "prop_lvl1",
+            "\"v-prop-zst-lvl1\"",
+            0x1111_2222_3333_4444u64,
+            0xAAAA_BBBB_CCCC_DDDDu64,
+        ),
+        (
+            3,
+            16,
+            20_011,
+            "prop_lvl3",
+            "\"v-prop-zst-lvl3\"",
+            0x5555_6666_7777_8888,
+            0xEEEE_FFFF_0000_1111,
+        ),
+        (
+            9,
+            20,
+            16_007,
+            "prop_lvl9",
+            "\"v-prop-zst-lvl9\"",
+            0x9999_AAAA_BBBB_CCCC,
+            0x2222_3333_4444_5555,
+        ),
+        (
+            19,
+            8,
+            24_001,
+            "prop_lvl19",
+            "\"v-prop-zst-lvl19\"",
+            0xDDDD_EEEE_FFFF_0000,
+            0x6666_7777_8888_9999,
+        ),
+    ] {
+        let body = build_misaligned_tar_zst_body(count, size, level, seed_arch);
+        run_dir_kill_resume_trials(label, "x.tar.zst", body, etag, seed_trials, 20);
+    }
 }
 
 // ---- harness: uncompressed `.tar` (PLAN_v2 §2) ------------------------
