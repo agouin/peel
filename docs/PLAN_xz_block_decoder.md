@@ -471,3 +471,176 @@ across the phases above — same envelope as the zstd plan. Phase 3
 will tighten this estimate.
 
 [.xz file format]: https://tukaani.org/xz/xz-file-format.txt
+
+## Appendix A — Phase 0 spike memo (2026-05-01)
+
+**Verdict**: feasible. Recommend proceeding to Phase 1. Cost estimate
+unchanged.
+
+**Spike scope.** Single-file Rust binary at `/tmp/xz-spike/`
+(~950 LOC, throwaway, dependency-free). Generates three reference
+vectors with `xz` (CLI 5.8.3) — tiny (16 B → uncompressed-mode LZMA2
+chunk), medium (64 KiB highly-redundant text → LZMA chunk, default
+preset 6, CRC64 check), and checksum (17 KB mixed RLE-friendly /
+incompressible / repeating, `--check=sha256`). All three decode
+**byte-identical** through the spike to both the original input and
+`xz -d` output.
+
+**What was validated end-to-end.**
+
+- *Stream Header / Block Header / Index / Stream Footer parsers*
+  (.xz spec §2–§4). Variable-length Block Headers (size byte ×4
+  arithmetic), multibyte (varint) ints for sizes and filter IDs,
+  filter-chain-of-one validation (LZMA2 only), Block Header CRC32,
+  Index Indicator + record list with padding + CRC32, Stream Footer
+  with backward-size cross-check against the Index real size.
+- *LZMA2 chunk walker* (LZMA2 spec). Control-byte mode dispatch:
+  `0x00` end-of-stream, `0x01`/`0x02` uncompressed (with/without
+  dict reset), `0x80..0xFF` LZMA-compressed (modes 0b00/0b01/0b10/
+  0b11). The "first chunk must reset dict" invariant is enforced;
+  the per-chunk uncompressed size is decoded from the 5-bit
+  high-nibble in the control byte plus the 16-bit BE field. Range
+  coder is reinitialized per chunk; LZMA model state is preserved
+  across mode-0 chunks.
+- *Range coder reader* — both `decode_bit(prob)` and
+  `decode_direct_bits(n)`. The direct-bits sign-bit-trick math
+  (`code -= range; t = 0 - (code >> 31); code += range & t; bit = t + 1`)
+  is the most counter-intuitive single piece of code in the whole
+  decoder; getting it right with a clear comment is cheap, but it
+  deserves its own unit test in Phase 2 (the LZMA spec's pseudocode
+  reads more naturally than it implements).
+- *LZMA literal coder*: both the plain (state < 7) and matched
+  (state ≥ 7) paths. Matched-literal mismatches correctly drop into
+  the plain path for the rest of the byte. Literal context lookup
+  via `(lp_bits << lc) | (prev_byte >> (8-lc))` works as documented.
+- *LZMA length decoder*: low/mid/high tree dispatch via two `choice`
+  bits, range 2..273. Both `match_len` and `rep_len` exercised in
+  the medium fixture (long literal-run RLE compresses heavily into
+  rep-matches).
+- *LZMA distance decoder*: slots 0..3 direct, slots 4..13 reverse-
+  bit-tree decode against the shared `pos_dec[128]` indexed by
+  `(dist - slot)`, slots 14..63 split into `(num_direct - 4)` raw
+  bits (via `decode_direct_bits`) plus a 4-bit aligned reverse-tree
+  decode against the shared `align_dec[16]`. The medium and
+  checksum fixtures both exercise distances large enough to reach
+  the slots-≥-14 path.
+- *Repeat-distance state*: `rep0..rep3` rotation on rep1/rep2/rep3
+  selection (rep0 is no-op, rep1 swaps with rep0, rep2/rep3 rotate
+  the chain). Short-rep (single-byte at rep0 distance) is its own
+  state-transition path (`STATE_TRANSITION_SHORTREP`).
+- *State machine*: all four transition tables (lit, match, rep,
+  shortrep) transcribed verbatim and exercised; the medium fixture
+  reaches state 11 within a hundred symbols.
+- *Block Check verification*: CRC32 (table-driven IEEE poly,
+  reflected), CRC64 (xz's ECMA-182 reflected, polynomial
+  `0xC96C5795D7870F42`), SHA-256 (FIPS 180-4, ~80 LOC pure-Rust).
+  All three checksum types are present in the fixtures and verified
+  byte-identical to the trailing Block Check field. The CRC64
+  module pattern is a near-copy of the SHA-256 shape; Phase 5's
+  `src/hash/crc64.rs` should fall out trivially.
+- *Multibyte (varint) reader*: continuation-bit termination, max-9-
+  byte cap, non-canonical trailing-zero rejection.
+- *Throughput sanity check*: 64 MiB single-Block fixture decodes at
+  **~290 MiB/s** sustained on an Apple Silicon (M-series) host;
+  liblzma's `xz -d` runs the same fixture at ~660 MiB/s. Ratio
+  ~2.3×. Comfortably above the plan's 100 MB/s target and well
+  above the < 30 MB/s alarm threshold (Risks §1). The spike is
+  unoptimized — no inline literal fast-path, no SIMD, plain
+  `Vec<u8>` for the dictionary — so the production decoder should
+  do at least as well, likely better with a ring-buffer dictionary
+  and the inner loop tightened.
+
+**What was NOT validated, and why.**
+
+- *Multi-Block streams.* `xz` defaults to `-T0` (auto-threads) on
+  modern hosts and emits a multi-Block stream once the input is
+  large enough — the spike's 64 MiB benchmark fixture came back
+  as 3 Blocks until forced single-Block with `-T1`. The spike's
+  outer loop does walk Block-by-Block (Block 1's LZMA2 stream
+  terminates with `0x00`, the loop reads the next Block Header,
+  etc.), but it does **not** track a per-Block dict floor. With a
+  shared `Vec<u8>` for output and no floor, Block 2's first
+  literal reads the previous-byte context from the *tail of
+  Block 1* instead of zero-byte (the post-dict-reset convention),
+  which corrupts the literal probability lookup and cascades
+  immediately into a bogus distance decode. This is well-known
+  and explicitly deferred (round-one in-scope is "single-Block,
+  per-LZMA2-chunk granularity"); flagged here because it is the
+  single most likely bug to bite during Phase 6's resume work
+  too. Phase 6's `decoder_state` blob must capture **dict-floor
+  offset within the Block** as well as the dictionary contents,
+  because the literal-context computation depends on whether the
+  dict has anything in it at all.
+- *BCJ pre-filters.* No fixture in scope; rejected at filter-chain
+  validation time, exactly as the plan specifies.
+- *`dict_size > 64 MiB`.* Default preset 6 is 8 MiB; not reached.
+- *Stream Padding.* Per plan, stays rejected.
+- *Differential against `xz2` / liblzma at scale.* The spike
+  cross-checks against `xz -d` on three hand-picked fixtures.
+  Phase 5's "500 random fixtures" differential is a follow-on.
+
+**Cost-estimate sanity check.** Code volumes from the spike map to
+plan effort estimates as follows:
+
+| Plan phase | Spike-equivalent surface | Spike LOC | Plan estimate |
+|------------|--------------------------|-----------|---------------|
+| Phase 1    | Stream/Block parser, multibyte, uncompressed chunks | ~250 | 1 week |
+| Phase 2    | range coder reader + bit-tree helpers | ~80 | 3 days |
+| Phase 3    | LZMA probability tables + state machine + literal/length/distance | ~330 | 1.5 weeks |
+| Phase 4    | LZMA2 chunk walker + match-copy on flat dict | ~150 | 2 weeks |
+| Phase 5    | CRC32/CRC64/SHA-256 + Index + Footer | ~140 | 3 days |
+
+The spike was written in roughly one focused day. It does **not**
+include: ring-buffer dictionary (the spike uses a flat `Vec<u8>`,
+which is fine up to 64 MiB but won't survive arbitrary
+preset-6 archives without growing without bound), per-Block
+dict-floor tracking, the `decoder_state` blob, the
+`StreamingDecoder` trait integration, error type design,
+multi-Block handling, or the test-corpus differential harness.
+The Phase 1 + 2 + 5 surfaces line up with the spike's sizes;
+the Phase 3 + 4 stack — which the spike *did* reach end-to-end
+on three real fixtures — is the largest piece by a comfortable
+margin, but the spike's first-try-correctness on three diverse
+LZMA-compressed inputs is the strongest signal that the algorithm
+is well-understood. Plan estimates look right. Adjusting any of
+them downward is not warranted; adjusting upward is also not
+warranted given the spike result.
+
+**Open questions surfaced.**
+
+1. *Per-Block dict-floor for multi-Block streams.* Per plan,
+   multi-Block is round-one-deferred; the spike confirms this is
+   exactly the right call — without floor tracking, decode silently
+   produces garbage rather than failing fast. Phase 6's
+   `decoder_state` design should include a `block_dict_start_offset`
+   alongside the dictionary contents, so resume is correct even
+   when the dictionary is partial within a Block. (For round-one
+   single-Block this is always 0, but encoding it makes Phase 10's
+   multi-Block promotion cheap.)
+2. *Distance-decoder shared `pos_dec` array indexing*
+   (`probs[dist - slot]`). This is the most pointy single piece of
+   code in the LZMA decoder — the indexing offset is non-obvious
+   from the spec text and easy to get wrong. The spike got it right
+   the first time by transcribing the LZMA reference algorithm
+   verbatim, but Phase 3 should include a test that decodes a
+   hand-built distance fixture covering each of slots 4..13
+   independently.
+3. *Range coder `decode_direct_bits` sign-bit math.* As noted
+   above, this is the algorithm's least-readable single piece and
+   the spec's pseudocode reads more naturally than it implements.
+   Worth its own unit test in Phase 2 with hand-built bit patterns
+   rather than relying on differential-fuzz alone to catch a sign
+   error.
+4. *Matched-literal indexing.* The
+   `((1 + match_bit) << 8) | symbol` indexing into the 0x300-byte
+   per-context literal table is correct but easy to off-by-one
+   (the literature varies on whether the matched-bit is the
+   high or low bit of `match_byte`). Phase 3 test vector should
+   exercise both `match_bit == bit` (continue matched) and
+   `match_bit != bit` (drop to plain) paths.
+
+**Recommendation.** Proceed to Phase 1. Drop the spike code
+(throwaway per the plan); carry forward only the bug-spotting notes
+above into Phase 1–4 commit messages and the open-question §1 into
+the Phase 6 design.
+
