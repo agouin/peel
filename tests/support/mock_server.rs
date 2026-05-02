@@ -66,6 +66,20 @@ pub enum MockResponse {
         remaining: u64,
         stall: Duration,
     },
+    /// Send headers, then drip the body in `bytes_per_chunk` slices
+    /// separated by `interval`. Frames keep arriving so the per-frame
+    /// idle watchdog stays satisfied, but the cumulative rate is
+    /// arbitrarily slow — designed to exercise the body-throughput
+    /// watchdog. The advertised `Content-Length` is the full body
+    /// length; the connection is closed cleanly after the last drip.
+    DripBody {
+        status: u16,
+        reason: &'static str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        bytes_per_chunk: usize,
+        interval: Duration,
+    },
 }
 
 impl MockResponse {
@@ -270,6 +284,51 @@ fn handle_connection(
                 // connection, surfacing a clean read EOF for the
                 // client (in lieu of timing out first).
                 thread::sleep(stall);
+                return;
+            }
+            MockResponse::DripBody {
+                status,
+                reason,
+                ref headers,
+                ref body,
+                bytes_per_chunk,
+                interval,
+            } => {
+                let mut hdrs = headers.clone();
+                if !hdrs
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                {
+                    hdrs.push(("Content-Length".into(), body.len().to_string()));
+                }
+                // Write the response line + headers but no body, then
+                // drip the body out chunk-at-a-time with `interval`
+                // between chunks. We deliberately bypass `write_reply`
+                // for the body so we can flush between chunks.
+                let mut buf = Vec::with_capacity(256);
+                let _ = write!(buf, "HTTP/1.1 {status} {reason}\r\n");
+                for (n, v) in &hdrs {
+                    let _ = write!(buf, "{n}: {v}\r\n");
+                }
+                buf.extend_from_slice(b"\r\n");
+                if writer.write_all(&buf).is_err() || writer.flush().is_err() {
+                    return;
+                }
+                let chunk = bytes_per_chunk.max(1);
+                let mut sent = 0usize;
+                while sent < body.len() {
+                    let end = (sent + chunk).min(body.len());
+                    if writer.write_all(&body[sent..end]).is_err() {
+                        return;
+                    }
+                    if writer.flush().is_err() {
+                        return;
+                    }
+                    sent = end;
+                    if sent < body.len() {
+                        thread::sleep(interval);
+                    }
+                }
                 return;
             }
         };

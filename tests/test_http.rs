@@ -380,6 +380,115 @@ fn body_idle_timeout_zero_disables_deadline() {
     );
 }
 
+// ---- Body-throughput watchdog -----------------------------------------
+
+#[test]
+fn body_throughput_watchdog_aborts_trickle_streams() {
+    // Server drips out 8 KiB total in 64-byte chunks, one chunk every
+    // 50 ms — sustained ~1.3 KiB/s. The per-frame idle deadline stays
+    // happy (frames arrive every 50 ms), but the throughput watchdog
+    // configured at 32 KiB/s over a 500 ms window should fire and
+    // return an error before the body completes naturally.
+    let body = vec![0xABu8; 8 * 1024];
+    let server = MockServer::start(move |_req, _n| MockResponse::DripBody {
+        status: 200,
+        reason: "OK",
+        headers: vec![],
+        body: body.clone(),
+        bytes_per_chunk: 64,
+        interval: Duration::from_millis(50),
+    });
+    let cfg = ClientConfig {
+        body_idle_timeout: Duration::from_secs(5),
+        body_min_throughput: 32 * 1024,
+        body_throughput_window: Duration::from_millis(500),
+        body_throughput_grace: Duration::from_millis(200),
+        timeout: Duration::from_secs(5),
+        ..ClientConfig::default()
+    };
+    let client = Client::with_config(cfg).expect("client");
+    let started = std::time::Instant::now();
+    let mut resp = client.get_full(&url(&server, "/")).expect("headers ok");
+    let mut buf = Vec::new();
+    let err = resp
+        .body
+        .read_to_end(&mut buf)
+        .expect_err("trickle must error");
+    let elapsed = started.elapsed();
+    // The watchdog should fire well before the natural body deadline
+    // (8 KiB / 64 B per 50 ms ≈ 6.4 s of dripping). Allow generous
+    // slack but ensure we did not block for the full natural runtime.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "client waited {elapsed:?} — watchdog did not fire promptly",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("throughput") || msg.contains("below floor") || msg.contains("B/s"),
+        "expected throughput-flavored message, got {msg:?}",
+    );
+}
+
+#[test]
+fn body_throughput_watchdog_zero_disables() {
+    // Same drip pattern; with the watchdog disabled (min_throughput
+    // = 0) the request must complete naturally with the full body
+    // and no error.
+    let body = vec![0xCDu8; 1024];
+    let server = MockServer::start(move |_req, _n| MockResponse::DripBody {
+        status: 200,
+        reason: "OK",
+        headers: vec![],
+        body: body.clone(),
+        bytes_per_chunk: 128,
+        interval: Duration::from_millis(20),
+    });
+    let cfg = ClientConfig {
+        body_idle_timeout: Duration::from_secs(5),
+        body_min_throughput: 0,
+        body_throughput_window: Duration::from_millis(50),
+        body_throughput_grace: Duration::from_millis(0),
+        timeout: Duration::from_secs(5),
+        ..ClientConfig::default()
+    };
+    let client = Client::with_config(cfg).expect("client");
+    let mut resp = client.get_full(&url(&server, "/")).expect("headers ok");
+    let mut received = Vec::new();
+    resp.body.read_to_end(&mut received).expect("body ok");
+    assert_eq!(received.len(), 1024);
+    assert!(received.iter().all(|b| *b == 0xCD));
+}
+
+#[test]
+fn body_throughput_watchdog_passes_fast_streams() {
+    // Sanity: a body that easily exceeds the floor must complete
+    // without the watchdog erroring out, even with the watchdog on.
+    let body = vec![0xEFu8; 32 * 1024];
+    let server = MockServer::start(move |_req, _n| MockResponse::DripBody {
+        status: 200,
+        reason: "OK",
+        headers: vec![],
+        body: body.clone(),
+        bytes_per_chunk: 4 * 1024,
+        interval: Duration::from_millis(10),
+    });
+    let cfg = ClientConfig {
+        body_idle_timeout: Duration::from_secs(5),
+        body_min_throughput: 32 * 1024,
+        body_throughput_window: Duration::from_millis(100),
+        body_throughput_grace: Duration::from_millis(0),
+        timeout: Duration::from_secs(5),
+        ..ClientConfig::default()
+    };
+    let client = Client::with_config(cfg).expect("client");
+    let mut resp = client.get_full(&url(&server, "/")).expect("headers ok");
+    let mut received = Vec::new();
+    resp.body
+        .read_to_end(&mut received)
+        .expect("fast body must succeed");
+    assert_eq!(received.len(), 32 * 1024);
+}
+
 // ---- Connection pool ---------------------------------------------------
 
 #[test]

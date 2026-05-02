@@ -73,6 +73,24 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// surfaces as an IO error and the worker's retry path opens a fresh
 /// connection.
 pub const DEFAULT_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default minimum acceptable throughput for an in-progress response
+/// body, in bytes per second. Catches the trickle case — frames
+/// arrive often enough to keep the per-frame idle timeout happy, but
+/// the cumulative rate is so low the connection is functionally
+/// stuck. 128 KiB/s ≈ 1 Mbps per worker; below this is well outside
+/// any realistic downloader's working range. Set to `0` to disable
+/// the watchdog (useful when running behind an aggressive
+/// `--rate-limit` cap).
+pub const DEFAULT_BODY_MIN_THROUGHPUT: u64 = 128 * 1024;
+/// Window (in seconds) over which body throughput is averaged before
+/// the watchdog evaluates it. Short windows false-positive on
+/// network jitter; long windows take longer to recover from real
+/// stalls. 15s is a reasonable middle ground.
+pub const DEFAULT_BODY_THROUGHPUT_WINDOW: Duration = Duration::from_secs(15);
+/// Grace period after a body starts streaming before the watchdog
+/// arms. Covers TCP slow-start and TLS handshake settling so the
+/// initial low-throughput phase doesn't trip the deadline.
+pub const DEFAULT_BODY_THROUGHPUT_GRACE: Duration = Duration::from_secs(30);
 /// Default upper bound on cached idle connections per host.
 pub const DEFAULT_POOL_CAPACITY: usize = 16;
 /// Default capacity of the per-connection read buffer, in bytes.
@@ -216,6 +234,21 @@ pub struct ClientConfig {
     /// (the pre-fix behaviour, only useful for tests that intentionally
     /// drive a slow stream).
     pub body_idle_timeout: Duration,
+    /// Minimum acceptable body throughput in bytes per second. After
+    /// [`Self::body_throughput_grace`] elapses, every
+    /// [`Self::body_throughput_window`] the watchdog measures the
+    /// rate over the window; if it is below this floor, the body
+    /// pump errors out so the worker's retry path opens a fresh
+    /// connection. Defaults to [`DEFAULT_BODY_MIN_THROUGHPUT`].
+    /// `0` disables the watchdog.
+    pub body_min_throughput: u64,
+    /// Tumbling window length used by the throughput watchdog.
+    /// Defaults to [`DEFAULT_BODY_THROUGHPUT_WINDOW`].
+    pub body_throughput_window: Duration,
+    /// Grace period after the body starts streaming before the
+    /// throughput watchdog arms. Defaults to
+    /// [`DEFAULT_BODY_THROUGHPUT_GRACE`].
+    pub body_throughput_grace: Duration,
     /// Maximum idle connections cached per host. Defaults to
     /// [`DEFAULT_POOL_CAPACITY`].
     pub pool_capacity: usize,
@@ -236,6 +269,9 @@ impl Default for ClientConfig {
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             timeout: DEFAULT_TIMEOUT,
             body_idle_timeout: DEFAULT_BODY_IDLE_TIMEOUT,
+            body_min_throughput: DEFAULT_BODY_MIN_THROUGHPUT,
+            body_throughput_window: DEFAULT_BODY_THROUGHPUT_WINDOW,
+            body_throughput_grace: DEFAULT_BODY_THROUGHPUT_GRACE,
             pool_capacity: DEFAULT_POOL_CAPACITY,
             read_buffer_bytes: DEFAULT_READ_BUFFER_BYTES,
             user_agent: None,
@@ -555,6 +591,11 @@ fn spawn_runtime_thread(
     let max_header_bytes = config.max_header_bytes;
     let timeout = config.timeout;
     let body_idle_timeout = config.body_idle_timeout;
+    let body_throughput = BodyThroughputConfig {
+        min_bytes_per_sec: config.body_min_throughput,
+        window: config.body_throughput_window,
+        grace: config.body_throughput_grace,
+    };
     let http_version = config.http_version;
 
     thread::Builder::new()
@@ -620,8 +661,10 @@ fn spawn_runtime_thread(
                     let client = hyper_client.clone();
                     let timeout_dur = timeout;
                     let body_idle = body_idle_timeout;
+                    let throughput_cfg = body_throughput;
                     tokio::spawn(async move {
-                        handle_request(client, envelope, timeout_dur, body_idle).await;
+                        handle_request(client, envelope, timeout_dur, body_idle, throughput_cfg)
+                            .await;
                     });
                 }
             });
@@ -634,6 +677,7 @@ async fn handle_request(
     envelope: RequestEnvelope,
     timeout: Duration,
     body_idle_timeout: Duration,
+    throughput: BodyThroughputConfig,
 ) {
     let RequestEnvelope {
         request,
@@ -675,7 +719,7 @@ async fn handle_request(
         && !(100..200).contains(&status.code)
     {
         let (body_tx, body_rx) = mpsc::unbounded_channel::<BodyCommand>();
-        tokio::spawn(body_pump(body, body_rx, body_idle_timeout));
+        tokio::spawn(body_pump(body, body_rx, body_idle_timeout, throughput));
         BodyReader::streaming(body_tx)
     } else {
         BodyReader::empty()
@@ -688,7 +732,9 @@ async fn body_pump(
     mut body: Incoming,
     mut rx: mpsc::UnboundedReceiver<BodyCommand>,
     idle_timeout: Duration,
+    throughput: BodyThroughputConfig,
 ) {
+    let mut watchdog = ThroughputWatchdog::new(std::time::Instant::now(), throughput);
     while let Some(cmd) = rx.recv().await {
         let BodyCommand::NextFrame { reply } = cmd;
         loop {
@@ -724,6 +770,19 @@ async fn body_pump(
                 }
                 Some(Ok(frame)) => match frame.into_data() {
                     Ok(bytes) if !bytes.is_empty() => {
+                        let now = std::time::Instant::now();
+                        watchdog.record(now, bytes.len() as u64);
+                        if let Some(rate) = watchdog.evaluate(now) {
+                            // Cumulative-window rate has fallen below
+                            // the configured floor. Drop the body so
+                            // hyper closes the connection; the worker
+                            // retries on a fresh socket.
+                            let _ = reply.send(Err(format!(
+                                "body throughput {rate:.0} B/s below floor {} B/s over {:?}",
+                                throughput.min_bytes_per_sec, throughput.window,
+                            )));
+                            return;
+                        }
                         let _ = reply.send(Ok(Some(bytes)));
                         break;
                     }
@@ -732,6 +791,87 @@ async fn body_pump(
                     _ => continue,
                 },
             }
+        }
+    }
+}
+
+/// Snapshot of the throughput-watchdog tunables, captured per-request.
+#[derive(Debug, Clone, Copy)]
+struct BodyThroughputConfig {
+    /// Minimum acceptable bytes-per-second floor; `0` disables the
+    /// watchdog entirely.
+    min_bytes_per_sec: u64,
+    /// Length of one tumbling-window evaluation interval.
+    window: Duration,
+    /// Time after the body starts streaming during which the watchdog
+    /// is silent (TCP slow-start, TLS settle, etc.).
+    grace: Duration,
+}
+
+/// Per-body throughput watchdog driven from `body_pump`.
+///
+/// Maintains a tumbling window: every `window` of wall-clock time
+/// since the last evaluation, `evaluate` checks how many bytes
+/// arrived in that interval and reports the rate when it falls
+/// below `min_bytes_per_sec`. The first window starts after `grace`
+/// so a slow start doesn't trip the deadline.
+struct ThroughputWatchdog {
+    config: BodyThroughputConfig,
+    /// Bytes accumulated since `body_pump` started.
+    cumulative: u64,
+    /// Bytes accumulated at the last anchor point (start of the
+    /// current window). Used with `cumulative` to derive a delta.
+    anchor_bytes: u64,
+    /// Wall-clock at the last anchor point. The first anchor sits
+    /// `grace` into the future from construction so the watchdog
+    /// stays silent during slow start.
+    anchor_at: std::time::Instant,
+}
+
+impl ThroughputWatchdog {
+    fn new(now: std::time::Instant, config: BodyThroughputConfig) -> Self {
+        Self {
+            config,
+            cumulative: 0,
+            anchor_bytes: 0,
+            anchor_at: now + config.grace,
+        }
+    }
+
+    fn record(&mut self, _now: std::time::Instant, bytes: u64) {
+        self.cumulative = self.cumulative.saturating_add(bytes);
+    }
+
+    /// If a window has elapsed since the last anchor, evaluate the
+    /// rate over that window. Returns `Some(rate)` when below the
+    /// floor (caller treats that as a fatal stall); otherwise `None`
+    /// and the anchor advances. Disabled (`min_bytes_per_sec == 0`)
+    /// always returns `None`.
+    fn evaluate(&mut self, now: std::time::Instant) -> Option<f64> {
+        if self.config.min_bytes_per_sec == 0 {
+            return None;
+        }
+        if now < self.anchor_at {
+            return None;
+        }
+        let dt = now.duration_since(self.anchor_at);
+        if dt < self.config.window {
+            return None;
+        }
+        let bytes = self.cumulative - self.anchor_bytes;
+        let secs = dt.as_secs_f64();
+        // Advance the anchor regardless of pass/fail so consecutive
+        // failing windows don't compound across the same delta.
+        self.anchor_at = now;
+        self.anchor_bytes = self.cumulative;
+        if secs <= 0.0 {
+            return None;
+        }
+        let rate = bytes as f64 / secs;
+        if rate < self.config.min_bytes_per_sec as f64 {
+            Some(rate)
+        } else {
+            None
         }
     }
 }
