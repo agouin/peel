@@ -15,17 +15,21 @@
 #![cfg(unix)]
 #![warn(unused, clippy::all)]
 
+use std::error::Error as StdError;
 use std::io::IsTerminal;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
 use peel::cli::{http_version_banner, Cli};
-use peel::coordinator::{run, CoordinatorError, ProgressEvent, ProgressFn};
+use peel::coordinator::{run, CoordinatorError, ProgressEvent, ProgressFn, RunArgs, RunStats};
+use peel::decode::DecoderRegistry;
+use peel::download::{SchedulerError, WorkerError};
 use peel::progress::{spawn_renderer, LogRenderer, ProgressState, TtyRenderer};
 
 /// SIGINT — `Ctrl-C` from an interactive shell.
@@ -359,6 +363,31 @@ fn main() -> Result<()> {
     }
 
     let state = ProgressState::new();
+
+    // Capture the cloneable bits of `args` so the outer-loop retry path
+    // can rebuild a fresh `RunArgs` per attempt. `RunArgs` itself is
+    // not `Clone` (the boxed `ProgressFn` and the `Arc<dyn IoBackend>`
+    // are not trivially cloneable as a unit), but every field we need
+    // is independently cloneable; we just have to assemble them.
+    let url = args.url.clone();
+    let output = args.output.clone();
+    let coord_config = args.config.clone();
+    let client = args.client.clone();
+    // INVARIANT: we set `args.io_backend = Some(io_backend)` above.
+    let io_backend_arc = args.io_backend.clone().expect("io_backend was set above");
+
+    let make_args = || RunArgs {
+        url: url.clone(),
+        output: output.clone(),
+        config: coord_config.clone(),
+        client: client.clone(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: Some(make_event_callback(stderr_is_tty)),
+        progress_state: Some(Arc::clone(&state)),
+        kill_switch: Some(Arc::clone(&kill_switch)),
+        io_backend: Some(Arc::clone(&io_backend_arc)),
+    };
+
     args.progress_state = Some(Arc::clone(&state));
     args.progress = Some(make_event_callback(stderr_is_tty));
     args.kill_switch = Some(Arc::clone(&kill_switch));
@@ -382,7 +411,7 @@ fn main() -> Result<()> {
         .context("spawning the log progress renderer")?
     };
 
-    let result = run(args);
+    let result = run_with_outer_retry(args, &make_args, &state, &kill_switch, stderr_is_tty);
 
     // Tell the renderer to stop, regardless of whether `run` succeeded
     // or errored, so we can join it before exiting `main`.
@@ -532,5 +561,294 @@ fn init_tracing(stderr_is_tty: bool) {
         let _ = builder.with_max_level(tracing::Level::WARN).try_init();
     } else {
         let _ = builder.with_max_level(tracing::Level::INFO).try_init();
+    }
+}
+
+/// Default number of additional `run` attempts after the first one
+/// fails with a transient error. Override via `PEEL_OUTER_RETRIES`.
+const DEFAULT_OUTER_RETRIES: u32 = 5;
+/// Initial delay between the first failure and its retry. Doubles up
+/// to [`OUTER_RETRY_MAX_BACKOFF`].
+const OUTER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+/// Cap on the exponential backoff between retry attempts. The user
+/// already endured a multi-minute failure window before reaching this
+/// path, so a one-minute ceiling is plenty — anything longer just
+/// stretches the operator's pager without improving recovery odds.
+const OUTER_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Read `PEEL_OUTER_RETRIES` (non-negative integer) and fall back to
+/// [`DEFAULT_OUTER_RETRIES`]. `0` disables the outer-loop retry
+/// entirely (one attempt, no restarts).
+fn outer_retries_from_env() -> u32 {
+    std::env::var("PEEL_OUTER_RETRIES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_OUTER_RETRIES)
+}
+
+/// Drive [`run`] in an outer retry loop: on a transient failure (a
+/// download-side error whose root `WorkerError` / `SchedulerError`
+/// reports `is_retryable`), wait, reset the shared progress counters,
+/// rebuild a fresh `RunArgs` (fresh HTTP `Client` connection pool,
+/// fresh `ProgressFn`), and call [`run`] again. The checkpoint and
+/// part-file on disk make the next attempt resume losslessly from
+/// where the failed one left off.
+///
+/// Non-retryable errors (`Aborted`, `SourceChanged*`, format-detection
+/// conflicts, sparse-file IO, integrity mismatches, …) bypass the
+/// retry path and surface immediately.
+///
+/// `kill_switch` is polled both before each retry and during the
+/// backoff sleep so a SIGINT/SIGTERM during the wait window terminates
+/// promptly instead of waiting out the full backoff.
+fn run_with_outer_retry(
+    initial: RunArgs,
+    rebuild_args: &dyn Fn() -> RunArgs,
+    state: &Arc<ProgressState>,
+    kill_switch: &Arc<AtomicBool>,
+    stderr_is_tty: bool,
+) -> Result<RunStats, CoordinatorError> {
+    let max_retries = outer_retries_from_env();
+    let mut args = initial;
+    let mut backoff = OUTER_RETRY_INITIAL_BACKOFF;
+    let mut attempt: u32 = 1;
+    loop {
+        match run(args) {
+            Ok(stats) => return Ok(stats),
+            Err(err) => {
+                let exhausted = attempt > max_retries;
+                let killed = kill_switch.load(Ordering::Acquire);
+                if exhausted || killed || !is_retryable_run_error(&err) {
+                    return Err(err);
+                }
+                emit_retry_notice(&err, attempt, max_retries, backoff, stderr_is_tty);
+                if !sleep_with_kill_switch(backoff, kill_switch) {
+                    return Err(err);
+                }
+                state.reset_for_retry();
+                attempt = attempt.saturating_add(1);
+                backoff = backoff.saturating_mul(2).min(OUTER_RETRY_MAX_BACKOFF);
+                args = rebuild_args();
+            }
+        }
+    }
+}
+
+/// Walk the `Error::source` chain looking for a typed `SchedulerError`
+/// or `WorkerError` and ask it whether the underlying failure is
+/// transient. We look at both because the actual root cause can land
+/// at either layer depending on which path failed: scheduler-level for
+/// failures the scheduler synthesizes itself (e.g. `SingleStream`),
+/// worker-level for failures the per-chunk loop bubbles up.
+///
+/// `Aborted` short-circuits to `false` because that variant means the
+/// kill switch tripped — retrying would re-enter the same shutdown.
+fn is_retryable_run_error(err: &CoordinatorError) -> bool {
+    if matches!(err, CoordinatorError::Aborted { .. }) {
+        return false;
+    }
+    let mut cursor: &(dyn StdError + 'static) = err;
+    loop {
+        if let Some(s) = cursor.downcast_ref::<SchedulerError>() {
+            return scheduler_err_is_retryable(s);
+        }
+        if let Some(w) = cursor.downcast_ref::<WorkerError>() {
+            return w.is_retryable();
+        }
+        match cursor.source() {
+            Some(src) => cursor = src,
+            None => return false,
+        }
+    }
+}
+
+/// Map a [`SchedulerError`] to "transient enough that a fresh `run`
+/// from checkpoint might succeed". The conservative default for
+/// unknown variants is `false`: prefer surfacing a real error than
+/// burning retry budget on something that won't fix itself.
+fn scheduler_err_is_retryable(s: &SchedulerError) -> bool {
+    match s {
+        SchedulerError::Head { .. } => true,
+        SchedulerError::ChunkFailed { source, .. } => source.is_retryable(),
+        SchedulerError::SingleStream { .. } => true,
+        SchedulerError::SingleStreamBodyLength { .. } => true,
+        SchedulerError::BodyIo { .. } => true,
+        SchedulerError::SourceChangedDuringDownload { .. } => false,
+        SchedulerError::SparseFile { .. } => false,
+        SchedulerError::WorkersExhausted { .. } => false,
+        SchedulerError::MissingContentLength { .. }
+        | SchedulerError::BitmapLengthMismatch { .. }
+        | SchedulerError::InvalidChunkSize
+        | SchedulerError::InvalidWorkerCount
+        | SchedulerError::TooManyChunks { .. } => false,
+    }
+}
+
+/// Emit a one-line `[retry]` notice describing the failure and the
+/// upcoming wait. Mirrors the existing `[start]` / `[done]` /
+/// `[abort]` line shapes so log parsers see a consistent prefix.
+fn emit_retry_notice(
+    err: &CoordinatorError,
+    attempt: u32,
+    max_retries: u32,
+    backoff: Duration,
+    stderr_is_tty: bool,
+) {
+    let total_attempts = max_retries.saturating_add(1);
+    let msg = format!(
+        "[retry] attempt {attempt}/{total_attempts} failed ({err:#}); \
+         restarting from checkpoint in {:.1}s",
+        backoff.as_secs_f64(),
+    );
+    if stderr_is_tty {
+        eprintln!("{msg}");
+    } else {
+        tracing::warn!("{msg}");
+    }
+}
+
+/// Sleep up to `dur`, polling `kill_switch` every 100 ms. Returns
+/// `false` if a kill signal landed during the wait (so the caller can
+/// surface the original error instead of looping into another
+/// attempt), `true` if the full duration elapsed cleanly.
+fn sleep_with_kill_switch(dur: Duration, kill: &AtomicBool) -> bool {
+    if dur.is_zero() {
+        return !kill.load(Ordering::Acquire);
+    }
+    let deadline = Instant::now() + dur;
+    let step = Duration::from_millis(100);
+    loop {
+        if kill.load(Ordering::Acquire) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let remaining = deadline - now;
+        thread::sleep(step.min(remaining));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peel::download::WorkerError;
+    use peel::http::ClientError;
+    use peel::types::ChunkIndex;
+
+    fn transport_worker_error() -> WorkerError {
+        WorkerError::Transport {
+            chunk: ChunkIndex::ZERO,
+            source: ClientError::Transport {
+                host: "example.test".into(),
+                port: 443,
+                detail: "connection reset".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn aborted_is_not_retryable() {
+        let err = CoordinatorError::Aborted {
+            checkpoints_written: 7,
+        };
+        assert!(!is_retryable_run_error(&err));
+    }
+
+    #[test]
+    fn scheduler_chunk_failed_with_transport_is_retryable() {
+        let err = CoordinatorError::Scheduler(SchedulerError::ChunkFailed {
+            chunk: ChunkIndex::new(294),
+            attempts: 5,
+            source: transport_worker_error(),
+        });
+        assert!(is_retryable_run_error(&err));
+    }
+
+    #[test]
+    fn scheduler_chunk_failed_with_terminal_worker_error_is_not_retryable() {
+        let err = CoordinatorError::Scheduler(SchedulerError::ChunkFailed {
+            chunk: ChunkIndex::new(0),
+            attempts: 1,
+            source: WorkerError::SourceChanged {
+                chunk: ChunkIndex::ZERO,
+                expected_etag: Some("\"abc\"".into()),
+                actual_etag: Some("\"def\"".into()),
+                expected_last_modified: None,
+                actual_last_modified: None,
+            },
+        });
+        assert!(!is_retryable_run_error(&err));
+    }
+
+    #[test]
+    fn extractor_wrapping_retryable_scheduler_error_is_retryable() {
+        // The realistic path from the bug report: a download-side
+        // failure wrapped in DecodeError::Read inside ExtractorError
+        // inside CoordinatorError::Extractor. The retry detector must
+        // walk the source chain to find the SchedulerError/WorkerError.
+        use peel::decode::DecodeError;
+        use peel::extractor::ExtractorError;
+        use std::io;
+
+        let scheduler_err = SchedulerError::ChunkFailed {
+            chunk: ChunkIndex::new(294),
+            attempts: 5,
+            source: transport_worker_error(),
+        };
+        let io_err = io::Error::other(scheduler_err);
+        let decode_err = DecodeError::Read {
+            consumed: 1_231_172_260,
+            source: io_err,
+        };
+        let extractor_err = ExtractorError::Decode(decode_err);
+        let coord_err = CoordinatorError::Extractor(extractor_err);
+        assert!(is_retryable_run_error(&coord_err));
+    }
+
+    #[test]
+    fn extractor_unrelated_to_download_is_not_retryable() {
+        // A sink-side failure (e.g. tar write IO) has no
+        // SchedulerError/WorkerError in its source chain — it should
+        // not trigger an outer-loop retry, since restarting won't
+        // address a stuck local disk.
+        use peel::decode::DecodeError;
+        use peel::extractor::ExtractorError;
+        use std::io;
+        let decode_err =
+            DecodeError::Write(io::Error::other("sink write failed for unrelated reasons"));
+        let coord_err = CoordinatorError::Extractor(ExtractorError::Decode(decode_err));
+        assert!(!is_retryable_run_error(&coord_err));
+    }
+
+    #[test]
+    fn sleep_returns_false_when_kill_set_immediately() {
+        let kill = AtomicBool::new(true);
+        let elapsed = std::time::Instant::now();
+        assert!(!sleep_with_kill_switch(Duration::from_secs(60), &kill));
+        // Should return promptly (well under the 60s budget).
+        assert!(elapsed.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sleep_returns_true_after_full_duration() {
+        let kill = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert!(sleep_with_kill_switch(Duration::from_millis(150), &kill));
+        assert!(started.elapsed() >= Duration::from_millis(140));
+    }
+
+    #[test]
+    fn outer_retries_env_overrides_default() {
+        let prev = std::env::var("PEEL_OUTER_RETRIES").ok();
+        std::env::set_var("PEEL_OUTER_RETRIES", "0");
+        assert_eq!(outer_retries_from_env(), 0);
+        std::env::set_var("PEEL_OUTER_RETRIES", "12");
+        assert_eq!(outer_retries_from_env(), 12);
+        match prev {
+            Some(v) => std::env::set_var("PEEL_OUTER_RETRIES", v),
+            None => std::env::remove_var("PEEL_OUTER_RETRIES"),
+        }
     }
 }

@@ -206,6 +206,23 @@ impl ProgressState {
         self.done.store(true, Ordering::Release);
     }
 
+    /// Clear the per-run byte counters and worker tallies so the next
+    /// [`crate::coordinator::run`] call (e.g. an outer-loop retry after
+    /// a transient download failure) re-credits resumed bytes from a
+    /// clean baseline. Leaves `done` alone so the renderer thread keeps
+    /// running, and leaves `total_size` / `max_disk_buffer` alone since
+    /// those are configuration that doesn't change between retries.
+    pub fn reset_for_retry(&self) {
+        self.bytes_downloaded.store(0, Ordering::Release);
+        self.bytes_extracted.store(0, Ordering::Release);
+        self.bytes_decoded_input.store(0, Ordering::Release);
+        self.extracted_estimate.store(0, Ordering::Release);
+        self.active_workers.store(0, Ordering::Release);
+        self.total_workers.store(0, Ordering::Release);
+        self.disk_bound.store(false, Ordering::Release);
+        self.started.store(false, Ordering::Release);
+    }
+
     /// `true` iff [`Self::mark_done`] has been called.
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -1499,6 +1516,39 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!(snap.bytes_downloaded, 0);
         assert_eq!(snap.bytes_extracted, 0);
+    }
+
+    #[test]
+    fn reset_for_retry_clears_per_run_counters_but_keeps_total_and_done() {
+        let s = ProgressState::new();
+        s.set_total_size(91_000_000_000);
+        s.set_max_disk_buffer(1_073_741_824);
+        s.set_total_workers(4);
+        s.add_downloaded(1_200_000_000);
+        s.add_extracted(1_800_000_000);
+        s.set_bytes_decoded_input(1_100_000_000);
+        s.set_extracted_estimate(95_000_000_000);
+        s.worker_started();
+        s.set_disk_bound(true);
+        s.mark_started();
+        s.mark_done();
+
+        s.reset_for_retry();
+
+        let snap = s.snapshot();
+        // Per-run counters: cleared.
+        assert_eq!(snap.bytes_downloaded, 0);
+        assert_eq!(snap.bytes_extracted, 0);
+        assert_eq!(snap.bytes_decoded_input, 0);
+        assert_eq!(snap.extracted_estimate, None);
+        assert_eq!(snap.active_workers, 0);
+        assert_eq!(snap.total_workers, 0);
+        assert!(!snap.disk_bound);
+        assert!(!snap.started);
+        // Configuration and renderer-lifecycle bits: preserved.
+        assert_eq!(snap.total_size, Some(91_000_000_000));
+        assert_eq!(snap.max_disk_buffer, Some(1_073_741_824));
+        assert!(snap.done);
     }
 
     #[test]

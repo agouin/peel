@@ -2478,7 +2478,13 @@ impl Read for BlockingSparseReader {
                 if self.download_done.load(Ordering::Acquire) {
                     if let Ok(mut slot) = self.download_outcome.lock() {
                         if let Some(Err(e)) = slot.take() {
-                            return Err(io::Error::other(format!("download failed: {e}")));
+                            // Wrap the typed scheduler error as the io::Error
+                            // source rather than stringifying it. The outer-loop
+                            // retry path in `main` walks `Error::source()` and
+                            // matches on the `SchedulerError` / `WorkerError`
+                            // types to decide whether to restart from checkpoint;
+                            // collapsing to a `String` here would erase that.
+                            return Err(io::Error::other(e));
                         }
                     }
                     return Err(io::Error::new(
