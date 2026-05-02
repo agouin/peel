@@ -21,7 +21,9 @@
 //! the source-reader boundary; production callers go through the
 //! `--sha256` CLI flag rather than touching this module directly.
 
+pub mod crc32;
 pub mod crc32c;
+pub mod crc64;
 pub mod sha256;
 pub mod xxh64;
 

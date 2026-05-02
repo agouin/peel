@@ -49,6 +49,7 @@
 
 use std::io::Write;
 
+use super::check::BlockCheckHasher;
 use super::dict::LzmaDict;
 use super::error::XzError;
 use super::lzma_state;
@@ -191,6 +192,7 @@ impl Lzma2State {
         &mut self,
         compressed_payload: &[u8],
         uncompressed_size: u32,
+        check_hasher: &mut BlockCheckHasher,
         sink: &mut dyn Write,
     ) -> Result<(), XzError> {
         let mut rc = RangeDecoder::new(compressed_payload)?;
@@ -315,6 +317,7 @@ impl Lzma2State {
             });
         }
 
+        check_hasher.update(&staging);
         sink.write_all(&staging).map_err(XzError::SinkIo)?;
         Ok(())
     }
@@ -377,7 +380,12 @@ mod tests {
         let mut state = Lzma2State::new(DICT_SIZE, LC, LP, PB).expect("state");
         let mut sink = Vec::new();
         state
-            .decode_chunk(&stream, payload.len() as u32, &mut sink)
+            .decode_chunk(
+                &stream,
+                payload.len() as u32,
+                &mut BlockCheckHasher::new(super::super::stream::CheckId::None),
+                &mut sink,
+            )
             .expect("decode");
         assert_eq!(sink, payload);
         // After decode, dict reflects every emitted byte.
@@ -441,7 +449,12 @@ mod tests {
         let mut decoder_state = Lzma2State::new(DICT_SIZE, LC, LP, PB).expect("state");
         let mut sink = Vec::new();
         decoder_state
-            .decode_chunk(&stream, 4, &mut sink)
+            .decode_chunk(
+                &stream,
+                4,
+                &mut BlockCheckHasher::new(super::super::stream::CheckId::None),
+                &mut sink,
+            )
             .expect("decode");
         assert_eq!(sink, b"ABBB");
         assert_eq!(decoder_state.rep0, 0);
@@ -519,7 +532,12 @@ mod tests {
         let mut state = Lzma2State::new(DICT_SIZE, 3, 0, 2).expect("state");
         let mut sink = Vec::new();
         state
-            .decode_chunk(&stream, payload.len() as u32, &mut sink)
+            .decode_chunk(
+                &stream,
+                payload.len() as u32,
+                &mut BlockCheckHasher::new(super::super::stream::CheckId::None),
+                &mut sink,
+            )
             .expect("decode");
         assert_eq!(sink, payload);
     }
@@ -568,7 +586,15 @@ mod tests {
         let too_short = [0u8; 3];
         let mut state = Lzma2State::new(DICT_SIZE, LC, LP, PB).expect("state");
         let mut sink = Vec::new();
-        match state.decode_chunk(&too_short, 1, &mut sink).unwrap_err() {
+        match state
+            .decode_chunk(
+                &too_short,
+                1,
+                &mut BlockCheckHasher::new(super::super::stream::CheckId::None),
+                &mut sink,
+            )
+            .unwrap_err()
+        {
             XzError::RangeCoderUnderflow(label) => assert_eq!(label, "init"),
             other => panic!("expected RangeCoderUnderflow, got {other:?}"),
         }
@@ -585,7 +611,15 @@ mod tests {
         let stream = encode_literal_run(b"ABCD", LC, LP, PB);
         let mut state = Lzma2State::new(DICT_SIZE, LC, LP, PB).expect("state");
         let mut sink = Vec::new();
-        match state.decode_chunk(&stream, 8, &mut sink).unwrap_err() {
+        match state
+            .decode_chunk(
+                &stream,
+                8,
+                &mut BlockCheckHasher::new(super::super::stream::CheckId::None),
+                &mut sink,
+            )
+            .unwrap_err()
+        {
             XzError::RangeCoderUnderflow(_) | XzError::LzmaUncompressedSizeMismatch { .. } => {}
             other => panic!("expected typed error, got {other:?}"),
         }

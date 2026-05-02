@@ -294,6 +294,45 @@ pub enum XzError {
     /// tables; without them the chunk cannot be decoded.
     #[error("xz: first LZMA2 chunk must carry properties (reset_props)")]
     Lzma2MissingFirstProperties,
+
+    /// Block-trailer Check (CRC32/CRC64/SHA-256) did not match
+    /// the hash of the decompressed Block bytes. Names the
+    /// specific Check variant so the caller can route the
+    /// diagnostic. This is the load-bearing
+    /// "the file got corrupted in transit / on disk" signal
+    /// the .xz format provides.
+    #[error("xz: Block Check verification failed ({kind})")]
+    BlockCheckMismatch {
+        /// One of `"CRC32"`, `"CRC64"`, `"SHA-256"`.
+        kind: &'static str,
+    },
+
+    /// Index Block-record count or one of its size fields did
+    /// not match the bytes the decoder actually pulled. The .xz
+    /// format places an Index after the last Block in every
+    /// Stream as a redundant cross-check; mismatch here is the
+    /// "file structure was tampered with" signal.
+    #[error("xz: Index {field} mismatch (declared {declared}, observed {observed})")]
+    IndexMismatch {
+        /// One of `"record count"`, `"unpadded_size"`, or
+        /// `"uncompressed_size"`.
+        field: &'static str,
+        /// The Index's declared value.
+        declared: u64,
+        /// The decoder's observed value.
+        observed: u64,
+    },
+
+    /// Index CRC32 trailer did not match the CRC the decoder
+    /// computed over the Index bytes (Indicator + records +
+    /// padding).
+    #[error("xz: Index CRC32 mismatch (expected 0x{expected:08X}, got 0x{got:08X})")]
+    IndexCrcMismatch {
+        /// CRC32 stored in the Index trailer.
+        expected: u32,
+        /// CRC32 we computed over the Index bytes.
+        got: u32,
+    },
 }
 
 impl XzError {
