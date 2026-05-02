@@ -188,6 +188,22 @@ pub struct Cli {
     /// `/tmp` on a multi-GiB archive.
     #[arg(long = "max-disk-buffer", value_name = "SIZE", default_value = "1GiB")]
     pub max_disk_buffer: String,
+
+    /// Directory for the `.peel.part` and `.peel.ckpt` sidecar files.
+    ///
+    /// Default places them as siblings of the output (`<output>.peel.part`
+    /// / `<output>.peel.ckpt`). Override when the output and the resumable
+    /// state should live in different places — for example, extracting
+    /// to slow HDD-backed storage while keeping the in-flight compressed
+    /// bytes on faster SSD, or pinning the sidecars *inside* a Kubernetes
+    /// PersistentVolume mount when the output's parent is on ephemeral
+    /// container storage.
+    ///
+    /// The directory is created if missing. The basenames stay the same
+    /// (`<output_name>.peel.part` / `<output_name>.peel.ckpt`); only
+    /// their parent directory changes.
+    #[arg(long = "workdir", value_name = "DIR")]
+    pub workdir: Option<PathBuf>,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -359,7 +375,7 @@ impl Cli {
                 punch_threshold: self.punch_threshold,
                 checkpoint_min_bytes: self.checkpoint_min_bytes,
                 checkpoint_min_interval: Duration::from_secs_f64(self.checkpoint_min_secs.max(0.0)),
-                workdir: None,
+                workdir: self.workdir,
                 reader_poll_interval: Duration::from_millis(5),
                 forced_format: self.forced_format,
                 force_format_from_magic: self.force_format_from_magic,
@@ -822,6 +838,32 @@ mod tests {
         .expect("parse");
         let err = cli.into_run_args().err().expect("must error");
         assert!(matches!(err, CliError::InvalidDiskBuffer(_)));
+    }
+
+    #[test]
+    fn workdir_default_is_none() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(args.config.workdir.is_none());
+    }
+
+    #[test]
+    fn workdir_flag_propagates_to_coordinator_config() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/slow/out.bin",
+            "--workdir",
+            "/fast/scratch",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(
+            args.config.workdir.as_deref(),
+            Some(std::path::Path::new("/fast/scratch"))
+        );
     }
 
     #[test]

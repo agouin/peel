@@ -450,6 +450,35 @@ pub enum CoordinatorError {
         reason: String,
     },
 
+    /// A `.peel.ckpt` checkpoint was loaded successfully but the
+    /// matching `.peel.part` sparse file is missing or smaller than
+    /// the source's total size. The bitmap inside the checkpoint
+    /// claims chunks complete that — without the part file's bytes
+    /// — would silently be replaced with zeros if we proceeded.
+    /// Refuse to resume rather than corrupt the run; the user must
+    /// either restore the part file or delete both sidecars and
+    /// start fresh.
+    ///
+    /// Common cause in container/Kubernetes setups: the `.peel.ckpt`
+    /// is on a persistent volume but the `.peel.part` was on
+    /// ephemeral storage and got wiped on pod restart, or vice
+    /// versa. The fix is to put both sidecars in the same durable
+    /// directory — see `--workdir`.
+    #[error(
+        "checkpoint at {ckpt_path} is present but {reason}; \
+         refusing to resume from an inconsistent state. \
+         Either restore the part file, or delete both sidecars to \
+         start fresh."
+    )]
+    CheckpointPartMismatch {
+        /// Path of the checkpoint file we loaded.
+        ckpt_path: PathBuf,
+        /// Path of the part file we expected to find next to it.
+        part_path: PathBuf,
+        /// Human-readable summary of the inconsistency.
+        reason: String,
+    },
+
     /// The `PLAN_v2.md` §11 resume probe re-fetched a chunk we
     /// thought was already complete and observed a CRC-32C that
     /// disagreed with the value the prior run wrote into the
@@ -600,6 +629,16 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     }
 
     let prior = Checkpoint::read(&ckpt_path).map_err(CoordinatorError::Checkpoint)?;
+    if prior.is_some() {
+        // A checkpoint exists — refuse to silently fall back to a
+        // fresh-zero part file. `open_sparse` would otherwise CREAT
+        // and `set_len` the part to `total_size`, leaving the bitmap's
+        // claim of complete chunks pointing at zero bytes. The §11
+        // probe catches the resulting CRC drift later, but with a
+        // misleading "source changed" message; this earlier check
+        // surfaces the real cause (sidecars out of sync) up front.
+        validate_part_file(&ckpt_path, &part_path, info.total_size)?;
+    }
     let resume_plan = build_resume_plan(prior.as_ref(), &info, &url, &config, &output)?;
     let resuming = matches!(resume_plan, ResumePlan::Resume { .. });
     let resume_decoder_position = match &resume_plan {
@@ -625,6 +664,26 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     };
 
     let chunks_resumed = u32::try_from(bitmap.count_complete()).unwrap_or(u32::MAX);
+
+    // Startup banner: log what peel decided about the sidecars and
+    // where it's reading them from. Visible in `kubectl logs` and
+    // any other non-TTY environment so operators can confirm at a
+    // glance whether resume is engaging — the symptom of a wiped PV
+    // or a path mismatch is "[fresh]" appearing on every run.
+    match resume_decoder_position {
+        Some(pos) => tracing::info!(
+            "[resume] checkpoint at {} part={} decoder_position={} chunks={}/{}",
+            ckpt_path.display(),
+            part_path.display(),
+            pos,
+            chunks_resumed,
+            total_chunks,
+        ),
+        None => tracing::info!(
+            "[fresh] no checkpoint at {} — starting from byte 0",
+            ckpt_path.display(),
+        ),
+    }
 
     // §11 per-chunk CRC-32C fingerprint store. Pre-populated from
     // the prior checkpoint when resuming a v4 run; an empty store
@@ -1911,6 +1970,57 @@ fn make_puncher(sparse: &SparseFile) -> Box<dyn PunchHole> {
     default_puncher()
 }
 
+/// Verify the `.peel.part` sparse file is consistent with the
+/// `.peel.ckpt` we just loaded.
+///
+/// `open_sparse` is willing to CREAT + `set_len` the part file
+/// unconditionally, which would silently turn a missing or truncated
+/// part into a `total_size`-of-zeros sparse file. The bitmap inside
+/// the checkpoint claims chunks complete that — without their bytes
+/// — would now be all-zero garbage. This check fires before
+/// `open_sparse` and surfaces the inconsistency as a hard error so
+/// the user can either restore the part or delete both sidecars,
+/// rather than discovering the corruption later via the §11 probe's
+/// "source changed" message (or, if the checkpoint claimed zero
+/// chunks complete, not at all).
+///
+/// Tolerates a part file that's *exactly* `total_size`, including
+/// the freshly-created sparse case from a prior run that died before
+/// any download had landed: in that case the bitmap claims zero
+/// chunks and the resume effectively starts from byte 0 anyway.
+fn validate_part_file(
+    ckpt_path: &Path,
+    part_path: &Path,
+    total_size: u64,
+) -> Result<(), CoordinatorError> {
+    match fs::metadata(part_path) {
+        Ok(meta) => {
+            let actual = meta.len();
+            if actual < total_size {
+                return Err(CoordinatorError::CheckpointPartMismatch {
+                    ckpt_path: ckpt_path.to_path_buf(),
+                    part_path: part_path.to_path_buf(),
+                    reason: format!(
+                        "part file is {actual} bytes, source's total_size is {total_size}"
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(CoordinatorError::CheckpointPartMismatch {
+                ckpt_path: ckpt_path.to_path_buf(),
+                part_path: part_path.to_path_buf(),
+                reason: "part file is missing".into(),
+            })
+        }
+        Err(source) => Err(CoordinatorError::Io {
+            path: part_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Compute `<anchor> + suffix` for the .peel.part / .peel.ckpt
 /// sidecars, optionally redirected to `config.workdir`.
 fn sidecar_path(output: &OutputTarget, config: &CoordinatorConfig, suffix: &str) -> PathBuf {
@@ -2430,6 +2540,62 @@ mod tests {
     }
 
     #[test]
+    fn validate_part_file_errors_when_missing() {
+        let dir = unique_temp("validate_missing");
+        let _g = TmpDir(dir.clone());
+        fs::create_dir_all(&dir).expect("mkdir");
+        let ckpt = dir.join("out.bin.peel.ckpt");
+        fs::write(&ckpt, b"placeholder").expect("write ckpt");
+        let part = dir.join("out.bin.peel.part");
+        let err = validate_part_file(&ckpt, &part, 1024).expect_err("should reject");
+        match err {
+            CoordinatorError::CheckpointPartMismatch { reason, .. } => {
+                assert!(reason.contains("missing"), "got: {reason}");
+            }
+            other => panic!("expected CheckpointPartMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_part_file_errors_when_undersized() {
+        let dir = unique_temp("validate_short");
+        let _g = TmpDir(dir.clone());
+        fs::create_dir_all(&dir).expect("mkdir");
+        let ckpt = dir.join("out.bin.peel.ckpt");
+        fs::write(&ckpt, b"placeholder").expect("write ckpt");
+        let part = dir.join("out.bin.peel.part");
+        fs::File::create(&part)
+            .expect("part create")
+            .set_len(512)
+            .expect("set_len");
+        let err = validate_part_file(&ckpt, &part, 1024).expect_err("should reject");
+        match err {
+            CoordinatorError::CheckpointPartMismatch { reason, .. } => {
+                assert!(
+                    reason.contains("512") && reason.contains("1024"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected CheckpointPartMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_part_file_accepts_exact_size() {
+        let dir = unique_temp("validate_exact");
+        let _g = TmpDir(dir.clone());
+        fs::create_dir_all(&dir).expect("mkdir");
+        let ckpt = dir.join("out.bin.peel.ckpt");
+        fs::write(&ckpt, b"placeholder").expect("write ckpt");
+        let part = dir.join("out.bin.peel.part");
+        fs::File::create(&part)
+            .expect("part create")
+            .set_len(1024)
+            .expect("set_len");
+        validate_part_file(&ckpt, &part, 1024).expect("should accept");
+    }
+
+    #[test]
     fn sidecar_paths_alongside_output_by_default() {
         let cfg = CoordinatorConfig::default();
         let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
@@ -2544,6 +2710,13 @@ mod tests {
     impl Drop for TmpFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
 }

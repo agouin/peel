@@ -81,6 +81,22 @@ fn fast_retry() -> RetryConfig {
     }
 }
 
+/// Write a synthetic checkpoint *and* a matching `total_size`-byte
+/// sparse part file. Several tests fabricate a "prior run" by hand;
+/// the coordinator's startup pre-check now refuses to resume when a
+/// `.peel.ckpt` is present without a sized `.peel.part` next to it,
+/// so every such fixture has to drop both files.
+fn write_synthetic_sidecars(
+    ckpt_path: &Path,
+    part_path: &Path,
+    ckpt: &Checkpoint,
+    total_size: u64,
+) {
+    ckpt.write(ckpt_path).expect("ckpt write");
+    let part = fs::File::create(part_path).expect("part create");
+    part.set_len(total_size).expect("part set_len");
+}
+
 fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
     CoordinatorConfig {
         chunk_size,
@@ -924,7 +940,8 @@ fn etag_mismatch_on_resume_aborts_cleanly() {
         decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
-    ckpt.write(&ckpt_path).expect("ckpt write");
+    let part_path = work.join("out.bin.peel.part");
+    write_synthetic_sidecars(&ckpt_path, &part_path, &ckpt, body_len);
 
     let args = make_args(
         &server,
@@ -975,7 +992,8 @@ fn url_change_on_resume_aborts_cleanly() {
         decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
-    ckpt.write(&ckpt_path).expect("ckpt write");
+    let part_path = work.join("out.bin.peel.part");
+    write_synthetic_sidecars(&ckpt_path, &part_path, &ckpt, body_len);
 
     let args = make_args(
         &server,
@@ -1594,12 +1612,8 @@ fn sha256_added_on_resume_without_saved_state_errors() {
         decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
-    ckpt.write(&ckpt_path).expect("ckpt write");
-    // The .peel.part needs to exist as a placeholder so the resume
-    // path doesn't trip on the missing file before reaching the
-    // integrity-check guard. The contents don't need to be valid;
-    // the coordinator opens it and reuses the file.
-    fs::File::create(work.join("out.bin.peel.part")).expect("part placeholder");
+    let part_path = work.join("out.bin.peel.part");
+    write_synthetic_sidecars(&ckpt_path, &part_path, &ckpt, body_len);
 
     let args = make_args(
         &server,
@@ -1655,8 +1669,8 @@ fn sha256_dropped_on_resume_with_saved_state_errors() {
         decoder_state: None,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
-    ckpt.write(&ckpt_path).expect("ckpt write");
-    fs::File::create(work.join("out.bin.peel.part")).expect("part placeholder");
+    let part_path = work.join("out.bin.peel.part");
+    write_synthetic_sidecars(&ckpt_path, &part_path, &ckpt, body_len);
 
     let args = make_args(
         &server,
