@@ -1,8 +1,17 @@
 # PLAN — Hand-rolled zstd block decoder for mid-frame resume + per-block puncher
 
-**Status**: proposed (2026-05-01).
-**Owner**: TBD.
-**Supersedes**: nothing yet — this is additive to `PLAN_v2.md`.
+> **Status: shipped (2026-05-01).** Phases 1–10 below have landed (see
+> `git log` — `zstd phase 1` through `zstd phase 10`); the `zstd` crate
+> is no longer a runtime dependency, single-frame `tar.zst` archives
+> now checkpoint and hole-punch every block, and the crash-resume
+> harness produces byte-identical output. Phase 11's deferred
+> follow-ons have been promoted to `OPTIMIZATIONS.md` as `O.26` through
+> `O.31`. This document is retained as the historical record of how
+> the plan was scoped and built; do not start new work from it —
+> promote items from `OPTIMIZATIONS.md` into a successor plan instead
+> (see "When to revisit this list" in that doc).
+
+**Supersedes**: nothing — this was additive to `PLAN_v2.md`.
 
 ## Why we're doing this
 
@@ -409,19 +418,24 @@ commit `34975da`). The shape:
 **Exit criteria**: 100 randomized crash-resume runs are byte-
 identical.
 
-### Phase 11 — Optional follow-ons (deferred)
+### Phase 11 — Optional follow-ons (promoted 2026-05-01)
 
-These all live in `OPTIMIZATIONS.md` after this plan ships:
+The deferred follow-ons listed at plan time now live in
+`OPTIMIZATIONS.md` as their own entries:
 
-- Multi-stream parallel literals decode (Phase 3 single-stream is
-  fine for round one).
-- Huffman X2 fast-path table for ≥ 11-bit symbols.
-- SIMD fast-path for sequence execution.
-- Custom-dictionary support.
-- `windowLog > 27` for `--long` archives larger than 128 MiB
-  context.
-- Differential fuzz harness with `cargo-fuzz` and a real-world
-  corpus.
+- `O.26` — Multi-stream parallel literals decode (Phase 3
+  single-stream is fine for round one).
+- `O.27` — Huffman X2 fast-path table for ≥ 11-bit symbols.
+- `O.28` — SIMD fast-path for sequence execution.
+- `O.29` — Custom-dictionary support.
+- `O.30` — `windowLog > 27` for `--long` archives larger than 128
+  MiB context.
+- `O.31` — Differential fuzz harness with `cargo-fuzz` and a
+  real-world corpus.
+
+Promote any of these into a successor plan only via the deliberate
+review process described in `OPTIMIZATIONS.md`; do not pick them up
+opportunistically.
 
 ## Risks & open questions
 

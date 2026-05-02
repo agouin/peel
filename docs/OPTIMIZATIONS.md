@@ -1,16 +1,22 @@
 # Optimizations & Future Work
 
-> **Status: PLAN_v2 round one shipped (2026-04-30).** The MVP in `PLAN.md`
-> landed 2026-04-29 (phases 1–10), and round one of `PLAN_v2.md` followed
-> immediately on top, delivering `O.1`, `O.2`, `O.3`, `O.6`, `O.7`, `O.8`,
-> `O.10`, `O.11`, `O.13`, `O.14`, and `O.19`. Their entries below are
-> annotated **"delivered in PLAN_v2 §<phase>"** and kept as historical
-> record — do not re-pull them. The remaining items are eligible for
-> prioritization, but the rule still stands: **promotion from this file
-> to active work happens through deliberate human review**, not by an agent
-> deciding "while I'm here…" When an item is selected, it should be lifted
-> into a successor plan (a new sequenced doc, same discipline as the
-> original `PLAN.md`) before implementation begins.
+> **Status: zstd block decoder plan shipped (2026-05-01).** The MVP in
+> `PLAN.md` landed 2026-04-29 (phases 1–10); round one of `PLAN_v2.md`
+> followed on top (2026-04-30), delivering `O.1`, `O.2`, `O.3`, `O.6`,
+> `O.7`, `O.8`, `O.10`, `O.11`, `O.13`, `O.14`, and `O.19`; and the
+> `PLAN_zstd_block_decoder.md` plan landed 2026-05-01 (phases 1–10),
+> replacing the `zstd` crate with a hand-rolled `decode/zstd_native/`
+> module that surfaces per-block frame boundaries and a sliding-window
+> resume blob. That plan's Phase 11 follow-ons are filed below as `O.26`
+> through `O.31`. Delivered entries are annotated **"delivered in
+> PLAN_v2 §<phase>"** (or, where applicable, the zstd plan) and kept as
+> historical record — do not re-pull them. The remaining items are
+> eligible for prioritization, but the rule still stands: **promotion
+> from this file to active work happens through deliberate human
+> review**, not by an agent deciding "while I'm here…" When an item is
+> selected, it should be lifted into a successor plan (a new sequenced
+> doc, same discipline as the original `PLAN.md`) before implementation
+> begins.
 
 This file started as a **wishlist of things explicitly deferred** during
 MVP. With round one of `PLAN_v2.md` now shipped on top of the MVP, it
@@ -107,6 +113,68 @@ identify independent blocks; not exposed by the upstream `zstd` crate.
 
 **Why deferred**: only relevant on multi-socket servers; we are a CLI
 utility for end-user machines first.
+
+---
+
+### O.26 zstd multi-stream parallel literals decode
+
+**What**: decode the 4-stream parallel literals format (used by zstd
+when the literals section's compressed size warrants it) in parallel
+across threads, instead of the sequential walk
+[`src/decode/zstd_native/literals.rs`](../src/decode/zstd_native/literals.rs)
+ships in round one.
+
+**Why deferred**: sequential decode hit the `PLAN_zstd_block_decoder.md`
+throughput target (within 3× of libzstd on a representative
+`tar.zst`). Parallelizing is a fixed 4× ceiling on one hot loop and
+adds thread-coordination machinery; only worth it if profiling shows
+literals as the bottleneck.
+
+**Sketch**: the literals header carries three `u16` stream sizes (the
+fourth is derived from the total). After Huffman-table construction
+(which is shared and immutable for the block), spawn a job per stream
+into a small pool and concatenate the four output slices on join.
+No synchronization beyond the join — the table is read-only.
+
+---
+
+### O.27 zstd Huffman X2 fast-path table
+
+**What**: build libzstd's two-symbols-per-step Huffman decode table
+(`HUF_DTableX2`) for high-`tableLog` codes, halving the per-symbol
+overhead in the literals decode loop.
+
+**Why deferred**: the round-one decoder in
+[`src/decode/zstd_native/huffman.rs`](../src/decode/zstd_native/huffman.rs)
+walks one symbol per bitstream lookup against a single 2048-entry
+table — adequate for the throughput target. X2 is an additive boost
+on a fraction of total runtime, not a blocker.
+
+**Sketch**: build the X2 table alongside the X1 table when `tableLog ≥
+11`; alternate-symbol entries point at a "consume the next bits and
+then this second symbol" tail. The format is a libzstd implementation
+detail (not in RFC 8478), so the design is "infer the contract from
+libzstd's documentation, implement clean-room" — the same discipline
+the rest of `zstd_native` was built under.
+
+---
+
+### O.28 zstd SIMD fast-path for sequence execution
+
+**What**: SIMD-accelerate the inner loop of the sliding window's
+`match_copy` for long matches with offsets ≥ 16, where vectorized
+copies dominate the scalar 8-byte-word path.
+
+**Why deferred**: the scalar implementation in
+[`src/decode/zstd_native/window.rs`](../src/decode/zstd_native/window.rs)
+handles overlap-by-design correctness and hits the throughput target.
+SIMD is purely a throughput improvement and fragments the
+implementation across architectures.
+
+**Sketch**: in `match_copy`, branch on `offset >= 16 && remaining >=
+16` and fall into a `_mm_storeu_si128` path on x86-64 / `vst1q_u8` on
+aarch64; keep the scalar path as the fallback. Gate behind the same
+`#[cfg]` shape the io_uring backend uses for its platform set.
 
 ---
 
@@ -264,6 +332,54 @@ much larger project.
 discussions. Block layout: `[magic][len][type][crc32][payload][pad]`.
 Block types: archive header, file header, file data, file end, archive
 end, sync marker.
+
+---
+
+### O.29 zstd custom-dictionary support
+
+**What**: decode zstd frames whose `Frame_Header_Descriptor` declares a
+non-zero `Dictionary_ID`, including loading the dictionary's
+literals/match tables and prior FSE distributions.
+
+**Why deferred**:
+[`src/decode/zstd_native/frame.rs`](../src/decode/zstd_native/frame.rs)
+rejects non-zero `Dictionary_ID` cleanly, per the round-one scope.
+Real-world `.tar.zst` archives don't use custom dictionaries (a niche
+feature for repository-level deduplication, e.g. zstd-trained npm
+packing); adds significant surface (dictionary file format,
+table-pre-population semantics) for a use case our users haven't
+asked for.
+
+**Sketch**: implement the [`Dictionary_Format`] parser; pre-populate
+the decoder's `prev_huffman` / `prev_fse_*` / repeat-offset slots from
+the dictionary at frame start. Surface `--zstd-dict <path>` on the CLI
+to load a single dictionary, or read from a known well-known location.
+
+[`Dictionary_Format`]: https://datatracker.ietf.org/doc/html/rfc8478#section-5
+
+---
+
+### O.30 zstd `windowLog > 27` for `--long` archives
+
+**What**: decode zstd frames with `windowLog > 27` (windows larger
+than 128 MiB), which `zstd --long=N` produces with `N` up to 31
+(2 GiB on 64-bit hosts).
+
+**Why deferred**: the 128 MiB cap was chosen so the resume blob
+(window contents + small constant) stays bounded — see
+`PLAN_zstd_block_decoder.md` §Risks #2. Lifting the cap means
+multi-GiB resume blobs, which interacts poorly with checkpoint-write
+cost. Real-world `tar.zst` corpora don't use `--long > 27`; promoting
+this should pair with a checkpoint-blob diffing scheme so the on-disk
+cost of every-block checkpoints stays reasonable.
+
+**Sketch**: lift the cap in
+[`src/decode/zstd_native/frame.rs`](../src/decode/zstd_native/frame.rs)
+behind a delta-encoded resume blob: only persist the slice of the
+window that changed since the previous checkpoint, plus a back-
+reference to the prior blob. Or trade granularity — write checkpoints
+every Nth block, with N scaled by window size — and accept that resume
+loses up to N blocks of work.
 
 ---
 
@@ -461,6 +577,29 @@ that the MVP explicitly defers.
 
 ---
 
+### O.31 zstd differential fuzz harness
+
+**What**: a `cargo-fuzz` target driving the
+[`zstd_native`](../src/decode/zstd_native/) decoder against a curated
+corpus of real-world `.tar.zst` fixtures, cross-checked byte-identical
+against libzstd.
+
+**Why deferred**: `PLAN_zstd_block_decoder.md` Phase 6 ships a
+500-fixture differential against the `zstd` crate as a
+dev-dependency, which catches the obvious shapes. Sustained fuzzing
+is a separate investment — corpus curation, CI cycles, triage
+workflow. Same posture as `O.20`, and ideally promoted alongside it
+so the harness wires both targets in one go.
+
+**Sketch**: a `fuzz_targets/zstd_decode.rs` that takes arbitrary bytes,
+runs them through both `zstd_native::Decoder` and `zstd::stream::
+Decoder`, asserts the outputs match (or both error). Seed corpus
+from real `.tar.zst` archives plus the existing Phase 6 fixtures. If
+this lands as part of an OSS-Fuzz integration (per `O.20`), the same
+infrastructure covers both.
+
+---
+
 ## Metadata & semantics
 
 ### O.23 File modes, ownership, mtimes
@@ -500,15 +639,24 @@ attack vector).
 
 ## When to revisit this list
 
-**This is the moment, again.** The MVP shipped 2026-04-29 and round
+**This is the moment, again.** The MVP shipped 2026-04-29, round
 one of `PLAN_v2.md` shipped on top of it (§§6, 7, 7b, 8–14
-delivered). What's left here splits cleanly into three buckets:
+delivered), and the `PLAN_zstd_block_decoder.md` plan shipped
+2026-05-01 (phases 1–10). What's left here splits cleanly into four
+buckets:
 
 - **Round-two follow-ons filed during round one** — `O.6b` (xz
-  per-Block boundaries), `O.7b` (lz4 per-block boundaries), `O.8b`
-  (zip Zip64/AES/extra-method support). These are the most concrete
-  candidates because the round-one phases that filed them named the
-  exact corpora and motivations that would justify promoting them.
+  per-Block boundaries), `O.8b` (zip Zip64/AES/extra-method support).
+  (`O.7b` was filed during round one and delivered immediately
+  after.) These are concrete candidates because the round-one phases
+  that filed them named the exact corpora and motivations that would
+  justify promoting them.
+- **zstd round-two follow-ons** — `O.26`–`O.28` (perf: multi-stream
+  literals, Huffman X2, sequence-execution SIMD), `O.29`–`O.30`
+  (format: custom dictionaries, `windowLog > 27`), `O.31` (fuzz
+  harness). Promote a perf item only if profiling on a real corpus
+  shows the relevant hot loop dominating; promote a format item only
+  if a real archive trips the round-one rejection path.
 - **Performance items still deferred** — `O.4` (parallel zstd block
   decoding), `O.5` (NUMA placement). Both remain niche; promote only
   if profiling on a real corpus shows them load-bearing.
