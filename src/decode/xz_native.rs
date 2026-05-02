@@ -35,6 +35,21 @@
 //!   into the [`Decoder`] state machine — that happens in Phase 4
 //!   when LZMA chunks become first-class.
 //!
+//! # What Phase 3 added
+//!
+//! - [`lzma_state`]: 12-state machine + four transition tables
+//!   (literal / match / rep / short-rep), transcribed from the
+//!   LZMA spec.
+//! - [`probs::LzmaProbs`]: probability table allocation sized to
+//!   the Block's `lc`/`lp`/`pb`, with `reset()` for the LZMA2
+//!   chunk control bytes that request a fresh model.
+//! - [`probs::decode_literal`] / [`probs::decode_length`] /
+//!   [`probs::decode_distance`]: the three inner-loop primitives
+//!   the Phase 4 chunk decoder will drive against the range coder
+//!   and the dictionary. Not yet wired into the [`Decoder`] state
+//!   machine — Phase 4 hooks them up when LZMA chunks become
+//!   first-class.
+//!
 //! # What's deferred
 //!
 //! - LZMA chunks (control bytes `0x80..=0xFF`) surface
@@ -69,8 +84,13 @@ use crate::types::ByteOffset;
 
 pub mod block;
 pub mod error;
+pub mod lzma_state;
+pub mod probs;
 pub mod range_coder;
 pub mod stream;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use self::block::{parse_block_header, parse_lzma2_chunk_header, BlockHeader, Lzma2ChunkHeader};
 use self::error::XzError;

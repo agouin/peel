@@ -217,6 +217,19 @@ pub enum XzError {
     /// state surfaced the underflow (e.g. `"normalize"`).
     #[error("xz: LZMA range coder ran past end of compressed payload at {0}")]
     RangeCoderUnderflow(&'static str),
+
+    /// LZMA literal-context properties (`lc + lp`) exceeded the
+    /// spec maximum of 4. Default preset uses `lc=3, lp=0` (sum 3);
+    /// the spec allows up to `lc=8, lp=4` individually but
+    /// constrains `lc + lp ≤ 4`. Surfaces a clean error rather
+    /// than silently allocating a multi-MiB literal table.
+    #[error("xz: LZMA lc + lp = {0} exceeds spec max of 4")]
+    LzmaLcLpTooLarge(u32),
+
+    /// LZMA `pb` (position-state bits) exceeded the spec maximum
+    /// of 4.
+    #[error("xz: LZMA pb = {0} exceeds spec max of 4")]
+    LzmaPbTooLarge(u32),
 }
 
 impl XzError {
