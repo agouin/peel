@@ -768,7 +768,7 @@ mod tests {
             blob.extend_from_slice(&0u32.to_le_bytes()); // repeats
         }
         blob.push(0); // has_prev_huffman = false
-        // Three FSE tables (LL, OF, ML), each absent.
+                      // Three FSE tables (LL, OF, ML), each absent.
         blob.extend(std::iter::repeat_n(0u8, 3));
         blob.extend_from_slice(&Xxh64::new().serialize());
 

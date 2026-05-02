@@ -307,12 +307,22 @@ struct BlockCtx {
     /// (control byte `0x00`). After that we still owe Block
     /// Padding + Check before returning to `BetweenBlocks`.
     lzma2_finished: bool,
-    /// LZMA2 model state, allocated lazily on the first
-    /// LZMA-compressed chunk in a Block. Uncompressed-only
-    /// Blocks never pay the allocation; mixed Blocks pay it once
-    /// and reuse it across subsequent LZMA chunks (with chunk-
-    /// header `reset_*` flags clearing the relevant pieces).
+    /// LZMA2 model state, allocated lazily on the first chunk of
+    /// any kind in a Block. Uncompressed chunks pre-allocate it
+    /// with placeholder `(lc, lp, pb) = (3, 0, 2)` so their bytes
+    /// can be mirrored into the dict — a subsequent LZMA chunk
+    /// will replace the placeholder properties via
+    /// `reset_props_and_state`. Without this, an LZMA chunk that
+    /// follows an Uncompressed-only opening sequence would see an
+    /// empty dict and reject any back-reference into prior bytes.
     lzma_state: Option<Lzma2State>,
+    /// `true` once any LZMA-compressed chunk has been processed
+    /// in this Block. Distinct from `seen_first_chunk` (which
+    /// trips on any chunk type, including Uncompressed openers):
+    /// the LZMA2 spec requires the first LZMA chunk after non-
+    /// LZMA chunks to carry `reset_props`, and this flag is what
+    /// the LZMA-chunk arm uses to enforce that.
+    seen_first_lzma_chunk: bool,
     /// Reusable scratch for one chunk's compressed payload. Sized
     /// up to 64 KiB on first use (the LZMA2 chunk format caps
     /// `Compressed_Size` at `1 << 16`); held thereafter.
@@ -468,6 +478,7 @@ impl Decoder {
                         seen_first_chunk: false,
                         lzma2_finished: false,
                         lzma_state: None,
+                        seen_first_lzma_chunk: false,
                         chunk_payload_buf: Vec::new(),
                         check_hasher: BlockCheckHasher::new(flags.check),
                     }),
@@ -497,13 +508,16 @@ impl Decoder {
                     // Phase 6: advance the per-LZMA2-chunk frame
                     // boundary so the coordinator's
                     // checkpoint cadence fires at every chunk.
-                    // Only valid when an `lzma_state` is
-                    // allocated and we're not yet past the EOS
-                    // chunk — those are the conditions
-                    // [`Self::decoder_state`] gates `Some(blob)`
-                    // on, and `frame_boundary` must point at the
-                    // same byte offset.
-                    if ctx.lzma_state.is_some() && !ctx.lzma2_finished {
+                    // Only valid when an LZMA chunk has run (so
+                    // `decoder_state` would actually emit a
+                    // resume blob — Uncompressed-only chunks
+                    // pre-allocate `lzma_state` with placeholder
+                    // properties that aren't safe to resume
+                    // against) and we're not yet past the EOS
+                    // chunk. `frame_boundary` must point at the
+                    // same byte offset `decoder_state` is gated
+                    // on.
+                    if ctx.seen_first_lzma_chunk && !ctx.lzma2_finished {
                         self.last_frame_boundary = Some(ByteOffset::new(self.bytes_consumed));
                     }
                     return Ok(DecodeStatus::MoreData);
@@ -850,18 +864,28 @@ impl Decoder {
                 uncompressed_size,
                 reset_dict,
             } => {
-                // Apply reset to an existing LZMA state's dict if
-                // one is allocated; the chunk's bytes will then
-                // start populating a fresh ring.
-                if let Some(state) = ctx.lzma_state.as_mut() {
-                    if reset_dict {
-                        state.dict.reset();
-                    }
+                // Pre-allocate the LZMA model state (with
+                // placeholder properties — the first LZMA chunk
+                // that follows is required by the spec to carry
+                // `reset_props` and will replace them) so this
+                // chunk's bytes can be mirrored into the dict.
+                // Without this, a later LZMA chunk that doesn't
+                // request `reset_dict` would see an empty dict
+                // and reject any back-reference into prior bytes.
+                if ctx.lzma_state.is_none() {
+                    ctx.lzma_state = Some(Lzma2State::new(ctx.header.dict_size, 3, 0, 2)?);
+                }
+                if reset_dict {
+                    ctx.lzma_state
+                        .as_mut()
+                        .expect("just allocated")
+                        .dict
+                        .reset();
                 }
                 // Stream the chunk payload to the sink in fixed-
                 // size pieces, mirroring it into the LZMA dict
-                // when one is allocated so subsequent LZMA
-                // chunks can match against these bytes.
+                // so subsequent LZMA chunks can match against
+                // these bytes.
                 let mut remaining = uncompressed_size as usize;
                 let mut scratch = [0u8; 4096];
                 while remaining > 0 {
@@ -874,10 +898,9 @@ impl Decoder {
                     )?;
                     ctx.check_hasher.update(&scratch[..take]);
                     sink.write_all(&scratch[..take]).map_err(XzError::SinkIo)?;
-                    if let Some(state) = ctx.lzma_state.as_mut() {
-                        for &b in &scratch[..take] {
-                            state.dict.push(b);
-                        }
+                    let state = ctx.lzma_state.as_mut().expect("allocated above");
+                    for &b in &scratch[..take] {
+                        state.dict.push(b);
                     }
                     remaining -= take;
                 }
@@ -894,14 +917,18 @@ impl Decoder {
                 compressed_size,
                 properties,
             } => {
-                // Apply reset semantics. The first LZMA chunk in a
-                // Block (when `lzma_state` is None) must carry
-                // properties — without them the decoder doesn't
-                // know `(lc, lp, pb)` to size its tables.
-                // Subsequent chunks may inherit from the prior
-                // chunk, with `reset_dict`, `reset_props`, or
-                // `reset_state` peeling back state in increasing
-                // order.
+                // The first LZMA chunk in a Block must carry
+                // properties — whether it's the first chunk in
+                // the Block or follows Uncompressed-only openers
+                // (in which case `lzma_state` exists but holds
+                // placeholder properties that aren't valid for
+                // decoding). Subsequent LZMA chunks may inherit
+                // from the prior chunk, with `reset_dict`,
+                // `reset_props`, or `reset_state` peeling back
+                // state in increasing order.
+                if !ctx.seen_first_lzma_chunk && !reset_props {
+                    return Err(XzError::Lzma2MissingFirstProperties);
+                }
                 if let Some(state) = ctx.lzma_state.as_mut() {
                     if reset_dict {
                         let props = properties.ok_or(XzError::Lzma2MissingFirstProperties)?;
@@ -945,6 +972,7 @@ impl Decoder {
                 ctx.decompressed_so_far = ctx
                     .decompressed_so_far
                     .saturating_add(u64::from(uncompressed_size));
+                ctx.seen_first_lzma_chunk = true;
                 Ok(())
             }
         }
@@ -1013,13 +1041,18 @@ impl StreamingDecoder for Decoder {
     fn decoder_state(&self) -> Option<Vec<u8>> {
         // The blob is meaningful only at an LZMA2 chunk boundary
         // inside a Block where the LZMA model has been
-        // allocated (i.e. at least one LZMA chunk has run) and
-        // the EOS chunk hasn't yet been observed. Any other
-        // position falls back to the regular factory at the
-        // last per-Stream `frame_boundary`.
+        // allocated *with real properties* (i.e. at least one
+        // LZMA chunk has run — Uncompressed-chunk pre-allocation
+        // uses placeholder (lc, lp, pb) that aren't safe to
+        // resume against) and the EOS chunk hasn't yet been
+        // observed. Any other position falls back to the regular
+        // factory at the last per-Stream `frame_boundary`.
         let State::InBlock { flags, ctx, .. } = &self.state else {
             return None;
         };
+        if !ctx.seen_first_lzma_chunk {
+            return None;
+        }
         let lzma_state = ctx.lzma_state.as_ref()?;
         if ctx.lzma2_finished {
             return None;
@@ -1089,6 +1122,11 @@ impl Decoder {
             seen_first_chunk: captured.block_seen_first_chunk,
             lzma2_finished: captured.block_lzma2_finished,
             lzma_state: Some(lzma_state),
+            // Resume blobs are only captured at LZMA2-chunk
+            // boundaries after at least one LZMA chunk has run
+            // (Uncompressed-only resumes were never produced),
+            // so this is always `true` on a successful resume.
+            seen_first_lzma_chunk: true,
             chunk_payload_buf: Vec::new(),
             check_hasher,
         });

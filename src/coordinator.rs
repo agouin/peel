@@ -2060,6 +2060,18 @@ fn run_cursor_chunk_audit(
     }
 
     let start_byte = cursor_chunk_idx.saturating_mul(chunk_size);
+    if decoder_position > start_byte {
+        // Cursor is mid-chunk: bytes below it have been hole-punched
+        // by the prior run's extractor (zeroed) up to roughly
+        // `align_down(decoder_position, fs_block)`. The fingerprint
+        // was recorded over the pristine pre-punch chunk, so a
+        // whole-chunk re-CRC here would always mismatch and produce
+        // a false-positive `PartFileCorrupted`. We skip rather than
+        // alarm; on-disk corruption of the post-cursor bytes will
+        // still surface as a decoder error when the decoder reads
+        // them.
+        return Ok(());
+    }
     let end_byte = start_byte.saturating_add(chunk_size).min(total_size);
     let len = end_byte.saturating_sub(start_byte);
     // INVARIANT: len ≤ chunk_size which fits in usize on every

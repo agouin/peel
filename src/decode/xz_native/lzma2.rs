@@ -176,9 +176,28 @@ impl Lzma2State {
         Ok(())
     }
 
-    /// Reset state machine + reps only (mode `0b01` of the LZMA
-    /// chunk control byte). Probs and dict survive.
+    /// Reset state machine + reps + reinitialize the probability
+    /// tables to their default values (mode `0b101` of the LZMA
+    /// chunk control byte — "Reset state"). The `(lc, lp, pb)`
+    /// triple stays the same (no new properties read from the
+    /// chunk header), so the probs tables are reallocated at the
+    /// same size and re-seeded to `PROB_INIT_VAL`. The
+    /// dictionary survives untouched.
+    ///
+    /// Per the LZMA2 spec, "reset state" means resetting BOTH the
+    /// LZMA state machine *and* the probability tables — without
+    /// the latter the decoder's probs evolve from where the prior
+    /// chunk ended while the encoder's were re-initialized,
+    /// causing the bitstream to drift out of sync.
     pub fn reset_state(&mut self) {
+        let lc = self.probs.lc;
+        let lp = self.probs.lp;
+        let pb = self.probs.pb;
+        // INVARIANT: `(lc, lp, pb)` already passed `LzmaProbs::new`
+        // when the prior chunk's reset_props (or the Block's
+        // first LZMA chunk) installed them, so reallocating with
+        // the same triple cannot fail.
+        self.probs = LzmaProbs::new(lc, lp, pb).expect("same triple revalidates");
         self.reset_state_and_reps();
     }
 

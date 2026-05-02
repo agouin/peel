@@ -1877,10 +1877,13 @@ fn cursor_chunk_audit_rejects_corrupted_part_file_on_resume() {
         let hi = ((i as u64 + 1) * chunk_size).min(body.len() as u64) as usize;
         crcs.push(peel::hash::crc32c::castagnoli(&body[lo..hi]));
     }
-    // Pick a cursor that lands inside chunk index 2 (the audit
-    // inspects exactly the chunk holding decoder_position).
+    // Pick a cursor at the start of chunk index 2 (the audit only
+    // runs the whole-chunk CRC when the cursor is at a chunk
+    // boundary; mid-chunk cursors mean the prior run hole-punched
+    // the chunk's lower portion and a whole-chunk CRC would
+    // false-alarm).
     let cursor_chunk: u32 = 2;
-    let cursor = u64::from(cursor_chunk) * chunk_size + 17;
+    let cursor = u64::from(cursor_chunk) * chunk_size;
     let ckpt = Checkpoint {
         url: format!("{}/data.zst", server.base_url()),
         etag: Some("\"v1\"".into()),
@@ -1936,6 +1939,116 @@ fn cursor_chunk_audit_rejects_corrupted_part_file_on_resume() {
     // .peel.part / .peel.ckpt left on disk so the user can decide.
     assert!(ckpt_path.exists(), "checkpoint should remain after error");
     assert!(part_path.exists(), "part file should remain after error");
+}
+
+/// Regression test for the cursor-chunk audit's mid-chunk skip:
+/// when the resume cursor lands inside (rather than at the start
+/// of) a chunk, the prior run's extractor has hole-punched the
+/// chunk's lower portion. A whole-chunk CRC would always disagree
+/// with the recorded fingerprint (which was computed pre-punch),
+/// so the audit must skip rather than false-alarm. The decoder
+/// itself is the safety net for on-disk corruption past the
+/// cursor.
+#[test]
+fn cursor_chunk_audit_skips_when_cursor_is_mid_chunk() {
+    let mut payload = Vec::with_capacity(64 * 1024);
+    let mut rng: u64 = 0x00C0_FFEE_F00D;
+    while payload.len() < 64 * 1024 {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        payload.extend_from_slice(&rng.to_le_bytes());
+    }
+    let body = encode_zstd(&payload);
+    let server = MockServer::start({
+        let body_clone = body.clone();
+        move |req, _n| serve(req, &body_clone, Some("\"v1\"".into()))
+    });
+
+    let work = unique_dir("cursor_audit_midchunk");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+    let chunk_size = 1024u64;
+    let mut config = coord_config_for_test(chunk_size);
+    config.checkpoint_min_bytes = 1;
+    config.checkpoint_min_interval = Duration::from_millis(0);
+
+    let args1 = make_args(
+        &server,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        config.clone(),
+    );
+    run(args1).expect("first run");
+    fs::remove_file(&out_path).ok();
+
+    let total_chunks = (body.len() as u64).div_ceil(chunk_size) as u32;
+    let bitmap = peel::bitmap::ChunkBitmap::new(total_chunks);
+    for i in 0..total_chunks {
+        bitmap.mark_complete(peel::types::ChunkIndex::new(i));
+    }
+    let mut crcs = Vec::with_capacity(total_chunks as usize);
+    for i in 0..total_chunks {
+        let lo = (i as u64 * chunk_size) as usize;
+        let hi = ((i as u64 + 1) * chunk_size).min(body.len() as u64) as usize;
+        crcs.push(peel::hash::crc32c::castagnoli(&body[lo..hi]));
+    }
+
+    // Cursor lands 17 bytes into chunk 2 — exactly the case where
+    // the prior run's extractor would have punched bytes [chunk_2_start,
+    // align_down(cursor, fs_block)).
+    let cursor_chunk: u32 = 2;
+    let cursor = u64::from(cursor_chunk) * chunk_size + 17;
+    let ckpt = Checkpoint {
+        url: format!("{}/data.zst", server.base_url()),
+        etag: Some("\"v1\"".into()),
+        last_modified: None,
+        total_size: body.len() as u64,
+        chunk_size,
+        decoder_position: ByteOffset::new(cursor),
+        bitmap_completed: bitmap.to_bytes(),
+        created_at: SystemTime::now(),
+        sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: None,
+        chunk_crc32c: Some(crcs),
+        decoder_state: None,
+    };
+    let part_path = work.join("out.bin.peel.part");
+    let ckpt_path = work.join("out.bin.peel.ckpt");
+    ckpt.write(&ckpt_path).expect("ckpt write");
+
+    // Simulate the post-punch state: zero out the chunk's bytes
+    // below `align_down(cursor, 4096)` (the realistic punch range
+    // a prior run's extractor would have produced for this cursor),
+    // leaving everything from there on intact.
+    let mut part_bytes = body.clone();
+    let punch_end = (cursor / 4096) * 4096;
+    let chunk_start = u64::from(cursor_chunk) * chunk_size;
+    if punch_end > chunk_start {
+        for byte in &mut part_bytes[chunk_start as usize..punch_end as usize] {
+            *byte = 0;
+        }
+    }
+    fs::write(&part_path, &part_bytes).expect("write punched part");
+
+    let args2 = make_args(
+        &server,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        config,
+    );
+    // The audit must NOT fire `PartFileCorrupted` here — the chunk's
+    // pre-cursor bytes are legitimately zero from punching, not on-disk
+    // bit-rot. The decoder may still surface its own error because we
+    // hand-built a checkpoint whose `decoder_position` doesn't sit on
+    // a real zstd frame boundary; that's fine and out of scope. We
+    // only assert the audit didn't fire.
+    if let Err(CoordinatorError::PartFileCorrupted { .. }) = run(args2) {
+        panic!("audit false-alarmed on a legitimately punched mid-chunk resume");
+    }
+    // Any other outcome (Ok, or a different error from the
+    // hand-built non-frame-boundary decoder_position) is acceptable;
+    // the test's only contract is that the audit doesn't fire.
 }
 
 #[test]

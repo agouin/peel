@@ -269,6 +269,49 @@ fn multi_chunk_integration_4mib_mixed() {
     assert_eq!(native, input, "4 MiB multi-chunk round-trip");
 }
 
+/// Incompressible (LCG-random) payload large enough that liblzma
+/// emits LZMA2 Uncompressed chunks (control bytes 0x01/0x02) for
+/// most of the stream. The decoder must mirror those bytes into
+/// the LZMA dict so that any LZMA chunk the encoder emits later
+/// can match back into them; without that, the first such match
+/// rejects with `LzmaMatchOutOfRange` against an essentially
+/// empty dict. 1 MiB is well above liblzma's per-chunk cap (so
+/// there are many Uncompressed chunks) and small enough to keep
+/// test time bounded.
+#[test]
+fn incompressible_payload_round_trips() {
+    let input = lcg_bytes(0xFEED_FACE, 1024 * 1024);
+    let stream = xz2_compress(&input, 6);
+    let native = native_decompress(&stream);
+    let reference = xz2_decompress(&stream);
+    assert_eq!(native, reference, "differential mismatch");
+    assert_eq!(native, input, "round-trip mismatch");
+}
+
+/// Mixed-content payload — alternating regions of incompressible
+/// random bytes and zero padding — that drives liblzma to emit a
+/// chunk pattern with reset_state-only LZMA chunks (control mode
+/// `0b101`, i.e. 0xA0..=0xBF) interleaved with Uncompressed
+/// chunks. The reset_state chunk requires the decoder to
+/// reinitialize the probability tables (not just the LZMA state
+/// machine + reps) so the bitstream stays in sync with the
+/// encoder, which has done the same. Two random regions plus a
+/// zero-padding region between them is the smallest shape that
+/// reliably exercises this path at preset 6.
+#[test]
+fn mixed_random_and_zeros_round_trips() {
+    let mut input = Vec::with_capacity(2 * 1024 * 1024 + 4096);
+    input.extend(lcg_bytes(0xBEEFu32, 1024 * 1024));
+    input.extend(std::iter::repeat_n(0u8, 4096));
+    input.extend(lcg_bytes(0xBEEFu32 + 1, 1024 * 1024));
+    input.extend(std::iter::repeat_n(0u8, 4096));
+    let stream = xz2_compress(&input, 6);
+    let native = native_decompress(&stream);
+    let reference = xz2_decompress(&stream);
+    assert_eq!(native, reference, "differential mismatch");
+    assert_eq!(native, input, "round-trip mismatch");
+}
+
 /// Concatenated streams (`cat a.xz b.xz`) decode in order.
 /// Mirrors `xz_native::tests::concatenated_streams_decode_in_order`
 /// at integration scale via real xz output.
