@@ -2109,9 +2109,9 @@ fn worker_probe_detects_source_drift() {
         },
     };
     let cancel = AtomicBool::new(false);
-    let err = peel::download::worker::download_dispatch(&ctx, dispatch, &fast_retry(), &cancel)
+    let failure = peel::download::worker::download_dispatch(&ctx, dispatch, &fast_retry(), &cancel)
         .expect_err("probe must detect drift");
-    match err {
+    match failure.error {
         peel::download::WorkerError::SourceDriftDetected {
             expected, actual, ..
         } => {

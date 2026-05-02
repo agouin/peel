@@ -1997,18 +1997,25 @@ fn run_resume_probe(
     let cancel = AtomicBool::new(false);
     match crate::download::worker::download_dispatch(&ctx, dispatch, retry, &cancel) {
         Ok(_) => Ok(()),
-        Err(crate::download::WorkerError::SourceDriftDetected {
-            chunk,
-            expected,
-            actual,
+        Err(crate::download::ChunkFailure {
+            error:
+                crate::download::WorkerError::SourceDriftDetected {
+                    chunk,
+                    expected,
+                    actual,
+                },
+            ..
         }) => Err(CoordinatorError::SourceChangedSinceCheckpoint {
             chunk,
             expected,
             actual,
         }),
-        Err(other) => Err(CoordinatorError::Scheduler(SchedulerError::ChunkFailed {
+        Err(crate::download::ChunkFailure {
+            error: other,
+            attempts,
+        }) => Err(CoordinatorError::Scheduler(SchedulerError::ChunkFailed {
             chunk,
-            attempts: 1,
+            attempts,
             source: other,
         })),
     }

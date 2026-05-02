@@ -317,6 +317,24 @@ pub struct ChunkOutcome {
     pub crcs: Vec<u32>,
 }
 
+/// What [`download_chunk`] reports on failure: the underlying error
+/// plus the actual attempt count at the moment it surfaced.
+///
+/// Pairing the count with the error preserves diagnostic fidelity:
+/// without it, the scheduler's `[ChunkFailed]` log line had to either
+/// hardcode `attempts: 1` or refuse to log a count, both of which hide
+/// whether the worker exhausted its retry budget or bailed on the
+/// first pass (e.g. a non-retryable status, a cancellation).
+#[derive(Debug)]
+pub struct ChunkFailure {
+    /// The error that ended the retry loop.
+    pub error: WorkerError,
+    /// Number of attempts taken before [`Self::error`] surfaced
+    /// (1 = the first attempt failed terminally; `>= 2` = at least
+    /// one retry happened).
+    pub attempts: u32,
+}
+
 /// What kind of work a [`Dispatch`] represents.
 ///
 /// Most dispatches are [`DispatchKind::Fetch`] — fetch the bytes
@@ -406,15 +424,16 @@ pub struct ChunkContext<'a> {
 ///
 /// # Errors
 ///
-/// Returns the *last* error observed if all retries are exhausted, or
-/// the first non-retryable error encountered.
+/// Returns a [`ChunkFailure`] carrying the *last* error observed if
+/// all retries are exhausted, or the first non-retryable error
+/// encountered, paired with the actual attempt count.
 pub fn download_chunk(
     ctx: &ChunkContext<'_>,
     chunk: ChunkIndex,
     range: ByteRange,
     retry: &RetryConfig,
     cancel: &AtomicBool,
-) -> Result<ChunkOutcome, WorkerError> {
+) -> Result<ChunkOutcome, ChunkFailure> {
     download_dispatch(
         ctx,
         Dispatch {
@@ -443,17 +462,23 @@ pub fn download_chunk(
 ///
 /// # Errors
 ///
-/// Returns the *last* error observed if all retries are exhausted, or
-/// the first non-retryable error encountered.
+/// Returns a [`ChunkFailure`] carrying the *last* error observed if
+/// all retries are exhausted, or the first non-retryable error
+/// encountered, paired with the actual attempt count. The attempt
+/// count is `>= 1` for any `Err`: a pre-loop cancel observation
+/// counts as one attempt that did not run.
 pub fn download_dispatch(
     ctx: &ChunkContext<'_>,
     dispatch: Dispatch,
     retry: &RetryConfig,
     cancel: &AtomicBool,
-) -> Result<ChunkOutcome, WorkerError> {
+) -> Result<ChunkOutcome, ChunkFailure> {
     let chunk = dispatch.first;
     if cancel.load(Ordering::Relaxed) {
-        return Err(WorkerError::Cancelled { chunk });
+        return Err(ChunkFailure {
+            error: WorkerError::Cancelled { chunk },
+            attempts: 1,
+        });
     }
     let mut attempt: u32 = 0;
     let mut backoff = retry.initial_backoff;
@@ -471,12 +496,17 @@ pub fn download_dispatch(
         {
             Some(i) => i,
             None => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(WorkerError::Cancelled { chunk });
-                }
-                return Err(WorkerError::NoLiveMirror {
-                    chunk,
-                    wait_secs: DEFAULT_MIRROR_PICK_DEADLINE.as_secs_f64(),
+                let error = if cancel.load(Ordering::Relaxed) {
+                    WorkerError::Cancelled { chunk }
+                } else {
+                    WorkerError::NoLiveMirror {
+                        chunk,
+                        wait_secs: DEFAULT_MIRROR_PICK_DEADLINE.as_secs_f64(),
+                    }
+                };
+                return Err(ChunkFailure {
+                    error,
+                    attempts: attempt,
                 });
             }
         };
@@ -491,10 +521,13 @@ pub fn download_dispatch(
                 if let DispatchKind::Probe { expected } = dispatch.kind {
                     let actual = crcs.first().copied().unwrap_or(0);
                     if actual != expected {
-                        return Err(WorkerError::SourceDriftDetected {
-                            chunk,
-                            expected,
-                            actual,
+                        return Err(ChunkFailure {
+                            error: WorkerError::SourceDriftDetected {
+                                chunk,
+                                expected,
+                                actual,
+                            },
+                            attempts: attempt,
                         });
                     }
                     return Ok(ChunkOutcome {
@@ -523,7 +556,10 @@ pub fn download_dispatch(
             // `NoLiveMirror`. Single-mirror runs short-circuit
             // immediately because there is nothing to fall back to.
             if !ctx.mirrors.has_alternates() {
-                return Err(err);
+                return Err(ChunkFailure {
+                    error: err,
+                    attempts: attempt,
+                });
             }
             // Don't sleep on a non-retryable error — the picker's
             // exclusion-aware wait handles backoff at the
@@ -531,10 +567,16 @@ pub fn download_dispatch(
             continue;
         }
         if attempt >= retry.max_attempts {
-            return Err(err);
+            return Err(ChunkFailure {
+                error: err,
+                attempts: attempt,
+            });
         }
         if !sleep_with_cancel(backoff, cancel) {
-            return Err(WorkerError::Cancelled { chunk });
+            return Err(ChunkFailure {
+                error: WorkerError::Cancelled { chunk },
+                attempts: attempt,
+            });
         }
         backoff = backoff.saturating_mul(2).min(retry.max_backoff);
     }

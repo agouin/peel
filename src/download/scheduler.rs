@@ -1271,15 +1271,15 @@ fn worker_loop(
                 crcs,
                 result: Ok(()),
             },
-            Err(err) => Completion {
+            Err(crate::download::worker::ChunkFailure { error, attempts }) => Completion {
                 first: dispatch.first,
                 count: dispatch.count,
                 bytes: 0,
-                attempts: 1,
+                attempts,
                 elapsed,
                 kind: dispatch.kind,
                 crcs: Vec::new(),
-                result: Err(err),
+                result: Err(error),
             },
         };
         if done_tx.send(msg).is_err() {

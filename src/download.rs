@@ -53,7 +53,7 @@ pub use scheduler::{
 };
 pub use sparse_file::{SparseFile, SparseFileError};
 pub use worker::{
-    ChunkOutcome, Dispatch, DispatchKind, RetryConfig, SourceFingerprint, WorkerError,
+    ChunkFailure, ChunkOutcome, Dispatch, DispatchKind, RetryConfig, SourceFingerprint, WorkerError,
 };
 pub use zip_pipeline::{
     BoundedSparseReader, ZipExtractionStats, ZipPipeline, ZipPipelineConfig, ZipPipelineError,

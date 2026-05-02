@@ -473,6 +473,76 @@ fn run_retries_on_503_then_succeeds() {
     assert_eq!(read_full(&path), body_clone);
 }
 
+// ---- run: failure carries actual attempt count ------------------------
+
+#[test]
+fn run_chunk_failed_reports_actual_attempt_count() {
+    // Regression: the worker_loop completion message used to hardcode
+    // `attempts: 1` on the failure path, hiding whether the worker
+    // exhausted its retry budget or bailed on the first pass. A 503
+    // is a retryable status, so a server that returns 503 forever
+    // forces `download_dispatch` to take all `max_attempts` tries
+    // before it surfaces. Asserting the count proves the wiring works.
+    let body = make_body(8000);
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 200,
+                reason: "OK",
+                headers: vec![
+                    ("Content-Length".into(), body.len().to_string()),
+                    ("Accept-Ranges".into(), "bytes".into()),
+                ],
+                body: Vec::new(),
+            };
+        }
+        // Always 503: every chunk dispatch will exhaust its retry budget.
+        MockResponse::Reply {
+            status: 503,
+            reason: "Service Unavailable",
+            headers: vec![("Retry-After".into(), "0".into())],
+            body: Vec::new(),
+        }
+    });
+    let client = build_client();
+
+    let info = discover(&client, &url(&server, "/")).expect("discover");
+    let chunk_size = 2000;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    let path = temp_path("attempts_count");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    // Pin max_attempts to a known non-default value so the assertion
+    // is unambiguous.
+    let mut scheduler_cfg = cfg(chunk_size, 2);
+    scheduler_cfg.retry = RetryConfig {
+        max_attempts: 4,
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+    };
+
+    let err = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
+        .expect_err("503 forever must surface ChunkFailed");
+    match err {
+        SchedulerError::ChunkFailed {
+            attempts, source, ..
+        } => {
+            assert_eq!(
+                attempts, 4,
+                "ChunkFailed must report the actual exhausted attempt count"
+            );
+            assert!(matches!(
+                source,
+                WorkerError::UnexpectedStatus { status: 503, .. }
+            ));
+        }
+        other => panic!("expected ChunkFailed, got {other:?}"),
+    }
+}
+
 // ---- run: ETag change aborts ------------------------------------------
 
 #[test]
