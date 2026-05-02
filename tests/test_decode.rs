@@ -111,16 +111,17 @@ fn registry_longest_suffix_takes_precedence_over_shorter() {
     assert_eq!(tar_decoder.bytes_consumed(), ByteOffset::ZERO);
 
     // Plain .zst should still reach the real zstd factory and reject
-    // empty input (the zstd-specific behavior), confirming we did NOT
-    // route to the marker.
+    // garbage input (the zstd-specific behavior — bad frame magic),
+    // confirming we did NOT route to the marker (which would happily
+    // return Eof for any source).
     let zst_factory = registry
         .factory_for_name("plain.zst")
         .expect(".zst registered");
     let mut zst_decoder =
-        zst_factory(Box::new(Cursor::new(Vec::<u8>::new()))).expect("zstd constructs");
+        zst_factory(Box::new(Cursor::new(vec![0xCC; 8]))).expect("zstd constructs");
     match zst_decoder.decode_step(&mut std::io::sink()) {
         Err(DecodeError::Read { .. }) => {}
-        other => panic!("expected real zstd factory to reject empty input, got {other:?}"),
+        other => panic!("expected real zstd factory to reject garbage input, got {other:?}"),
     }
 }
 

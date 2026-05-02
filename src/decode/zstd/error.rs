@@ -38,6 +38,13 @@ pub enum ZstdError {
     #[error("zstd decoder source IO failed")]
     SourceIo(#[source] io::Error),
 
+    /// The sink we were writing decoded output into rejected a
+    /// write. Surfaces as [`DecodeError::Write`] so the extractor's
+    /// sink-error path (`src/extractor.rs`) can recover the typed
+    /// `SinkError` the adapter captured.
+    #[error("zstd decoder sink IO failed")]
+    SinkIo(#[source] io::Error),
+
     /// The initial 4-byte magic did not match a known frame magic
     /// (regular `0xFD2FB528` LE or skippable `0x184D2A50..=0x184D2A5F`).
     #[error("zstd: bad frame magic 0x{magic:08X}")]
@@ -125,6 +132,7 @@ impl ZstdError {
     pub fn into_decode_error(self, consumed: u64) -> DecodeError {
         match self {
             ZstdError::SourceIo(source) => DecodeError::Read { consumed, source },
+            ZstdError::SinkIo(source) => DecodeError::Write(source),
             other => DecodeError::Read {
                 consumed,
                 source: io::Error::other(other.to_string()),

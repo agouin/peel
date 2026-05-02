@@ -10,11 +10,10 @@
 //! `xxh64.finalize() as u32` against the trailer.
 //!
 //! This module mirrors the shape of [`super::sha256::Sha256`] —
-//! `update` / `finalize` streaming surface — but without the
-//! serialization round-trip support: the zstd resume blob lives in
-//! [`crate::decode::zstd_native`] and Phase 7 of the zstd block
-//! decoder plan is where mid-frame XXH64 state will be persisted.
-//! Phase 6 only needs in-memory streaming.
+//! `update` / `finalize` streaming surface — and a small
+//! [`Xxh64::snapshot`] / [`Xxh64::restore`] pair so the zstd
+//! resume blob in [`crate::decode::zstd::resume`] can serialize
+//! mid-frame state.
 //!
 //! # Why hand-roll
 //!
@@ -131,9 +130,9 @@ impl Xxh64 {
 
     /// Serialize the streaming hasher's full internal state.
     ///
-    /// Used by the zstd `decode/zstd_native` Phase-7 resume blob so a
-    /// crash mid-frame can resume the content-checksum computation
-    /// from the last block boundary. The byte layout is:
+    /// Used by the zstd `decode/zstd` Phase-7 resume blob so a crash
+    /// mid-frame can resume the content-checksum computation from the
+    /// last block boundary. The byte layout is:
     ///
     /// - `4 × 8 B` — four lane accumulators `v[0..4]`, each u64 LE.
     /// - `32 B` — `buffer` (full stripe-sized scratch; only the

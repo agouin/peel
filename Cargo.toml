@@ -11,15 +11,6 @@ readme = "README.md"
 keywords = ["download", "extract", "archive", "streaming", "tar"]
 categories = ["command-line-utilities", "compression", "network-programming"]
 
-[features]
-# In-progress hand-rolled pure-Rust zstd decoder. Off by default so the
-# production zstd path (the upstream `zstd` crate binding) stays the one
-# `cargo test` exercises. Enable with `--features peel_zstd_native` when
-# working on the new decoder. Tracked in `docs/PLAN_zstd_block_decoder.md`;
-# the flag goes away in Phase 8 when the new decoder replaces the
-# wrapper as the production path.
-peel_zstd_native = []
-
 [lib]
 name = "peel"
 path = "src/lib.rs"
@@ -37,9 +28,12 @@ thiserror = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
 # Compression backends, pre-approved per docs/ENGINEERING_STANDARDS.md §2.2.
-# We use only the streaming reader API plus `encode_all` for tests; the
-# default features (legacy decoders, dictionary builder, etc.) are not
-# needed and would expand the audit surface for no gain.
+# zstd-encoded ZIP entries (`src/zip/decode.rs`) decode through the
+# upstream `zstd` crate's streaming reader API; the streaming
+# `.tar.zst` / `.zst` decoder is hand-rolled in `src/decode/zstd/`
+# and does not depend on this crate. The default features (legacy
+# decoders, dictionary builder, etc.) are not needed and would expand
+# the audit surface for no gain.
 zstd = { version = "0.13", default-features = false }
 # xz / LZMA decompression backend (PLAN_v2.md §3 / docs/ENGINEERING_STANDARDS.md §2.2).
 # Bindings to upstream liblzma; we use only the raw `stream::Stream` API

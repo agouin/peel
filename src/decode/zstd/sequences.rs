@@ -816,7 +816,7 @@ mod tests {
         use super::super::frame::parse_frame_header;
         use super::super::literals::{decode_literals, parse_literals_header};
 
-        // Same generator as `decode::zstd_native::tests::wide_alphabet_compressible_payload`.
+        // Same generator as `decode::zstd::tests::wide_alphabet_compressible_payload`.
         let mut payload = Vec::with_capacity(32 * 1024);
         for i in 0..32 * 1024 {
             let block = i / 17;

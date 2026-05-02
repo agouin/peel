@@ -22,8 +22,9 @@
 //!
 //! Concrete implementations live in submodules:
 //!
-//! - [`zstd`] — wraps the upstream `zstd` crate's streaming reader and
-//!   detects frame boundaries by single-frame stepping.
+//! - [`zstd`] — hand-rolled pure-Rust zstd decoder
+//!   (`docs/PLAN_zstd_block_decoder.md`) with per-block mid-frame
+//!   restart points.
 //! - [`identity`] — passthrough decoder for archive formats that have
 //!   no compression layer (uncompressed `.tar`).
 //! - [`xz`] — wraps `xz2`'s raw [`xz2::stream::Stream`] in single-Stream
@@ -39,14 +40,12 @@
 //! # Source ownership
 //!
 //! Unlike the Python prototype — where the source was re-bound on every
-//! call to give the codec a fresh file handle — Rust's
-//! [`zstd::stream::read::Decoder`] takes ownership of its input. Carrying
-//! that ownership across calls would require type-erased lifetimes that
-//! buy nothing in practice, so the decoder takes the source at
-//! construction and keeps it for its lifetime. This is a deliberate
-//! deviation from the trait sketch in `docs/PLAN.md` §6.1; the contract
-//! the *extractor* relies on (bounded steps, monotone `bytes_consumed`,
-//! optional `frame_boundary`) is unchanged.
+//! call to give the codec a fresh file handle — every in-tree decoder
+//! takes ownership of its input at construction and keeps it for its
+//! lifetime. This is a deliberate deviation from the trait sketch in
+//! `docs/PLAN.md` §6.1; the contract the *extractor* relies on
+//! (bounded steps, monotone `bytes_consumed`, optional
+//! `frame_boundary`) is unchanged.
 //!
 //! # Registry
 //!
@@ -70,8 +69,6 @@ pub mod identity;
 pub mod lz4;
 pub mod xz;
 pub mod zstd;
-#[cfg(feature = "peel_zstd_native")]
-pub mod zstd_native;
 
 /// Status returned by [`StreamingDecoder::decode_step`].
 ///
@@ -98,14 +95,13 @@ pub enum DecodeStatus {
 pub enum DecodeError {
     /// Reading from the source or interpreting its bytes failed.
     ///
-    /// The upstream `zstd` reader surfaces both true IO failures
-    /// (errno from the file descriptor) and format violations (corrupt
-    /// frame header, bad checksum, truncated input) as
-    /// [`std::io::Error`]. The kinds we observe in practice are
-    /// [`std::io::ErrorKind::UnexpectedEof`] for truncation and
-    /// [`std::io::ErrorKind::Other`] for libzstd-reported format
-    /// failures (the wrapped message contains the libzstd reason);
-    /// anything else is an underlying IO error from the source.
+    /// In-tree decoders surface both true IO failures (errno from the
+    /// file descriptor) and format violations (corrupt frame header,
+    /// bad checksum, truncated input) as [`std::io::Error`]. The kinds
+    /// we observe in practice are [`std::io::ErrorKind::UnexpectedEof`]
+    /// for truncation and [`std::io::ErrorKind::Other`] for
+    /// format-decoder-reported failures (the wrapped message names the
+    /// reason); anything else is an underlying IO error from the source.
     #[error("decoder failed after consuming {consumed} bytes from source")]
     Read {
         /// Number of source bytes the decoder had consumed when the
@@ -169,8 +165,9 @@ pub trait StreamingDecoder: Send {
     /// output already emitted, equals a fresh decode of the full
     /// source. When `decoder_state()` returns `None` at the same step,
     /// the offset alone is restartable via the format's normal factory
-    /// (this is the contract every in-tree decoder upholds today
-    /// except `lz4`'s mid-frame block boundaries).
+    /// (the contract every in-tree decoder upholds today *except* at
+    /// `lz4` and `zstd` mid-frame block boundaries, which require the
+    /// `decoder_state` blob).
     fn frame_boundary(&self) -> Option<ByteOffset>;
 
     /// Opaque per-decoder state needed to resume from
@@ -179,16 +176,17 @@ pub trait StreamingDecoder: Send {
     ///
     /// Returns `None` for boundaries where a freshly constructed
     /// decoder reading the source from `frame_boundary` onward
-    /// produces byte-identical output to a clean run. This is the
-    /// default and is correct for every format whose frame boundaries
-    /// happen at format-level container ends (zstd frame, xz Stream,
-    /// gzip member, lz4 frame EndMark).
+    /// produces byte-identical output to a clean run. This is correct
+    /// for end-of-frame boundaries in every container format we ship
+    /// (zstd frame end, xz Stream end, gzip member end, lz4 frame
+    /// EndMark), and is the default for decoders that do not override
+    /// it.
     ///
     /// Returns `Some(blob)` when the boundary is restart-safe only if
     /// the resuming decoder is seeded with the captured state. Today
-    /// only `lz4`'s mid-frame block boundaries use this path. The
-    /// blob is opaque to the rest of the crate: only the originating
-    /// decoder module knows the layout.
+    /// `lz4` and `zstd` use this path for mid-frame block boundaries.
+    /// The blob is opaque to the rest of the crate: only the
+    /// originating decoder module knows the layout.
     fn decoder_state(&self) -> Option<Vec<u8>> {
         None
     }
@@ -283,10 +281,10 @@ pub struct DecoderRegistry {
     /// Optional resume-factory companion to `name_entries`. Only
     /// populated for formats whose
     /// [`StreamingDecoder::decoder_state`] returns `Some(...)`
-    /// (today: `lz4`'s mid-frame block boundaries). Coordinator
-    /// looks up the resume factory by format name when a checkpoint
-    /// carries a `decoder_state` blob; absence means the regular
-    /// `factory` is sufficient.
+    /// (today: `lz4` and `zstd` mid-frame block boundaries).
+    /// Coordinator looks up the resume factory by format name when a
+    /// checkpoint carries a `decoder_state` blob; absence means the
+    /// regular `factory` is sufficient.
     name_resume_entries: Vec<(String, DecoderResumeFactory)>,
 }
 
@@ -368,10 +366,16 @@ impl DecoderRegistry {
             }],
             lz4::factory,
         );
-        // O.7b: lz4 supports mid-frame resume via a per-frame state
-        // blob. Other in-tree formats today restart cleanly from
-        // their `frame_boundary` offset and don't need this hook.
+        // Mid-frame resume hook: lz4 (per-block) and zstd (per-block
+        // inside a frame) both stamp `frame_boundary` at points where
+        // a fresh decoder cannot pick up from the source offset alone
+        // — the captured `decoder_state` blob carries the
+        // sliding-window / repeat-offset / FSE-table state needed to
+        // produce byte-identical output past the boundary. xz, gzip,
+        // identity (tar) restart cleanly from `frame_boundary` and so
+        // do not need this hook.
         r.register_resume_factory("lz4", lz4::resume_factory);
+        r.register_resume_factory("zstd", zstd::resume_factory);
         r.register_format(
             "gzip",
             &[".gz", ".tar.gz"],
@@ -913,10 +917,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_with_defaults_registers_lz4_resume_factory_and_no_others() {
-        // O.7b: lz4 is the only format whose registry carries a
-        // resume factory today. Other formats fall through to the
-        // generic `factory(source)` path on resume.
+    fn registry_with_defaults_registers_resume_factories_for_lz4_and_zstd() {
+        // lz4 (per-block mid-frame) and zstd (per-block mid-frame)
+        // both stamp `frame_boundary` at points whose `decoder_state`
+        // blob is required to resume byte-identically. Other formats
+        // fall through to the generic `factory(source)` path.
         let r = DecoderRegistry::with_defaults();
         let lz4_resume = r
             .resume_factory_for_name("lz4")
@@ -925,11 +930,19 @@ mod tests {
             lz4_resume,
             lz4::resume_factory as DecoderResumeFactory,
         ));
+        let zstd_resume = r
+            .resume_factory_for_name("zstd")
+            .expect("zstd resume registered");
+        assert!(std::ptr::fn_addr_eq(
+            zstd_resume,
+            zstd::resume_factory as DecoderResumeFactory,
+        ));
         // Case-insensitive lookup matches the rest of the registry.
         assert!(r.resume_factory_for_name("LZ4").is_some());
+        assert!(r.resume_factory_for_name("ZSTD").is_some());
 
         // No other format registers a resume factory yet.
-        for name in ["zstd", "xz", "gzip", "tar", "zip"] {
+        for name in ["xz", "gzip", "tar", "zip"] {
             assert!(
                 r.resume_factory_for_name(name).is_none(),
                 "{name} unexpectedly has a resume factory",
