@@ -74,6 +74,15 @@ pub mod xz;
 pub mod xz_native;
 pub mod zstd;
 
+// Hand-rolled DEFLATE decoder under construction
+// (`docs/PLAN_deflate_block_decoder.md`). Phase 1 ships behind the
+// `peel_deflate_native` cargo feature so default builds keep using
+// the existing `flate2`-based [`gzip`] wrapper unchanged. Phase 8
+// drops the gate and registers this module as the production gzip /
+// zip-DEFLATE backend.
+#[cfg(feature = "peel_deflate_native")]
+pub mod deflate_native;
+
 /// Status returned by [`StreamingDecoder::decode_step`].
 ///
 /// Does not indicate whether *any* output was produced this step;

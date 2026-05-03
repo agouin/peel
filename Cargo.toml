@@ -19,6 +19,14 @@ path = "src/lib.rs"
 name = "peel"
 path = "src/main.rs"
 
+[features]
+# Hand-rolled DEFLATE decoder under construction
+# (`docs/PLAN_deflate_block_decoder.md`). Phases 1–7 ship behind this
+# feature; Phase 8 swaps it in as the production gzip path and drops
+# the gate. Off by default so `cargo test` against `main` exercises the
+# `flate2` wrapper at `src/decode/gzip.rs` exactly as before.
+peel_deflate_native = []
+
 [dependencies]
 thiserror = "2"
 # TLS dependencies are pre-approved per docs/ENGINEERING_STANDARDS.md §2.4.
