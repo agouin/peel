@@ -1,6 +1,6 @@
 //! Hand-rolled, pure-Rust DEFLATE streaming decoder.
 //!
-//! Phases 1–2 of `docs/PLAN_deflate_block_decoder.md` — currently
+//! Phases 1–5 of `docs/PLAN_deflate_block_decoder.md` — currently
 //! shipped behind the cargo feature flag `peel_deflate_native`. The
 //! existing [`crate::decode::gzip`] wrapper around `flate2` remains
 //! the production gzip path; this module is built up phase-by-phase
@@ -39,14 +39,32 @@
 //!   helper out for the bit reader once Phases 3 and 4 land
 //!   fixed and dynamic Huffman bodies that need it.
 //!
-//! # What Phase 1 / 2 do *not* do
+//! # What Phases 3–5 added
 //!
-//! - Fixed Huffman block bodies (Phase 3) — the bit reader is
-//!   ready; the canonical-Huffman table builder and the literal /
-//!   length / distance dispatch land in Phase 3.
-//! - Dynamic Huffman blocks with the HLIT / HDIST / HCLEN preamble
-//!   (Phase 4).
-//! - LZ77 sliding window (Phase 5).
+//! - **Phase 3.** [`huffman::HuffTable`] canonical-code builder,
+//!   precomputed [`huffman::FIXED_LITLEN_TABLE`] /
+//!   [`huffman::FIXED_DIST_TABLE`] singletons via `LazyLock`, RFC
+//!   1951 §3.2.5 length / distance base tables, and the
+//!   [`Self::decode_huffman_body`] inner-symbol loop (shared with
+//!   Phase 4).
+//! - **Phase 4.** [`dynamic::parse_preamble`] for the RFC 1951
+//!   §3.2.7 three-stage preamble (HLIT / HDIST / HCLEN counts → CL
+//!   alphabet code lengths in permuted order → flat lit/length +
+//!   distance code-length sequence with RLE 16/17/18 expansion).
+//!   Per-block tables live in [`Self::dyn_lit`] / [`Self::dyn_dist`]
+//!   and are taken in / out around each [`Self::decode_huffman_body`]
+//!   call to satisfy the borrow checker. [`bitstream::BitReader`]
+//!   gained soft-`ensure` semantics so streams ending exactly at
+//!   the EOB code's last bit decode cleanly.
+//! - **Phase 5.** [`window::RingWindow`] — 32 KiB ring buffer
+//!   replacing the unbounded `Vec<u8>` window stand-in. Holds the
+//!   most-recent 32 KiB of decoded output across blocks; bounded
+//!   regardless of total decoded volume. Pairs with a per-step
+//!   `decoded_buf` staging vec that streams to the sink at
+//!   end-of-block / end-of-stream / output-cap boundaries.
+//!
+//! # What Phases 1–5 do *not* do
+//!
 //! - gzip framing — this decoder takes raw deflate input, the same
 //!   shape `flate2::read::DeflateDecoder` consumes. The RFC 1952
 //!   header / trailer / multi-member chaining wrapper lands in
@@ -80,11 +98,13 @@ pub mod block;
 pub mod dynamic;
 pub mod error;
 pub mod huffman;
+pub mod window;
 
 use self::bitstream::BitReader;
 use self::block::{parse_stored_lengths, STORED_HEADER_LEN};
 use self::error::DeflateError;
 use self::huffman::{HuffTable, DIST_BASE, FIXED_DIST_TABLE, FIXED_LITLEN_TABLE, LENGTH_BASE};
+use self::window::RingWindow;
 
 /// Output buffer size used per [`StreamingDecoder::decode_step`] for
 /// stored-block payload streaming. Matches the existing in-tree
@@ -111,15 +131,20 @@ pub struct Decoder {
     bits: BitReader,
     /// State machine; see [`State`].
     state: State,
-    /// Sliding-window stand-in (Phase 5 swaps for a 32 KiB ring).
-    /// Holds the cumulative decompressed output for the current
-    /// run; back-references inside fixed/dynamic Huffman blocks
-    /// index from `window.len() - distance`. Phase 5 trims the
-    /// front to keep the window bounded.
-    window: Vec<u8>,
-    /// Bytes already flushed from `window` to the sink. Phase 5
-    /// swaps for the ring's tail cursor.
-    window_flushed: usize,
+    /// 32 KiB sliding window for back-references (RFC 1951 §3.2.5).
+    /// Holds the most-recent 32 KiB of decoded output across
+    /// blocks; a back-reference at distance `d` reads from `d`
+    /// bytes back. Back-references are bounded by `d <= 32 KiB`
+    /// per the spec's max-distance constant, so the window's
+    /// bounded ring covers every valid lookup. Bytes that fall off
+    /// the back of the ring have already been written to the sink
+    /// via [`Self::decoded_buf`].
+    window: RingWindow,
+    /// Per-step staging buffer for sink writes. Decoded literal
+    /// bytes and back-reference output land here as they're
+    /// emitted; flushed to the sink at end-of-block, end-of-stream,
+    /// and whenever the per-step output cap is reached.
+    decoded_buf: Vec<u8>,
     /// Pre-allocated scratch buffer for stored-block aligned
     /// payload reads. Reused across steps to avoid per-call
     /// allocation.
@@ -237,22 +262,23 @@ impl Decoder {
         Ok(Self {
             bits: BitReader::new(src),
             state: State::AwaitingBlockType,
-            window: Vec::new(),
-            window_flushed: 0,
+            window: RingWindow::new(),
+            decoded_buf: Vec::new(),
             output_buf: vec![0u8; OUTPUT_CHUNK],
             dyn_lit: None,
             dyn_dist: None,
         })
     }
 
-    /// Flush every newly-decoded byte from the window stand-in to
-    /// the sink. Phase 5 will replace this with a ring-buffer-aware
-    /// flush that respects the 32 KiB tail.
-    fn flush_window_to_sink(&mut self, sink: &mut dyn Write) -> Result<(), DeflateError> {
-        if self.window_flushed < self.window.len() {
-            sink.write_all(&self.window[self.window_flushed..])
+    /// Flush the per-step decoded staging buffer to the sink and
+    /// clear it. Called at end-of-block, end-of-stream, and
+    /// whenever the per-step output cap is reached. Idempotent
+    /// when the staging buffer is empty.
+    fn flush_decoded_to_sink(&mut self, sink: &mut dyn Write) -> Result<(), DeflateError> {
+        if !self.decoded_buf.is_empty() {
+            sink.write_all(&self.decoded_buf)
                 .map_err(DeflateError::SinkIo)?;
-            self.window_flushed = self.window.len();
+            self.decoded_buf.clear();
         }
         Ok(())
     }
@@ -329,12 +355,12 @@ impl Decoder {
                     let want = (remaining as usize).min(self.output_buf.len());
                     let buf = &mut self.output_buf[..want];
                     relabel_eof(self.bits.read_aligned(buf), "stored-block payload")?;
-                    // Push to the sliding-window stand-in so a
-                    // subsequent fixed/dynamic-Huffman block can
-                    // back-reference into stored output, then flush
-                    // the new bytes to the sink.
-                    self.window.extend_from_slice(buf);
-                    self.flush_window_to_sink(sink)?;
+                    // Push into the sliding window so a subsequent
+                    // fixed/dynamic-Huffman block can back-reference
+                    // into the stored output, and stage to the
+                    // decoded buffer for the sink flush below.
+                    self.window.append_slice(buf, &mut self.decoded_buf);
+                    self.flush_decoded_to_sink(sink)?;
                     // INVARIANT: `want <= remaining` and
                     // `want <= u32::MAX`, so the cast and subtract
                     // cannot underflow.
@@ -438,17 +464,16 @@ impl Decoder {
         dist_table: Option<&HuffTable>,
         sink: &mut dyn Write,
     ) -> Result<HuffmanBodyOutcome, DeflateError> {
-        let start_window_len = self.window.len();
         loop {
             let sym = lit_table.decode(&mut self.bits)?;
             match sym {
                 0..=255 => {
                     // INVARIANT: sym < 256, fits in u8.
-                    self.window.push(sym as u8);
+                    self.window.append_byte(sym as u8, &mut self.decoded_buf);
                 }
                 256 => {
                     // End of block. Flush; caller transitions state.
-                    self.flush_window_to_sink(sink)?;
+                    self.flush_decoded_to_sink(sink)?;
                     return Ok(HuffmanBodyOutcome::Eob);
                 }
                 257..=285 => {
@@ -478,26 +503,8 @@ impl Decoder {
                     };
                     let distance = dbase + dextra;
 
-                    let available = self.window.len() as u64;
-                    if u64::from(distance) > available {
-                        return Err(DeflateError::BackReferenceUnderflow {
-                            distance,
-                            available,
-                        });
-                    }
-                    // INVARIANT: distance <= window.len() per the
-                    // bounds check above; the subtraction cannot
-                    // underflow.
-                    let start = self.window.len() - distance as usize;
-                    // RFC 1951 §3.2.5 overlap-by-design: when
-                    // `length > distance`, the early bytes of the
-                    // copy are read as soon as they're appended.
-                    // The byte-by-byte loop honors this without any
-                    // special casing.
-                    for k in 0..length as usize {
-                        let byte = self.window[start + k];
-                        self.window.push(byte);
-                    }
+                    self.window
+                        .match_copy(distance, length, &mut self.decoded_buf)?;
                 }
                 286..=287 => {
                     return Err(DeflateError::MalformedHuffman(
@@ -514,8 +521,8 @@ impl Decoder {
             // symbol; the cap is therefore "soft" by up to one
             // match's worth of output, which is well under the
             // extractor's punch granularity.
-            if self.window.len() - start_window_len >= OUTPUT_CHUNK {
-                self.flush_window_to_sink(sink)?;
+            if self.decoded_buf.len() >= OUTPUT_CHUNK {
+                self.flush_decoded_to_sink(sink)?;
                 return Ok(HuffmanBodyOutcome::Yielded);
             }
         }
@@ -1546,6 +1553,155 @@ mod tests {
         };
         let prefix: Vec<u8> = (0..4096).map(|_| (step() & 0xFF) as u8).collect();
         let payload: Vec<u8> = (0..16).flat_map(|_| prefix.iter().copied()).collect();
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&payload).expect("encode");
+        let raw = enc.finish().expect("finish");
+
+        let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
+        let mut sink = Vec::new();
+        while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        assert_eq!(sink, payload);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5 — cross-block back-references + ring-buffer integration
+    // ----------------------------------------------------------------
+
+    /// Hand-built fixture exercising the single most important
+    /// Phase 5 invariant: a back-reference whose distance reaches
+    /// into the **previous block**'s output. The flat-`Vec<u8>`
+    /// stand-in we used through Phase 4 happened to support this
+    /// because it accumulated everything without trimming; the
+    /// 32 KiB ring-buffer introduced in Phase 5 must continue to.
+    ///
+    /// Stream shape (all fixed-Huffman):
+    /// - Block A (BFINAL=0): literals `'a' 'b' 'c'`, EOB.
+    /// - Block B (BFINAL=1): literal `'X'`, match
+    ///   `(length=3, distance=4)` — reads back `4` bytes from the
+    ///   write-cursor (which sits just after `'X'` at total
+    ///   position 4), copying the original `'a' 'b' 'c'`. EOB.
+    ///
+    /// Decoded output: `"abcXabc"`. The match's source bytes lived
+    /// entirely in block A.
+    #[test]
+    fn cross_block_back_reference_resolves_through_ring_window() {
+        let mut w = BitWriter::new();
+
+        // -- Block A: BFINAL=0, BTYPE=01, literals "abc", EOB -----
+        w.write_bits(0, 1);
+        w.write_bits(0b01, 2);
+        for &b in b"abc" {
+            let (c, l) = fixed_litlen_canonical(u16::from(b));
+            w.write_bits(rev(c, l), l);
+        }
+        let (eob_c, eob_l) = fixed_litlen_canonical(256);
+        w.write_bits(rev(eob_c, eob_l), eob_l);
+
+        // -- Block B: BFINAL=1, BTYPE=01, literal 'X', match,  EOB
+        w.write_bits(1, 1);
+        w.write_bits(0b01, 2);
+        let (xc, xl) = fixed_litlen_canonical(u16::from(b'X'));
+        w.write_bits(rev(xc, xl), xl);
+
+        // Length code for length 3 = lit/length symbol 257
+        // (LENGTH_BASE[0] = (extra=0, base=3)).
+        let (lc, ll) = fixed_litlen_canonical(257);
+        w.write_bits(rev(lc, ll), ll);
+
+        // Distance code for distance 4 = distance symbol 3
+        // (DIST_BASE[3] = (extra=0, base=4)). 5-bit canonical 3 →
+        // reversed 0b11000 = 24.
+        let dist_canonical = 3u32;
+        w.write_bits(rev(dist_canonical, 5), 5);
+
+        // EOB.
+        w.write_bits(rev(eob_c, eob_l), eob_l);
+
+        let stream = w.finish();
+        let out = decode_all(stream);
+        assert_eq!(out, b"abcXabc");
+    }
+
+    /// flate2 differential at multiple compression levels — Phase 5
+    /// stresses the ring-buffer + multi-block path against
+    /// miniz_oxide's range of block-iteration heuristics. Levels 1,
+    /// 6 (default), and 9 (best) emit different block sizes /
+    /// shapes; the round-trip must be byte-identical at every
+    /// level.
+    #[test]
+    fn flate2_round_trip_random_payloads_at_every_level() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut rng = 0xACDC_1234u32;
+        let mut step = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        // 16 KiB-ish English-ish payload with embedded high-entropy
+        // patches — exercises a mix of long matches (from the
+        // repeated text) and literals (from the high-entropy
+        // patches). Big enough that level 9 produces multiple
+        // blocks.
+        let mut payload = Vec::with_capacity(16 * 1024);
+        let lines: &[&[u8]] = &[
+            b"the quick brown fox jumps over the lazy dog. ",
+            b"sphinx of black quartz, judge my vow. ",
+            b"pack my box with five dozen liquor jugs. ",
+        ];
+        let mut idx = 0;
+        while payload.len() < 16 * 1024 {
+            payload.extend_from_slice(lines[idx % lines.len()]);
+            idx += 1;
+            if idx % 7 == 0 {
+                for _ in 0..32 {
+                    payload.push((step() & 0xFF) as u8);
+                }
+            }
+        }
+        payload.truncate(16 * 1024);
+
+        for level in [
+            Compression::fast(),
+            Compression::default(),
+            Compression::best(),
+        ] {
+            let mut enc = DeflateEncoder::new(Vec::new(), level);
+            enc.write_all(&payload).expect("encode");
+            let raw = enc.finish().expect("finish");
+
+            let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
+            let mut sink = Vec::new();
+            while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+            assert_eq!(sink, payload, "round-trip at level {level:?}");
+        }
+    }
+
+    /// Stream large enough that the ring buffer wraps at least
+    /// once: deflate at 256 KiB (8× the 32 KiB window). The
+    /// decoder must still produce byte-identical output even when
+    /// the most-recent 32 KiB is the only history available for
+    /// back-references.
+    #[test]
+    fn flate2_round_trip_payload_spanning_window_wrap() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        // 256 KiB compressible payload — repeating short phrase so
+        // miniz_oxide finds plenty of within-window matches but
+        // never tries to back-reference farther than the ring's
+        // 32 KiB capacity.
+        let mut payload = Vec::with_capacity(256 * 1024);
+        let phrase: &[u8] = b"deflate sliding-window stress test phrase 0123456789 ";
+        while payload.len() < 256 * 1024 {
+            payload.extend_from_slice(phrase);
+        }
+        payload.truncate(256 * 1024);
 
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
         enc.write_all(&payload).expect("encode");
