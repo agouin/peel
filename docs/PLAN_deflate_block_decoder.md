@@ -732,3 +732,236 @@ phases. Phase 0's spike result will tighten this estimate.
 
 [RFC 1951]: https://www.rfc-editor.org/rfc/rfc1951
 [RFC 1952]: https://www.rfc-editor.org/rfc/rfc1952
+
+## Appendix A — Phase 0 spike memo (2026-05-03)
+
+**Verdict**: feasible. Recommend proceeding to Phase 1. Cost estimate
+unchanged.
+
+**Spike scope.** Single-file Rust binary at `/tmp/deflate-spike/`
+(~440 LOC of decoder + ~420 LOC of harness/fixtures/benchmarks,
+throwaway, dependency-free). Generates four reference vectors —
+hand-built BTYPE=00 stored block, Apple `gzip -1` on a 16-byte
+all-`a` payload (BTYPE=01 fixed Huffman + a length-15 distance-1
+back-reference), Apple `gzip -1` on 131 bytes of mixed text (BTYPE=10
+dynamic Huffman), and Apple `gzip -9` on a 256 KiB pseudorandomly-
+mixed payload (BTYPE=10 dynamic Huffman across one large block) —
+plus a fifth multi-member case (concatenated `gzip -1` outputs) to
+validate gzip member chaining. All five decode **byte-identical** to
+`gunzip -c`.
+
+**What was validated end-to-end.**
+
+- *Bit reader* (RFC 1951 §3.1.1). LSB-first byte order, LSB-first
+  bit-within-byte order, with a 64-bit refill buffer and a
+  byte-aligned `align_to_byte()` for stored-block transitions. The
+  `cursor() -> (byte_pos, bit_off)` accessor — load-bearing for the
+  decoder_state blob's bit cursor in Phase 7 — accounts for buffered-
+  but-unconsumed bits correctly: `byte_pos = src_pos -
+  ceil(nbits/8)`, `bit_off = (8 - nbits & 7) % 8`. The 8-byte gzip
+  trailer reads cleanly after every fixture (proves the bit cursor
+  rounds up to the byte boundary correctly when the deflate stream
+  ends mid-byte).
+- *Block walker.* `BFINAL` (1 bit) + `BTYPE` (2 bits) per block,
+  loop until `BFINAL=1`. Multi-block in a single member (the 256 KiB
+  fixture observed only one block at `gzip -9`, but the multi-member
+  test exercised back-to-back inflate cycles).
+- *BTYPE=00 stored block* (§3.2.4): `align_to_byte`, then 4 raw
+  bytes `(LEN_lo, LEN_hi, NLEN_lo, NLEN_hi)` with `LEN ^ 0xFFFF ==
+  NLEN` invariant check, then `LEN` literal bytes copied through.
+- *BTYPE=01 fixed Huffman* (§3.2.6). Lit/length codes 0..143 = 8
+  bits, 144..255 = 9, 256..279 = 7, 280..287 = 8; distance codes all
+  5 bits. Built via the same canonical-Huffman table builder as
+  dynamic blocks, transcribed from RFC 1951's procedure verbatim.
+- *BTYPE=10 dynamic Huffman* (§3.2.7). Full preamble: `HLIT` (5 bits,
+  +257), `HDIST` (5 bits, +1), `HCLEN` (4 bits, +4), then `HCLEN+4`
+  3-bit code lengths in the permuted order
+  `[16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]`.
+  Code-length-code Huffman built, then the lit/length and distance
+  code-length sequences decoded with RLE codes 16 / 17 / 18
+  (repeat-prev-3+2bits / zero-3+3bits / zero-11+7bits) all
+  exercised on the 131-byte and 256 KiB fixtures.
+- *Canonical Huffman table builder.* RFC 1951 §3.2.2 procedure
+  (count → next_code → assign), into a flat `1 << max_len` lookup
+  table indexed by `peek_bits(max_len)` (`max_len ≤ 15`). Every
+  canonical code is bit-reversed before being installed, because
+  the deflate stream reads bits LSB-first while canonical Huffman
+  codes are MSB-first; this is the single most easily-bungled piece
+  of inflate and the spike got it right via the explicit
+  `bit_reverse` helper.
+- *LZ77 sliding-window match-copy* (§3.2.5). Length codes 257..285
+  → base length 3..258 + 0..5 extra bits; distance codes 0..29 →
+  base distance 1..24577 + 0..13 extra bits. **Overlap-by-design**
+  works: the 16-byte all-`a` fixture decodes via a length-15
+  distance-1 match (one literal `a` then "copy 15 bytes from 1
+  behind, where each byte you read was just produced") with no
+  special-casing — a byte-by-byte loop reading from `out[len -
+  distance]` while pushing to `out` does the right thing because
+  the read index never catches up to the write index. The
+  256 KiB fixture exercises distances large enough to reach the
+  10–13-bit-extra distance-code range.
+- *gzip framing* (RFC 1952). Header parser handles all five FLG
+  bits (FTEXT / FHCRC / FEXTRA / FNAME / FCOMMENT) — only FNAME
+  was triggered by Apple gzip without `-n`, but the parser path is
+  the same for every flag and the spike's `-n` fixtures avoid
+  filename injection. Trailer: `CRC32(decompressed) == recorded`
+  and `len(decompressed) mod 2^32 == ISIZE` both verified for
+  every fixture. Multi-member chaining (concatenated members)
+  works without intermediate state, because each member's deflate
+  stream ends at the bit-cursor position before the trailer, then
+  the next member's header parser picks up after the 8-byte
+  trailer.
+- *CRC32-IEEE* (table-driven, reflected polynomial 0xEDB8_8320,
+  produced via a `const fn` table builder so the lookup table is
+  baked into `.rodata`). Cross-checks byte-identical against every
+  fixture's recorded trailer CRC.
+- *Throughput sanity check* (Apple Silicon, M-series, single
+  thread, 8 MiB plaintext → `gzip -6` → spike decode):
+
+  | payload                     | ratio | spike       | gunzip      | ratio |
+  |-----------------------------|-------|-------------|-------------|-------|
+  | redundant text (8 MiB)      | 343×  | **448 MiB/s** | 1397 MiB/s  | 3.1×  |
+  | low-redundancy text (8 MiB) | 1.3×  | **228 MiB/s** | 344 MiB/s   | 1.5×  |
+
+  The low-redundancy number is the realistic worst case (most
+  symbols are literal Huffman decodes rather than back-reference
+  memcpy). 228 MiB/s is **2.85× the plan's 80 MiB/s alarm
+  threshold** and comfortably above the 150 MiB/s "comfortable"
+  target (Risks §1). The spike is unoptimized — per-block table
+  allocation (`Vec<HuffEntry>` rebuilt on every dynamic block,
+  `Vec<u8>` for the sliding window with no ring-buffer
+  trimming) and no inner-loop tightening — so the production
+  decoder should land at least as well, likely meaningfully
+  better with table reuse and a 32 KiB ring window.
+
+**What was NOT validated, and why.**
+
+- *Apple gzip emits BTYPE=01 only at very small input sizes*
+  (`-1` on ≤ ~30 bytes). Larger inputs at every level go straight
+  to BTYPE=10. The spike's small fixture (`gzip -1` on 16 bytes
+  of `aaa...`) exercises BTYPE=01 with one back-reference; broader
+  fixed-Huffman coverage (multiple back-references, distance codes
+  beyond 0..3, length codes with extra bits) wasn't exercised at
+  the spike scale and is a Phase 3 concern. Hand-building a richer
+  fixed-Huffman fixture is straightforward (the canonical fixed
+  tables are short) and is the right Phase 3 test pattern.
+- *FHCRC, FEXTRA, FCOMMENT bits in gzip header.* Code path is
+  written and tested via inspection, but no fixture exercises them
+  end-to-end — Apple gzip's `-n` flag suppresses everything except
+  the fixed 10-byte header. Phase 6 should add hand-built fixtures
+  with each flag set (the parser is sequential — `if flg & FEXTRA
+  { skip 2 + xlen }`, `if flg & FNAME { skip until NUL }`, etc. —
+  so the test surface is 4 small additions to Phase 6's test
+  module).
+- *Decoder state at every block boundary across an 8 KiB-block
+  multi-block stream.* The spike's `cursor()` accessor was
+  validated only at end-of-stream (where it must point at the
+  byte after the last byte the bit reader fully consumed, modulo
+  alignment). Phase 7's resume-blob round-trip tests will need
+  fixtures with multiple blocks per member (typical for `gzip
+  --rsyncable` or producers like `pigz`) so the bit-cursor
+  capture-and-replay is exercised at every boundary, not only
+  the final one. Apple gzip in single-threaded mode appears to
+  emit one block per member at every level (256 KiB into one
+  block at `-9`), which understates the typical real-world block
+  count — `pigz -p4` or `gzip` from GNU coreutils on heterogeneous
+  input emit far more.
+- *BTYPE=11 reserved rejection.* Spike panics; production code
+  should surface a clean `DecodeError::Read` naming the offset.
+- *Distance code 30/31 reserved rejection.* Same — spike asserts
+  `< 30` on the index; production code should surface a typed
+  error.
+- *Truncated stream.* No fixture; relies on Rust's `&[u8]` bounds
+  checks panicking. Production code surfaces `DecodeError::Read`
+  with `UnexpectedEof` exactly as the existing gzip / zstd / xz
+  paths do — the path the spike takes (panic on out-of-bounds)
+  is wrong for production but doesn't change the cost estimate.
+- *Differential at fuzz scale.* The spike differential is
+  `gunzip -c` on five hand-picked fixtures plus 8 MiB benchmark
+  payloads. Phase 4 / 5's "100 / 500 random fixtures" differential
+  against `flate2` is a follow-on, not a Phase 0 deliverable.
+
+**Cost-estimate sanity check.** Spike LOC vs plan effort estimates:
+
+| Plan phase | Spike-equivalent surface                                    | Spike LOC | Plan estimate |
+|------------|-------------------------------------------------------------|-----------|---------------|
+| Phase 1    | gzip-level state machine + BTYPE=00 stored block            | ~70       | 3 days        |
+| Phase 2    | bit reader (forward, LSB-first, with cursor accessor)       | ~80       | 2 days        |
+| Phase 3    | canonical Huffman builder + fixed-Huffman tables            | ~120      | 3 days        |
+| Phase 4    | dynamic-Huffman preamble (HLIT/HDIST/HCLEN + RLE 16/17/18)  | ~80       | 1.5 weeks     |
+| Phase 5    | sliding window + LZ77 overlap-aware copy + multi-block loop | ~50       | 3 days        |
+| Phase 6    | gzip framing + CRC32 + ISIZE                                | ~80       | 3 days        |
+
+The spike was written in one focused half-day. The Phase 1 + 2 + 3
++ 5 + 6 surfaces (~400 LOC) line up with the plan's cumulative
+~2.5 weeks of effort for the same surfaces — proportional to the
+existing spike-vs-estimate ratios in the zstd and xz Appendix A
+memos, allowing for production-quality testing, error-type
+plumbing, trait integration, and the StreamingDecoder /
+DecoderResumeFactory contract code the spike doesn't write. Phase
+4's plan estimate (1.5 weeks) is the conspicuous outlier — only
+~80 LOC in the spike — but that surface includes the
+code-length-codes preamble, which is the deflate equivalent of
+zstd's FSE distribution parser, with the same "easy to get subtly
+wrong" reputation. The plan's outsized allocation for Phase 4 is
+right; do not adjust it. Phase 7 (decoder_state) and Phase 9b
+(zip plumbing + checkpoint format bump) are not represented in
+the spike at all and remain the heaviest single phases.
+
+**Open questions surfaced.**
+
+1. *Per-block table allocation cost.* The spike rebuilds a fresh
+   `Vec<HuffEntry>` for every block (lit/length and distance both,
+   plus the code-length-code table for dynamic blocks). For an
+   archive with thousands of blocks that's thousands of
+   `Vec::with_capacity` + populate + drop cycles. Phase 3 should
+   pre-allocate a single set of `Box<[HuffEntry]>` buffers as
+   fields on the decoder struct and rebuild in place. This is a
+   Phase 3 implementation note, not a plan-level concern, but
+   worth flagging because the spike's 228 MiB/s low-redundancy
+   number is partially allocation-bound.
+2. *Bit-reverse helper hot path.* `bit_reverse(canonical, len)`
+   is called once per **populated symbol** when building each
+   Huffman table — i.e. potentially hundreds of calls per block
+   for a typical dynamic block. The spike implementation is a
+   naive bit-by-bit loop. Phase 3 should either inline a
+   constant-time 16-bit reverse (e.g. the standard
+   `(x & 0xAA55) | ...` cascade) or precompute a 256-byte table
+   and reverse in two lookups. Same scale of optimization as
+   zstd's bitstream readers; not a correctness issue.
+3. *Distance code 30/31 reserved.* Round-one rejects them, but
+   the rejection is via `assert!`; Phase 5 should route through
+   `DecodeError::Read` with a structured error variant. Same
+   note for `BTYPE=11`.
+4. *FHCRC validation.* Spike skips the 2-byte CRC16 (gzip
+   header CRC) without verification. Phase 6 should *verify*
+   when the bit is set, mirroring how the existing
+   [`gzip.rs`](../src/decode/gzip.rs) wrapper relies on
+   `flate2`'s default behaviour (which validates internally).
+5. *Multi-member checkpoint blob shape.* The plan's blob layout
+   carries `bytes_decompressed_in_member` for ISIZE cross-check
+   and gzip-level CRC32. When a checkpoint lands at a
+   member-boundary (the previous member is closed, the next one
+   has yet to be parsed), the captured state has a clean reset
+   for both fields. The spike confirms the boundary semantics
+   (members are byte-aligned, member-end is a clean restart
+   point) but Phase 7 will need to encode "between members"
+   versus "mid-member at a deflate-block boundary" as two
+   distinct blob states. The plan's `container` byte and the
+   gzip-only suffix already permit this — Phase 7 just has to
+   wire it explicitly.
+6. *Apple gzip block density.* Apple gzip emits one deflate block
+   per member at every level on the fixtures used; this is a
+   weaker block-density signal than expected and will understate
+   the per-block puncher cadence in the integration tests. Phase
+   10 / 11 should explicitly use `pigz -p4` or `gzip` from GNU
+   coreutils (via Homebrew) to get a more representative
+   multi-block stream for the puncher-coverage test. Note this in
+   the Phase 10 fixture-generation comments.
+
+**Recommendation.** Proceed to Phase 1. Drop the spike code
+(throwaway per the plan); carry forward only the bug-spotting
+notes above into Phase 1 / 3 / 6 commit messages and the
+allocation / bit-reverse optimizations into Phase 3's
+implementation comments.
+
