@@ -474,41 +474,43 @@ fn paint(s: &str, color: &str) -> String {
 /// Priority:
 /// 1. If [`ProgressSnapshot::disk_bound`] is set, the scheduler is
 ///    actively throttling — definitively disk-bound.
-/// 2. Otherwise, when both download and extract rates are known, fall
-///    back to a rate comparison. The decoder consumes compressed
-///    bytes at roughly the download rate; the sink writes uncompressed
-///    bytes at the extract rate. We compare the extract rate against
-///    the download rate scaled by the compression ratio
-///    (`extracted_estimate / total_size`); the slower side is the
-///    bottleneck. A 10% margin keeps the indicator from flapping when
-///    the two sides are roughly balanced.
+/// 2. Otherwise, when both the download rate and the decoder-input
+///    rate are known, compare them directly. Both are measured in
+///    *compressed* bytes per second (`bytes_downloaded` and
+///    `bytes_decoded_input` advance over the same byte stream — the
+///    part file), so the comparison needs no compression-ratio
+///    correction: whichever side moves slower is the bottleneck. A
+///    growing gap between them is the lookahead growing, which is
+///    the operator-visible signal of disk-side starvation. A 10%
+///    margin keeps the indicator from flapping when the two sides
+///    are roughly balanced.
 /// 3. Otherwise, return `None` (no claim).
+///
+/// The earlier formulation compared the download rate against the
+/// extract (uncompressed-output) rate scaled by an
+/// `extracted_estimate / total_size` ratio that defaulted to 1.0
+/// when the estimate was unknown — for any compressed archive that
+/// understated the download rate's headroom and badged
+/// `Bottleneck::Network` while the lookahead was visibly growing.
+/// `PLAN_decoder_freeze.md` §1.1 has the rationale.
 #[must_use]
 pub fn classify_bottleneck(
     snap: &ProgressSnapshot,
     dl_rate: Option<f64>,
-    ex_rate: Option<f64>,
+    decoded_in_rate: Option<f64>,
 ) -> Option<Bottleneck> {
     if snap.disk_bound {
         return Some(Bottleneck::Disk);
     }
-    let (dl, ex) = (dl_rate?, ex_rate?);
-    if dl <= 0.0 || ex <= 0.0 {
+    let (dl, di) = (dl_rate?, decoded_in_rate?);
+    if dl <= 0.0 || di <= 0.0 {
         return None;
     }
-    // Compression ratio: bytes-out per byte-in. Default to 1.0 (treat
-    // as if uncompressed) when we don't have an estimate yet.
-    let ratio = match (snap.total_size, snap.extracted_estimate) {
-        (Some(total), Some(est)) if total > 0 => (est as f64 / total as f64).max(1.0),
-        _ => 1.0,
-    };
-    // Effective extract rate measured in *source* (compressed) bytes
-    // per second, so it's directly comparable to the download rate.
-    let ex_in_source_units = ex / ratio;
-    // 10% deadband around equality.
-    if dl < ex_in_source_units * 0.9 {
+    // 10% deadband around equality. Both rates are compressed bytes/s
+    // over the same stream, so direct comparison is the truth.
+    if dl < di * 0.9 {
         Some(Bottleneck::Network)
-    } else if ex_in_source_units < dl * 0.9 {
+    } else if di < dl * 0.9 {
         Some(Bottleneck::Disk)
     } else {
         None
@@ -543,6 +545,7 @@ pub struct TtyRenderer<W: Write + Send> {
     out: W,
     rate_dl: RateBuffer,
     rate_ex: RateBuffer,
+    rate_decoded_in: RateBuffer,
     style: BarStyle,
     /// Override the detected terminal width. Tests use this; the
     /// binary leaves it `None` so the renderer picks up the live
@@ -563,6 +566,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             out,
             rate_dl: RateBuffer::for_renderer(),
             rate_ex: RateBuffer::for_renderer(),
+            rate_decoded_in: RateBuffer::for_renderer(),
             style: BarStyle::detect(),
             terminal_width_override: None,
             bar_max_columns: MAX_BAR_COLUMNS,
@@ -580,6 +584,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             out,
             rate_dl: RateBuffer::for_renderer(),
             rate_ex: RateBuffer::for_renderer(),
+            rate_decoded_in: RateBuffer::for_renderer(),
             style: BarStyle::Ascii,
             terminal_width_override: None,
             bar_max_columns: bar,
@@ -595,6 +600,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             out,
             rate_dl: RateBuffer::for_renderer(),
             rate_ex: RateBuffer::for_renderer(),
+            rate_decoded_in: RateBuffer::for_renderer(),
             style,
             terminal_width_override: Some(terminal_width.max(20)),
             bar_max_columns: MAX_BAR_COLUMNS,
@@ -628,16 +634,18 @@ impl<W: Write + Send> TtyRenderer<W> {
     ) -> (String, String, String, String, String) {
         self.rate_dl.push(now, snap.bytes_downloaded);
         self.rate_ex.push(now, snap.bytes_extracted);
+        self.rate_decoded_in.push(now, snap.bytes_decoded_input);
 
         let dl_rate = self.rate_dl.rate_bytes_per_sec();
         let ex_rate = self.rate_ex.rate_bytes_per_sec();
+        let decoded_in_rate = self.rate_decoded_in.rate_bytes_per_sec();
 
         let percent = overall_percent(snap);
         let eta = compute_eta(snap, dl_rate, ex_rate);
 
         let term_cols = self.columns();
         let bar_cap = self.bar_max_columns.min(MAX_BAR_COLUMNS);
-        let bottleneck = classify_bottleneck(snap, dl_rate, ex_rate);
+        let bottleneck = classify_bottleneck(snap, dl_rate, decoded_in_rate);
 
         let line1 = format_overall_line(snap, percent, term_cols, bar_cap, self.style);
         let line2 = format_download_line(snap, dl_rate, bottleneck);
@@ -708,6 +716,7 @@ impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
 pub struct LogRenderer {
     rate_dl: RateBuffer,
     rate_ex: RateBuffer,
+    rate_decoded_in: RateBuffer,
 }
 
 impl Default for LogRenderer {
@@ -723,6 +732,7 @@ impl LogRenderer {
         Self {
             rate_dl: RateBuffer::for_renderer(),
             rate_ex: RateBuffer::for_renderer(),
+            rate_decoded_in: RateBuffer::for_renderer(),
         }
     }
 
@@ -739,11 +749,13 @@ impl LogRenderer {
     pub fn format_line(&mut self, snap: &ProgressSnapshot, now: Instant) -> String {
         self.rate_dl.push(now, snap.bytes_downloaded);
         self.rate_ex.push(now, snap.bytes_extracted);
+        self.rate_decoded_in.push(now, snap.bytes_decoded_input);
         let dl_rate = self.rate_dl.rate_bytes_per_sec();
         let ex_rate = self.rate_ex.rate_bytes_per_sec();
+        let decoded_in_rate = self.rate_decoded_in.rate_bytes_per_sec();
         let percent = overall_percent(snap);
         let eta = compute_eta(snap, dl_rate, ex_rate);
-        let bottleneck = classify_bottleneck(snap, dl_rate, ex_rate);
+        let bottleneck = classify_bottleneck(snap, dl_rate, decoded_in_rate);
 
         let pct = percent
             .map(|p| format!("{p:.1}%"))
@@ -2089,20 +2101,20 @@ mod tests {
     fn classify_bottleneck_returns_disk_when_flag_is_set() {
         let mut snap = base_snapshot();
         snap.disk_bound = true;
+        // disk_bound short-circuits regardless of the rates passed.
         let b = classify_bottleneck(&snap, Some(10.0), Some(1.0));
         assert_eq!(b, Some(Bottleneck::Disk));
     }
 
     #[test]
-    fn classify_bottleneck_falls_back_to_rate_comparison() {
-        // Throttle disabled (max_disk_buffer = None, disk_bound = false)
-        // and download is slower than extract (after compression
-        // correction): we should be net-bound.
+    fn classify_bottleneck_network_when_download_lags_decoder() {
+        // Throttle disabled, decoder consuming compressed bytes faster
+        // than the network is producing them: we should be net-bound.
         let snap = ProgressSnapshot {
             total_size: Some(1_000_000),
             bytes_downloaded: 100_000,
             bytes_extracted: 50_000,
-            extracted_estimate: Some(2_000_000), // 2x compression
+            extracted_estimate: None,
             active_workers: 4,
             total_workers: 4,
             started: true,
@@ -2111,19 +2123,21 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
         };
-        // dl = 100kB/s, ex = 1MB/s => ex_in_source = 1MB/2 = 500kB/s
-        // dl < 0.9 * 500kB/s, so net-bound.
-        let b = classify_bottleneck(&snap, Some(100_000.0), Some(1_000_000.0));
+        // dl = 50 MiB/s, decoded_in = 100 MiB/s. dl < 0.9 * decoded_in.
+        let b = classify_bottleneck(&snap, Some(50.0e6), Some(100.0e6));
         assert_eq!(b, Some(Bottleneck::Network));
     }
 
     #[test]
-    fn classify_bottleneck_disk_bound_when_extract_lags() {
+    fn classify_bottleneck_disk_when_decoder_lags_download() {
+        // The exact freeze-prelude scenario from PLAN_decoder_freeze.md:
+        // download moving compressed bytes into the part file faster
+        // than the decoder drains them. Lookahead grows; bottleneck=disk.
         let snap = ProgressSnapshot {
             total_size: Some(1_000_000),
             bytes_downloaded: 100_000,
             bytes_extracted: 50_000,
-            extracted_estimate: Some(2_000_000),
+            extracted_estimate: None,
             active_workers: 4,
             total_workers: 4,
             started: true,
@@ -2132,9 +2146,10 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
         };
-        // dl = 5MB/s, ex = 1MB/s => ex_in_source = 500kB/s.
-        // ex_in_source < 0.9 * dl, so disk-bound.
-        let b = classify_bottleneck(&snap, Some(5_000_000.0), Some(1_000_000.0));
+        // dl = 60 MiB/s, decoded_in = 50 MiB/s. decoded_in < 0.9 * dl
+        // is false (50 vs 54 — too tight), so widen to make the test
+        // unambiguous: dl = 60, decoded_in = 40.
+        let b = classify_bottleneck(&snap, Some(60.0e6), Some(40.0e6));
         assert_eq!(b, Some(Bottleneck::Disk));
     }
 
@@ -2144,17 +2159,17 @@ mod tests {
             total_size: Some(1_000_000),
             bytes_downloaded: 100_000,
             bytes_extracted: 50_000,
-            extracted_estimate: Some(2_000_000),
+            extracted_estimate: None,
             active_workers: 4,
             total_workers: 4,
             started: true,
             done: false,
-            bytes_decoded_input: 50_000,
+            bytes_decoded_input: 100_000,
             max_disk_buffer: None,
             disk_bound: false,
         };
-        // Balanced: dl = 1MB/s, ex = 2MB/s => ex_in_source = 1MB/s.
-        let b = classify_bottleneck(&snap, Some(1_000_000.0), Some(2_000_000.0));
+        // Within the 10% deadband: dl = 100, decoded_in = 95.
+        let b = classify_bottleneck(&snap, Some(100.0e6), Some(95.0e6));
         assert_eq!(b, None);
     }
 
@@ -2164,6 +2179,33 @@ mod tests {
         assert_eq!(classify_bottleneck(&snap, None, None), None);
         assert_eq!(classify_bottleneck(&snap, Some(1.0), None), None);
         assert_eq!(classify_bottleneck(&snap, None, Some(1.0)), None);
+    }
+
+    #[test]
+    fn classify_bottleneck_ignores_extracted_estimate() {
+        // Regression: the prior implementation read total_size and
+        // extracted_estimate to derive a compression ratio. The new one
+        // must not — both rates are already in compressed bytes/s.
+        // Same compressed-byte rates, two different estimates → same
+        // verdict either way.
+        let mut snap = ProgressSnapshot {
+            total_size: Some(1_000_000),
+            bytes_downloaded: 100_000,
+            bytes_extracted: 50_000,
+            extracted_estimate: None,
+            active_workers: 4,
+            total_workers: 4,
+            started: true,
+            done: false,
+            bytes_decoded_input: 50_000,
+            max_disk_buffer: None,
+            disk_bound: false,
+        };
+        let a = classify_bottleneck(&snap, Some(60.0e6), Some(40.0e6));
+        snap.extracted_estimate = Some(10_000_000);
+        let b = classify_bottleneck(&snap, Some(60.0e6), Some(40.0e6));
+        assert_eq!(a, b);
+        assert_eq!(a, Some(Bottleneck::Disk));
     }
 
     #[test]
@@ -2194,32 +2236,35 @@ mod tests {
     fn tty_renderer_paints_net_badge_when_net_bound() {
         let buf: Vec<u8> = Vec::new();
         let mut r = TtyRenderer::with_style_and_width(buf, BarStyle::Ascii, 120);
-        // Snapshot where rate-comparison should pick Network
-        // (download is slower than extract / compression ratio).
+        // Net-bound: the decoder is draining the on-disk lookahead
+        // faster than the network is replenishing it. This is the
+        // physically valid Network case under the new classifier
+        // (PLAN_decoder_freeze.md §1.1) — `decoded_in_rate >
+        // dl_rate * 1.1`.
         let snap = ProgressSnapshot {
             total_size: Some(2_000_000),
             bytes_downloaded: 600_000,
             bytes_extracted: 30_000_000,
-            extracted_estimate: Some(2_000_000),
+            extracted_estimate: None,
             active_workers: 4,
             total_workers: 4,
             started: true,
             done: false,
-            bytes_decoded_input: 600_000,
+            bytes_decoded_input: 1_500_000,
             max_disk_buffer: None,
             disk_bound: false,
         };
-        // Drive `format_block` with two samples spanning > 5s (the
-        // rate buffer's min-span) at the same wall-clock anchor so we
-        // don't introduce flake from `Instant::now()` jitter inside
-        // `render`. We assert against `format_block` directly.
+        // Drive `format_block` with two samples spanning > min_span
+        // (1 s) at the same wall-clock anchor so we don't introduce
+        // flake from `Instant::now()` jitter inside `render`. We
+        // assert against `format_block` directly.
         let t0 = Instant::now();
         let mut snap1 = snap;
         snap1.bytes_downloaded = 0;
         snap1.bytes_extracted = 0;
+        snap1.bytes_decoded_input = 0;
         let _ = r.format_block(&snap1, t0);
-        // Exactly 5 s span — the buffer's window is also 5 s and
-        // eviction is `dt > window`, so the older sample is kept.
+        // 5 s span keeps both samples inside the 10 s rate window.
         let (_l1, l2, _l3, _l4, l5) = r.format_block(&snap, t0 + Duration::from_secs(5));
         // The bottleneck badge now lives on the trailing ETA line, not
         // the bar line.
