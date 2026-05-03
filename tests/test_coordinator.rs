@@ -2142,3 +2142,292 @@ fn unrecognized_suffix_returns_no_decoder() {
     let err = run(args).expect_err("must error");
     assert!(matches!(err, CoordinatorError::NoDecoder { .. }));
 }
+
+// ---- disk-buffer throttle: forward-progress under tight caps ----------
+//
+// PLAN_decoder_freeze.md is investigating a freeze whose signature is
+// "lookahead pinned at the cap, decoder parked, scheduler idle." These
+// tests deliberately force the throttle to engage by setting
+// `max_disk_buffer` an order of magnitude smaller than a healthy buffer
+// would be, then verify the run still makes forward progress and
+// reproduces the source bytes. Hidden by `cfg(unix)` at the file
+// header. Each test wraps the `run()` call in a 30-second deadline
+// that flips the kill switch — if forward progress stops, the run
+// surfaces `CoordinatorError::Aborted` and we fail loudly with a
+// "deadlock?" message rather than letting the test framework's own
+// timeout terminate the whole binary.
+
+/// Run `args` under a wall-clock deadline. After `deadline` elapses, the
+/// caller-supplied `kill` flag is flipped, which causes `run()` to
+/// return `CoordinatorError::Aborted` from the next kill-switch poll.
+/// The caller decides whether timing out is a failure (typical) or an
+/// expected behavior (rare).
+///
+/// Returns the run's `Result` and a `bool` indicating whether the
+/// deadline tripped.
+fn run_with_kill_deadline(
+    args: RunArgs,
+    kill: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Duration,
+) -> (Result<peel::coordinator::RunStats, CoordinatorError>, bool) {
+    let kill_for_watcher = Arc::clone(&kill);
+    let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tripped_for_watcher = Arc::clone(&tripped);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_for_watcher = Arc::clone(&done);
+    // Watchdog thread: flip kill if `done` hasn't flipped by `deadline`.
+    let watcher = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            if done_for_watcher.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        tripped_for_watcher.store(true, Ordering::Release);
+        kill_for_watcher.store(true, Ordering::Release);
+    });
+    let result = run(args);
+    done.store(true, Ordering::Release);
+    let _ = watcher.join();
+    let did_trip = tripped.load(Ordering::Acquire);
+    (result, did_trip)
+}
+
+/// Build a tar.zst archive whose body is `n_files` files of
+/// `bytes_per_file` random-ish bytes each, then return the
+/// uncompressed archive bytes and the compressed body. Sized so the
+/// caller can pick chunk_size / max_disk_buffer ratios that force
+/// throttle engagement.
+fn build_test_archive(n_files: usize, bytes_per_file: usize) -> (Vec<u8>, Vec<u8>) {
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_files);
+    for i in 0..n_files {
+        let path = format!("dir/file_{i:05}.bin");
+        // Deterministic but compressible — bytes vary so zstd has work
+        // to do but the output is reproducible across runs.
+        let mut bytes = Vec::with_capacity(bytes_per_file);
+        for j in 0..bytes_per_file {
+            bytes.push(((i.wrapping_mul(31)).wrapping_add(j) & 0xFF) as u8);
+        }
+        entries.push((path, bytes));
+    }
+    let entries_ref: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let archive = build_simple_archive(&entries_ref);
+    let body = encode_zstd(&archive);
+    (archive, body)
+}
+
+/// Tight cap (4× chunk_size), normal mock server. The throttle should
+/// engage and disengage as the decoder drains the lookahead, and the
+/// run should reproduce the archive byte-for-byte. The "deadlock?"
+/// failure mode here would be the freeze pattern documented in
+/// `PLAN_decoder_freeze.md`.
+#[test]
+fn small_disk_buffer_completes_under_throttle() {
+    let (archive, body) = build_test_archive(32, 8 * 1024);
+    let server = MockServer::start(ok_handler(body, Some("\"v-tiny-cap\"")));
+
+    let work = unique_dir("tiny_cap");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let chunk_size: u64 = 16 * 1024; // 16 KiB
+    let mut config = coord_config_for_test(chunk_size);
+    config.workers = 4;
+    // Cap = 4 chunks (64 KiB). Forces the throttle to engage almost
+    // every dispatch round on an archive that's many chunks long.
+    config.max_disk_buffer = Some(4 * chunk_size);
+
+    let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let args = RunArgs {
+        url: format!("{}/x.tar.zst", server.base_url()),
+        output: OutputTarget::Dir(out_dir.clone()),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: Some(Arc::clone(&kill)),
+        io_backend: None,
+    };
+    let (result, tripped) = run_with_kill_deadline(args, kill, Duration::from_secs(30));
+    assert!(
+        !tripped,
+        "deadlock? small-cap throttle run did not finish in 30 s; \
+         see PLAN_decoder_freeze.md §2 for the failure pattern"
+    );
+    let stats = result.expect("small-cap run");
+    assert!(!stats.resumed);
+    // Output reproduces the archive bytes — verify a couple of files
+    // round-tripped and the directory shape matches.
+    let out = read_dir_recursive(&out_dir);
+    assert_eq!(out.len(), 32, "all 32 files extracted");
+    assert!(!archive.is_empty()); // archive isn't empty (sanity)
+}
+
+/// Cap = exactly one chunk. Workers can have at most one chunk of
+/// undecoded compressed bytes at a time, so the throttle engages on
+/// *every* dispatch round and only disengages once the decoder has
+/// fully consumed the previous chunk.
+#[test]
+fn one_chunk_cap_run_completes_under_heavy_throttling() {
+    let (_archive, body) = build_test_archive(16, 4 * 1024);
+    let server = MockServer::start(ok_handler(body, Some("\"v-1chunk-cap\"")));
+
+    let work = unique_dir("one_chunk_cap");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let chunk_size: u64 = 16 * 1024;
+    let mut config = coord_config_for_test(chunk_size);
+    config.workers = 4;
+    config.max_disk_buffer = Some(chunk_size); // exactly 1 chunk
+
+    let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let args = RunArgs {
+        url: format!("{}/x.tar.zst", server.base_url()),
+        output: OutputTarget::Dir(out_dir.clone()),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: Some(Arc::clone(&kill)),
+        io_backend: None,
+    };
+    let (result, tripped) = run_with_kill_deadline(args, kill, Duration::from_secs(30));
+    assert!(
+        !tripped,
+        "deadlock? one-chunk-cap run did not finish in 30 s"
+    );
+    let _stats = result.expect("one-chunk-cap run");
+    let out = read_dir_recursive(&out_dir);
+    assert_eq!(out.len(), 16);
+}
+
+/// Tight cap + 8 workers all competing for the throttle window. The
+/// goal is to maximize contention on the dispatch / completion path so
+/// any race in the throttle release surfaces.
+#[test]
+fn small_cap_with_many_workers_completes() {
+    let (_archive, body) = build_test_archive(48, 4 * 1024);
+    let server = MockServer::start(ok_handler(body, Some("\"v-8w-cap\"")));
+
+    let work = unique_dir("many_workers_cap");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let chunk_size: u64 = 8 * 1024;
+    let mut config = coord_config_for_test(chunk_size);
+    config.workers = 8;
+    config.max_disk_buffer = Some(2 * chunk_size); // 2 chunks for 8 workers
+
+    let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let args = RunArgs {
+        url: format!("{}/x.tar.zst", server.base_url()),
+        output: OutputTarget::Dir(out_dir.clone()),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: Some(Arc::clone(&kill)),
+        io_backend: None,
+    };
+    let (result, tripped) = run_with_kill_deadline(args, kill, Duration::from_secs(30));
+    assert!(
+        !tripped,
+        "deadlock? many-worker tight-cap run did not finish in 30 s"
+    );
+    let _stats = result.expect("many-worker run");
+    let out = read_dir_recursive(&out_dir);
+    assert_eq!(out.len(), 48);
+}
+
+/// Tight cap + DripBody server that forces ranged GETs to deliver
+/// their bytes in small slow drips. Workers' bytes-from-socket arrive
+/// in pieces, the throttle is engaged for most of the run, and there
+/// are many points at which the cursor advances by a few bytes at a
+/// time. This is the closest synthetic analog to the snapshot-restore
+/// pod's profile (steady ~50 MiB/s real network with frequent small
+/// drains).
+#[test]
+fn small_cap_with_drip_server_completes() {
+    let (_archive, body) = build_test_archive(8, 8 * 1024);
+    let body_len = body.len();
+
+    let etag = "\"v-drip-cap\"";
+    let body_for_handler = body.clone();
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 200,
+                reason: "OK",
+                headers: vec![
+                    ("Content-Length".into(), body_for_handler.len().to_string()),
+                    ("Accept-Ranges".into(), "bytes".into()),
+                    ("ETag".into(), etag.into()),
+                ],
+                body: Vec::new(),
+            };
+        }
+        // Range requests get drip-fed.
+        let (a, b) = if let Some(r) = req.header("range").and_then(parse_range) {
+            r
+        } else {
+            (0u64, (body_for_handler.len() as u64).saturating_sub(1))
+        };
+        let slice = body_for_handler[a as usize..=b as usize].to_vec();
+        MockResponse::DripBody {
+            status: 206,
+            reason: "Partial Content",
+            headers: vec![
+                (
+                    "Content-Range".into(),
+                    format!("bytes {a}-{b}/{}", body_len),
+                ),
+                ("ETag".into(), etag.into()),
+            ],
+            body: slice,
+            bytes_per_chunk: 1024,
+            interval: Duration::from_millis(2),
+        }
+    });
+
+    let work = unique_dir("drip_cap");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let chunk_size: u64 = 16 * 1024;
+    let mut config = coord_config_for_test(chunk_size);
+    config.workers = 4;
+    config.max_disk_buffer = Some(2 * chunk_size);
+
+    let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let args = RunArgs {
+        url: format!("{}/x.tar.zst", server.base_url()),
+        output: OutputTarget::Dir(out_dir.clone()),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: Some(Arc::clone(&kill)),
+        io_backend: None,
+    };
+    let (result, tripped) = run_with_kill_deadline(args, kill, Duration::from_secs(60));
+    assert!(
+        !tripped,
+        "deadlock? drip-server + tight-cap run did not finish in 60 s"
+    );
+    let _stats = result.expect("drip-cap run");
+    let out = read_dir_recursive(&out_dir);
+    assert_eq!(out.len(), 8);
+}

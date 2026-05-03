@@ -1238,6 +1238,88 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
     }
 }
 
+/// `PLAN_decoder_freeze.md` regression: the §11 probe path used to
+/// inflate `bytes_downloaded` by one chunk per probe — the worker's
+/// `read_with_progress` credits the bytes for every dispatch kind,
+/// but the scheduler's Probe completion handler did not subtract
+/// them. Combined with the disk-buffer throttle's
+/// `bytes_downloaded - bytes_decoded_input ≥ max_disk_buffer` test,
+/// long-running production downloads accumulated enough phantom
+/// bytes for the throttle to engage on inflation alone — the
+/// scheduler stopped dispatching, the decoder eventually reached an
+/// undispatched chunk, and the run wedged with the §2.5 diagnostic's
+/// "cliff" pattern (`next_incomplete_after(cursor) == cursor`,
+/// `bitmap[cursor..] = all false`).
+///
+/// The test runs a probe-heavy download to completion *without* a
+/// throttle, so the bug shows up as raw counter inflation rather
+/// than a deadlock. Without the fix, `bytes_downloaded` ends up
+/// roughly `2 × body.len()` (one credit per Fetch byte plus another
+/// per Probe byte). With the fix the counter equals `body.len()`.
+#[test]
+fn probe_completion_does_not_inflate_bytes_downloaded() {
+    use peel::progress::ProgressState;
+
+    let chunk_size = 1024u64;
+    // 32 chunks; with `probe.interval = 1` we expect ~30+ probes
+    // (every Fetch except possibly the very last one triggers a
+    // probe). The test asserts an exact equality, so the precise
+    // probe count doesn't matter — only that the per-probe inflation
+    // is zero.
+    let total_chunks = 32u32;
+    let body = make_body((chunk_size as u32 * total_chunks) as usize);
+    let server = MockServer::start(ok_handler(body.clone(), Some("\"v1\"")));
+
+    let url = url(&server, "/data.bin");
+    let client = build_client();
+    let info = discover(&client, &url).expect("discover");
+
+    let path = temp_path("probe_no_inflate");
+    let _g = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let fingerprints = Arc::new(peel::download::ChunkFingerprints::new(total_chunks));
+    let cursor = AtomicU64::new(0);
+
+    let progress = ProgressState::new();
+
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size,
+        workers: 2,
+        retry: fast_retry(),
+        progress: Some(Arc::clone(&progress)),
+        policy: None,
+        fingerprints: Some(Arc::clone(&fingerprints)),
+        // Probe after every Fetch — maximizes inflation pressure.
+        probe: peel::download::ProbeConfig { interval: 1 },
+        mirrors: None,
+        rate_limiter: None,
+        // No throttle: this test is pure counter accounting; the
+        // disk-buffer interaction is the *consequence* and is covered
+        // by the small-cap tests in `test_coordinator.rs`.
+        max_disk_buffer: None,
+        abort: None,
+    };
+
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
+        .expect("download must complete");
+    assert_eq!(stats.chunks_completed, total_chunks);
+
+    // The load-bearing assertion: after the run, `bytes_downloaded`
+    // must equal the source body length, not `body.len() +
+    // N × chunk_size` where N is the number of probes that fired.
+    let snap = progress.snapshot();
+    assert_eq!(
+        snap.bytes_downloaded,
+        body.len() as u64,
+        "bytes_downloaded inflated by probe re-fetches: \
+         expected {} (one credit per actual body byte) but observed {} \
+         — the §11 probe completion path must refund the probe's bytes",
+        body.len(),
+        snap.bytes_downloaded,
+    );
+}
+
 // ---- multi-mirror downloads (PLAN_v2 §13) -------------------------------
 
 /// Standard "well-behaved server" handler factory that also tracks

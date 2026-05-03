@@ -1123,9 +1123,30 @@ fn run_parallel(
                     }
                     DispatchKind::Probe { expected: _ } => {
                         // Probe success: the worker already verified
-                        // CRC-32C in-line. No bitmap / completion
-                        // bookkeeping; the bytes were already counted
-                        // in the original Fetch.
+                        // CRC-32C in-line. No bitmap update — the chunk
+                        // was already complete before the probe.
+                        //
+                        // PLAN_decoder_freeze.md: the worker's
+                        // [`read_with_progress`] credits `add_downloaded`
+                        // on every socket read regardless of dispatch
+                        // kind, which means a probe's bytes ARE counted
+                        // again in `bytes_downloaded` — even though the
+                        // chunk's bytes were already counted by the
+                        // original Fetch. Without a refund here the
+                        // counter inflates by one chunk per probe, so
+                        // after enough probes the throttle equation
+                        // `downloaded - decoded ≥ max_disk_buffer`
+                        // engages on phantom bytes. Workers stop
+                        // dispatching, the decoder reaches an
+                        // undispatched chunk, and the run wedges with
+                        // every counter flat at the cap — the
+                        // production freeze documented in §2.5.
+                        //
+                        // Refund the probe's bytes here so the gross
+                        // counter tracks real on-disk lookahead.
+                        if let Some(p) = config.progress.as_ref() {
+                            p.sub_downloaded(msg.bytes);
+                        }
                     }
                 },
                 Err(err) => {
