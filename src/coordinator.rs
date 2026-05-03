@@ -2468,6 +2468,23 @@ impl Read for BlockingSparseReader {
                 return Err(io::Error::other(KILL_SENTINEL));
             }
         }
+        // §2.5 (PLAN_decoder_freeze.md): one-shot diagnostic when the
+        // poll loop has been waiting on the same chunk for too long.
+        // The §2.4b watchdog fires from the renderer thread to flag
+        // *that* a `decode_step` is hung; this dump prints the bitmap
+        // state local to the read so we can distinguish:
+        //   - gap   : `bitmap[N] = false` but `bitmap[N+1..]` = true
+        //             → something orphaned a chunk in `dispatched`
+        //   - cliff : `bitmap[N..] = false`
+        //             → scheduler isn't dispatching N (likely the
+        //               throttle-deadlock pattern)
+        //   - other : `next_incomplete_after(N)` returns something
+        //             unexpected → bitmap consistency bug
+        // Local to the read invocation: each fresh `read()` resets the
+        // counter, so a healthy short wait never triggers it.
+        let read_started = Instant::now();
+        let mut last_dump_at: Option<Instant> = None;
+        let dump_interval = Duration::from_secs(30);
         loop {
             let pos = self.cursor.load(Ordering::Acquire);
             if pos >= self.total_size {
@@ -2501,6 +2518,45 @@ impl Read for BlockingSparseReader {
                              complete"
                         ),
                     ));
+                }
+                // §2.5 diagnostic: once we've been waiting `dump_interval`
+                // (or `2 × dump_interval`, `3 ×`, …) on the same `read()`
+                // invocation, dump the bitmap state around the cursor
+                // chunk. Cheap (a handful of atomic loads) and scoped
+                // to a true wedge.
+                let elapsed = read_started.elapsed();
+                if elapsed >= dump_interval {
+                    let should_dump = last_dump_at.is_none_or(|prev| {
+                        Instant::now().saturating_duration_since(prev) >= dump_interval
+                    });
+                    if should_dump {
+                        last_dump_at = Some(Instant::now());
+                        let next_incomplete = self
+                            .bitmap
+                            .next_incomplete_after(ChunkIndex::new(chunk_idx))
+                            .map(ChunkIndex::get);
+                        let mut neighbors: Vec<u8> = Vec::with_capacity(13);
+                        let lo = chunk_idx.saturating_sub(2);
+                        let hi = chunk_idx.saturating_add(10);
+                        for i in lo..=hi {
+                            neighbors.push(u8::from(self.bitmap.is_complete(ChunkIndex::new(i))));
+                        }
+                        tracing::warn!(
+                            target: "peel::reader",
+                            cursor = pos,
+                            chunk_idx,
+                            elapsed_secs = elapsed.as_secs(),
+                            next_incomplete = ?next_incomplete,
+                            window_lo = lo,
+                            window_hi = hi,
+                            neighbors = ?neighbors,
+                            "blocking_sparse_read stuck waiting for chunk: \
+                             cursor at byte {pos} (chunk {chunk_idx}), waiting {} s; \
+                             next_incomplete_after={next_incomplete:?}; \
+                             chunks [{lo}..={hi}]={neighbors:?}",
+                            elapsed.as_secs(),
+                        );
+                    }
                 }
                 // §2.1: a decoder waiting for the next chunk to arrive
                 // can sit here indefinitely on a slow network. Polling
