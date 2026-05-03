@@ -1,6 +1,6 @@
 //! Hand-rolled, pure-Rust DEFLATE streaming decoder.
 //!
-//! Phase 1 of `docs/PLAN_deflate_block_decoder.md` — currently
+//! Phases 1–2 of `docs/PLAN_deflate_block_decoder.md` — currently
 //! shipped behind the cargo feature flag `peel_deflate_native`. The
 //! existing [`crate::decode::gzip`] wrapper around `flate2` remains
 //! the production gzip path; this module is built up phase-by-phase
@@ -24,10 +24,28 @@
 //!   [`StreamingDecoder::bytes_consumed`] reports exactly the bytes
 //!   the decoder has pulled off the source, never speculatively.
 //!
-//! # What Phase 1 does *not* do
+//! # What Phase 2 added
 //!
-//! - Bit-level reading (Phase 2 lands the bit reader, the foundation
-//!   for fixed/dynamic Huffman blocks).
+//! - [`bitstream::BitReader`]: streaming forward bit reader over a
+//!   `Box<dyn Read + Send>` source. RFC 1951 §3.1.1 bit ordering
+//!   (LSB-first byte order, LSB-first bit ordering within each
+//!   byte). Provides `peek_bits` / `consume_bits` / `read_bits` /
+//!   `align_to_byte` / `byte_position`. Pure logic on top of a
+//!   small (4 KiB) pull-buffer; cursor accounting honours the
+//!   floor convention from `docs/PLAN_deflate_block_decoder.md`
+//!   §Risks 2 (the byte the bit cursor is fractionally inside is
+//!   *not* freeable). Not yet wired into the [`Decoder`] state
+//!   machine — Phase 5 swaps the byte-oriented `read_exact_into`
+//!   helper out for the bit reader once Phases 3 and 4 land
+//!   fixed and dynamic Huffman bodies that need it.
+//!
+//! # What Phase 1 / 2 do *not* do
+//!
+//! - Fixed Huffman block bodies (Phase 3) — the bit reader is
+//!   ready; the canonical-Huffman table builder and the literal /
+//!   length / distance dispatch land in Phase 3.
+//! - Dynamic Huffman blocks with the HLIT / HDIST / HCLEN preamble
+//!   (Phase 4).
 //! - LZ77 sliding window (Phase 5).
 //! - gzip framing — this decoder takes raw deflate input, the same
 //!   shape `flate2::read::DeflateDecoder` consumes. The RFC 1952
@@ -53,6 +71,7 @@ use std::io::{self, Read, Write};
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
 use crate::types::ByteOffset;
 
+pub mod bitstream;
 pub mod block;
 pub mod error;
 
