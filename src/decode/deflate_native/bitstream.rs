@@ -105,16 +105,30 @@ impl BitReader {
         }
     }
 
-    /// Top up the accumulator from the pull-buffer (and the source,
-    /// if the pull-buffer is empty) until it holds at least `n`
-    /// valid bits, or the source is exhausted.
+    /// Best-effort: top up the accumulator from the pull-buffer
+    /// (and the source, if the pull-buffer is empty) until it
+    /// holds at least `n` valid bits, **or the source is
+    /// exhausted**. Returns `Ok(())` either way; the caller is
+    /// responsible for checking [`Self::bits_buffered`] before
+    /// consuming bits.
+    ///
+    /// This soft contract matters at deflate-block boundaries: a
+    /// Huffman code's actual length is data-dependent and may be
+    /// shorter than the table's max-bits ceiling, so a strict
+    /// `ensure(max)` near end-of-stream would falsely surface
+    /// truncation when the bits needed for the actual code are
+    /// present. Strict variants live as
+    /// [`Self::read_bits`] (EOFs the call when fewer than `n` bits
+    /// can be assembled) and
+    /// [`Self::read_aligned`] (EOFs when a byte-aligned read
+    /// can't be filled).
     ///
     /// # Errors
     ///
-    /// - [`DeflateError::UnexpectedEof`] when the source delivers
-    ///   `Ok(0)` before `n` bits could be assembled.
-    /// - [`DeflateError::SourceIo`] for any other `Read::read`
-    ///   failure (after honoring `Interrupted`).
+    /// Only [`DeflateError::SourceIo`] for an underlying
+    /// `Read::read` failure (after honoring `Interrupted`). Source
+    /// EOF — including the case where zero bytes were ever
+    /// delivered — surfaces as `Ok(())` with `bits_buffered() == 0`.
     ///
     /// # Panics
     ///
@@ -126,10 +140,11 @@ impl BitReader {
         );
         while self.nbits < n {
             // Refill the pull-buffer from the source if it's empty.
-            // Source exhausted and no buffered bytes left = permanent
-            // EOF, surface as UnexpectedEof.
+            // Source exhausted with no buffered bytes left → return
+            // what we have; the caller decides whether short bits
+            // are an error.
             if self.pull_pos >= self.pull_filled && !self.refill_pull_buf()? {
-                return Err(DeflateError::UnexpectedEof("bit stream"));
+                return Ok(());
             }
             // Shift one byte from the pull-buffer into the
             // accumulator, low-bytes-first per RFC 1951 §3.1.1.
@@ -182,20 +197,26 @@ impl BitReader {
     /// **closest to the start of the stream** (the LSB of the byte
     /// at `byte_position().0`, at offset `byte_position().1`).
     ///
+    /// **Short-buffer semantics.** The accumulator is initialized
+    /// to `0` and only validly-buffered bits are ever shifted into
+    /// its low positions, so the high bits past `nbits` are always
+    /// zero. A `peek_bits(n)` with `nbits < n` therefore returns
+    /// the available bits in the low positions plus implicit
+    /// zero-padding in the high. Huffman-decode lookups exploit
+    /// this to peek at the table's max-bits width even when a
+    /// stream is approaching EOF: the table replicates short codes
+    /// across all values of the high don't-care bits, so the
+    /// zero-padded peek still hits the correct entry. Callers that
+    /// need strict "n bits or error" semantics should use
+    /// [`Self::read_bits`] (or check [`Self::bits_buffered`] before
+    /// committing to a [`Self::consume_bits`]).
+    ///
     /// # Panics
     ///
-    /// Debug-asserts `n <= MAX_BITS_PER_READ` and `nbits >= n`.
-    /// Callers must call [`Self::ensure`] (or [`Self::read_bits`])
-    /// before peeking; the typical Huffman-decode pattern is
-    /// `ensure(MAX_HUFFMAN_BITS); peek_bits(MAX_HUFFMAN_BITS); consume_bits(actual_code_len)`.
+    /// Debug-asserts `n <= MAX_BITS_PER_READ`.
     #[must_use]
     pub fn peek_bits(&self, n: u32) -> u32 {
         debug_assert!(n <= MAX_BITS_PER_READ);
-        debug_assert!(
-            self.nbits >= n,
-            "BitReader::peek_bits({n}) called with only {} bits buffered — caller must ensure first",
-            self.nbits,
-        );
         let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
         (self.acc as u32) & mask
     }
@@ -221,14 +242,29 @@ impl BitReader {
     /// Read the next `n` bits and advance the cursor — the
     /// fallible `ensure + peek + consume` composition.
     ///
+    /// Strict variant: surfaces [`DeflateError::UnexpectedEof`]
+    /// when the source is exhausted before `n` bits are available.
+    /// Used at every site that wants the historical "give me
+    /// exactly `n` or error" semantics (block-header bits,
+    /// length / distance extra bits, stored-block lengths).
+    /// [`super::huffman::HuffTable::decode`] takes the softer path
+    /// of [`Self::ensure`] + [`Self::peek_bits`] + a per-symbol
+    /// length check before [`Self::consume_bits`].
+    ///
     /// Returns the bits as a `u32` with the same bit ordering as
     /// [`Self::peek_bits`]: LSB closest to the start of the stream.
     ///
     /// # Errors
     ///
-    /// Forwards any error from [`Self::ensure`].
+    /// - [`DeflateError::UnexpectedEof`] when fewer than `n` bits
+    ///   are available after a best-effort refill.
+    /// - [`DeflateError::SourceIo`] from the underlying
+    ///   [`Self::ensure`].
     pub fn read_bits(&mut self, n: u32) -> Result<u32, DeflateError> {
         self.ensure(n)?;
+        if self.nbits < n {
+            return Err(DeflateError::UnexpectedEof("bit stream"));
+        }
         let v = self.peek_bits(n);
         self.consume_bits(n);
         Ok(v)
@@ -514,17 +550,21 @@ mod tests {
     }
 
     #[test]
-    fn ensure_after_eof_keeps_reporting_eof_idempotently() {
-        // Repeated calls after the source has signaled EOF must
-        // continue surfacing UnexpectedEof rather than silently
-        // returning success or panicking.
+    fn ensure_after_eof_returns_ok_with_zero_buffered_repeatedly() {
+        // Soft-ensure semantics: at EOF, repeated `ensure` calls
+        // return `Ok(())` with `bits_buffered() == 0`. The strict
+        // "give me n or error" contract lives on
+        // [`BitReader::read_bits`], which is exercised below.
         let mut br = reader(vec![0xFF]);
         br.read_bits(8).expect("byte");
         for _ in 0..5 {
-            match br.ensure(1) {
-                Err(DeflateError::UnexpectedEof(_)) => {}
-                other => panic!("expected UnexpectedEof, got {other:?}"),
-            }
+            br.ensure(1).expect("soft ensure tolerates EOF");
+            assert_eq!(br.bits_buffered(), 0);
+        }
+        // The strict gate is now `read_bits`.
+        match br.read_bits(1) {
+            Err(DeflateError::UnexpectedEof(_)) => {}
+            other => panic!("expected UnexpectedEof from read_bits, got {other:?}"),
         }
     }
 

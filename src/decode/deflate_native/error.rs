@@ -70,20 +70,6 @@ pub enum DeflateError {
     #[error("deflate: unexpected EOF while reading {0}")]
     UnexpectedEof(&'static str),
 
-    /// A `BTYPE=01` (fixed Huffman) block was observed. Phase 1 ships
-    /// stored blocks only; fixed-Huffman support arrives in Phase 3
-    /// per `docs/PLAN_deflate_block_decoder.md`. Distinct variant so
-    /// the gate can be lifted phase-by-phase without churning every
-    /// call site.
-    #[error("deflate: fixed Huffman block (BTYPE=01) decoding not yet implemented")]
-    FixedHuffmanUnimplemented,
-
-    /// A `BTYPE=10` (dynamic Huffman) block was observed. Phase 1
-    /// ships stored blocks only; dynamic-Huffman support arrives in
-    /// Phase 4 per `docs/PLAN_deflate_block_decoder.md`.
-    #[error("deflate: dynamic Huffman block (BTYPE=10) decoding not yet implemented")]
-    DynamicHuffmanUnimplemented,
-
     /// Generic Huffman-layer failure. Variants include an
     /// over/under-subscribed code-length table (Kraft inequality
     /// violation), a code length exceeding RFC 1951's 15-bit cap,
@@ -192,12 +178,14 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_variants_carry_phase_specific_messages() {
-        assert!(DeflateError::FixedHuffmanUnimplemented
-            .to_string()
-            .contains("BTYPE=01"));
-        assert!(DeflateError::DynamicHuffmanUnimplemented
-            .to_string()
-            .contains("BTYPE=10"));
+    fn malformed_huffman_carries_static_reason() {
+        let e = DeflateError::MalformedHuffman("code length > 15");
+        assert!(e.to_string().contains("code length > 15"));
+    }
+
+    #[test]
+    fn reserved_distance_code_renders_value() {
+        let e = DeflateError::ReservedDistanceCode { code: 30 };
+        assert!(e.to_string().contains("30"));
     }
 }

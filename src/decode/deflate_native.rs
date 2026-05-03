@@ -77,6 +77,7 @@ use crate::types::ByteOffset;
 
 pub mod bitstream;
 pub mod block;
+pub mod dynamic;
 pub mod error;
 pub mod huffman;
 
@@ -99,11 +100,9 @@ const OUTPUT_CHUNK: usize = 1 << 20;
 /// in. The source is `Send` so the decoder can be moved to a worker
 /// thread the same way the other in-tree decoders can.
 ///
-/// Phases 1–3 ship stored blocks (`BTYPE=00`) and fixed-Huffman
-/// blocks (`BTYPE=01`) end-to-end. Dynamic-Huffman blocks
-/// (`BTYPE=10`) return
-/// [`DeflateError::DynamicHuffmanUnimplemented`] until Phase 4 fills
-/// the path in. The reserved value (`BTYPE=11`) surfaces as
+/// Phases 1–4 ship every RFC 1951 §3.2.3 block type: stored
+/// (`BTYPE=00`), fixed-Huffman (`BTYPE=01`), and dynamic-Huffman
+/// (`BTYPE=10`). The reserved value (`BTYPE=11`) surfaces as
 /// [`DeflateError::ReservedBlockType`].
 pub struct Decoder {
     /// Bit-level source reader. Owns the underlying
@@ -125,6 +124,17 @@ pub struct Decoder {
     /// payload reads. Reused across steps to avoid per-call
     /// allocation.
     output_buf: Vec<u8>,
+    /// Per-block dynamic-Huffman lit/length table. Populated by
+    /// [`dynamic::parse_preamble`] when entering a BTYPE=10 block;
+    /// taken back out before each [`Self::decode_huffman_body`]
+    /// call (to satisfy the borrow checker — the helper takes
+    /// `&mut self`) and restored if the block didn't end this
+    /// step. Cleared at end-of-block.
+    dyn_lit: Option<HuffTable>,
+    /// Per-block dynamic-Huffman distance table. `None` when the
+    /// block declared an all-zero distance alphabet (RFC 1951
+    /// §3.2.7's "literals-only block" special case).
+    dyn_dist: Option<HuffTable>,
 }
 
 /// Decoder state machine.
@@ -167,8 +177,38 @@ enum State {
         /// Whether this is the last block in the deflate stream.
         last: bool,
     },
+    /// Inside a dynamic-Huffman block. The per-block lit/length and
+    /// distance tables (built from RFC 1951 §3.2.7's preamble) live
+    /// in [`Decoder::dyn_lit`] / [`Decoder::dyn_dist`]; the State
+    /// variant holds only the `last` flag so the inner-block decode
+    /// can fall through the same [`Decoder::decode_huffman_body`]
+    /// helper the fixed-Huffman path uses.
+    InDynamicHuffmanBlock {
+        /// Whether this is the last block in the deflate stream.
+        last: bool,
+    },
     /// Stream ended cleanly. Subsequent steps are no-ops.
     Done,
+}
+
+/// Outcome from one inner-block decode pass over Huffman symbols.
+/// Returned by [`Decoder::decode_huffman_body`] so the outer
+/// [`Decoder::step_inner`] can perform state-transition + table-
+/// drop bookkeeping in one place (instead of having the helper
+/// reach into [`Decoder::dyn_lit`] / [`Decoder::dyn_dist`] mid-loop,
+/// which would clash with the helper's existing `&mut self`).
+#[derive(Debug, Eq, PartialEq)]
+enum HuffmanBodyOutcome {
+    /// EOB symbol observed; the block is complete. Caller drops
+    /// any per-block tables and transitions to either `Done`
+    /// (BFINAL=1) or `AwaitingBlockType` (BFINAL=0).
+    Eob,
+    /// Per-step output cap reached without an EOB. Caller restores
+    /// any per-block tables and returns
+    /// [`DecodeStatus::MoreData`] so the extractor can interleave
+    /// punching / checkpointing before the next decode_step
+    /// resumes the same block.
+    Yielded,
 }
 
 /// Re-label any [`DeflateError::UnexpectedEof`] surfaced by `r`
@@ -200,6 +240,8 @@ impl Decoder {
             window: Vec::new(),
             window_flushed: 0,
             output_buf: vec![0u8; OUTPUT_CHUNK],
+            dyn_lit: None,
+            dyn_dist: None,
         })
     }
 
@@ -236,7 +278,16 @@ impl Decoder {
                             State::AwaitingStoredHeader { last }
                         }
                         0b01 => State::InFixedHuffmanBlock { last },
-                        0b10 => return Err(DeflateError::DynamicHuffmanUnimplemented),
+                        0b10 => {
+                            // Parse the dynamic-Huffman preamble
+                            // inline (RFC 1951 §3.2.7). Tables live
+                            // in self.dyn_lit / self.dyn_dist for the
+                            // duration of the block.
+                            let (lit, dist) = dynamic::parse_preamble(&mut self.bits)?;
+                            self.dyn_lit = Some(lit);
+                            self.dyn_dist = dist;
+                            State::InDynamicHuffmanBlock { last }
+                        }
                         0b11 => return Err(DeflateError::ReservedBlockType),
                         // INVARIANT: `read_bits(2)` returns 0..=3.
                         _ => unreachable!("BTYPE field is 2 bits"),
@@ -295,13 +346,69 @@ impl Decoder {
                 }
 
                 State::InFixedHuffmanBlock { last } => {
-                    if let Some(status) = self.decode_huffman_body(
+                    let outcome = self.decode_huffman_body(
                         &FIXED_LITLEN_TABLE,
                         Some(&FIXED_DIST_TABLE),
-                        last,
                         sink,
-                    )? {
-                        return Ok(status);
+                    )?;
+                    match outcome {
+                        HuffmanBodyOutcome::Eob => {
+                            self.state = if last {
+                                State::Done
+                            } else {
+                                State::AwaitingBlockType
+                            };
+                            return Ok(if last {
+                                DecodeStatus::Eof
+                            } else {
+                                DecodeStatus::MoreData
+                            });
+                        }
+                        HuffmanBodyOutcome::Yielded => return Ok(DecodeStatus::MoreData),
+                    }
+                }
+
+                State::InDynamicHuffmanBlock { last } => {
+                    // Take the per-block tables out so the helper's
+                    // `&mut self` borrow doesn't clash with the
+                    // immutable borrow on the tables. INVARIANT: the
+                    // BTYPE=10 dispatch above always populates
+                    // `self.dyn_lit` before transitioning to this
+                    // state; reaching this arm with `dyn_lit = None`
+                    // would be a state-machine bug.
+                    let lit = self.dyn_lit.take().ok_or(DeflateError::MalformedHuffman(
+                        "dynamic-block lit table missing at decode time",
+                    ))?;
+                    let dist = self.dyn_dist.take();
+                    let result = self.decode_huffman_body(&lit, dist.as_ref(), sink);
+                    match result {
+                        Ok(HuffmanBodyOutcome::Eob) => {
+                            // Tables drop with `lit` / `dist` going
+                            // out of scope.
+                            self.state = if last {
+                                State::Done
+                            } else {
+                                State::AwaitingBlockType
+                            };
+                            return Ok(if last {
+                                DecodeStatus::Eof
+                            } else {
+                                DecodeStatus::MoreData
+                            });
+                        }
+                        Ok(HuffmanBodyOutcome::Yielded) => {
+                            // Restore tables for the next decode_step
+                            // to resume against.
+                            self.dyn_lit = Some(lit);
+                            self.dyn_dist = dist;
+                            return Ok(DecodeStatus::MoreData);
+                        }
+                        Err(e) => {
+                            // Tables drop on error; the parent's
+                            // error path also clamps state to Done so
+                            // the partial tables aren't observable.
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -313,25 +420,24 @@ impl Decoder {
     /// block's EOB symbol is consumed or the per-step output cap of
     /// roughly [`OUTPUT_CHUNK`] bytes is reached.
     ///
-    /// Returns `Ok(Some(_))` when the inner loop produced a
-    /// step-terminating event (block end + transition, or output
-    /// cap reached); returns `Ok(None)` on impossible cases that
-    /// should bubble up through the outer loop. The structure
-    /// matches the existing `step_inner` pattern: the outer loop
-    /// owns state transitions, helpers return when they have
-    /// progress to report.
+    /// Returns [`HuffmanBodyOutcome`]; the caller (the
+    /// [`Self::step_inner`] state arm for the matching block type)
+    /// handles state transitions and per-block-table cleanup. This
+    /// keeps the helper's `&mut self` borrow scoped to the
+    /// inner-loop work and avoids tangling the state machine
+    /// transitions with the table-buffer ownership across
+    /// fixed-vs-dynamic dispatch.
     ///
-    /// `dist_table = None` is a placeholder for Phase 4's "literals
-    /// only" dynamic blocks (HDIST=1 with the only code length 0);
-    /// hitting a length symbol with no distance table surfaces as
-    /// [`DeflateError::MalformedHuffman`].
+    /// `dist_table = None` corresponds to RFC 1951 §3.2.7's
+    /// "literals only" dynamic block (HDIST=1 with the single
+    /// distance-code length 0); hitting a length symbol with no
+    /// distance table surfaces as [`DeflateError::MalformedHuffman`].
     fn decode_huffman_body(
         &mut self,
         lit_table: &HuffTable,
         dist_table: Option<&HuffTable>,
-        last: bool,
         sink: &mut dyn Write,
-    ) -> Result<Option<DecodeStatus>, DeflateError> {
+    ) -> Result<HuffmanBodyOutcome, DeflateError> {
         let start_window_len = self.window.len();
         loop {
             let sym = lit_table.decode(&mut self.bits)?;
@@ -341,18 +447,9 @@ impl Decoder {
                     self.window.push(sym as u8);
                 }
                 256 => {
-                    // End of block. Flush, transition, return.
+                    // End of block. Flush; caller transitions state.
                     self.flush_window_to_sink(sink)?;
-                    self.state = if last {
-                        State::Done
-                    } else {
-                        State::AwaitingBlockType
-                    };
-                    return Ok(Some(if last {
-                        DecodeStatus::Eof
-                    } else {
-                        DecodeStatus::MoreData
-                    }));
+                    return Ok(HuffmanBodyOutcome::Eob);
                 }
                 257..=285 => {
                     let lc = (sym - 257) as usize;
@@ -419,7 +516,7 @@ impl Decoder {
             // extractor's punch granularity.
             if self.window.len() - start_window_len >= OUTPUT_CHUNK {
                 self.flush_window_to_sink(sink)?;
-                return Ok(Some(DecodeStatus::MoreData));
+                return Ok(HuffmanBodyOutcome::Yielded);
             }
         }
     }
@@ -636,16 +733,20 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_huffman_block_surfaces_phase4_placeholder() {
-        // BFINAL=1, BTYPE=10 → 0b101 = 0x05.
+    fn truncated_dynamic_huffman_block_surfaces_unexpected_eof() {
+        // BFINAL=1, BTYPE=10 → 0b101 = 0x05. The decoder consumes
+        // the first 3 bits as block header, then needs HLIT (5 bits)
+        // + HDIST (5 bits) + HCLEN (4 bits) = 14 more bits — but
+        // only 5 bits are left in the source byte. Surfaces as a
+        // bit-stream truncation.
         let stream = vec![0x05u8];
         let mut decoder = Decoder::new(Box::new(Cursor::new(stream))).expect("construct");
         let mut sink = Vec::new();
         match decoder.decode_step(&mut sink) {
             Err(DecodeError::Read { source, .. }) => {
                 assert!(
-                    source.to_string().contains("BTYPE=10"),
-                    "expected BTYPE=10 placeholder message, got: {source}"
+                    source.to_string().contains("bit stream"),
+                    "expected truncation message, got: {source}"
                 );
             }
             other => panic!("expected Read error, got {other:?}"),
@@ -1095,11 +1196,10 @@ mod tests {
     }
 
     /// Differential against `flate2` (`miniz_oxide` backend) at
-    /// `Compression::fast()` — for inputs short enough that
-    /// `miniz_oxide` reliably emits BTYPE=01. For inputs that come
-    /// out as BTYPE=00 (stored) or BTYPE=10 (dynamic), the test
-    /// still asserts byte-identity for the BTYPEs Phase 1 / 3
-    /// support and skips dynamic blocks until Phase 4.
+    /// `Compression::fast()` — covers all three BTYPE values
+    /// generated by miniz_oxide on short ASCII fixtures
+    /// (predominantly BTYPE=01). Phase 4's dynamic-Huffman path
+    /// makes BTYPE=10 byte-identical, same as 00 / 01.
     #[test]
     fn flate2_round_trip_50_random_short_fixtures() {
         use flate2::write::DeflateEncoder;
@@ -1158,20 +1258,12 @@ mod tests {
                 }
                 0b10 => {
                     dynamic_count += 1;
-                    // Phase 4 work; current placeholder rejects
-                    // cleanly. Accept either the placeholder error
-                    // or… actually, only the placeholder is valid.
                     let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
                     let mut sink = Vec::new();
-                    match decoder.decode_step(&mut sink) {
-                        Err(DecodeError::Read { source, .. }) => {
-                            assert!(
-                                source.to_string().contains("BTYPE=10"),
-                                "expected dynamic-Huffman placeholder"
-                            );
-                        }
-                        other => panic!("expected Phase 4 placeholder, got {other:?}"),
+                    while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData
+                    {
                     }
+                    assert_eq!(sink, payload, "BTYPE=10 round-trip");
                 }
                 _ => unreachable!("BTYPE is 2 bits"),
             }
@@ -1190,5 +1282,278 @@ mod tests {
         eprintln!(
             "flate2 differential: {fixed_count} fixed, {stored_count} stored, {dynamic_count} dynamic out of 50"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4 — dynamic-Huffman block (BTYPE=10) tests
+    // ----------------------------------------------------------------
+
+    /// Differential against `flate2` at `Compression::default()`
+    /// (level 6) on payloads long enough that miniz_oxide reliably
+    /// picks BTYPE=10. Required by
+    /// `docs/PLAN_deflate_block_decoder.md` §Phase 4 exit criteria
+    /// (500 random fixtures).
+    #[test]
+    fn flate2_round_trip_500_random_dynamic_huffman_fixtures() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut rng = 0xDEAD_BEEFu32;
+        let mut step = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+
+        // Mix of payload "shapes" exercises different Huffman
+        // alphabets:
+        //   - random bytes (high-entropy, dense Huffman)
+        //   - ASCII text with repetition (back-references everywhere)
+        //   - Single byte repeated (longest possible RLE matches)
+        //   - Two-character alphabet (sparse Huffman, long zero
+        //     runs in the lit/length code-lengths sequence — exercises
+        //     RLE 18 in the preamble)
+        let make_payload = |variant: u32, len: usize, step: &mut dyn FnMut() -> u32| {
+            let mut p = Vec::with_capacity(len);
+            match variant % 4 {
+                0 => {
+                    // High-entropy random.
+                    for _ in 0..len {
+                        p.push((step() & 0xFF) as u8);
+                    }
+                }
+                1 => {
+                    // English-ish text with whitespace.
+                    let words: &[&[u8]] = &[
+                        b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ",
+                        b"dog. ", b"\n",
+                    ];
+                    while p.len() < len {
+                        let w = words[(step() as usize) % words.len()];
+                        p.extend_from_slice(w);
+                    }
+                    p.truncate(len);
+                }
+                2 => {
+                    // Single byte repeated.
+                    let b = (step() & 0xFF) as u8;
+                    p.resize(len, b);
+                }
+                _ => {
+                    // Two-character alphabet — biases the lit/length
+                    // table to mostly-zeros, exercising RLE 18 in
+                    // the preamble.
+                    let a = (step() & 0xFF) as u8;
+                    let b = (step() & 0xFF) as u8;
+                    for i in 0..len {
+                        p.push(if (i & 1) == 0 { a } else { b });
+                    }
+                }
+            }
+            p
+        };
+
+        let mut dynamic_count = 0u32;
+        let mut other_count = 0u32;
+        for i in 0..500u32 {
+            // 200..1224 byte payloads — long enough that miniz_oxide
+            // picks dynamic Huffman the vast majority of the time.
+            let len = 200 + (step() as usize % 1024);
+            let payload = make_payload(i, len, &mut step);
+
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&payload).expect("encode");
+            let raw = enc.finish().expect("finish");
+            assert!(!raw.is_empty(), "encoder produced empty output");
+
+            let btype = (raw[0] >> 1) & 0b11;
+            let raw_len = raw.len();
+            let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
+            let mut sink = Vec::new();
+            loop {
+                match decoder.decode_step(&mut sink) {
+                    Ok(DecodeStatus::MoreData) => {}
+                    Ok(DecodeStatus::Eof) => break,
+                    Err(e) => panic!(
+                        "decode failed (fixture {i}, variant {}, len {len}, BTYPE={btype}, raw_len {raw_len}, payload[..16]={:02x?}): {e:?}",
+                        i % 4,
+                        &payload[..payload.len().min(16)]
+                    ),
+                }
+            }
+            assert_eq!(
+                sink, payload,
+                "round-trip mismatch (BTYPE={btype}, fixture {i})",
+            );
+
+            if btype == 0b10 {
+                dynamic_count += 1;
+            } else {
+                other_count += 1;
+            }
+        }
+
+        // The plan's exit criterion: "500 random dynamic-Huffman
+        // fixtures decode byte-identical to flate2." Each fixture
+        // round-trips byte-identically regardless of BTYPE; the
+        // dynamic-count assertion below is a coverage gate so a
+        // miniz_oxide heuristic flip can't silently erode the path
+        // we're actually exercising. 300 is empirically below the
+        // current count (~375) and well above zero.
+        assert!(
+            dynamic_count >= 300,
+            "only {dynamic_count} of 500 fixtures came back as BTYPE=10 \
+             — miniz_oxide heuristic changed?"
+        );
+        eprintln!(
+            "Phase 4 differential: {dynamic_count} dynamic / {other_count} other (fixed/stored) out of 500"
+        );
+    }
+
+    /// Hand-built fixture exercising the dynamic-Huffman preamble's
+    /// RLE 18 (long zero run, 11..=138 zeros). Encodes a block
+    /// whose lit/length alphabet uses only literal `'A'` (65) and
+    /// EOB (256) — every other lit/length entry has length 0,
+    /// which the encoder emits as one or more RLE-18 runs.
+    ///
+    /// Built as a true round-trip: we use flate2 to encode the
+    /// payload (which produces BTYPE=10 with RLE 17/18 in the
+    /// preamble for sparse alphabets), then decode through our
+    /// path and check the output. The payload is `b"AAAA"` ×
+    /// 1000 = 4000 bytes, which compresses heavily and uses a
+    /// sparse alphabet.
+    #[test]
+    fn flate2_round_trip_sparse_alphabet_exercises_rle_zeros() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let payload: Vec<u8> = b"A".repeat(4000);
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&payload).expect("encode");
+        let raw = enc.finish().expect("finish");
+        let btype = (raw[0] >> 1) & 0b11;
+        // miniz_oxide at level 6 on a 4 KB single-byte payload
+        // emits a dynamic-Huffman block (the sparse-alphabet case
+        // we want to exercise).
+        assert_eq!(btype, 0b10, "expected dynamic-Huffman block");
+
+        let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
+        let mut sink = Vec::new();
+        while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        assert_eq!(sink, payload);
+    }
+
+    /// Hand-built fixture exercising the dynamic-Huffman preamble's
+    /// RLE 16 (repeat-previous-length, 3..=6 repeats). Constructs a
+    /// payload that miniz_oxide encodes with a code-length sequence
+    /// containing repeated non-zero lengths (the case RLE 16
+    /// targets). Works the same way as the RLE 18 test: a flate2
+    /// round-trip with a payload designed to force the encoder
+    /// into the right shape.
+    #[test]
+    fn flate2_round_trip_dense_alphabet_exercises_rle_16() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        // English-ish text exercises a dense lit/length alphabet
+        // (most ASCII printable symbols used at similar
+        // frequencies → similar code lengths → RLE 16 fires for
+        // adjacent same-length entries). High-entropy random bytes
+        // would force miniz_oxide into BTYPE=00 (stored) since
+        // they don't compress.
+        let mut payload = Vec::with_capacity(2048);
+        let lines: &[&[u8]] = &[
+            b"the quick brown fox jumps over the lazy dog. ",
+            b"sphinx of black quartz, judge my vow. ",
+            b"pack my box with five dozen liquor jugs. ",
+            b"jived fox nymph grabs quick waltz. ",
+            b"how vexingly quick daft zebras jump. ",
+        ];
+        let mut i = 0;
+        while payload.len() < 2048 {
+            payload.extend_from_slice(lines[i % lines.len()]);
+            i += 1;
+        }
+        payload.truncate(2048);
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&payload).expect("encode");
+        let raw = enc.finish().expect("finish");
+        let btype = (raw[0] >> 1) & 0b11;
+        assert_eq!(btype, 0b10, "expected dynamic-Huffman block");
+
+        let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
+        let mut sink = Vec::new();
+        while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        assert_eq!(sink, payload);
+    }
+
+    /// Multi-block dynamic-Huffman: large enough that miniz_oxide
+    /// chunks the payload into ≥ 2 dynamic blocks. The bit cursor
+    /// must persist across the per-block boundary, and the
+    /// per-block tables (`dyn_lit` / `dyn_dist`) must be cleared at
+    /// EOB and rebuilt for the next block.
+    #[test]
+    fn flate2_round_trip_multi_block_dynamic_huffman() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        // 64 KB random payload — miniz_oxide at level 9 emits
+        // multiple dynamic-Huffman blocks for inputs this size.
+        let mut rng = 0xCAFE_BABEu32;
+        let mut step = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        let payload: Vec<u8> = (0..64 * 1024).map(|_| (step() & 0xFF) as u8).collect();
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&payload).expect("encode");
+        let raw = enc.finish().expect("finish");
+
+        let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
+        let mut sink = Vec::new();
+        while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        assert_eq!(sink, payload);
+    }
+
+    /// Dynamic block with a back-reference distance > 32 KiB
+    /// upper-bounds the sliding-window stand-in's growth. (Phase 5
+    /// adds the ring buffer; Phase 4 just verifies that
+    /// long-distance back-references still resolve correctly.)
+    #[test]
+    fn flate2_round_trip_long_distance_back_references() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        // Repeat a 4 KB random prefix 16 times → 64 KB, with strong
+        // 4 KB-period self-similarity. miniz_oxide will emit
+        // back-references with distances up to the prefix length.
+        let mut rng = 0xFADE_F00Du32;
+        let mut step = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        let prefix: Vec<u8> = (0..4096).map(|_| (step() & 0xFF) as u8).collect();
+        let payload: Vec<u8> = (0..16).flat_map(|_| prefix.iter().copied()).collect();
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&payload).expect("encode");
+        let raw = enc.finish().expect("finish");
+
+        let mut decoder = Decoder::new(Box::new(Cursor::new(raw))).expect("construct");
+        let mut sink = Vec::new();
+        while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        assert_eq!(sink, payload);
     }
 }

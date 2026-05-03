@@ -214,14 +214,24 @@ impl HuffTable {
     /// Decode the next Huffman symbol off `br`.
     ///
     /// Performs the canonical "peek max-len bits, look up entry,
-    /// consume actual code length" cycle.
+    /// consume actual code length" cycle. Uses the bit reader's
+    /// soft [`BitReader::ensure`] so a stream that ends exactly at
+    /// the EOB code's last bit (an extremely common case for
+    /// Huffman-block deflate streams) decodes cleanly without a
+    /// false-positive truncation: the lookup table's entries for
+    /// short codes are replicated across every high-bit pattern
+    /// of the lookup index, so an "ensure-up-to" peek with
+    /// implicit zero-padding above `bits_buffered` still hits the
+    /// correct entry.
     ///
     /// # Errors
     ///
-    /// - [`DeflateError::UnexpectedEof`] when fewer than
-    ///   [`Self::bits`] bits remain in the source.
+    /// - [`DeflateError::UnexpectedEof`] when the source is
+    ///   exhausted *and* fewer bits than the entry's actual code
+    ///   length are buffered (i.e. the stream truly couldn't
+    ///   provide enough bits for the next symbol).
     /// - [`DeflateError::SourceIo`] for any underlying source IO
-    ///   error.
+    ///   error during refill.
     /// - [`DeflateError::MalformedHuffman`] when this table has no
     ///   symbols (an empty alphabet — caller must not invoke
     ///   `decode` on those) or when the peeked bit pattern lands
@@ -232,13 +242,25 @@ impl HuffTable {
                 "decode from empty Huffman alphabet",
             ));
         }
+        // Best-effort refill — short reads near EOF are tolerated;
+        // the per-entry length check below catches the case where
+        // we genuinely don't have enough bits for the symbol.
         br.ensure(self.bits)?;
+        if br.bits_buffered() == 0 {
+            return Err(DeflateError::UnexpectedEof("bit stream"));
+        }
         let key = br.peek_bits(self.bits) as usize;
         let entry = self.table[key];
         if entry.len == 0 {
             return Err(DeflateError::MalformedHuffman(
                 "bit pattern not assigned to any code",
             ));
+        }
+        if u32::from(entry.len) > br.bits_buffered() {
+            // The lookup landed on a symbol whose code length
+            // exceeds what's actually available in the stream —
+            // legitimate truncation.
+            return Err(DeflateError::UnexpectedEof("bit stream"));
         }
         br.consume_bits(u32::from(entry.len));
         Ok(entry.sym)
