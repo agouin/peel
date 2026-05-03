@@ -36,7 +36,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use io_uring::{opcode, squeue, types, IoUring};
 
@@ -66,6 +66,34 @@ pub const MIN_RING_DEPTH: u32 = 8;
 /// architectures the standards doc cares about (x86_64 and aarch64
 /// Linux).
 const RLIMIT_NOFILE: i32 = 7;
+
+/// Default age threshold for the per-op in-flight watchdog
+/// (`PLAN_decoder_freeze.md` §2.1). Any op whose CQE has not
+/// arrived within this window emits one `tracing::warn!` per
+/// warn-interval, identifying the op that the IO thread is
+/// stuck waiting on.
+///
+/// Matches `progress::DEFAULT_STALL_WARN_INTERVAL` (30 s) so the
+/// uring-side warning composes with the renderer-side
+/// "pipeline frozen" warning: a freeze surfaces both signals
+/// inside the same wall-clock window. Override via
+/// `PEEL_URING_INFLIGHT_WARN_SECS`.
+const DEFAULT_INFLIGHT_WARN: Duration = Duration::from_secs(30);
+
+/// Read `PEEL_URING_INFLIGHT_WARN_SECS` (positive integer
+/// seconds) and fall back to [`DEFAULT_INFLIGHT_WARN`]. `0` or
+/// any other invalid value disables the env override; the default
+/// applies. There is no way to disable the watchdog entirely
+/// today — the warning is cheap and silent under healthy
+/// operation.
+fn inflight_warn_from_env() -> Duration {
+    std::env::var("PEEL_URING_INFLIGHT_WARN_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_INFLIGHT_WARN)
+}
 
 /// IO-thread loop result reported back to the constructor.
 ///
@@ -506,10 +534,27 @@ struct InFlight {
     /// otherwise.
     #[allow(dead_code)]
     timeout_ts: Option<Box<types::Timespec>>,
+    /// Wall-clock time the op was first inserted into the tracker.
+    /// Used by the §2.1 watchdog to detect ops whose CQE has not
+    /// arrived in `PEEL_URING_INFLIGHT_WARN_SECS`. Reset to the
+    /// resume time when a partial WriteAll/ReadExact resubmits, so
+    /// the watchdog only complains about a single submission's age
+    /// — not the cumulative time across resubmits.
+    submitted_at: Instant,
+    /// Most recent wall-clock time the watchdog warned about this op.
+    /// Used to rate-limit the warning to one line per warn-interval
+    /// per op, matching the stall detector's discipline at
+    /// [`crate::progress::StallDetector`]. `None` until the first
+    /// warning fires.
+    last_warned_at: Option<Instant>,
 }
 
 impl InFlight {
-    fn from_request(req: OpRequest, timeout_ts: Option<Box<types::Timespec>>) -> Self {
+    fn from_request(
+        req: OpRequest,
+        timeout_ts: Option<Box<types::Timespec>>,
+        now: Instant,
+    ) -> Self {
         Self {
             kind: req.kind,
             fd: req.fd,
@@ -519,6 +564,8 @@ impl InFlight {
             bytes_done: 0,
             completion: req.completion,
             timeout_ts,
+            submitted_at: now,
+            last_warned_at: None,
         }
     }
 
@@ -630,6 +677,10 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
     let mut tracker = InFlightTracker::new(inflight_cap);
     let mut next_id: u64 = 0;
     let mut sender_open = true;
+    // §2.1 (PLAN_decoder_freeze.md): cache the warn threshold once.
+    // The env var is read at process start before any worker submits,
+    // and re-reading it per loop iteration would just be syscall noise.
+    let inflight_warn = inflight_warn_from_env();
 
     'main: loop {
         // Drain new submissions until the in-flight cap is hit or the
@@ -646,9 +697,10 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
                         match push_initial(&mut ring, id, &req) {
                             Ok(timeout_ts) => {
                                 next_id = next_id.wrapping_add(1);
-                                tracker
-                                    .map
-                                    .insert(id, InFlight::from_request(req, timeout_ts));
+                                tracker.map.insert(
+                                    id,
+                                    InFlight::from_request(req, timeout_ts, Instant::now()),
+                                );
                             }
                             Err(()) => {
                                 req.completion.set(Err(io::Error::other(
@@ -669,9 +721,10 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
                         match push_initial(&mut ring, id, &req) {
                             Ok(timeout_ts) => {
                                 next_id = next_id.wrapping_add(1);
-                                tracker
-                                    .map
-                                    .insert(id, InFlight::from_request(req, timeout_ts));
+                                tracker.map.insert(
+                                    id,
+                                    InFlight::from_request(req, timeout_ts, Instant::now()),
+                                );
                             }
                             Err(()) => {
                                 req.completion.set(Err(io::Error::other(
@@ -722,9 +775,56 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
             };
             handle_cqe(&mut ring, &mut tracker, cqe.user_data(), cqe.result());
         }
+
+        // §2.1 watchdog: any op still in flight with an age past
+        // `inflight_warn` gets a one-line warning, rate-limited to
+        // one entry per warn-interval per op. Cheap (a HashMap walk
+        // and an Instant compare per entry) — runs at most once per
+        // CQE batch, which is bounded by the in-flight cap.
+        warn_long_inflight(&mut tracker, Instant::now(), inflight_warn);
     }
     // tracker drops on return: drains any leftover in-flight ops
     // with a "io thread terminated" error so workers do not deadlock.
+}
+
+/// Walk every in-flight op and emit one `tracing::warn!` line per op
+/// whose CQE has not arrived in `warn_after`. Returns the number of
+/// warnings emitted on this pass — the IO thread does not consume
+/// the count, but tests use it to assert the rate-limit behavior
+/// without having to install a tracing subscriber.
+///
+/// Rate-limited via each op's `last_warned_at` field: an op already
+/// warned about within the last `warn_after` window is silently
+/// skipped. The first warning fires as soon as `age >= warn_after`;
+/// subsequent warnings fire `warn_after`-spaced thereafter for as
+/// long as the op stays stuck.
+fn warn_long_inflight(tracker: &mut InFlightTracker, now: Instant, warn_after: Duration) -> usize {
+    let mut warned = 0usize;
+    for ifl in tracker.map.values_mut() {
+        let age = now.saturating_duration_since(ifl.submitted_at);
+        if age < warn_after {
+            continue;
+        }
+        if let Some(prev) = ifl.last_warned_at {
+            if now.saturating_duration_since(prev) < warn_after {
+                continue;
+            }
+        }
+        let age_secs = age.as_secs();
+        tracing::warn!(
+            target: "peel::io_uring",
+            kind = ?ifl.kind,
+            fd = ifl.fd,
+            base_offset = ifl.base_offset,
+            total_len = ifl.total_len,
+            bytes_done = ifl.bytes_done,
+            age_secs,
+            "io_uring op stalled: no CQE in {age_secs}s",
+        );
+        ifl.last_warned_at = Some(now);
+        warned = warned.saturating_add(1);
+    }
+    warned
 }
 
 /// Push the initial SQE(s) for a fresh request.
@@ -910,6 +1010,14 @@ fn handle_cqe(ring: &mut IoUring, tracker: &mut InFlightTracker, id: u64, res: i
                 ifl.complete(Err(io::Error::other("uring SQ full on resume push")));
                 return;
             }
+            // Reset the §2.1 watchdog timestamps so the warn path
+            // measures only this resubmit's age, not the cumulative
+            // time across earlier partials. A genuinely stuck op will
+            // re-cross the threshold inside its single submission;
+            // we do not want a series of healthy resubmits to summed-
+            // age into a false alarm.
+            ifl.submitted_at = Instant::now();
+            ifl.last_warned_at = None;
             tracker.map.insert(id, ifl);
         }
     }
@@ -1244,5 +1352,124 @@ mod tests {
         let n = std::io::Read::read(&mut stream, &mut buf).expect("read");
         assert_eq!(n, 0);
         server.join().expect("server thread");
+    }
+
+    // ---- §2.1 watchdog -------------------------------------------------
+
+    /// Construct a synthetic [`InFlight`] entry far enough away from
+    /// the live ring path to test [`warn_long_inflight`] in isolation.
+    /// The entry will never fire its [`Completion`] — the test controls
+    /// the lifecycle and drops the tracker before any wait could occur.
+    fn fake_inflight(submitted_at: Instant) -> InFlight {
+        InFlight {
+            kind: OpKind::ReadShort,
+            fd: -1,
+            base_offset: 0,
+            ptr: std::ptr::null_mut(),
+            total_len: 0,
+            bytes_done: 0,
+            completion: Arc::new(Completion::new()),
+            timeout_ts: None,
+            submitted_at,
+            last_warned_at: None,
+        }
+    }
+
+    /// Stale entries past the threshold get warned exactly once per
+    /// pass; fresh entries are silent. Mirrors the §2.1 demo: a 60-s-
+    /// old op at a 30-s threshold fires; a 5-s-old one does not.
+    #[test]
+    fn warn_long_inflight_warns_only_stale_entries() {
+        let mut tracker = InFlightTracker::new(8);
+        let now = Instant::now();
+        let warn_after = Duration::from_secs(30);
+        tracker
+            .map
+            .insert(1, fake_inflight(now - Duration::from_secs(60)));
+        tracker
+            .map
+            .insert(2, fake_inflight(now - Duration::from_secs(5)));
+
+        let warned = warn_long_inflight(&mut tracker, now, warn_after);
+        assert_eq!(warned, 1);
+
+        // The stale entry has its rate-limit watermark set; the fresh
+        // one is untouched.
+        assert!(tracker
+            .map
+            .get(&1)
+            .expect("present")
+            .last_warned_at
+            .is_some());
+        assert!(tracker
+            .map
+            .get(&2)
+            .expect("present")
+            .last_warned_at
+            .is_none());
+    }
+
+    /// Re-running the walker inside the same warn window does not
+    /// re-warn for the same op — the rate-limit field gates it.
+    #[test]
+    fn warn_long_inflight_rate_limits_within_window() {
+        let mut tracker = InFlightTracker::new(8);
+        let t0 = Instant::now();
+        let warn_after = Duration::from_secs(30);
+        tracker
+            .map
+            .insert(1, fake_inflight(t0 - Duration::from_secs(60)));
+
+        let first = warn_long_inflight(&mut tracker, t0, warn_after);
+        assert_eq!(first, 1);
+
+        // Another walker pass 5 s later: still inside the rate-limit
+        // window; no second warning.
+        let second = warn_long_inflight(&mut tracker, t0 + Duration::from_secs(5), warn_after);
+        assert_eq!(second, 0);
+
+        // After a full warn_after has elapsed since the first warning,
+        // the next pass fires again — a stuck op produces one entry
+        // per warn-interval, not one per CQE drain.
+        let third = warn_long_inflight(&mut tracker, t0 + Duration::from_secs(35), warn_after);
+        assert_eq!(third, 1);
+    }
+
+    /// Ops that complete (and are removed from the tracker) cannot
+    /// fire spurious warnings on later passes.
+    #[test]
+    fn warn_long_inflight_ignores_completed_ops() {
+        let mut tracker = InFlightTracker::new(8);
+        let now = Instant::now();
+        let warn_after = Duration::from_secs(30);
+        tracker
+            .map
+            .insert(1, fake_inflight(now - Duration::from_secs(60)));
+        // Simulate the CQE drain removing the entry before the walker
+        // runs.
+        tracker.map.remove(&1);
+
+        let warned = warn_long_inflight(&mut tracker, now, warn_after);
+        assert_eq!(warned, 0);
+    }
+
+    /// `PEEL_URING_INFLIGHT_WARN_SECS` overrides the default; an
+    /// invalid or zero value falls back. Mirrors the env-override
+    /// pattern in `progress::StallDetector::from_env`.
+    #[test]
+    fn inflight_warn_env_override() {
+        let prev = std::env::var("PEEL_URING_INFLIGHT_WARN_SECS").ok();
+        std::env::set_var("PEEL_URING_INFLIGHT_WARN_SECS", "5");
+        assert_eq!(inflight_warn_from_env(), Duration::from_secs(5));
+        std::env::set_var("PEEL_URING_INFLIGHT_WARN_SECS", "0");
+        assert_eq!(inflight_warn_from_env(), DEFAULT_INFLIGHT_WARN);
+        std::env::set_var("PEEL_URING_INFLIGHT_WARN_SECS", "not-a-number");
+        assert_eq!(inflight_warn_from_env(), DEFAULT_INFLIGHT_WARN);
+        std::env::remove_var("PEEL_URING_INFLIGHT_WARN_SECS");
+        assert_eq!(inflight_warn_from_env(), DEFAULT_INFLIGHT_WARN);
+        match prev {
+            Some(v) => std::env::set_var("PEEL_URING_INFLIGHT_WARN_SECS", v),
+            None => std::env::remove_var("PEEL_URING_INFLIGHT_WARN_SECS"),
+        }
     }
 }

@@ -649,21 +649,33 @@ fn try_once(
     // once per whole dispatch. With adaptive chunk sizing growing
     // dispatches up to 64 MiB, a slow link would otherwise leave the
     // counter flat for tens of seconds and the renderer's rate window
-    // would read 0 b/s until a chunk landed. `attempt_progress` tracks
-    // what we incremented during *this* attempt so we can roll it back
-    // if the read fails — the retry re-issues the range from byte 0
-    // and the next attempt's increments would otherwise double-count.
-    let mut attempt_progress: u64 = 0;
+    // would read 0 b/s until a chunk landed.
+    //
+    // [`ProgressRefundGuard`] (PLAN_decoder_freeze.md §1.2) wraps the
+    // attempt-progress counter so a partial increment is automatically
+    // rolled back on any non-success exit — the original retry path,
+    // a `pwrite_at` failure, a verify failure, the `cancel` flag
+    // tripping mid-read, or a panic caught by the scheduler's
+    // `catch_unwind`. The guard is disarmed only after every step
+    // that could leave bytes credited has succeeded.
+    let mut refund = ProgressRefundGuard::new(ctx.progress);
     let read_result = if let Some(limiter) = ctx.rate_limiter {
         let mut limited = RateLimitedReader::new(&mut body, Arc::clone(limiter), cancel);
-        read_with_progress(&mut limited, &mut buf, ctx.progress, &mut attempt_progress)
+        read_with_progress(
+            &mut limited,
+            &mut buf,
+            ctx.progress,
+            &mut refund.attempt_progress,
+        )
     } else {
-        read_with_progress(&mut body, &mut buf, ctx.progress, &mut attempt_progress)
+        read_with_progress(
+            &mut body,
+            &mut buf,
+            ctx.progress,
+            &mut refund.attempt_progress,
+        )
     };
     if let Err(source) = read_result {
-        if let Some(p) = ctx.progress {
-            p.sub_downloaded(attempt_progress);
-        }
         return Err(WorkerError::BodyIo { chunk, source });
     }
 
@@ -689,7 +701,57 @@ fn try_once(
         verify_on_disk_chunks(ctx.sparse, dispatch, ctx.chunk_size, &buf, &crcs)?;
     }
 
+    refund.disarm();
     Ok((range.len(), crcs))
+}
+
+/// RAII guard that refunds partial download-counter increments on any
+/// non-success exit from a single `try_once` attempt.
+///
+/// The disk-buffer throttle in
+/// [`crate::download::scheduler`] gates dispatch on
+/// `bytes_downloaded - bytes_decoded_input ≥ max_disk_buffer`. Any
+/// path that increments `bytes_downloaded` without later decrementing
+/// it on failure inflates the gap — a respawn re-fetches the same
+/// chunk and its bytes are credited a second time. The original code
+/// refunded only on the `Err(BodyIo)` branch, which left the
+/// `pwrite_at` failure path, the `verify_on_disk_chunks` path, and a
+/// panic caught by the scheduler's `catch_unwind` all leaking. This
+/// guard is the single refund site for the attempt: armed at
+/// construction, disarmed only when every byte has been written and
+/// verified, and refunds on `Drop` otherwise.
+///
+/// `attempt_progress` is exposed as a `&mut u64` so the existing
+/// `read_with_progress` loop can keep adding into it without learning
+/// about the guard type.
+struct ProgressRefundGuard<'a> {
+    progress: Option<&'a ProgressState>,
+    attempt_progress: u64,
+    armed: bool,
+}
+
+impl<'a> ProgressRefundGuard<'a> {
+    fn new(progress: Option<&'a ProgressState>) -> Self {
+        Self {
+            progress,
+            attempt_progress: 0,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProgressRefundGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && self.attempt_progress > 0 {
+            if let Some(p) = self.progress {
+                p.sub_downloaded(self.attempt_progress);
+            }
+        }
+    }
 }
 
 /// Read the env once per process (the value is set before any
@@ -1298,5 +1360,82 @@ mod tests {
         assert!(sleep_with_cancel(Duration::ZERO, &cancel));
         cancel.store(true, Ordering::Relaxed);
         assert!(!sleep_with_cancel(Duration::ZERO, &cancel));
+    }
+
+    // ---- ProgressRefundGuard (PLAN_decoder_freeze.md §1.2) -----------
+
+    fn snapshot_downloaded(state: &ProgressState) -> u64 {
+        state.snapshot().bytes_downloaded
+    }
+
+    /// Drop without disarming refunds every credited byte. This is the
+    /// path a panicking worker, a `pwrite_at` failure, or a cancelled
+    /// read would all hit.
+    #[test]
+    fn progress_refund_guard_drop_unarmed_subtracts_credited_bytes() {
+        let state = ProgressState::new();
+        state.add_downloaded(1_000_000);
+        {
+            let mut guard = ProgressRefundGuard::new(Some(&state));
+            // Mirror the read loop: every `read` call adds to both the
+            // shared counter and the guard's local tally.
+            for _ in 0..3 {
+                state.add_downloaded(64 * 1024);
+                guard.attempt_progress = guard.attempt_progress.saturating_add(64 * 1024);
+            }
+            // Guard never disarmed — a real worker would have hit an
+            // error or panicked on the way to `disarm()`.
+        }
+        assert_eq!(
+            snapshot_downloaded(&state),
+            1_000_000,
+            "expected full refund of the in-flight increments"
+        );
+    }
+
+    /// Disarmed guard leaves the credited bytes intact — the success
+    /// path of a completed attempt.
+    #[test]
+    fn progress_refund_guard_disarmed_leaves_bytes_credited() {
+        let state = ProgressState::new();
+        {
+            let mut guard = ProgressRefundGuard::new(Some(&state));
+            state.add_downloaded(128 * 1024);
+            guard.attempt_progress = guard.attempt_progress.saturating_add(128 * 1024);
+            guard.disarm();
+        }
+        assert_eq!(snapshot_downloaded(&state), 128 * 1024);
+    }
+
+    /// A panic across the guard's scope still triggers refund — that's
+    /// the whole point of choosing RAII over a manual call site. The
+    /// scheduler's `catch_unwind` would otherwise leak the bytes.
+    #[test]
+    fn progress_refund_guard_refunds_on_panic_unwind() {
+        let state = Arc::new(ProgressState::new());
+        let state_for_panic = Arc::clone(&state);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = ProgressRefundGuard::new(Some(&state_for_panic));
+            state_for_panic.add_downloaded(256 * 1024);
+            guard.attempt_progress = guard.attempt_progress.saturating_add(256 * 1024);
+            // Simulate a panic site after partial credit (e.g. a
+            // pwrite_at that triple-faulted, or a verify path that
+            // assertion-failed). We never reach `disarm()`.
+            panic!("simulated worker fault");
+        }));
+        assert!(result.is_err(), "panic should propagate");
+        assert_eq!(snapshot_downloaded(&state), 0);
+    }
+
+    /// `progress = None` (the rare path where no progress sink is
+    /// attached) must be a silent no-op on drop.
+    #[test]
+    fn progress_refund_guard_with_no_progress_is_noop() {
+        let mut guard = ProgressRefundGuard::new(None);
+        guard.attempt_progress = 4096;
+        drop(guard);
+        // Nothing to assert beyond "did not panic"; the test exists to
+        // pin the None-branch behavior so a future refactor can't
+        // accidentally make it write through a None.
     }
 }

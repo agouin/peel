@@ -40,6 +40,38 @@ on its own. SIGTERM brings it down promptly (Phase 2 of
 durable checkpoint resumes at the same byte position and runs
 cleanly.
 
+A second incident (smaller archive, same pod profile, same build)
+captured the same signature at a different byte position:
+
+```
+INFO progress: 100.0% download 91.4 GiB / 91.3 GiB @ 0 B/s
+                     extract 138.1 GiB / unknown @ 0 B/s
+                     lookahead 1.0 GiB / 1.0 GiB cap  decoded_in 90.4 GiB
+                     workers 0/4  bottleneck=disk
+WARN pipeline frozen, no counters advanced in 30s
+     decoder at byte 97081360384, sink at byte 148306395136
+     bytes_downloaded=98155102208
+```
+
+Same signature (all counters flat, kill switch works, resume runs
+cleanly), different byte offset, different total size — confirming
+the freeze is reproducible across run sizes and not tied to a
+specific archive offset. The second incident also surfaces an
+adjacent observation:
+**`bytes_downloaded` (98,155,102,208) exceeds `total_size`
+(91.3 GiB) by ~1 GiB.** That points at a counter inflation bug
+distinct from the freeze: `read_with_progress` only refunds
+`attempt_progress` from the `BodyIo` error path
+([src/download/worker.rs:663-666](src/download/worker.rs#L663-L666)).
+Workers that panic, observe `cancel` mid-read, or exit through any
+other path skip the refund; the chunk re-dispatches on respawn and
+the bytes are credited a second time. Cosmetic on its own, but the
+disk-buffer throttle math
+(`bytes_downloaded - bytes_decoded_input ≥ max_disk_buffer`,
+[src/download/scheduler.rs:1198-1200](src/download/scheduler.rs#L1198-L1200))
+is the load-bearing equation in this plan, so trusting the counter
+matters. Fix folded into Phase 1 as §1.2.
+
 Reading the sequence:
 
 - **Lookahead grows under `bottleneck=net`** during the steady-state
@@ -165,6 +197,46 @@ Capture log lines from the steady-state window before the freeze.
 Verify the badge reads `disk` (or `None`) when `lookahead` is
 trending up, and `net` only when `decoded_in` is keeping up
 with `download`.
+
+### §1.2 Refund partial download bytes on any worker exit path
+
+**What.** Today `try_once`
+([src/download/worker.rs:656-668](src/download/worker.rs#L656-L668))
+tracks `attempt_progress` byte-by-byte and refunds via
+`progress.sub_downloaded(attempt_progress)` only on the
+`Err(BodyIo)` branch. Any other exit path — a panicking worker
+caught by the scheduler's `catch_unwind`
+([src/download/scheduler.rs:838-840](src/download/scheduler.rs#L838-L840)),
+a cancellation observed mid-`read_with_progress`, a
+`SparseFile::pwrite_at` failure after partial reads — leaves the
+bytes credited. After respawn the chunk re-dispatches and the
+next worker re-reads and re-credits.
+
+Convert the refund into a RAII guard scoped to the attempt: the
+guard captures `&attempt_progress` and the optional progress
+sink, calls `sub_downloaded` on `Drop` unless the attempt
+explicitly disarmed it on the `Ok` path. One refund per
+not-fully-successful attempt, automatically, regardless of how
+the attempt exits.
+
+**Why.** The disk-buffer throttle's load-bearing comparison is
+`bytes_downloaded - bytes_decoded_input ≥ max_disk_buffer`. An
+inflated `bytes_downloaded` makes the throttle engage on less
+real lookahead than the cap implies, which is a confounder we do
+not want carrying into the §2 freeze investigation. Cheap,
+local, and decoupled.
+
+**Tests.**
+- Unit test in `worker.rs`: drive `read_with_progress` to credit
+  N bytes, then panic out of the call site. Assert the post-drop
+  `progress.bytes_downloaded` equals zero.
+- Unit test: cancellation mid-read leaves zero credited.
+- Existing happy-path tests should not change behavior (refund
+  disarmed on `Ok`).
+
+**Demo.** Synthetic respawn fixture (panic → restart) where the
+final `bytes_downloaded` equals exactly the sum of completed
+chunk sizes — no inflation, even after multiple respawn cycles.
 
 ---
 
@@ -374,7 +446,8 @@ smoothly when we get here:
 
 | Phase | Done when                                                                 |
 |-------|---------------------------------------------------------------------------|
-| 1     | Classifier badge agrees with the lookahead trend in the steady-state log; new unit tests pass. |
+| 1.1   | Classifier badge agrees with the lookahead trend in the steady-state log; new unit tests pass. |
+| 1.2   | `bytes_downloaded` never exceeds `total_size` across panic / cancel / pwrite-fail respawn fixtures; existing happy-path tests unchanged. |
 | 2.1   | Per-op in-flight warn line fires in a synthetic test and in production at the next freeze. |
 | 2.2   | `decode_step` watchdog warn line fires in a synthetic test and at the next freeze. |
 | 2.3   | Captured production freeze has been triaged into one of the three branches; the chosen branch is appended to this plan as a follow-up note. |

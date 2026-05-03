@@ -55,6 +55,73 @@ use crate::types::ByteOffset;
 /// bytes.
 pub const DEFAULT_PUNCH_THRESHOLD: u64 = 4 * 1024 * 1024;
 
+/// Default duration past which the §2.2 watchdog warns that a single
+/// `decode_step` call took unusually long.
+///
+/// 30 s matches the renderer's stall threshold
+/// ([`crate::progress::DEFAULT_STALL_WARN_INTERVAL`]) and the io_uring
+/// backend's in-flight watchdog ([`crate::io_backend`] §2.1) so the
+/// three signals compose: a freeze surfaces all of them inside the
+/// same wall-clock window and the operator can correlate from log
+/// alone. Override via `PEEL_DECODE_STEP_WARN_SECS`.
+pub const DEFAULT_DECODE_STEP_WARN: Duration = Duration::from_secs(30);
+
+/// Read `PEEL_DECODE_STEP_WARN_SECS` (positive integer seconds) and
+/// fall back to [`DEFAULT_DECODE_STEP_WARN`]. `0` or any malformed
+/// value uses the default.
+fn decode_step_warn_from_env() -> Duration {
+    std::env::var("PEEL_DECODE_STEP_WARN_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_DECODE_STEP_WARN)
+}
+
+/// §2.2 (`PLAN_decoder_freeze.md`): post-hoc watchdog that fires a
+/// single `tracing::warn!` line when one `decode_step` call exceeds
+/// `threshold`.
+///
+/// Post-hoc because we run on the same thread as the call we are
+/// timing — we cannot preempt it. The point is to localise the wedge
+/// after the fact: if the watchdog fires on the freeze and the
+/// io_uring §2.1 watchdog also fires, the wedge is inside a
+/// kernel-level op the ring is waiting on. If §2.2 fires but §2.1
+/// stays silent, the wedge is somewhere `decode_step` reaches that
+/// is not the IO backend (sink-side `write_all`, a CPU spin, etc.).
+///
+/// Rate-limited via `last_warned_at`: a sustained slow window emits
+/// one entry per `threshold`-sized interval, not one per loop tick.
+struct DecodeStepWatchdog {
+    threshold: Duration,
+    last_warned_at: Option<Instant>,
+}
+
+impl DecodeStepWatchdog {
+    fn from_env() -> Self {
+        Self {
+            threshold: decode_step_warn_from_env(),
+            last_warned_at: None,
+        }
+    }
+
+    /// `true` iff `elapsed` exceeds the threshold *and* the rate-limit
+    /// window has elapsed since the last warning. Mutates
+    /// `last_warned_at` to `Some(now)` on a positive return.
+    fn should_warn(&mut self, elapsed: Duration, now: Instant) -> bool {
+        if elapsed < self.threshold {
+            return false;
+        }
+        if let Some(prev) = self.last_warned_at {
+            if now.saturating_duration_since(prev) < self.threshold {
+                return false;
+            }
+        }
+        self.last_warned_at = Some(now);
+        true
+    }
+}
+
 /// Errors produced by [`Extractor::extract`].
 ///
 /// The variants distinguish the three responsibilities the extractor
@@ -403,6 +470,10 @@ impl Extractor {
             progress: self.progress.as_deref(),
         };
 
+        // §2.2 (PLAN_decoder_freeze.md): post-hoc watchdog. Reads the
+        // env once at loop entry; the threshold is fixed for the run.
+        let mut step_watchdog = DecodeStepWatchdog::from_env();
+
         loop {
             // §2.3: poll the kill switch at the top of every loop
             // iteration — independent of the source-read poll, since a
@@ -426,6 +497,12 @@ impl Extractor {
             // here (e.g., a decoder spinning without producing) is
             // visible under `RUST_LOG=peel=debug`.
             let bytes_consumed = decoder.bytes_consumed().get();
+            // §2.2: capture the sink's bytes_out before the call so the
+            // watchdog can report whether the slow step *produced*
+            // output or merely *read* source. The two deltas, taken
+            // together with `write_delta`, distinguish a
+            // sink-blocked step from a source-blocked step.
+            let bytes_out_before = adapter.bytes_out;
             let step = {
                 let span = tracing::debug_span!(
                     target: "peel::extractor",
@@ -442,6 +519,31 @@ impl Extractor {
                 .decode_time
                 .saturating_add(total.saturating_sub(write_delta));
             stats.write_time = stats.write_time.saturating_add(write_delta);
+
+            // §2.2 watchdog firing site. Runs *after* the call returns
+            // (post-hoc — we cannot preempt a step we are running on
+            // the same thread as). On a true wedge the call never
+            // returns; on a slow-but-finite call the warning surfaces
+            // exactly which step took the time and what it produced.
+            if step_watchdog.should_warn(total, Instant::now()) {
+                let after_consumed = decoder.bytes_consumed().get();
+                let consumed_delta = after_consumed.saturating_sub(bytes_consumed);
+                let bytes_out_delta = adapter.bytes_out.saturating_sub(bytes_out_before);
+                tracing::warn!(
+                    target: "peel::extractor",
+                    elapsed_secs = total.as_secs(),
+                    write_time_secs = write_delta.as_secs(),
+                    bytes_consumed = after_consumed,
+                    consumed_delta,
+                    bytes_out = adapter.bytes_out,
+                    bytes_out_delta,
+                    "decode_step took {}s (consumed +{} src bytes, wrote +{} out bytes, sink time {}s)",
+                    total.as_secs(),
+                    consumed_delta,
+                    bytes_out_delta,
+                    write_delta.as_secs(),
+                );
+            }
 
             let status = match step {
                 Ok(s) => s,
@@ -1389,5 +1491,95 @@ mod tests {
             .read_to_end(&mut got)
             .expect("read dst");
         assert_eq!(got, payload);
+    }
+
+    // ---- §2.2 DecodeStepWatchdog --------------------------------------
+
+    /// Healthy steps (under threshold) never trip the watchdog,
+    /// regardless of how many we feed it.
+    #[test]
+    fn decode_step_watchdog_silent_under_threshold() {
+        let mut wd = DecodeStepWatchdog {
+            threshold: Duration::from_secs(30),
+            last_warned_at: None,
+        };
+        let now = Instant::now();
+        for i in 0..10 {
+            let elapsed = Duration::from_millis(50);
+            assert!(
+                !wd.should_warn(elapsed, now + Duration::from_millis(i)),
+                "tick {i}: healthy step should not warn"
+            );
+        }
+        assert!(wd.last_warned_at.is_none());
+    }
+
+    /// One slow step crosses the threshold; the watchdog fires once
+    /// and stamps `last_warned_at`.
+    #[test]
+    fn decode_step_watchdog_warns_when_threshold_exceeded() {
+        let mut wd = DecodeStepWatchdog {
+            threshold: Duration::from_secs(30),
+            last_warned_at: None,
+        };
+        let now = Instant::now();
+        assert!(wd.should_warn(Duration::from_secs(45), now));
+        assert!(wd.last_warned_at.is_some());
+    }
+
+    /// Two consecutive slow steps inside the same warn window only
+    /// fire once — the rate-limit prevents log spam from a steadily
+    /// slow phase.
+    #[test]
+    fn decode_step_watchdog_rate_limits_within_window() {
+        let mut wd = DecodeStepWatchdog {
+            threshold: Duration::from_secs(30),
+            last_warned_at: None,
+        };
+        let t0 = Instant::now();
+        assert!(wd.should_warn(Duration::from_secs(45), t0));
+        // 5 s later, still slow → silent.
+        assert!(!wd.should_warn(Duration::from_secs(45), t0 + Duration::from_secs(5)));
+        // 35 s later, the rate-limit window has elapsed → fires again.
+        assert!(wd.should_warn(Duration::from_secs(45), t0 + Duration::from_secs(35)));
+    }
+
+    /// `PEEL_DECODE_STEP_WARN_SECS` overrides the default; an invalid
+    /// or zero value falls back. Mirrors the env-override pattern in
+    /// `progress::StallDetector::from_env` and the §2.1 watchdog.
+    #[test]
+    fn decode_step_warn_env_override() {
+        let prev = std::env::var("PEEL_DECODE_STEP_WARN_SECS").ok();
+        std::env::set_var("PEEL_DECODE_STEP_WARN_SECS", "5");
+        assert_eq!(decode_step_warn_from_env(), Duration::from_secs(5));
+        std::env::set_var("PEEL_DECODE_STEP_WARN_SECS", "0");
+        assert_eq!(decode_step_warn_from_env(), DEFAULT_DECODE_STEP_WARN);
+        std::env::set_var("PEEL_DECODE_STEP_WARN_SECS", "garbage");
+        assert_eq!(decode_step_warn_from_env(), DEFAULT_DECODE_STEP_WARN);
+        std::env::remove_var("PEEL_DECODE_STEP_WARN_SECS");
+        assert_eq!(decode_step_warn_from_env(), DEFAULT_DECODE_STEP_WARN);
+        match prev {
+            Some(v) => std::env::set_var("PEEL_DECODE_STEP_WARN_SECS", v),
+            None => std::env::remove_var("PEEL_DECODE_STEP_WARN_SECS"),
+        }
+    }
+
+    /// Once a slow step has fired, recovery (a series of fast steps)
+    /// must clear the rate-limit watermark only by aging out — the
+    /// watchdog does not auto-arm. This matches the StallDetector's
+    /// behaviour under transient slowness.
+    #[test]
+    fn decode_step_watchdog_does_not_double_fire_immediately_after_recovery() {
+        let mut wd = DecodeStepWatchdog {
+            threshold: Duration::from_secs(30),
+            last_warned_at: None,
+        };
+        let t0 = Instant::now();
+        assert!(wd.should_warn(Duration::from_secs(60), t0));
+        // Healthy step 5 s later — silent (under threshold).
+        assert!(!wd.should_warn(Duration::from_millis(10), t0 + Duration::from_secs(5)));
+        // Another slow step 10 s after the original — still inside the
+        // rate-limit window, still silent.
+        assert!(!wd.should_warn(Duration::from_secs(60), t0 + Duration::from_secs(10)));
     }
 }
