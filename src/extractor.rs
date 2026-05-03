@@ -503,6 +503,19 @@ impl Extractor {
             // together with `write_delta`, distinguish a
             // sink-blocked step from a source-blocked step.
             let bytes_out_before = adapter.bytes_out;
+            // §2.4b: publish the entry timestamp so the renderer-side
+            // peer watchdog ([`crate::progress::DecodeStepStallDetector`])
+            // can fire even when this thread is parked inside a
+            // blocking syscall — the §2.2 post-hoc check below cannot
+            // run while the call is still in flight. The
+            // `mark_decode_step_exited` pair-call sits right after the
+            // return below; on a panic from the decoder, the renderer
+            // would briefly continue to see a non-zero `started_ns`,
+            // but the surrounding `extract_with_callback` unwinds and
+            // tears down the extractor before the next renderer tick.
+            if let Some(p) = self.progress.as_deref() {
+                p.mark_decode_step_entered();
+            }
             let step = {
                 let span = tracing::debug_span!(
                     target: "peel::extractor",
@@ -513,6 +526,9 @@ impl Extractor {
                 let _enter = span.enter();
                 decoder.decode_step(&mut adapter)
             };
+            if let Some(p) = self.progress.as_deref() {
+                p.mark_decode_step_exited();
+            }
             let total = t_decode.elapsed();
             let write_delta = adapter.write_time.saturating_sub(pre_write);
             stats.decode_time = stats

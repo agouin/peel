@@ -17,8 +17,12 @@
 //! handle, drains the channel, pushes SQEs, and completes ops as CQEs
 //! arrive.
 //!
-//! `submit_and_wait` is the only sync primitive used; no async runtime
-//! is involved (PLAN_v2.md §7's hard rule).
+//! `submit_with_args` (or `submit_and_wait` on the kernel-disagrees
+//! fallback) is the only sync primitive used; no async runtime is
+//! involved (PLAN_v2.md §7's hard rule). The IO thread bounds its
+//! wait via a kernel-side timespec so it wakes at least once per
+//! watchdog cadence even when no CQE arrives — see
+//! `PLAN_decoder_freeze.md` §2.4a.
 //!
 //! # Capability probe
 //!
@@ -79,6 +83,35 @@ const RLIMIT_NOFILE: i32 = 7;
 /// inside the same wall-clock window. Override via
 /// `PEEL_URING_INFLIGHT_WARN_SECS`.
 const DEFAULT_INFLIGHT_WARN: Duration = Duration::from_secs(30);
+
+/// Linux `ETIME` (timer expired) errno. The kernel returns this from
+/// `io_uring_enter` when a `submit_with_args` timespec elapses
+/// before the requested number of completions arrive — *not* a
+/// failure mode, just "no CQE in this window, try again."
+///
+/// Hard-coded to keep us off `libc` per the policy in `RLIMIT_NOFILE`'s
+/// comment.
+const ETIME: i32 = 62;
+
+/// Lower / upper bound on the IO thread's wait cadence
+/// (`PLAN_decoder_freeze.md` §2.4a). The thread wakes at least every
+/// `inflight_warn / 4`, clamped to `[1s, 5s]`, so the §2.1 walker has
+/// a chance to fire even when no CQE ever arrives. Without this, a
+/// kernel-level CQE drop wedges `submit_with_args` indefinitely and
+/// the walker line is unreachable — exactly the silence we observed
+/// in the snapshot-restore freeze.
+const WALKER_WAKE_FLOOR: Duration = Duration::from_secs(1);
+const WALKER_WAKE_CEIL: Duration = Duration::from_secs(5);
+
+/// Compute the IO thread's bounded-wait cadence from the configured
+/// in-flight warn threshold. Aims for roughly four wake-ups per
+/// warn-interval — frequent enough that a stuck op is identified
+/// inside the same `inflight_warn` window the operator already knows,
+/// rare enough that a healthy idle ring does not burn syscalls.
+fn walker_wake_period(inflight_warn: Duration) -> Duration {
+    let quarter = inflight_warn / 4;
+    quarter.clamp(WALKER_WAKE_FLOOR, WALKER_WAKE_CEIL)
+}
 
 /// Read `PEEL_URING_INFLIGHT_WARN_SECS` (positive integer
 /// seconds) and fall back to [`DEFAULT_INFLIGHT_WARN`]. `0` or
@@ -681,6 +714,13 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
     // The env var is read at process start before any worker submits,
     // and re-reading it per loop iteration would just be syscall noise.
     let inflight_warn = inflight_warn_from_env();
+    // §2.4a: bound the wait so the walker runs even when no CQE
+    // arrives. The Timespec must outlive every `submit_with_args`
+    // call that references it; constructing once and reusing matches
+    // the kernel's expectation (the pointer is read each call).
+    let walker_period = walker_wake_period(inflight_warn);
+    let walker_ts = types::Timespec::from(walker_period);
+    let submit_args = types::SubmitArgs::new().timespec(&walker_ts);
 
     'main: loop {
         // Drain new submissions until the in-flight cap is hit or the
@@ -749,16 +789,22 @@ fn io_thread_loop(mut ring: IoUring, rx: mpsc::Receiver<OpRequest>, depth: u32) 
             continue;
         }
 
-        // Submit and wait for at least one CQE. `submit_and_wait`
-        // returns immediately if a CQE is already queued.
-        match ring.submit_and_wait(1) {
+        // §2.4a: submit + wait with a kernel-side timespec. Returns
+        // promptly with `Ok(_)` when a CQE is queued, or with
+        // `Err(ETIME)` when `walker_period` elapses without one. The
+        // ETIME path is *not* a failure — we drop through to the
+        // walker so a stuck op gets its diagnostic line, then loop
+        // and re-arm the wait. Any other error is treated as before:
+        // drain every in-flight with the error and tear down.
+        match ring.submitter().submit_with_args(1, &submit_args) {
             Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(ETIME) => {
+                // No CQE arrived within walker_period. Continue to
+                // the walker; in-flight ops remain in the kernel.
+            }
             Err(e) => {
-                // Submission failure: the kernel rejected the ring
-                // op. Complete every in-flight with this error so
-                // workers do not block forever.
                 let kind = e.kind();
-                let msg = format!("uring submit_and_wait failed: {e}");
+                let msg = format!("uring submit_with_args failed: {e}");
                 tracker.map.drain().for_each(|(_, ifl)| {
                     ifl.complete(Err(io::Error::new(kind, msg.clone())));
                 });
@@ -1451,6 +1497,40 @@ mod tests {
 
         let warned = warn_long_inflight(&mut tracker, now, warn_after);
         assert_eq!(warned, 0);
+    }
+
+    /// §2.4a: the walker wakes at least every quarter of the warn
+    /// threshold, clamped to `[1s, 5s]`. The bounds matter: too
+    /// short and we burn syscalls on a healthy idle ring; too long
+    /// and a stuck op stays invisible past the operator-set warning
+    /// interval.
+    #[test]
+    fn walker_wake_period_clamps() {
+        // Default 30s warn → 7.5s, clamped down to 5s ceiling.
+        assert_eq!(
+            walker_wake_period(Duration::from_secs(30)),
+            Duration::from_secs(5),
+        );
+        // 8s warn → 2s, inside the band.
+        assert_eq!(
+            walker_wake_period(Duration::from_secs(8)),
+            Duration::from_secs(2),
+        );
+        // 2s warn → 0.5s, clamped up to 1s floor.
+        assert_eq!(
+            walker_wake_period(Duration::from_secs(2)),
+            Duration::from_secs(1),
+        );
+        // Tiny warn → still 1s floor.
+        assert_eq!(
+            walker_wake_period(Duration::from_millis(100)),
+            Duration::from_secs(1),
+        );
+        // Huge warn (2 minutes) → 30s, clamped to 5s ceiling.
+        assert_eq!(
+            walker_wake_period(Duration::from_secs(120)),
+            Duration::from_secs(5),
+        );
     }
 
     /// `PEEL_URING_INFLIGHT_WARN_SECS` overrides the default; an

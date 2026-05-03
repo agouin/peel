@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 ///
 /// Construct once via [`ProgressState::new`] and share through
 /// [`Arc`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProgressState {
     /// Total source size, in bytes. `0` means "not yet known"; the
     /// renderer treats it as `None` in the snapshot.
@@ -98,13 +98,44 @@ pub struct ProgressState {
     /// dispatch round. The renderer reads this for the bottleneck
     /// indicator.
     disk_bound: AtomicBool,
+    /// Anchor for [`Self::decode_step_started_ns`], captured at
+    /// construction. Both the publishing extractor and the reading
+    /// renderer compute elapsed times relative to this — `Instant`
+    /// itself isn't `Atomic` but its delta-as-nanos is, and a u64
+    /// covers ~584 years of run time.
+    state_anchor: Instant,
+    /// Wall-clock time the most recent `decode_step` *entered*,
+    /// encoded as nanoseconds since [`Self::state_anchor`]. `0` is the
+    /// sentinel for "no step in progress" — both initially and
+    /// between every pair of entries. The extractor publishes on entry
+    /// and clears on return; the renderer's
+    /// [`DecodeStepStallDetector`] reads it from a peer thread to
+    /// detect a step that has not returned (PLAN_decoder_freeze.md
+    /// §2.4b — the post-hoc watchdog at
+    /// [`crate::extractor`] §2.2 cannot fire while the call is still
+    /// running, so this is the reachable signal during a true wedge).
+    decode_step_started_ns: AtomicU64,
 }
 
 impl ProgressState {
     /// Construct an empty state, wrapped in [`Arc`] for sharing.
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Self {
+            total_size: AtomicU64::new(0),
+            bytes_downloaded: AtomicU64::new(0),
+            bytes_extracted: AtomicU64::new(0),
+            extracted_estimate: AtomicU64::new(0),
+            active_workers: AtomicU64::new(0),
+            total_workers: AtomicU64::new(0),
+            started: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            bytes_decoded_input: AtomicU64::new(0),
+            max_disk_buffer: AtomicU64::new(0),
+            disk_bound: AtomicBool::new(false),
+            state_anchor: Instant::now(),
+            decode_step_started_ns: AtomicU64::new(0),
+        })
     }
 
     /// Set the total source size. `0` is the sentinel for "unknown".
@@ -221,6 +252,46 @@ impl ProgressState {
         self.total_workers.store(0, Ordering::Release);
         self.disk_bound.store(false, Ordering::Release);
         self.started.store(false, Ordering::Release);
+        // Any decode_step in flight is owned by the failed run that's
+        // about to be torn down; clear the marker so the next run's
+        // peer watchdog starts from "no step in progress."
+        self.decode_step_started_ns.store(0, Ordering::Release);
+    }
+
+    /// Publish that the extractor has just *entered* a `decode_step`
+    /// call. The peer watchdog ([`DecodeStepStallDetector`]) reads
+    /// this from the renderer thread and warns if the call has not
+    /// returned within its threshold (PLAN_decoder_freeze.md §2.4b).
+    ///
+    /// Called from the extractor's `run_loop` before every
+    /// `decode_step` invocation. Pairs with
+    /// [`Self::mark_decode_step_exited`] on the way back out — the
+    /// `1` minimum below ensures the sentinel `0` is never used as a
+    /// real timestamp on freshly-anchored states.
+    pub fn mark_decode_step_entered(&self) {
+        // u64 nanos of state lifetime — covers ~584 years.
+        let ns = u64::try_from(self.state_anchor.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.decode_step_started_ns
+            .store(ns.max(1), Ordering::Release);
+    }
+
+    /// Publish that the extractor has *returned* from a `decode_step`
+    /// call. Pairs with [`Self::mark_decode_step_entered`].
+    pub fn mark_decode_step_exited(&self) {
+        self.decode_step_started_ns.store(0, Ordering::Release);
+    }
+
+    /// Wall-clock time the current `decode_step` has been running.
+    /// `None` when no call is in progress (the gap between entries).
+    /// Read from the renderer thread.
+    #[must_use]
+    pub fn decode_step_elapsed(&self) -> Option<Duration> {
+        let started_ns = self.decode_step_started_ns.load(Ordering::Acquire);
+        if started_ns == 0 {
+            return None;
+        }
+        let now_ns = u64::try_from(self.state_anchor.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Some(Duration::from_nanos(now_ns.saturating_sub(started_ns)))
     }
 
     /// `true` iff [`Self::mark_done`] has been called.
@@ -247,6 +318,7 @@ impl ProgressState {
             bytes_decoded_input: self.bytes_decoded_input.load(Ordering::Relaxed),
             max_disk_buffer: if max_buf == 0 { None } else { Some(max_buf) },
             disk_bound: self.disk_bound.load(Ordering::Acquire),
+            decode_step_elapsed: self.decode_step_elapsed(),
         }
     }
 }
@@ -285,6 +357,14 @@ pub struct ProgressSnapshot {
     /// download because the lookahead has hit the cap. The renderer
     /// reads this for the bottleneck indicator.
     pub disk_bound: bool,
+    /// Wall-clock time the current `decode_step` has been running
+    /// (PLAN_decoder_freeze.md §2.4b). `None` if no step is in
+    /// progress at the snapshot instant. The
+    /// [`DecodeStepStallDetector`] uses this to fire from the
+    /// renderer thread when the extractor thread is wedged inside a
+    /// blocking syscall on its own thread (where the §2.2 post-hoc
+    /// watchdog cannot reach).
+    pub decode_step_elapsed: Option<Duration>,
 }
 
 /// Rolling-window rate tracker.
@@ -1022,6 +1102,107 @@ pub enum StallKind {
     ExtractorStalled,
     /// Decoder flat for `warn_interval` while download is throttled.
     DecoderStalledThrottled,
+    /// A single `decode_step` call has been running for at least
+    /// `warn_interval` and has not yet returned. Detected from a peer
+    /// thread (PLAN_decoder_freeze.md §2.4b) — the
+    /// post-hoc watchdog at [`crate::extractor`] cannot fire while
+    /// the call is still in flight.
+    DecodeStepHung,
+}
+
+/// Default duration past which the §2.4b peer watchdog warns that the
+/// extractor is wedged inside a single `decode_step` call.
+///
+/// 30 s matches [`DEFAULT_STALL_WARN_INTERVAL`] and the io_uring
+/// in-flight watchdog so a freeze surfaces all three signals inside
+/// the same wall-clock window. Override via
+/// `PEEL_DECODE_STEP_WARN_SECS` (the same env var the post-hoc
+/// watchdog at [`crate::extractor`] reads — same threshold seen
+/// from two different angles).
+pub const DEFAULT_DECODE_STEP_HUNG_WARN: Duration = Duration::from_secs(30);
+
+/// Read `PEEL_DECODE_STEP_WARN_SECS` (positive integer seconds) and
+/// fall back to [`DEFAULT_DECODE_STEP_HUNG_WARN`]. `0` or any
+/// malformed value uses the default.
+fn decode_step_hung_warn_from_env() -> Duration {
+    std::env::var("PEEL_DECODE_STEP_WARN_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_DECODE_STEP_HUNG_WARN)
+}
+
+/// Peer-thread watchdog for a wedged `decode_step` call
+/// (PLAN_decoder_freeze.md §2.4b). The extractor publishes the entry
+/// time of every call to [`ProgressState::mark_decode_step_entered`]
+/// and clears it on return; this detector — running on the renderer
+/// thread — checks the snapshot's `decode_step_elapsed` and warns
+/// once per warn-interval if the call is past threshold.
+///
+/// Why a peer detector when [`crate::extractor`] already has a
+/// post-hoc watchdog: the post-hoc one runs *after* `decode_step`
+/// returns, so it cannot fire while the call is still in flight.
+/// During a freeze the call never returns and the post-hoc warning
+/// is unreachable. This detector runs on the renderer thread and
+/// fires regardless of what the extractor thread is parked on.
+#[derive(Debug)]
+pub struct DecodeStepStallDetector {
+    threshold: Duration,
+    last_warned_at: Option<Instant>,
+}
+
+impl DecodeStepStallDetector {
+    /// Construct with an explicit threshold. Tests use this; the
+    /// renderer thread uses [`Self::from_env`].
+    #[must_use]
+    pub fn new(threshold: Duration) -> Self {
+        Self {
+            threshold,
+            last_warned_at: None,
+        }
+    }
+
+    /// Construct using [`DEFAULT_DECODE_STEP_HUNG_WARN`] honoring the
+    /// `PEEL_DECODE_STEP_WARN_SECS` env override.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::new(decode_step_hung_warn_from_env())
+    }
+
+    /// Inspect a snapshot. Emit one `tracing::warn!` if the current
+    /// `decode_step` elapsed crosses `threshold`, rate-limited to one
+    /// warning per `threshold`-sized window. Returns the
+    /// (test-friendly) classification of what was observed.
+    pub fn tick(&mut self, snap: &ProgressSnapshot, now: Instant) -> StallObservation {
+        let Some(elapsed) = snap.decode_step_elapsed else {
+            // No step in flight: clear the rate-limit watermark so the
+            // next genuine wedge fires promptly.
+            self.last_warned_at = None;
+            return StallObservation::Healthy;
+        };
+        if elapsed < self.threshold {
+            return StallObservation::Healthy;
+        }
+        if let Some(prev) = self.last_warned_at {
+            if now.saturating_duration_since(prev) < self.threshold {
+                return StallObservation::SuppressedDuplicate;
+            }
+        }
+        let elapsed_secs = elapsed.as_secs();
+        tracing::warn!(
+            target: "peel::progress",
+            bytes_decoded_input = snap.bytes_decoded_input,
+            bytes_extracted = snap.bytes_extracted,
+            elapsed_secs,
+            "decode_step has been running for {elapsed_secs}s without returning \
+             (decoder cursor {dec}, sink cursor {ex})",
+            dec = snap.bytes_decoded_input,
+            ex = snap.bytes_extracted,
+        );
+        self.last_warned_at = Some(now);
+        StallObservation::Warned(StallKind::DecodeStepHung)
+    }
 }
 
 /// Spawn a dedicated thread that renders `state` via `renderer` every
@@ -1054,6 +1235,7 @@ where
         .name("peel-progress-renderer".into())
         .spawn(move || {
             let mut detector = StallDetector::from_env(Instant::now());
+            let mut step_detector = DecodeStepStallDetector::from_env();
             // Tick loop: render, sleep, render, … until done. We do an
             // extra final render after the done flag flips so the user
             // sees the final counters.
@@ -1062,6 +1244,7 @@ where
                 let now = Instant::now();
                 renderer.render(&snap);
                 detector.tick(&snap, now);
+                step_detector.tick(&snap, now);
                 if snap.done {
                     break;
                 }
@@ -1620,6 +1803,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         let p = overall_percent(&snap).expect("percent");
         // 250/1000 = 25%, even though download is 50%.
@@ -1640,6 +1824,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         let p = overall_percent(&snap).expect("percent");
         assert!((p - 50.0).abs() < 0.01);
@@ -1659,6 +1844,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         assert!(overall_percent(&snap).is_none());
     }
@@ -1677,6 +1863,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         // dl: 500k remaining @ 100kB/s = 5 s; ex: 1.9M remaining @
         // 100kB/s = 19 s. Bottleneck = extract = 19 s.
@@ -1698,6 +1885,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         assert!(compute_eta(&snap, None, None).is_none());
     }
@@ -1776,6 +1964,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         }
     }
 
@@ -1803,6 +1992,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         let bar = render_bar(&snap, 8, BarStyle::Ascii);
         assert_eq!(bar.matches('#').count(), 0);
@@ -1850,6 +2040,7 @@ mod tests {
             bytes_decoded_input: 600,
             max_disk_buffer: Some(1024),
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -1889,6 +2080,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -1924,6 +2116,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
@@ -1950,6 +2143,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
@@ -1977,6 +2171,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         r.render(&snap);
         r.render(&snap);
@@ -2001,6 +2196,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         let line = r.format_line(&snap, Instant::now());
         // Sizes are KiB/MiB-formatted, not raw bytes.
@@ -2041,6 +2237,7 @@ mod tests {
             bytes_decoded_input: 200,
             max_disk_buffer: Some(100),
             disk_bound: true,
+            decode_step_elapsed: None,
         };
         let line = r.format_line(&snap, Instant::now());
         assert!(line.contains("bottleneck=disk"), "got {line:?}");
@@ -2122,6 +2319,7 @@ mod tests {
             bytes_decoded_input: 100_000,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         // dl = 50 MiB/s, decoded_in = 100 MiB/s. dl < 0.9 * decoded_in.
         let b = classify_bottleneck(&snap, Some(50.0e6), Some(100.0e6));
@@ -2145,6 +2343,7 @@ mod tests {
             bytes_decoded_input: 50_000,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         // dl = 60 MiB/s, decoded_in = 50 MiB/s. decoded_in < 0.9 * dl
         // is false (50 vs 54 — too tight), so widen to make the test
@@ -2167,6 +2366,7 @@ mod tests {
             bytes_decoded_input: 100_000,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         // Within the 10% deadband: dl = 100, decoded_in = 95.
         let b = classify_bottleneck(&snap, Some(100.0e6), Some(95.0e6));
@@ -2200,6 +2400,7 @@ mod tests {
             bytes_decoded_input: 50_000,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         let a = classify_bottleneck(&snap, Some(60.0e6), Some(40.0e6));
         snap.extracted_estimate = Some(10_000_000);
@@ -2224,6 +2425,7 @@ mod tests {
             bytes_decoded_input: 200_000,
             max_disk_buffer: Some(1_000_000),
             disk_bound: true,
+            decode_step_elapsed: None,
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -2253,6 +2455,7 @@ mod tests {
             bytes_decoded_input: 1_500_000,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         };
         // Drive `format_block` with two samples spanning > min_span
         // (1 s) at the same wall-clock anchor so we don't introduce
@@ -2287,6 +2490,7 @@ mod tests {
             bytes_decoded_input: 0,
             max_disk_buffer: None,
             disk_bound: false,
+            decode_step_elapsed: None,
         }
     }
 
@@ -2427,6 +2631,167 @@ mod tests {
             obs,
             StallObservation::Warned(StallKind::DecoderStalledThrottled)
         );
+    }
+
+    // ---- §2.4b DecodeStepStallDetector + ProgressState wiring ---------
+
+    /// `mark_decode_step_entered` publishes a non-zero start; the
+    /// snapshot reports a small but non-`None` elapsed; clearing
+    /// returns to `None`. Mirrors how the extractor and renderer
+    /// pair up across the run.
+    #[test]
+    fn decode_step_marker_publishes_and_clears() {
+        let state = ProgressState::new();
+        // No call in flight initially.
+        assert_eq!(state.decode_step_elapsed(), None);
+        assert_eq!(state.snapshot().decode_step_elapsed, None);
+
+        state.mark_decode_step_entered();
+        // Two reads near each other will differ by sub-microseconds —
+        // we just want to assert the reported elapsed is *some* small
+        // value, not a precise match between two `Instant::now()` calls.
+        let elapsed = state.decode_step_elapsed().expect("call in progress");
+        assert!(elapsed < Duration::from_millis(100));
+        let snap_elapsed = state
+            .snapshot()
+            .decode_step_elapsed
+            .expect("snapshot mirrors the marker");
+        assert!(snap_elapsed < Duration::from_millis(100));
+
+        state.mark_decode_step_exited();
+        assert_eq!(state.decode_step_elapsed(), None);
+        assert_eq!(state.snapshot().decode_step_elapsed, None);
+    }
+
+    /// Repeated entered/exited toggles overwrite cleanly; the field
+    /// is a single AtomicU64 with `0` as the off sentinel.
+    #[test]
+    fn decode_step_marker_round_trips() {
+        let state = ProgressState::new();
+        for _ in 0..3 {
+            state.mark_decode_step_entered();
+            assert!(state.decode_step_elapsed().is_some());
+            state.mark_decode_step_exited();
+            assert!(state.decode_step_elapsed().is_none());
+        }
+    }
+
+    /// `reset_for_retry` clears any in-flight marker so the next run's
+    /// peer watchdog starts from "no call in progress."
+    #[test]
+    fn decode_step_marker_cleared_on_retry_reset() {
+        let state = ProgressState::new();
+        state.mark_decode_step_entered();
+        assert!(state.decode_step_elapsed().is_some());
+        state.reset_for_retry();
+        assert!(state.decode_step_elapsed().is_none());
+    }
+
+    /// No call in flight → `Healthy`. Empty snapshot is the steady
+    /// state between every pair of decode_step calls.
+    #[test]
+    fn decode_step_stall_detector_silent_when_no_call_in_flight() {
+        let mut det = DecodeStepStallDetector::new(Duration::from_secs(30));
+        let mut snap = base_snapshot();
+        snap.decode_step_elapsed = None;
+        let now = Instant::now();
+        for i in 0..10 {
+            assert_eq!(
+                det.tick(&snap, now + Duration::from_millis(i)),
+                StallObservation::Healthy,
+            );
+        }
+    }
+
+    /// Call in flight under threshold → silent.
+    #[test]
+    fn decode_step_stall_detector_silent_under_threshold() {
+        let mut det = DecodeStepStallDetector::new(Duration::from_secs(30));
+        let mut snap = base_snapshot();
+        snap.decode_step_elapsed = Some(Duration::from_secs(5));
+        assert_eq!(det.tick(&snap, Instant::now()), StallObservation::Healthy);
+    }
+
+    /// Call in flight at threshold → warn once; subsequent ticks
+    /// inside the rate-limit window are suppressed; after the window
+    /// passes, a still-stuck call warns again.
+    #[test]
+    fn decode_step_stall_detector_warns_then_rate_limits() {
+        let mut det = DecodeStepStallDetector::new(Duration::from_secs(30));
+        let mut snap = base_snapshot();
+        snap.decode_step_elapsed = Some(Duration::from_secs(45));
+        let t0 = Instant::now();
+
+        let first = det.tick(&snap, t0);
+        assert_eq!(first, StallObservation::Warned(StallKind::DecodeStepHung));
+
+        // Same tick again (or 5 s later, doesn't matter — still in
+        // the same rate-limit window).
+        snap.decode_step_elapsed = Some(Duration::from_secs(50));
+        let second = det.tick(&snap, t0 + Duration::from_secs(5));
+        assert_eq!(second, StallObservation::SuppressedDuplicate);
+
+        // After the threshold has elapsed since the prior warn, the
+        // detector fires again — a wedged call produces one entry per
+        // warn-interval.
+        snap.decode_step_elapsed = Some(Duration::from_secs(75));
+        let third = det.tick(&snap, t0 + Duration::from_secs(35));
+        assert_eq!(third, StallObservation::Warned(StallKind::DecodeStepHung));
+    }
+
+    /// Recovery (call returns) clears the rate-limit watermark so a
+    /// fresh wedge fires immediately rather than waiting for the
+    /// previous window to age out.
+    #[test]
+    fn decode_step_stall_detector_recovery_clears_watermark() {
+        let mut det = DecodeStepStallDetector::new(Duration::from_secs(30));
+        let mut snap = base_snapshot();
+        let t0 = Instant::now();
+
+        snap.decode_step_elapsed = Some(Duration::from_secs(40));
+        assert_eq!(
+            det.tick(&snap, t0),
+            StallObservation::Warned(StallKind::DecodeStepHung),
+        );
+
+        // Call returns; detector resets watermark.
+        snap.decode_step_elapsed = None;
+        assert_eq!(
+            det.tick(&snap, t0 + Duration::from_secs(2)),
+            StallObservation::Healthy
+        );
+
+        // A new wedge a moment later → fires immediately, even though
+        // the previous warn was only seconds ago.
+        snap.decode_step_elapsed = Some(Duration::from_secs(31));
+        assert_eq!(
+            det.tick(&snap, t0 + Duration::from_secs(3)),
+            StallObservation::Warned(StallKind::DecodeStepHung),
+        );
+    }
+
+    /// `PEEL_DECODE_STEP_WARN_SECS` overrides the default; an invalid
+    /// value falls back. Same env var the post-hoc watchdog reads;
+    /// both watchdogs share the threshold.
+    #[test]
+    fn decode_step_hung_warn_env_override() {
+        let prev = std::env::var("PEEL_DECODE_STEP_WARN_SECS").ok();
+        std::env::set_var("PEEL_DECODE_STEP_WARN_SECS", "10");
+        assert_eq!(decode_step_hung_warn_from_env(), Duration::from_secs(10));
+        std::env::set_var("PEEL_DECODE_STEP_WARN_SECS", "0");
+        assert_eq!(
+            decode_step_hung_warn_from_env(),
+            DEFAULT_DECODE_STEP_HUNG_WARN
+        );
+        std::env::remove_var("PEEL_DECODE_STEP_WARN_SECS");
+        assert_eq!(
+            decode_step_hung_warn_from_env(),
+            DEFAULT_DECODE_STEP_HUNG_WARN
+        );
+        match prev {
+            Some(v) => std::env::set_var("PEEL_DECODE_STEP_WARN_SECS", v),
+            None => std::env::remove_var("PEEL_DECODE_STEP_WARN_SECS"),
+        }
     }
 
     #[test]
