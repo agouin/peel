@@ -1,16 +1,21 @@
 # Plan: diagnose and address decoder/sink freeze
 
-> **Status:** drafted 2026-05-02 in response to a fresh occurrence of
-> the decoder/sink freeze in the snapshot-restore pod (4 TiB
-> `.tar.zst` over R2).
+> **Status:** **resolved 2026-05-03.** Drafted 2026-05-02 in response
+> to a fresh occurrence of the decoder/sink freeze in the
+> snapshot-restore pod (4 TiB `.tar.zst` over R2). Phases 1–2 landed
+> as planned; Phase 2 surfaced enough data through §2.4–§2.5 to
+> identify the root cause as the §11 probe path silently inflating
+> `bytes_downloaded` (see "Resolution" at the bottom of this file).
+> Phases 3a / 3b were never started — the actual fix was much
+> smaller and lives outside the original branch sketch.
 >
 > This is a *follow-on* to `PLAN_responsiveness.md` Phase 3. Phase 1 of
 > that plan landed the lookahead/`decoded_in` counters and the stall
 > heartbeat; Phase 2 made the kill switch reachable from inside the
 > read poll. Phase 3 closed the corruption gap that produced the
-> earlier silent stalls. The freeze documented here is **a different
+> earlier silent stalls. The freeze documented here was **a different
 > failure mode** that the new instrumentation surfaced but did not
-> resolve, and it points at the IO layer rather than the source bytes.
+> resolve until the work below.
 
 The same sequencing discipline as `PLAN.md` / `PLAN_v2.md` /
 `PLAN_responsiveness.md` applies: each phase ends with a runnable
@@ -444,16 +449,160 @@ smoothly when we get here:
 
 ## Phase ordering and "done" criteria
 
-| Phase | Done when                                                                 |
-|-------|---------------------------------------------------------------------------|
-| 1.1   | Classifier badge agrees with the lookahead trend in the steady-state log; new unit tests pass. |
-| 1.2   | `bytes_downloaded` never exceeds `total_size` across panic / cancel / pwrite-fail respawn fixtures; existing happy-path tests unchanged. |
-| 2.1   | Per-op in-flight warn line fires in a synthetic test and in production at the next freeze. |
-| 2.2   | `decode_step` watchdog warn line fires in a synthetic test and at the next freeze. |
-| 2.3   | Captured production freeze has been triaged into one of the three branches; the chosen branch is appended to this plan as a follow-up note. |
-| 3a/3b | Per the branch selected in §2.3.                                          |
+| Phase | Status        | Notes                                                                                       |
+|-------|---------------|---------------------------------------------------------------------------------------------|
+| 1.1   | DONE 2026-05-02 | Classifier compares compressed-side rates; badge agreed with lookahead trend in the very next pod log. |
+| 1.2   | DONE 2026-05-02 | `ProgressRefundGuard` RAII; refund covers panic / cancel / pwrite-fail / verify-fail paths. |
+| 2.1   | DONE 2026-05-03 | Per-op in-flight age warning + `submit_with_args` bounded wait (§2.4a) so the walker actually runs during a wedge. |
+| 2.2   | DONE 2026-05-03 | Post-hoc `decode_step` duration watchdog plus peer-thread `DecodeStepStallDetector` (§2.4b) that fires while the step is still hung. |
+| 2.3   | DONE 2026-05-03 | Captured production freeze; §2.4b fired with monotonically increasing elapsed; §2.1 stayed silent (tracker empty). Result: cliff pattern via §2.5 → bug was *not* an io_uring stall. |
+| 2.4a  | DONE 2026-05-03 | `ring.submit_with_args(1, args.timespec(&ts))` with `walker_period = clamp(warn_after / 4, [1s, 5s])`. |
+| 2.4b  | DONE 2026-05-03 | `ProgressState::{mark_decode_step_entered,_exited}` + `DecodeStepStallDetector` ticked from the renderer thread. |
+| 2.5   | DONE 2026-05-03 | `BlockingSparseReader::read` dumps bitmap state around the cursor chunk on multi-window waits; produced the cliff pattern that pinpointed the bug. |
+| 3a/3b | NOT STARTED   | Superseded — see "Resolution" below. The wedge wasn't a lost CQE or a sink-side blocker; no auto-restart needed once the inflation bug is fixed. |
 
-Do not start §2.3's chosen branch (3a or 3b) without that
-follow-up note in this file. The whole point of Phase 2 is to
-**not** burn implementation effort on a hypothesis we have not
-verified.
+---
+
+## Resolution (2026-05-03)
+
+### What §2.5's diagnostic showed
+
+The first captured freeze under the §2.4 + §2.5 instrumentation
+produced this line, repeated every 30 s for the rest of the run:
+
+```
+WARN blocking_sparse_read stuck waiting for chunk:
+     cursor at byte 1158139609088 (chunk 276122), waiting 30 s;
+     next_incomplete_after=Some(276122);
+     chunks [276120..=276132]=[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+```
+
+Pattern B from §2.3 — the **cliff**. Chunks 276,120 and 276,121 are
+complete (the decoder consumed them); chunk 276,122 (the cursor
+position) is incomplete and so is *every* chunk after it.
+`next_incomplete_after(276122) = Some(276122)` confirms
+`pick_next_chunk` *would* dispatch chunk 276,122 — except the
+throttle gate at [scheduler.rs:989](src/download/scheduler.rs#L989)
+is engaged.
+
+The decoder cursor is at exactly chunk 276,122 × 4 MiB
+(`1,158,139,609,088 / 4,194,304 = 276,122` exactly), so the decoder
+finished chunk 276,121 cleanly and is now blocking on its first
+unread byte. `bytes_downloaded - bytes_decoded_input` reads exactly
+1.0 GiB (= the configured `max_disk_buffer`). But the bitmap shows
+**zero** chunks of real lookahead. Those two facts can't both be
+true unless `bytes_downloaded` is being incremented without a
+corresponding bitmap mark.
+
+A live process stack via `cat /proc/$(pidof peel)/task/*/stack`
+made the picture even sharper: every thread was parked in a futex
+or `nanosleep` — *no* thread was in any IO syscall. Pure userspace
+deadlock; nothing the kernel had on its plate.
+
+### Root cause
+
+The §11 mid-flight probe path
+([scheduler.rs:1098-1122](src/download/scheduler.rs#L1098-L1122))
+re-fetches an already-complete chunk every `probe.interval` Fetch
+completions to verify CRC-32C drift. The worker uses the same
+`try_once` machinery as a Fetch, including
+`read_with_progress` ([worker.rs:766](src/download/worker.rs#L766)),
+which calls `ProgressState::add_downloaded(n)` on every successful
+socket read **regardless of dispatch kind**.
+
+The scheduler's Probe completion handler at
+[scheduler.rs:1124](src/download/scheduler.rs#L1124) carried a
+comment claiming "the bytes were already counted in the original
+Fetch" and intentionally skipped the bitmap update. The comment
+was correct about not touching the bitmap (the chunk was already
+complete) but wrong about the byte counter — those bytes *were*
+counted again by the worker, and nothing subtracted them.
+
+So every successful probe inflated `bytes_downloaded` by one
+chunk-size, with no offsetting subtract or bitmap mark. With a
+default `probe.interval = 32` and a 1.1 TiB run at 4 MiB chunks,
+the inflation accumulates to ~35 GiB across the run. Long before
+that, `bytes_downloaded - bytes_decoded_input` exceeds
+`max_disk_buffer = 1 GiB` on phantom bytes alone:
+
+1. Throttle engages because the *measured* gap is at the cap.
+2. `pick_next_dispatch` doesn't run (gated on `!throttled`).
+3. The chunk at the decoder cursor is never dispatched.
+4. The decoder waits forever on `bitmap[cursor]`.
+5. Every counter stays flat, no syscall is hung, the kill switch
+   works (all the §1 / §2 PLAN_responsiveness work paid off here),
+   and a fresh process resumes cleanly because the inflation lives
+   only in `ProgressState` — reset on startup.
+
+That accounts for every signature we'd been collecting:
+
+| Signal                                     | Explained by                                                  |
+|--------------------------------------------|---------------------------------------------------------------|
+| Lookahead pinned at exactly `max_disk_buffer` | Inflation matches cap as it accumulates                       |
+| Decoder + sink freeze together             | Both are the same single-threaded `decode_step` blocked on read |
+| §2.4a uring watchdog silent                | No in-flight ops; tracker is empty (workers idle)             |
+| §2.4b decode-step watchdog firing         | The `decode_step` is genuinely hung in `BlockingSparseReader` |
+| §2.5 cliff pattern                         | Chunk really wasn't dispatched                                |
+| Freeze position varies by run              | Each run accumulates inflation at a different rate            |
+| No worker-death warnings                   | No worker died — pure counter bug                             |
+| Restart from checkpoint resumes cleanly    | Phantom counter is in-memory state, reset on startup          |
+
+### The fix
+
+Three lines at
+[scheduler.rs:1124-1149](src/download/scheduler.rs#L1124-L1149):
+
+```rust
+DispatchKind::Probe { expected: _ } => {
+    // ... long comment pointing at this section ...
+    if let Some(p) = config.progress.as_ref() {
+        p.sub_downloaded(msg.bytes);
+    }
+}
+```
+
+The probe's bytes are refunded the same way `ProgressRefundGuard`
+refunds a failed Fetch's partial bytes — they're real network
+bytes the worker read, but they don't represent new on-disk
+lookahead, so the scheduler subtracts them after observing the
+probe's success.
+
+### Regression test
+
+`probe_completion_does_not_inflate_bytes_downloaded` in
+[tests/test_download.rs](tests/test_download.rs) drives a
+32-chunk download with `probe.interval = 1` (probe after every
+Fetch) and asserts `bytes_downloaded == body.len()` after
+completion. The test was verified both ways: passes with the fix
+(32,768 == 32,768), fails without it (63,488 ≠ 32,768 — every
+probe added another 1024 bytes of phantom inflation).
+
+### Lessons
+
+- **The diagnostic instrumentation didn't reveal the bug, but it
+  ruled out enough hypotheses to point at the bug.** §2.4a's
+  silence didn't prove "io_uring is fine" until §2.5 explicitly
+  showed the bitmap had nothing past the cursor. Each layer of
+  observability eliminated one branch.
+- **A peer-thread watchdog can fire when the worked-on thread
+  can't.** §2.2 (post-hoc) was silent; §2.4b (peer) fired
+  monotonically. Future watchdogs should default to the peer
+  pattern when the wedged thread can't observe its own
+  wedge.
+- **Counter accounting needs the same care as bitmap accounting.**
+  The inflation bug had no on-disk symptom — the part file was
+  perfect, the bitmap was perfect, the source bytes were perfect.
+  Only the in-memory `bytes_downloaded` was off, and only the
+  throttle equation cared. A `// SAFETY:`-style "// COUNTER
+  INVARIANT:" pattern around `add_downloaded` / `sub_downloaded`
+  call sites would have caught this at code-review time.
+
+### Phase 3 disposition
+
+Phases 3a (io_uring fix) and 3b (auto-restart on stall) are
+**closed without implementation**. Both were sketches conditional
+on §2.3 selecting them; §2.3 selected neither. The auto-restart
+trigger from 3b *would* have masked the inflation bug rather than
+fixing it (a fresh process would re-accumulate phantom bytes), so
+landing it would have been actively harmful. If we ever discover
+a true io_uring CQE-loss bug, 3a remains a viable starting point.
