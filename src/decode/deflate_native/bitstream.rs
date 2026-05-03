@@ -287,6 +287,75 @@ impl BitReader {
     pub fn bits_buffered(&self) -> u32 {
         self.nbits
     }
+
+    /// Read exactly `buf.len()` bytes into `buf`, requiring the bit
+    /// cursor to already be byte-aligned (call [`Self::align_to_byte`]
+    /// first). Drains the bit accumulator, then the pull-buffer,
+    /// then issues `Read::read` calls until satisfied. Far faster
+    /// than `read_bits(8)` per byte, used by the stored-block
+    /// payload path in [`super::Decoder`].
+    ///
+    /// # Errors
+    ///
+    /// - [`DeflateError::UnexpectedEof`] when the source is
+    ///   exhausted before `buf.len()` bytes have been delivered.
+    /// - [`DeflateError::SourceIo`] for any other `Read::read`
+    ///   failure (after honoring `Interrupted`).
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts the bit cursor is byte-aligned. Calling on a
+    /// non-aligned cursor would silently corrupt the cursor's bit
+    /// offset; the assertion catches the misuse early.
+    pub fn read_aligned(&mut self, buf: &mut [u8]) -> Result<(), DeflateError> {
+        debug_assert_eq!(
+            self.byte_position().1,
+            0,
+            "BitReader::read_aligned: cursor must be byte-aligned (call align_to_byte first)",
+        );
+        let mut filled = 0;
+
+        // Phase A: drain the bit accumulator. Aligned cursor →
+        // accumulator holds whole bytes (`nbits` is a multiple of 8).
+        while filled < buf.len() && self.nbits >= 8 {
+            // INVARIANT: `acc & 0xFF` is in 0..=255, fits in `u8`.
+            buf[filled] = (self.acc & 0xFF) as u8;
+            self.acc >>= 8;
+            self.nbits -= 8;
+            filled += 1;
+        }
+
+        // Phase B: drain the pull-buffer in bulk. Bytes copied
+        // directly bypass the accumulator entirely; cursor
+        // accounting is preserved by advancing `bytes_into_acc` as
+        // if the bytes had been shifted in then immediately
+        // consumed (the `bits_consumed = bytes_into_acc * 8 -
+        // nbits` formula stays correct).
+        while filled < buf.len() && self.pull_pos < self.pull_filled {
+            let n = (self.pull_filled - self.pull_pos).min(buf.len() - filled);
+            buf[filled..filled + n]
+                .copy_from_slice(&self.pull_buf[self.pull_pos..self.pull_pos + n]);
+            self.pull_pos += n;
+            // INVARIANT: `n <= pull_filled - pull_pos <=
+            // PULL_BUF_LEN`, so `as u64` cannot truncate.
+            self.bytes_into_acc = self.bytes_into_acc.saturating_add(n as u64);
+            filled += n;
+        }
+
+        // Phase C: refill from the source until satisfied.
+        while filled < buf.len() {
+            if !self.refill_pull_buf()? {
+                return Err(DeflateError::UnexpectedEof("aligned-byte read"));
+            }
+            let n = self.pull_filled.min(buf.len() - filled);
+            buf[filled..filled + n].copy_from_slice(&self.pull_buf[..n]);
+            self.pull_pos = n;
+            self.bytes_into_acc = self.bytes_into_acc.saturating_add(n as u64);
+            filled += n;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +640,85 @@ mod tests {
             br.align_to_byte();
             assert_eq!(br.byte_position(), before);
         }
+    }
+
+    #[test]
+    fn read_aligned_drains_accumulator_then_pull_buffer_then_source() {
+        // Stream is large enough to span all three phases of the
+        // read_aligned implementation: accumulator drain (after
+        // ensure(8) shifts a byte in), pull-buffer drain, and
+        // source-side refill (PULL_BUF_LEN forces a refill).
+        let len = PULL_BUF_LEN + 256;
+        let bytes: Vec<u8> = (0..len).map(|i| (i & 0xFF) as u8).collect();
+        let mut br = reader(bytes.clone());
+        // Force one byte into the accumulator first.
+        br.ensure(1).expect("ensure 1 to seed accumulator");
+        assert!(br.bits_buffered() >= 8);
+        // We're still byte-aligned (no bits consumed yet).
+        assert_eq!(br.byte_position(), (0, 0));
+        // Read every byte; the cursor should march byte-by-byte.
+        let mut out = vec![0u8; len];
+        br.read_aligned(&mut out).expect("read_aligned");
+        assert_eq!(out, bytes);
+        assert_eq!(br.byte_position(), (len as u64, 0));
+    }
+
+    #[test]
+    fn read_aligned_short_buffer_round_trips() {
+        let bytes = b"hello".to_vec();
+        let mut br = reader(bytes.clone());
+        let mut out = [0u8; 5];
+        br.read_aligned(&mut out).expect("aligned");
+        assert_eq!(&out, b"hello");
+        assert_eq!(br.byte_position(), (5, 0));
+    }
+
+    #[test]
+    fn read_aligned_after_some_bit_reads_picks_up_at_byte_boundary() {
+        // Read the first byte's worth of bits, align (no-op since
+        // already aligned), then read the next 4 bytes via
+        // read_aligned.
+        let bytes = vec![0xAA, 0x01, 0x02, 0x03, 0x04];
+        let mut br = reader(bytes);
+        br.read_bits(8).expect("byte 0");
+        let mut out = [0u8; 4];
+        br.read_aligned(&mut out).expect("aligned 4");
+        assert_eq!(&out, &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(br.byte_position(), (5, 0));
+    }
+
+    #[test]
+    fn read_aligned_after_partial_bit_consumption_realigns_via_align_to_byte() {
+        // Reader consumed 3 bits; align_to_byte drops the rest of
+        // the byte; read_aligned starts from byte 1.
+        let bytes = vec![0x00, 0xAB, 0xCD, 0xEF];
+        let mut br = reader(bytes);
+        br.read_bits(3).expect("3 bits");
+        br.align_to_byte();
+        let mut out = [0u8; 3];
+        br.read_aligned(&mut out).expect("aligned");
+        assert_eq!(&out, &[0xAB, 0xCD, 0xEF]);
+    }
+
+    #[test]
+    fn read_aligned_truncated_source_surfaces_unexpected_eof() {
+        let bytes = vec![0x01, 0x02];
+        let mut br = reader(bytes);
+        let mut out = [0u8; 4];
+        match br.read_aligned(&mut out) {
+            Err(DeflateError::UnexpectedEof(label)) => {
+                assert_eq!(label, "aligned-byte read");
+            }
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_aligned_empty_buffer_is_a_noop() {
+        let mut br = reader(vec![0x42]);
+        let before = br.byte_position();
+        br.read_aligned(&mut []).expect("empty");
+        assert_eq!(br.byte_position(), before);
     }
 
     #[test]

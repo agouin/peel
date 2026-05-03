@@ -83,6 +83,40 @@ pub enum DeflateError {
     /// Phase 4 per `docs/PLAN_deflate_block_decoder.md`.
     #[error("deflate: dynamic Huffman block (BTYPE=10) decoding not yet implemented")]
     DynamicHuffmanUnimplemented,
+
+    /// Generic Huffman-layer failure. Variants include an
+    /// over/under-subscribed code-length table (Kraft inequality
+    /// violation), a code length exceeding RFC 1951's 15-bit cap,
+    /// and a peeked bit pattern with no matching code in the
+    /// canonical table. Carries a static reason string so test
+    /// assertions and tracing can distinguish failure modes
+    /// without parsing the message.
+    #[error("deflate: malformed Huffman code: {0}")]
+    MalformedHuffman(&'static str),
+
+    /// A back-reference distance code in `30..=31` was decoded.
+    /// RFC 1951 §3.2.5 reserves these (the distance-code alphabet
+    /// is 30 entries; encoders never emit them). Surfacing as a
+    /// dedicated variant keeps the per-symbol diagnostic separate
+    /// from the more general
+    /// [`Self::MalformedHuffman`] failures (Phase 0 spike Q3 calls
+    /// out the value of typed rejection here).
+    #[error("deflate: reserved distance code {code} (only 0..=29 are valid)")]
+    ReservedDistanceCode {
+        /// The reserved code (30 or 31).
+        code: u16,
+    },
+
+    /// A back-reference's `(distance, length)` declared a copy
+    /// from past the start of the decoded stream. Indicates
+    /// either source corruption or a decoder bug.
+    #[error("deflate: back-reference distance {distance} exceeds available history {available}")]
+    BackReferenceUnderflow {
+        /// Distance the back-reference declared.
+        distance: u32,
+        /// Bytes of decoded output available for the copy.
+        available: u64,
+    },
 }
 
 impl DeflateError {
