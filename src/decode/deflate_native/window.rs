@@ -183,6 +183,42 @@ impl RingWindow {
         Ok(())
     }
 
+    /// Restore the window from a snapshot taken via
+    /// [`Self::recent_in_order`]. `recent` must be ≤
+    /// [`MAX_WINDOW_SIZE`] bytes; `total_written` is the original
+    /// cumulative byte count the resumed window should report
+    /// going forward (so [`Self::match_copy`]'s
+    /// distance-vs-total bounds-check stays correct after resume).
+    ///
+    /// Does not stage the restored bytes into any sink — the
+    /// resumer has already emitted them in the original run, so
+    /// re-emitting would corrupt the user's output.
+    pub fn restore_from_snapshot(&mut self, recent: &[u8], total_written: u64) {
+        debug_assert!(
+            recent.len() <= MAX_WINDOW_SIZE,
+            "RingWindow::restore_from_snapshot: snapshot longer than MAX_WINDOW_SIZE",
+        );
+        // Reset to a known state, then write the snapshot bytes
+        // directly into the ring (no `out` staging).
+        self.head = 0;
+        let mut remaining = recent;
+        while !remaining.is_empty() {
+            let space = MAX_WINDOW_SIZE - self.head;
+            let take = remaining.len().min(space);
+            self.buf[self.head..self.head + take].copy_from_slice(&remaining[..take]);
+            self.head += take;
+            if self.head == MAX_WINDOW_SIZE {
+                self.head = 0;
+            }
+            remaining = &remaining[take..];
+        }
+        // Override total_written to the resumed cumulative count.
+        // Snapshot `recent.len()` may be < total_written for a
+        // window that has wrapped at least once, so we can't
+        // derive total_written from the snapshot alone.
+        self.total_written = total_written;
+    }
+
     /// Snapshot the most-recent `min(MAX_WINDOW_SIZE, total_written)`
     /// bytes of the window in chronological order (oldest first,
     /// newest last).

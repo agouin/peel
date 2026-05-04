@@ -160,6 +160,15 @@ pub enum DeflateError {
         /// Low 32 bits of the count we observed.
         computed: u32,
     },
+
+    /// A Phase-7 resume blob was structurally malformed. Surfaced
+    /// from [`super::resume::DflResumeState::deserialize`] when
+    /// the magic / version / fields don't satisfy the layout
+    /// described in `super::resume`. Carries a static reason
+    /// string so test assertions and tracing can distinguish
+    /// failure modes without parsing the message.
+    #[error("deflate: resume blob rejected: {0}")]
+    ResumeBlob(&'static str),
 }
 
 impl DeflateError {

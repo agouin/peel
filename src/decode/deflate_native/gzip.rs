@@ -447,6 +447,40 @@ impl StreamingDecoder for GzipDecoder {
     fn frame_boundary(&self) -> Option<ByteOffset> {
         self.last_frame_boundary
     }
+
+    fn decoder_state(&self) -> Option<Vec<u8>> {
+        // Gzip blobs only round-trip mid-deflate-body, when the
+        // inner decoder is at a deflate-block boundary. Between
+        // members the per-member `frame_boundary` is restartable
+        // via the regular factory at that offset; mid-header /
+        // mid-trailer have no clean restart point. Mirrors
+        // `Lz4Decoder::between_blocks` and the zstd analogue.
+        if !matches!(self.state, State::InDeflateBody) {
+            return None;
+        }
+        let inner = self.inner.as_ref()?;
+        let inner_blob = inner.decoder_state()?;
+        // The inner blob's container is RawDeflate; rewrap as Gzip
+        // and inject the wrapper's running CRC32 / ISIZE. Round-
+        // tripping through deserialise + reserialise is a small
+        // cost (≤ 33 KiB) and keeps the gzip layer from having to
+        // know the inner blob's wire format.
+        let mut state = match super::resume::DflResumeState::deserialize(&inner_blob) {
+            Ok(s) => s,
+            Err(_) => {
+                // Inner blob shape is internal to our crate; a
+                // deserialize failure here would be a bug, not a
+                // legitimate caller error. Return None so the
+                // coordinator falls back to the regular factory at
+                // the per-member frame_boundary.
+                return None;
+            }
+        };
+        state.container = super::resume::Container::Gzip;
+        state.running_crc32 = self.running_crc.current();
+        state.total_decompressed = u64::from(self.running_isize);
+        Some(state.serialize())
+    }
 }
 
 /// [`crate::decode::DecoderFactory`] adapter for [`GzipDecoder`].
@@ -461,6 +495,76 @@ impl StreamingDecoder for GzipDecoder {
 /// Forwards any error returned by [`GzipDecoder::new`].
 pub fn factory(src: Box<dyn Read + Send>) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
     Ok(Box::new(GzipDecoder::new(src)?))
+}
+
+/// [`crate::decode::DecoderResumeFactory`] adapter for
+/// [`GzipDecoder`].
+///
+/// Reconstructs a wrapper sitting at a mid-member deflate-block
+/// boundary: the inner deflate decoder's state is restored from
+/// the blob's deflate-half (window snapshot + bit cursor), and
+/// the gzip framing's running CRC32 + ISIZE counter are restored
+/// from the blob's gzip-half so the trailer-validation phase
+/// after the resumed deflate stream produces the same outcome a
+/// clean run would.
+///
+/// `start_offset` must equal the blob's
+/// `source_byte_position`; mismatch surfaces as
+/// [`DecodeError::ResumeMismatch`].
+///
+/// # Errors
+///
+/// - [`DecodeError::Construct`] when the blob is malformed or the
+///   bit-offset skip would read past the end of `src`.
+/// - [`DecodeError::ResumeMismatch`] when `start_offset` doesn't
+///   match the blob's saved cursor.
+pub fn resume_factory(
+    src: Box<dyn Read + Send>,
+    state_blob: &[u8],
+    start_offset: u64,
+) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+    let state = super::resume::deserialize_at_boundary(state_blob, start_offset)?;
+    if state.container != super::resume::Container::Gzip {
+        return Err(DecodeError::Construct(io::Error::other(
+            "gzip resume blob rejected: expected container=Gzip",
+        )));
+    }
+
+    // Restore the running CRC32 + ISIZE counter from the blob's
+    // gzip-half. The hasher's seed() method primes the internal
+    // state to the captured running value (NOT the finalised
+    // CRC), so subsequent updates compound correctly with the
+    // original prefix's contribution.
+    let mut running_crc = Crc32::new();
+    running_crc.seed(state.running_crc32);
+    // INVARIANT: bytes_decompressed_in_member is u64 in the blob,
+    // u32 here — the trailer's ISIZE is mod 2^32 by spec, so the
+    // low-32 truncation is the desired behavior.
+    let running_isize = state.total_decompressed as u32;
+
+    // The deflate-half of the blob feeds an inner deflate decoder
+    // resumed at the same source byte / bit offset. We rewrap the
+    // state so `Decoder::resume` sees a RawDeflate container.
+    let deflate_state = super::resume::DflResumeState {
+        container: super::resume::Container::RawDeflate,
+        ..state
+    };
+    let inner = super::Decoder::resume(src, deflate_state)?;
+
+    // The wrapper takes the inner decoder back over and re-enters
+    // `InDeflateBody`. The bit reader currently lives inside the
+    // inner decoder; the wrapper reclaims it after the deflate
+    // stream hits Eof, exactly the same path the non-resume run
+    // takes.
+    let last_frame_boundary = Some(ByteOffset::new(start_offset));
+    Ok(Box::new(GzipDecoder {
+        state: State::InDeflateBody,
+        bits: None,
+        inner: Some(inner),
+        running_crc,
+        running_isize,
+        last_frame_boundary,
+    }))
 }
 
 #[cfg(test)]
@@ -878,5 +982,238 @@ mod tests {
 
         let out = decode_all(frame);
         assert_eq!(out, payload);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7 — gzip wrapper resume tests
+    // ----------------------------------------------------------------
+
+    /// Capture every (decoder_state blob, frame_boundary, prefix
+    /// emitted so far) triple where the wrapper exposes a resume
+    /// point during a clean run. For the gzip wrapper, blobs are
+    /// emitted at deflate-block boundaries inside a member; the
+    /// per-member `frame_boundary` updates also fire but
+    /// `decoder_state` returns None at those (the regular factory
+    /// can resume from a member boundary on its own).
+    #[allow(clippy::type_complexity)]
+    fn capture_gzip_resume_points(raw: &[u8]) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
+        let mut decoder = GzipDecoder::new(Box::new(Cursor::new(raw.to_vec()))).expect("construct");
+        let mut sink: Vec<u8> = Vec::new();
+        let mut points: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
+        loop {
+            let status = decoder.decode_step(&mut sink).expect("decode");
+            // `decoder_state` only returns Some at deflate-block
+            // boundaries inside a member; capture each unique blob.
+            if let (Some(blob), Some(b)) = (decoder.decoder_state(), decoder.bytes_consumed())
+                .pipe(|(s, b)| (s, Some(b.get())))
+            {
+                points.push((blob, b, sink.clone()));
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        points
+    }
+
+    /// Trait bridge for the `.pipe(...)` form above; keeps the
+    /// capture loop readable. (Internal to this test module.)
+    trait Pipe: Sized {
+        fn pipe<R, F: FnOnce(Self) -> R>(self, f: F) -> R {
+            f(self)
+        }
+    }
+    impl<T> Pipe for T {}
+
+    /// Construct a gzip stream by concatenating a custom 10-byte
+    /// header + a hand-built multi-block deflate body (so the
+    /// resume tests are reproducible across flate2 / miniz_oxide
+    /// version updates) + an RFC 1952-conformant trailer.
+    fn build_multi_block_gzip(chunks: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        // Build the deflate body via the parent test module's
+        // helper. We re-implement it locally here so the gzip
+        // module's tests don't depend on test-only items in the
+        // parent.
+        struct W {
+            bytes: Vec<u8>,
+            acc: u64,
+            n: u32,
+        }
+        impl W {
+            fn new() -> Self {
+                Self {
+                    bytes: Vec::new(),
+                    acc: 0,
+                    n: 0,
+                }
+            }
+            fn put(&mut self, v: u32, n: u32) {
+                self.acc |= u64::from(v) << self.n;
+                self.n += n;
+                while self.n >= 8 {
+                    self.bytes.push(self.acc as u8);
+                    self.acc >>= 8;
+                    self.n -= 8;
+                }
+            }
+            fn finish(mut self) -> Vec<u8> {
+                if self.n > 0 {
+                    self.bytes.push(self.acc as u8);
+                }
+                self.bytes
+            }
+        }
+        fn rev(mut v: u32, n: u32) -> u32 {
+            let mut r = 0u32;
+            for _ in 0..n {
+                r = (r << 1) | (v & 1);
+                v >>= 1;
+            }
+            r
+        }
+        fn fixed_litlen(sym: u16) -> (u32, u32) {
+            match sym {
+                0..=143 => (0b0011_0000_u32 + u32::from(sym), 8),
+                144..=255 => (0b1_1001_0000_u32 + u32::from(sym - 144), 9),
+                256..=279 => (u32::from(sym - 256), 7),
+                280..=287 => (0b1100_0000_u32 + u32::from(sym - 280), 8),
+                _ => panic!("invalid sym"),
+            }
+        }
+
+        let combined: Vec<u8> = chunks.iter().flat_map(|p| p.iter().copied()).collect();
+        let mut w = W::new();
+        for (i, payload) in chunks.iter().enumerate() {
+            let last = i + 1 == chunks.len();
+            w.put(u32::from(last), 1);
+            w.put(0b01, 2); // BTYPE=01 fixed Huffman
+            for &b in *payload {
+                let (c, l) = fixed_litlen(u16::from(b));
+                w.put(rev(c, l), l);
+            }
+            let (eob_c, eob_l) = fixed_litlen(256);
+            w.put(rev(eob_c, eob_l), eob_l);
+        }
+        let deflate_body = w.finish();
+
+        // Wrap in gzip framing: header + deflate body + trailer.
+        let mut gz = Vec::with_capacity(10 + deflate_body.len() + 8);
+        gz.extend_from_slice(&[0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03]);
+        gz.extend_from_slice(&deflate_body);
+        let crc = crate::zip::crc32::ieee(&combined);
+        gz.extend_from_slice(&crc.to_le_bytes());
+        let isize_low32 = (combined.len() as u32).to_le_bytes();
+        gz.extend_from_slice(&isize_low32);
+        (gz, combined)
+    }
+
+    #[test]
+    fn gzip_resume_blob_round_trips_at_each_block_boundary() {
+        let chunks: &[&[u8]] = &[b"first ", b"second ", b"third ", b"fourth ", b"fifth."];
+        let (raw, payload) = build_multi_block_gzip(chunks);
+
+        // Sanity: clean decode.
+        let mut clean = GzipDecoder::new(Box::new(Cursor::new(raw.clone()))).expect("construct");
+        let mut sink = Vec::new();
+        while clean.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        assert_eq!(sink, payload);
+
+        // Capture resume points and confirm each round-trips
+        // byte-identically through the gzip resume_factory.
+        let points = capture_gzip_resume_points(&raw);
+        assert!(
+            !points.is_empty(),
+            "expected at least one mid-member resume point"
+        );
+
+        for (i, (blob, boundary, prefix)) in points.iter().enumerate() {
+            let suffix_src = raw[*boundary as usize..].to_vec();
+            let mut resumed: Box<dyn StreamingDecoder> =
+                resume_factory(Box::new(Cursor::new(suffix_src)), blob, *boundary).expect("resume");
+            let mut sink = Vec::new();
+            while resumed.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+            let mut combined = prefix.clone();
+            combined.extend_from_slice(&sink);
+            assert_eq!(
+                combined, payload,
+                "gzip resume point {i} (boundary={boundary}) didn't round-trip",
+            );
+        }
+    }
+
+    #[test]
+    fn gzip_resume_factory_rejects_raw_deflate_blob() {
+        // A blob with container=RawDeflate must be rejected by the
+        // gzip resume factory — the framing layers don't agree on
+        // CRC32 / ISIZE semantics.
+        let chunks: &[&[u8]] = &[b"alpha ", b"beta."];
+        let (raw, _) = build_multi_block_gzip(chunks);
+        // Construct a raw-deflate blob from the embedded deflate
+        // body (skip header, drop trailer), pull a resume point
+        // out of *that*, and feed it to the gzip resume factory.
+        let deflate_body = &raw[10..raw.len() - 8];
+        let mut decoder = super::super::Decoder::new(Box::new(Cursor::new(deflate_body.to_vec())))
+            .expect("construct");
+        let mut sink = Vec::new();
+        let mut blob = None;
+        let mut boundary = 0u64;
+        loop {
+            let status = decoder.decode_step(&mut sink).expect("decode");
+            if let Some(b) = decoder.decoder_state() {
+                blob = Some(b);
+                boundary = decoder.bytes_consumed().get();
+                break;
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        let blob = blob.expect("captured a raw-deflate blob");
+        match resume_factory(Box::new(Cursor::new(Vec::<u8>::new())), &blob, boundary) {
+            Err(DecodeError::Construct(e)) => {
+                assert!(
+                    e.to_string().contains("expected container=Gzip"),
+                    "unexpected message: {e}",
+                );
+            }
+            Err(other) => panic!("expected Construct error, got {other:?}"),
+            Ok(_) => panic!("expected Construct error, got Ok(decoder)"),
+        }
+    }
+
+    #[test]
+    fn gzip_resume_blob_carries_running_crc_and_isize() {
+        // Pin the contract that gzip's running CRC + ISIZE land in
+        // the blob and round-trip through the resume factory. We
+        // verify by parsing the captured blob directly.
+        let chunks: &[&[u8]] = &[b"hello ", b"world."];
+        let (raw, payload) = build_multi_block_gzip(chunks);
+        let points = capture_gzip_resume_points(&raw);
+        let (blob, _boundary, _prefix) = points
+            .first()
+            .expect("at least one mid-member resume point");
+
+        let parsed = super::super::resume::DflResumeState::deserialize(blob).expect("parse");
+        assert_eq!(parsed.container, super::super::resume::Container::Gzip);
+        // The running CRC at the first block boundary equals the
+        // CRC32 of the bytes the first block emitted.
+        let first_chunk_crc = crate::zip::crc32::ieee(chunks[0]);
+        assert_eq!(parsed.running_crc32, first_chunk_crc);
+        // The running ISIZE equals the bytes emitted so far.
+        assert_eq!(parsed.total_decompressed, chunks[0].len() as u64);
+        // Sanity: the full payload still round-trips through the
+        // resume factory at this point.
+        let suffix_src = raw[parsed.source_byte_position as usize..].to_vec();
+        let mut resumed: Box<dyn StreamingDecoder> = resume_factory(
+            Box::new(Cursor::new(suffix_src)),
+            blob,
+            parsed.source_byte_position,
+        )
+        .expect("resume");
+        let mut sink = Vec::new();
+        while resumed.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        let mut combined = chunks[0].to_vec();
+        combined.extend_from_slice(&sink);
+        assert_eq!(combined, payload);
     }
 }

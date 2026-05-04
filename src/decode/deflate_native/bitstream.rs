@@ -94,6 +94,18 @@ impl BitReader {
     /// that may issue `Read::read`.
     #[must_use]
     pub fn new(source: Box<dyn Read + Send>) -> Self {
+        Self::new_at(source, 0)
+    }
+
+    /// Construct a [`BitReader`] over `source` with the cursor's
+    /// byte counter primed to `byte_offset`. The initial cursor
+    /// reports as `(byte_offset, 0)`; the first byte the reader
+    /// delivers is treated as if it were source byte
+    /// `byte_offset`. Used by [`super::resume`] (Phase 7) to
+    /// anchor a resumed decoder's source-cursor accounting at the
+    /// saved checkpoint position.
+    #[must_use]
+    pub fn new_at(source: Box<dyn Read + Send>, byte_offset: u64) -> Self {
         Self {
             source: Some(source),
             pull_buf: vec![0u8; PULL_BUF_LEN].into_boxed_slice(),
@@ -101,7 +113,7 @@ impl BitReader {
             pull_filled: 0,
             acc: 0,
             nbits: 0,
-            bytes_into_acc: 0,
+            bytes_into_acc: byte_offset,
         }
     }
 

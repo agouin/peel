@@ -99,6 +99,7 @@ pub mod dynamic;
 pub mod error;
 pub mod gzip;
 pub mod huffman;
+pub mod resume;
 pub mod window;
 
 use self::bitstream::BitReader;
@@ -161,6 +162,18 @@ pub struct Decoder {
     /// block declared an all-zero distance alphabet (RFC 1951
     /// §3.2.7's "literals-only block" special case).
     dyn_dist: Option<HuffTable>,
+    /// Latest restart-safe boundary inside the deflate stream, in
+    /// source bytes. Set when the decoder transitions into
+    /// `State::AwaitingBlockType` after a non-final block —
+    /// i.e. just past the EOB / end-of-stored-payload of the
+    /// previous block. The boundary's *bit* offset within the
+    /// returned byte lives on the [`Self::decoder_state`] blob;
+    /// callers that ignore the blob and resume via
+    /// [`Self::from_bits`] alone get byte-aligned behavior, which
+    /// is correct only when this boundary happens to land on a
+    /// byte boundary. Use [`crate::decode::DecoderResumeFactory`]
+    /// for bit-aligned resume.
+    last_frame_boundary: Option<ByteOffset>,
 }
 
 /// Decoder state machine.
@@ -283,6 +296,7 @@ impl Decoder {
             output_buf: vec![0u8; OUTPUT_CHUNK],
             dyn_lit: None,
             dyn_dist: None,
+            last_frame_boundary: None,
         }
     }
 
@@ -377,6 +391,14 @@ impl Decoder {
                             self.state = State::Done;
                             return Ok(DecodeStatus::Eof);
                         }
+                        // Record the block boundary at the current
+                        // (byte-aligned) bit cursor so
+                        // [`Self::decoder_state`] can emit a resume
+                        // blob from this point. Stored blocks are
+                        // byte-aligned by RFC 1951 §3.2.4, so the
+                        // bit_offset captured by the blob is 0 here.
+                        self.last_frame_boundary =
+                            Some(ByteOffset::new(self.bits.byte_position().0));
                         self.state = State::AwaitingBlockType;
                         // Don't loop — return so the caller observes
                         // one step of progress per block boundary.
@@ -417,6 +439,16 @@ impl Decoder {
                             self.state = if last {
                                 State::Done
                             } else {
+                                // Record the post-EOB boundary
+                                // before transitioning. The bit
+                                // cursor is generally mid-byte; the
+                                // [`Self::decoder_state`] blob
+                                // carries the bit-offset within the
+                                // returned byte so a resumed
+                                // decoder can re-skip the consumed
+                                // bits.
+                                self.last_frame_boundary =
+                                    Some(ByteOffset::new(self.bits.byte_position().0));
                                 State::AwaitingBlockType
                             };
                             return Ok(if last {
@@ -449,6 +481,8 @@ impl Decoder {
                             self.state = if last {
                                 State::Done
                             } else {
+                                self.last_frame_boundary =
+                                    Some(ByteOffset::new(self.bits.byte_position().0));
                                 State::AwaitingBlockType
                             };
                             return Ok(if last {
@@ -595,16 +629,40 @@ impl StreamingDecoder for Decoder {
     }
 
     fn frame_boundary(&self) -> Option<ByteOffset> {
-        // Phases 1–3 don't surface mid-stream restart points yet —
-        // Phase 7 lands the per-block boundary + decoder_state blob.
-        // The byte-aligned stored-block payload boundary *is* a
-        // valid restart point in principle (the gzip wrapper today
-        // surfaces per-member boundaries that satisfy the same
-        // contract), but exposing it before the per-block
-        // checkpoint cadence wiring is in place would invite the
-        // coordinator to act on a boundary the rest of the pipeline
-        // can't yet take advantage of.
-        None
+        // Phase 7 advances this at every transition into
+        // `State::AwaitingBlockType` after a non-final block — i.e.
+        // the post-EOB / post-stored-payload point of every
+        // intermediate block. The boundary's byte index is the bit
+        // reader's `byte_position` floor; the bit-offset within
+        // that byte (typically non-zero for Huffman blocks) lives
+        // on the [`Self::decoder_state`] blob and is re-skipped on
+        // resume by [`resume::resume`]. Callers must use the blob
+        // — restarting at this offset alone produces correct
+        // output only when the boundary happens to be byte-aligned.
+        self.last_frame_boundary
+    }
+
+    fn decoder_state(&self) -> Option<Vec<u8>> {
+        // Snapshotable iff we're between blocks (just past EOB /
+        // end-of-stored-payload) and we've decoded at least one
+        // block — the initial `AwaitingBlockType` (no decoding
+        // done yet) is covered by the regular factory at
+        // offset 0.
+        if !matches!(self.state, State::AwaitingBlockType) {
+            return None;
+        }
+        self.last_frame_boundary?;
+        let (byte_pos, bit_off) = self.bits.byte_position();
+        let blob = resume::DflResumeState {
+            container: resume::Container::RawDeflate,
+            source_byte_position: byte_pos,
+            bit_offset: bit_off,
+            window_contents: self.window.recent_in_order(),
+            total_decompressed: self.window.total_written(),
+            running_crc32: 0,
+            bfinal_seen: false,
+        };
+        Some(blob.serialize())
     }
 }
 
@@ -620,6 +678,74 @@ impl StreamingDecoder for Decoder {
 /// Forwards any error returned by [`Decoder::new`].
 pub fn factory(src: Box<dyn Read + Send>) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
     Ok(Box::new(Decoder::new(src)?))
+}
+
+/// [`crate::decode::DecoderResumeFactory`] adapter for the
+/// hand-rolled deflate decoder.
+///
+/// Reconstructs a [`Decoder`] from a blob previously produced by
+/// [`Decoder::decoder_state`]. The new decoder's bit cursor lands
+/// at the saved `(source_byte_position, bit_offset)` and the
+/// sliding window is pre-seeded from the blob's chronological
+/// tail so subsequent back-references resolve correctly.
+///
+/// `start_offset` must equal the blob's
+/// `source_byte_position`; the function surfaces
+/// [`DecodeError::ResumeMismatch`] on disagreement so the
+/// extractor's resume seam can distinguish "blob mis-aligned with
+/// the source cursor" from a downstream malformed-stream failure.
+///
+/// # Errors
+///
+/// - [`DecodeError::Construct`] when the blob is structurally
+///   malformed (bad magic, unsupported version, oversized window,
+///   etc.) or when the bit-offset skip would read past the end of
+///   `src`.
+/// - [`DecodeError::ResumeMismatch`] when `start_offset` doesn't
+///   match the blob's saved cursor.
+pub fn resume_factory(
+    src: Box<dyn Read + Send>,
+    state_blob: &[u8],
+    start_offset: u64,
+) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+    let state = resume::deserialize_at_boundary(state_blob, start_offset)?;
+    if state.container != resume::Container::RawDeflate {
+        return Err(DecodeError::Construct(std::io::Error::other(
+            "deflate resume blob rejected: expected container=RawDeflate",
+        )));
+    }
+    Ok(Box::new(Decoder::resume(src, state)?))
+}
+
+impl Decoder {
+    /// Internal: build a [`Decoder`] from a parsed
+    /// [`resume::DflResumeState`]. Public callers go through
+    /// [`resume_factory`]; the [`gzip::GzipDecoder`] resume path
+    /// also funnels through here once it has unwrapped the gzip
+    /// framing fields.
+    pub(super) fn resume(
+        src: Box<dyn Read + Send>,
+        state: resume::DflResumeState,
+    ) -> Result<Self, DecodeError> {
+        let mut bits = BitReader::new_at(src, state.source_byte_position);
+        // Skip the bits already consumed of the first delivered
+        // byte. `read_bits` is strict — propagate truncation as
+        // `DecodeError::Construct` rather than letting it surface
+        // as a mid-decode error later.
+        if state.bit_offset > 0 {
+            bits.read_bits(u32::from(state.bit_offset)).map_err(|e| {
+                DecodeError::Construct(std::io::Error::other(format!(
+                    "deflate resume blob rejected: cannot skip bit_offset: {e}"
+                )))
+            })?;
+        }
+        let mut decoder = Self::from_bits(bits);
+        decoder
+            .window
+            .restore_from_snapshot(&state.window_contents, state.total_decompressed);
+        decoder.last_frame_boundary = Some(ByteOffset::new(state.source_byte_position));
+        Ok(decoder)
+    }
 }
 
 #[cfg(test)]
@@ -926,16 +1052,53 @@ mod tests {
     }
 
     #[test]
-    fn frame_boundary_stays_none_until_phase_7() {
-        // Phases 1–3 do not yet surface restart points; Phase 7
-        // lands the resume blob and starts advancing this. Pin the
-        // contract so we notice if it accidentally regresses before
-        // the rest of the resume plumbing is ready.
+    fn frame_boundary_remains_none_for_single_block_streams() {
+        // For a stream consisting of a single (final) block, no
+        // intermediate-block boundary is ever observed: the
+        // BFINAL=1 path transitions straight to `State::Done`
+        // without going through `AwaitingBlockType`. Pin this
+        // contract so we don't accidentally start surfacing
+        // end-of-stream as a "frame boundary" — that's the
+        // [`StreamingDecoder::bytes_consumed`] cursor's job.
         let stream = build_stored_stream(b"x", true);
         let mut decoder = Decoder::new(Box::new(Cursor::new(stream))).expect("construct");
         let mut sink = Vec::new();
         while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
         assert_eq!(decoder.frame_boundary(), None);
+    }
+
+    #[test]
+    fn frame_boundary_advances_at_each_intermediate_stored_block() {
+        // Two non-final stored blocks then a final one. The decoder
+        // should record a frame boundary after each of the first
+        // two blocks ends — between the two non-final blocks and
+        // between the second non-final and the final one. The
+        // final block's end is NOT a frame boundary (we transition
+        // directly to Done).
+        let block_a = build_stored_stream(b"alpha-", false);
+        let block_b = build_stored_stream(b"beta-", false);
+        let block_c = build_stored_stream(b"gamma!", true);
+        let mut stream = block_a.clone();
+        stream.extend_from_slice(&block_b);
+        stream.extend_from_slice(&block_c);
+        let mut decoder = Decoder::new(Box::new(Cursor::new(stream))).expect("construct");
+        let mut sink = Vec::new();
+        let mut boundaries: Vec<u64> = Vec::new();
+        loop {
+            let prior = decoder.frame_boundary();
+            let status = decoder.decode_step(&mut sink).expect("decode");
+            let next = decoder.frame_boundary();
+            if next != prior {
+                boundaries.push(next.expect("just observed").get());
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        assert_eq!(
+            boundaries,
+            vec![block_a.len() as u64, (block_a.len() + block_b.len()) as u64],
+        );
     }
 
     // ----------------------------------------------------------------
@@ -1746,5 +1909,213 @@ mod tests {
         let mut sink = Vec::new();
         while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
         assert_eq!(sink, payload);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7 — decoder_state / resume round-trip tests
+    // ----------------------------------------------------------------
+
+    /// Reference-clean decode of `raw` for cross-checking
+    /// resume runs. Drives a fresh decoder to EOF and returns the
+    /// full output.
+    fn decode_clean(raw: &[u8]) -> Vec<u8> {
+        let mut decoder = Decoder::new(Box::new(Cursor::new(raw.to_vec()))).expect("construct");
+        let mut sink = Vec::new();
+        while decoder.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+        sink
+    }
+
+    /// Capture every `(decoder_state blob, frame_boundary, prefix
+    /// emitted so far)` triple observed during a clean run of
+    /// `raw`. The triples are exactly the resume points the
+    /// coordinator could checkpoint at — Phase 7's contract is
+    /// that each one round-trips to byte-identical output.
+    #[allow(clippy::type_complexity)]
+    fn capture_resume_points(raw: &[u8]) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
+        let mut decoder = Decoder::new(Box::new(Cursor::new(raw.to_vec()))).expect("construct");
+        let mut sink: Vec<u8> = Vec::new();
+        let mut points: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
+        let mut last_boundary: Option<u64> = None;
+        loop {
+            let status = decoder.decode_step(&mut sink).expect("decode");
+            let boundary = decoder.frame_boundary().map(|b| b.get());
+            // Capture once per new boundary observation.
+            if boundary != last_boundary {
+                if let Some(b) = boundary {
+                    if let Some(blob) = decoder.decoder_state() {
+                        points.push((blob, b, sink.clone()));
+                    }
+                }
+                last_boundary = boundary;
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+        points
+    }
+
+    /// Build a multi-block raw deflate stream by concatenating
+    /// hand-built fixed-Huffman blocks, only the last with
+    /// BFINAL=1. Each block emits the corresponding `payloads[i]`
+    /// as literals (no back-references), so block boundaries are
+    /// deterministic and resume tests are reproducible across
+    /// flate2 / miniz_oxide version updates.
+    fn build_multi_block_fixed_huffman_stream(payloads: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        assert!(!payloads.is_empty());
+        let mut w = BitWriter::new();
+        let combined: Vec<u8> = payloads.iter().flat_map(|p| p.iter().copied()).collect();
+        for (i, payload) in payloads.iter().enumerate() {
+            let last = i + 1 == payloads.len();
+            // BFINAL + BTYPE=01.
+            w.write_bits(u32::from(last), 1);
+            w.write_bits(0b01, 2);
+            for &b in *payload {
+                let (c, l) = fixed_litlen_canonical(u16::from(b));
+                w.write_bits(rev(c, l), l);
+            }
+            // EOB.
+            let (eob_c, eob_l) = fixed_litlen_canonical(256);
+            w.write_bits(rev(eob_c, eob_l), eob_l);
+        }
+        (w.finish(), combined)
+    }
+
+    #[test]
+    fn resume_blob_round_trips_byte_identical_at_every_block_boundary() {
+        // Hand-built 5-block fixed-Huffman stream — guaranteed to
+        // produce 4 intermediate block boundaries regardless of
+        // any flate2 / miniz_oxide heuristic. Each block decodes
+        // to a different short payload so we can detect off-by-one
+        // resume errors.
+        let chunks: &[&[u8]] = &[
+            b"first block content; ",
+            b"second is a bit longer than the first; ",
+            b"third has unique tokens 12345 67890; ",
+            b"fourth: more bytes here for good measure!! ",
+            b"fifth and final block to close out.",
+        ];
+        let (raw, payload) = build_multi_block_fixed_huffman_stream(chunks);
+
+        // Sanity: the clean decode matches the original payload.
+        let clean = decode_clean(&raw);
+        assert_eq!(clean, payload);
+
+        // Capture every resume point.
+        let points = capture_resume_points(&raw);
+        assert_eq!(
+            points.len(),
+            chunks.len() - 1,
+            "expected {} intermediate block boundaries",
+            chunks.len() - 1,
+        );
+
+        // Resume from each point and confirm the suffix
+        // round-trips byte-identically.
+        for (i, (blob, boundary, prefix)) in points.iter().enumerate() {
+            let suffix_src = raw[*boundary as usize..].to_vec();
+            let mut resumed: Box<dyn StreamingDecoder> =
+                resume_factory(Box::new(Cursor::new(suffix_src)), blob, *boundary).expect("resume");
+            let mut sink = Vec::new();
+            while resumed.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+            let mut combined = prefix.clone();
+            combined.extend_from_slice(&sink);
+            assert_eq!(
+                combined, payload,
+                "resume point {i} (boundary={boundary}) didn't round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_factory_rejects_blob_with_mismatched_start_offset() {
+        // Capture a blob from a real run, then call resume_factory
+        // with a deliberately wrong start_offset. Hand-built
+        // multi-block stream so the test doesn't depend on flate2
+        // / miniz_oxide block-boundary heuristics.
+        let chunks: &[&[u8]] = &[b"resume mismatch block A ", b"resume mismatch block B "];
+        let (raw, _payload) = build_multi_block_fixed_huffman_stream(chunks);
+        let points = capture_resume_points(&raw);
+        let (blob, boundary, _) = points
+            .first()
+            .expect("at least one resume point on the captured stream");
+        // Wrong start_offset: shift by 1 byte.
+        let bad_offset = boundary + 1;
+        let result = resume_factory(
+            Box::new(Cursor::new(raw[*boundary as usize..].to_vec())),
+            blob,
+            bad_offset,
+        );
+        match result {
+            Err(DecodeError::ResumeMismatch { expected, actual }) => {
+                assert_eq!(expected, *boundary);
+                assert_eq!(actual, bad_offset);
+            }
+            Err(other) => panic!("expected ResumeMismatch, got {other:?}"),
+            Ok(_) => panic!("expected ResumeMismatch, got Ok(decoder)"),
+        }
+    }
+
+    #[test]
+    fn resume_factory_rejects_malformed_blob() {
+        let bogus = vec![0u8; 32];
+        let result = resume_factory(Box::new(Cursor::new(Vec::<u8>::new())), &bogus, 0);
+        match result {
+            Err(DecodeError::Construct(e)) => {
+                assert!(
+                    e.to_string().contains("resume blob rejected"),
+                    "unexpected message: {e}",
+                );
+            }
+            Err(other) => panic!("expected Construct error, got {other:?}"),
+            Ok(_) => panic!("expected Construct error, got Ok(decoder)"),
+        }
+    }
+
+    /// Bit-cursor edge case from the plan: capture a resume point
+    /// where the bit cursor is mid-byte (the next BFINAL bit lives
+    /// in the same source byte as the previous block's EOB code).
+    /// On resume, the bit reader must re-deliver that byte and the
+    /// blob must skip the consumed bits, not the whole byte.
+    ///
+    /// Uses the hand-built fixed-Huffman multi-block helper so
+    /// boundaries land on deterministic bit positions. Each EOB is
+    /// 7 bits long; with 8 bits per byte and BFINAL+BTYPE taking
+    /// 3 bits at the start of each block, most boundaries fall
+    /// mid-byte.
+    #[test]
+    fn resume_at_mid_byte_boundary_reads_shared_byte_again() {
+        let chunks: &[&[u8]] = &[b"a", b"b", b"cd", b"ef", b"ghi", b"jkl"];
+        let (raw, payload) = build_multi_block_fixed_huffman_stream(chunks);
+
+        let points = capture_resume_points(&raw);
+        // Find at least one resume point whose blob carries a
+        // non-zero bit_offset (the mid-byte case).
+        let mut mid_byte_count = 0u32;
+        for (blob, boundary, prefix) in &points {
+            let parsed = resume::DflResumeState::deserialize(blob).expect("parse blob");
+            if parsed.bit_offset != 0 {
+                mid_byte_count += 1;
+                // Resume from this mid-byte boundary.
+                let suffix_src = raw[*boundary as usize..].to_vec();
+                let mut resumed: Box<dyn StreamingDecoder> =
+                    resume_factory(Box::new(Cursor::new(suffix_src)), blob, *boundary)
+                        .expect("resume");
+                let mut sink = Vec::new();
+                while resumed.decode_step(&mut sink).expect("decode") == DecodeStatus::MoreData {}
+                let mut combined = prefix.clone();
+                combined.extend_from_slice(&sink);
+                assert_eq!(
+                    combined, payload,
+                    "mid-byte resume (boundary={boundary}, bit_offset={}) didn't round-trip",
+                    parsed.bit_offset,
+                );
+            }
+        }
+        assert!(
+            mid_byte_count > 0,
+            "expected at least one mid-byte boundary in {} resume points",
+            points.len()
+        );
     }
 }
