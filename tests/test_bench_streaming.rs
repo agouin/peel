@@ -117,6 +117,10 @@ fn encode_zstd(payload: &[u8]) -> Vec<u8> {
     zstd::encode_all(payload, 1).expect("encode zstd")
 }
 
+fn encode_identity(payload: &[u8]) -> Vec<u8> {
+    payload.to_vec()
+}
+
 fn encode_xz(payload: &[u8]) -> Vec<u8> {
     use xz2::stream::{Action, Check, Status, Stream};
     let mut encoder = Stream::new_easy_encoder(6, Check::Crc64).expect("encoder");
@@ -985,6 +989,279 @@ fn diag_tar_xz_breakdown() {
             ov = overlap,
         );
         assert_extracted_tar_matches(&work, &archive);
+    }
+}
+
+// ---- diagnostic: streaming hot-lane source pipeline ------------------
+
+const TEN_GBPS_BYTES_PER_SEC: u64 = 10_000_000_000 / 8;
+
+struct HotLaneFormat {
+    label: &'static str,
+    suffix: &'static str,
+    encode: fn(&[u8]) -> Vec<u8>,
+}
+
+struct HotLaneVariant {
+    label: &'static str,
+    build: fn(CoordinatorConfig) -> CoordinatorConfig,
+}
+
+fn hot_lane_10gbps(mut config: CoordinatorConfig) -> CoordinatorConfig {
+    config.max_bandwidth_bps = Some(TEN_GBPS_BYTES_PER_SEC);
+    config
+}
+
+fn hot_lane_uncapped(config: CoordinatorConfig) -> CoordinatorConfig {
+    config
+}
+
+fn hot_lane_no_checkpoints(mut config: CoordinatorConfig) -> CoordinatorConfig {
+    config.max_bandwidth_bps = Some(TEN_GBPS_BYTES_PER_SEC);
+    config.checkpoint_min_bytes = u64::MAX;
+    config.checkpoint_min_interval = Duration::from_secs(60 * 60);
+    config
+}
+
+fn hot_lane_no_punch(mut config: CoordinatorConfig) -> CoordinatorConfig {
+    config.max_bandwidth_bps = Some(TEN_GBPS_BYTES_PER_SEC);
+    config.punch_threshold = u64::MAX;
+    config
+}
+
+fn hot_lane_tight_reader_poll(mut config: CoordinatorConfig) -> CoordinatorConfig {
+    config.max_bandwidth_bps = Some(TEN_GBPS_BYTES_PER_SEC);
+    config.reader_poll_interval = Duration::ZERO;
+    config
+}
+
+#[cfg(target_os = "linux")]
+fn hot_lane_mmap_10gbps(mut config: CoordinatorConfig) -> CoordinatorConfig {
+    config.max_bandwidth_bps = Some(TEN_GBPS_BYTES_PER_SEC);
+    config.io_backend = peel::io_backend::IoBackendChoice::Mmap;
+    config
+}
+
+#[cfg(target_os = "linux")]
+fn hot_lane_uring_10gbps(mut config: CoordinatorConfig) -> CoordinatorConfig {
+    config.max_bandwidth_bps = Some(TEN_GBPS_BYTES_PER_SEC);
+    config.io_backend = peel::io_backend::IoBackendChoice::Uring;
+    config
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0
+}
+
+fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
+    let secs = elapsed.as_secs_f64();
+    if secs > 0.0 {
+        mib(bytes) / secs
+    } else {
+        0.0
+    }
+}
+
+/// Phase 0 of `docs/PLAN_streaming_hot_lane_throughput.md`: run the
+/// same hot-lane configuration matrix across the streaming tar-family
+/// formats and print a source/download/extraction breakdown.
+///
+/// The rows answer the cross-format ramp question directly: at the
+/// 10 Gbps cap, are we spending the missing time in source bitmap
+/// waits, sparse `pread`, download `pwrite`, checkpoint/punch work, or
+/// decoder/sink time? `default_uncapped` is the control row for "is the
+/// rate limiter itself part of the 10 Gbps ceiling?"
+#[test]
+#[ignore = "diagnostic; opt-in via --ignored"]
+fn diag_streaming_source_pipeline_10gbps() {
+    let archive = build_tar_payload();
+    let formats = &[
+        HotLaneFormat {
+            label: "tar",
+            suffix: "bundle.tar",
+            encode: encode_identity,
+        },
+        HotLaneFormat {
+            label: "tar.zst",
+            suffix: "bundle.tar.zst",
+            encode: encode_zstd,
+        },
+        HotLaneFormat {
+            label: "tar.lz4",
+            suffix: "bundle.tar.lz4",
+            encode: encode_lz4_uncompressed_frame,
+        },
+        HotLaneFormat {
+            label: "tar.xz",
+            suffix: "bundle.tar.xz",
+            encode: encode_xz,
+        },
+    ];
+
+    let variants = vec![
+        HotLaneVariant {
+            label: "default_10gbps_cap",
+            build: hot_lane_10gbps,
+        },
+        HotLaneVariant {
+            label: "default_uncapped",
+            build: hot_lane_uncapped,
+        },
+        HotLaneVariant {
+            label: "no_checkpoints",
+            build: hot_lane_no_checkpoints,
+        },
+        HotLaneVariant {
+            label: "no_punch",
+            build: hot_lane_no_punch,
+        },
+        HotLaneVariant {
+            label: "tight_reader_poll",
+            build: hot_lane_tight_reader_poll,
+        },
+    ];
+    #[cfg(target_os = "linux")]
+    let variants = {
+        let mut variants = variants;
+        variants.push(HotLaneVariant {
+            label: "mmap_10gbps",
+            build: hot_lane_mmap_10gbps,
+        });
+        variants.push(HotLaneVariant {
+            label: "uring_10gbps",
+            build: hot_lane_uring_10gbps,
+        });
+        variants
+    };
+
+    println!(
+        "[diag-hot] {:7} {:18} {:>8} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7}",
+        "format",
+        "variant",
+        "total",
+        "srcMiB/s",
+        "dl",
+        "pwMiB",
+        "pwrite",
+        "rdMiB",
+        "pread",
+        "wait",
+        "waits",
+        "sleeps",
+        "decode",
+        "write",
+        "punch",
+        "chunks",
+        "frames",
+        "quiesc",
+    );
+    // Second header line for the per-checkpoint cost decomposition
+    // emitted alongside each `[diag-hot]` row.
+    // `PLAN_checkpoint_cadence_throughput.md` Phase 0.
+    println!(
+        "[ckpt-hot] {:7} {:18} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7} {:>9} {:>9} {:>7}",
+        "format",
+        "variant",
+        "obs",
+        "spsync",
+        "serial",
+        "tmpwr",
+        "tmpfs",
+        "rename",
+        "dirfs#",
+        "dirfs",
+        "sum",
+        "ckpts",
+    );
+
+    for format in formats {
+        let body = (format.encode)(&archive);
+        let body_len = body.len() as u64;
+        let server = MockServer::start(ok_handler(body));
+
+        for variant in &variants {
+            let work = unique_dir(&format!(
+                "diag_hot_{}_{}",
+                format.label.replace('.', "_"),
+                variant.label
+            ));
+            let _g = CleanupDir(work.clone());
+            let args = RunArgs {
+                url: format!("{}/{}", server.base_url(), format.suffix),
+                output: OutputTarget::Dir(work.clone()),
+                config: (variant.build)(coord_config()),
+                client: build_client(),
+                registry: DecoderRegistry::with_defaults(),
+                progress: None,
+                progress_state: None,
+                kill_switch: None,
+                io_backend: None,
+            };
+            let stats = match run(args) {
+                Ok(stats) => stats,
+                Err(e) => {
+                    println!(
+                        "[diag-hot] {:7} {:18} [skip] {e}",
+                        format.label, variant.label
+                    );
+                    continue;
+                }
+            };
+            assert_extracted_tar_matches(&work, &archive);
+            println!(
+                "[diag-hot] {fmt:7} {var:18} {tot:>7.3}s {src:>9.1} {dl:>7.3}s \
+                 {pw_mib:>8.1} {pw:>7.3}s {rd_mib:>8.1} {rd:>7.3}s {wait:>7.3}s \
+                 {waits:>7} {sleeps:>7} {dec:>7.3}s {wr:>7.3}s {pn:>7.3}s \
+                 {chunks:>7} {frames:>7} {quiesc:>7}",
+                fmt = format.label,
+                var = variant.label,
+                tot = stats.elapsed.as_secs_f64(),
+                src = mib_per_sec(body_len, stats.elapsed),
+                dl = stats.download.elapsed.as_secs_f64(),
+                pw_mib = mib(stats.download.pwrite_bytes),
+                pw = stats.download.pwrite_time.as_secs_f64(),
+                rd_mib = mib(stats.extraction.source_sparse_read_bytes),
+                rd = stats.extraction.source_sparse_read_time.as_secs_f64(),
+                wait = stats.extraction.source_wait_time.as_secs_f64(),
+                waits = stats.extraction.source_wait_count,
+                sleeps = stats.extraction.source_poll_sleeps,
+                dec = stats.extraction.decode_time.as_secs_f64(),
+                wr = stats.extraction.write_time.as_secs_f64(),
+                pn = stats.extraction.punch_time.as_secs_f64(),
+                chunks = stats.download.chunks_completed,
+                frames = stats.extraction.frame_boundaries_observed,
+                quiesc = stats.extraction.quiescent_checkpoints,
+            );
+            // Per-checkpoint cost decomposition. The per-step
+            // columns are non-overlapping; `sum` is their total
+            // and should match `obs` within syscall-noise. A
+            // material gap means a stage isn't being timed.
+            // `PLAN_checkpoint_cadence_throughput.md` Phase 0.
+            let e = &stats.extraction;
+            let sum = e.ckpt_sparse_sync_time
+                + e.ckpt_serialize_time
+                + e.ckpt_tmp_write_time
+                + e.ckpt_tmp_fsync_time
+                + e.ckpt_rename_time
+                + e.ckpt_dir_fsync_time;
+            println!(
+                "[ckpt-hot] {fmt:7} {var:18} {obs:>7.3}s {spsync:>8.3}s \
+                 {serial:>8.3}s {tmpwr:>8.3}s {tmpfs:>8.3}s {rename:>8.3}s \
+                 {dfs_n:>7} {dfs:>8.3}s {sum:>8.3}s {ckpts:>7}",
+                fmt = format.label,
+                var = variant.label,
+                obs = e.ckpt_observer_time.as_secs_f64(),
+                spsync = e.ckpt_sparse_sync_time.as_secs_f64(),
+                serial = e.ckpt_serialize_time.as_secs_f64(),
+                tmpwr = e.ckpt_tmp_write_time.as_secs_f64(),
+                tmpfs = e.ckpt_tmp_fsync_time.as_secs_f64(),
+                rename = e.ckpt_rename_time.as_secs_f64(),
+                dfs_n = e.ckpt_dir_fsync_calls,
+                dfs = e.ckpt_dir_fsync_time.as_secs_f64(),
+                sum = sum.as_secs_f64(),
+                ckpts = e.quiescent_checkpoints,
+            );
+        }
     }
 }
 

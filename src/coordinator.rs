@@ -71,18 +71,23 @@
 //! both depend on this ordering.
 //!
 //! Bytes are *not* durable across a SIGKILL until either
-//! [`SparseFile::sync_all`] runs (the checkpoint observer calls it
-//! before persisting the `.peel.ckpt`) or the OS flushes the page
-//! cache asynchronously. The bitmap-in-memory may therefore claim a
-//! chunk complete that, after a crash, the kernel never wrote to
-//! disk. The next run's resume loads only the **persisted**
-//! checkpoint's bitmap, which is `sync_all`-clean by construction;
-//! any chunk that was complete in memory but missed the
-//! `sync_all` reverts to "not complete" on resume and is re-fetched
+//! [`SparseFile::order_writes`] runs (the checkpoint observer calls
+//! it before persisting the `.peel.ckpt`; on macOS this is
+//! `F_BARRIERFSYNC`, on Linux `fdatasync(2)`) or the OS flushes the
+//! page cache asynchronously. The barrier guarantees ordering: any
+//! page the bitmap claims durable in a checkpoint is on stable
+//! storage no later than the rename that publishes the checkpoint.
+//! Pre-Phase 1 of `PLAN_checkpoint_cadence_throughput.md` this was a
+//! full `sync_all`; the contract resume relies on (rename-observable
+//! ⇒ pages durable) is identical. The next run's resume loads only
+//! the **persisted** checkpoint's bitmap, which is barrier-clean by
+//! construction; any chunk that was complete in memory but missed
+//! the barrier reverts to "not complete" on resume and is re-fetched
 //! cleanly. The `.peel.part` file's bytes for those chunks are
-//! either the genuine bytes (if they raced past the cache before
-//! the crash) or zero (if not) — and the fresh fetch overwrites
-//! either case.
+//! either the genuine bytes (if they raced past the cache before the
+//! crash) or zero (if not) — and the §11 chunk CRC-32C check on
+//! resume catches any corruption either way; the fresh fetch
+//! overwrites the cells.
 //!
 //! ### What `decoder_position` guarantees
 //!
@@ -363,9 +368,9 @@ pub enum ProgressEvent<'a> {
     /// The run finished cleanly.
     Finished {
         /// Aggregated download statistics.
-        download: DownloadStats,
+        download: &'a DownloadStats,
         /// Aggregated extraction statistics.
-        extraction: ExtractionStats,
+        extraction: &'a ExtractionStats,
     },
 }
 
@@ -1090,6 +1095,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     &ckpt_path,
                     reader_start,
                 )?;
+                let source_metrics = Arc::new(SourceReadMetrics::default());
                 let reader = BlockingSparseReader::new(
                     Arc::clone(&sparse),
                     Arc::clone(&bitmap),
@@ -1099,7 +1105,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     Arc::clone(&download_done),
                     Arc::clone(&download_outcome),
                     config.reader_poll_interval,
-                );
+                )
+                .with_source_metrics(Arc::clone(&source_metrics));
                 let reader = match progress_state.clone() {
                     Some(state) => reader.with_progress(state),
                     None => reader,
@@ -1183,7 +1190,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 };
 
                 let hasher_handle = hasher_setup.as_ref().map(|s| Arc::clone(&s.hasher));
-                let stats = match &output {
+                let mut stats = match &output {
                     OutputTarget::File(path) => {
                         let sink = build_raw_sink(path, &resume_plan)?;
                         run_one(
@@ -1225,6 +1232,12 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                         )?
                     }
                 };
+                let source_snapshot = source_metrics.snapshot();
+                stats.source_sparse_read_bytes = source_snapshot.sparse_read_bytes;
+                stats.source_sparse_read_time = source_snapshot.sparse_read_time;
+                stats.source_wait_time = source_snapshot.wait_time;
+                stats.source_wait_count = source_snapshot.wait_count;
+                stats.source_poll_sleeps = source_snapshot.poll_sleeps;
 
                 // Drop the decoder before finalizing the hasher: the
                 // decoder owns the HashingReader, which holds a
@@ -1316,8 +1329,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 
     if let Some(cb) = progress.as_mut() {
         cb(ProgressEvent::Finished {
-            download: outcome.download.clone(),
-            extraction: outcome.extraction,
+            download: &outcome.download,
+            extraction: &outcome.extraction,
         });
     }
 
@@ -1533,6 +1546,54 @@ fn build_tar_sink(path: &Path, plan: &ResumePlan) -> Result<TarSink, Coordinator
     TarSink::new(path).map_err(CoordinatorError::Sink)
 }
 
+/// Per-step accumulator for the checkpoint observer's wall-clock cost.
+///
+/// `PLAN_checkpoint_cadence_throughput.md` Phase 0 needs the per-step
+/// breakdown to attribute the per-checkpoint stall to a specific
+/// syscall. The fields are non-overlapping; the run loop sums them
+/// across every observer invocation and merges them into the
+/// extractor's [`ExtractionStats`] before the function returns.
+#[derive(Debug, Default, Clone, Copy)]
+struct CheckpointObserverStats {
+    sparse_sync_time: Duration,
+    sparse_sync_calls: u64,
+    serialize_time: Duration,
+    tmp_write_time: Duration,
+    tmp_fsync_time: Duration,
+    rename_time: Duration,
+    dir_fsync_time: Duration,
+    dir_fsync_calls: u64,
+    observer_time: Duration,
+}
+
+impl CheckpointObserverStats {
+    fn merge_into(&self, stats: &mut ExtractionStats) {
+        stats.ckpt_sparse_sync_time = stats
+            .ckpt_sparse_sync_time
+            .saturating_add(self.sparse_sync_time);
+        stats.ckpt_sparse_sync_calls = stats
+            .ckpt_sparse_sync_calls
+            .saturating_add(self.sparse_sync_calls);
+        stats.ckpt_serialize_time = stats
+            .ckpt_serialize_time
+            .saturating_add(self.serialize_time);
+        stats.ckpt_tmp_write_time = stats
+            .ckpt_tmp_write_time
+            .saturating_add(self.tmp_write_time);
+        stats.ckpt_tmp_fsync_time = stats
+            .ckpt_tmp_fsync_time
+            .saturating_add(self.tmp_fsync_time);
+        stats.ckpt_rename_time = stats.ckpt_rename_time.saturating_add(self.rename_time);
+        stats.ckpt_dir_fsync_time = stats
+            .ckpt_dir_fsync_time
+            .saturating_add(self.dir_fsync_time);
+        stats.ckpt_dir_fsync_calls = stats
+            .ckpt_dir_fsync_calls
+            .saturating_add(self.dir_fsync_calls);
+        stats.ckpt_observer_time = stats.ckpt_observer_time.saturating_add(self.observer_time);
+    }
+}
+
 /// Internal: drive the extractor with a checkpoint-writing observer.
 #[allow(clippy::too_many_arguments)]
 fn run_one<S: Sink>(
@@ -1554,6 +1615,7 @@ fn run_one<S: Sink>(
 ) -> Result<ExtractionStats, CoordinatorError> {
     let mut progress_inner = progress;
     let mut checkpoints_written: u64 = 0;
+    let mut obs_stats = CheckpointObserverStats::default();
 
     let result = extractor.extract_with_callback(
         sparse.as_fd(),
@@ -1576,14 +1638,28 @@ fn run_one<S: Sink>(
                 }
             }
 
-            // Flush the sparse file's pending writes so the bitmap's
-            // claim of "this chunk is durable" is honest. This is
-            // best-effort; a failure here surfaces to the extractor as
-            // an Observer error.
-            sparse
-                .sync_all()
-                .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
+            let observer_start = Instant::now();
 
+            // Phase 1 of `PLAN_checkpoint_cadence_throughput.md`:
+            // order writes instead of full fsync. The checkpoint
+            // about to be written is a publication event; the resume
+            // contract is "if the renamed `.peel.ckpt` is observed by
+            // a future run, every page the bitmap claims durable is
+            // at least as durable as the checkpoint", and an ordering
+            // barrier is the right primitive for that. The
+            // clean-completion path below still issues a full
+            // `sync_all` before returning so the post-run state is
+            // device-flushed.
+            let sparse_sync_start = Instant::now();
+            let sparse_sync_result = sparse.order_writes();
+            obs_stats.sparse_sync_time = obs_stats
+                .sparse_sync_time
+                .saturating_add(sparse_sync_start.elapsed());
+            obs_stats.sparse_sync_calls = obs_stats.sparse_sync_calls.saturating_add(1);
+            sparse_sync_result
+                .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+
+            let serialize_prep_start = Instant::now();
             let sink_state = info_cb.sink_state.clone();
             let hash_state = snapshot_hash_state(hasher_for_ckpt);
             let chunk_crc32c = if fingerprints.is_empty() {
@@ -1605,8 +1681,32 @@ fn run_one<S: Sink>(
                 chunk_crc32c,
                 decoder_state: info_cb.decoder_state.clone(),
             };
-            ckpt.write(ckpt_path)
+            let prep_time = serialize_prep_start.elapsed();
+            let write_timings = ckpt
+                .write_timed(ckpt_path)
                 .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+            // Bucket the prep clones together with the body
+            // serialize so the diagnostic's `serialize` column
+            // reflects everything that pre-builds the on-disk image,
+            // not just the binary frame itself.
+            obs_stats.serialize_time = obs_stats
+                .serialize_time
+                .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+            obs_stats.tmp_write_time = obs_stats
+                .tmp_write_time
+                .saturating_add(write_timings.tmp_write_time);
+            obs_stats.tmp_fsync_time = obs_stats
+                .tmp_fsync_time
+                .saturating_add(write_timings.tmp_fsync_time);
+            obs_stats.rename_time = obs_stats
+                .rename_time
+                .saturating_add(write_timings.rename_time);
+            obs_stats.dir_fsync_time = obs_stats
+                .dir_fsync_time
+                .saturating_add(write_timings.dir_fsync_time);
+            if write_timings.dir_fsync_called {
+                obs_stats.dir_fsync_calls = obs_stats.dir_fsync_calls.saturating_add(1);
+            }
 
             checkpoints_written = checkpoints_written.saturating_add(1);
             if let Some(cb) = progress_inner.as_deref_mut() {
@@ -1616,6 +1716,9 @@ fn run_one<S: Sink>(
                     bytes_out: info_cb.bytes_out,
                 });
             }
+            obs_stats.observer_time = obs_stats
+                .observer_time
+                .saturating_add(observer_start.elapsed());
             Ok(())
         },
     );
@@ -1623,7 +1726,10 @@ fn run_one<S: Sink>(
     // Avoid unused-variable warnings even when no `Err` path runs.
     let _ = part_path;
     match result {
-        Ok(stats) => Ok(stats),
+        Ok(mut stats) => {
+            obs_stats.merge_into(&mut stats);
+            Ok(stats)
+        }
         Err(ExtractorError::Observer(e)) if e.to_string() == KILL_SENTINEL => {
             Err(CoordinatorError::Aborted {
                 checkpoints_written,
@@ -1743,6 +1849,7 @@ fn run_zip(
     let mut entries_completed: Vec<u32> = resume.entries_completed.clone();
     let mut entries_extracted_this_run: u64 = 0;
     let mut checkpoints_written: u64 = 0;
+    let mut obs_stats = CheckpointObserverStats::default();
 
     let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
         // Kill-switch fires before any state mutation so the
@@ -1784,9 +1891,18 @@ fn run_zip(
                 {
                     return Ok(());
                 }
-                sparse
-                    .sync_all()
-                    .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
+                let observer_start = Instant::now();
+                // Phase 1: barrier-style publication. See run_one for
+                // the full rationale.
+                let sparse_sync_start = Instant::now();
+                let sparse_sync_result = sparse.order_writes();
+                obs_stats.sparse_sync_time = obs_stats
+                    .sparse_sync_time
+                    .saturating_add(sparse_sync_start.elapsed());
+                obs_stats.sparse_sync_calls = obs_stats.sparse_sync_calls.saturating_add(1);
+                sparse_sync_result
+                    .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+                let serialize_prep_start = Instant::now();
                 let chunk_crc32c = if fingerprints.is_empty() {
                     None
                 } else {
@@ -1811,8 +1927,28 @@ fn run_zip(
                     chunk_crc32c,
                     decoder_state: None,
                 };
-                ckpt.write(ckpt_path)
+                let prep_time = serialize_prep_start.elapsed();
+                let write_timings = ckpt
+                    .write_timed(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+                obs_stats.serialize_time = obs_stats
+                    .serialize_time
+                    .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+                obs_stats.tmp_write_time = obs_stats
+                    .tmp_write_time
+                    .saturating_add(write_timings.tmp_write_time);
+                obs_stats.tmp_fsync_time = obs_stats
+                    .tmp_fsync_time
+                    .saturating_add(write_timings.tmp_fsync_time);
+                obs_stats.rename_time = obs_stats
+                    .rename_time
+                    .saturating_add(write_timings.rename_time);
+                obs_stats.dir_fsync_time = obs_stats
+                    .dir_fsync_time
+                    .saturating_add(write_timings.dir_fsync_time);
+                if write_timings.dir_fsync_called {
+                    obs_stats.dir_fsync_calls = obs_stats.dir_fsync_calls.saturating_add(1);
+                }
                 last_write_at = Instant::now();
                 last_progress = in_flight_progress;
                 checkpoints_written = checkpoints_written.saturating_add(1);
@@ -1823,6 +1959,9 @@ fn run_zip(
                         bytes_out: in_flight_progress,
                     });
                 }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
                 Ok(())
             }
             ZipPipelineEvent::EntryFinished {
@@ -1855,12 +1994,20 @@ fn run_zip(
                     return Ok(());
                 }
 
-                // Flush the sparse file's pending writes so the
-                // bitmap claim of "this chunk is durable" is honest.
-                sparse
-                    .sync_all()
-                    .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
+                let observer_start = Instant::now();
 
+                // Phase 1: barrier-style publication. See run_one for
+                // the full rationale.
+                let sparse_sync_start = Instant::now();
+                let sparse_sync_result = sparse.order_writes();
+                obs_stats.sparse_sync_time = obs_stats
+                    .sparse_sync_time
+                    .saturating_add(sparse_sync_start.elapsed());
+                obs_stats.sparse_sync_calls = obs_stats.sparse_sync_calls.saturating_add(1);
+                sparse_sync_result
+                    .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+
+                let serialize_prep_start = Instant::now();
                 let chunk_crc32c = if fingerprints.is_empty() {
                     None
                 } else {
@@ -1898,8 +2045,28 @@ fn run_zip(
                     // [`Checkpoint::decoder_state`] field. Phase 9b.
                     decoder_state: None,
                 };
-                ckpt.write(ckpt_path)
+                let prep_time = serialize_prep_start.elapsed();
+                let write_timings = ckpt
+                    .write_timed(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+                obs_stats.serialize_time = obs_stats
+                    .serialize_time
+                    .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+                obs_stats.tmp_write_time = obs_stats
+                    .tmp_write_time
+                    .saturating_add(write_timings.tmp_write_time);
+                obs_stats.tmp_fsync_time = obs_stats
+                    .tmp_fsync_time
+                    .saturating_add(write_timings.tmp_fsync_time);
+                obs_stats.rename_time = obs_stats
+                    .rename_time
+                    .saturating_add(write_timings.rename_time);
+                obs_stats.dir_fsync_time = obs_stats
+                    .dir_fsync_time
+                    .saturating_add(write_timings.dir_fsync_time);
+                if write_timings.dir_fsync_called {
+                    obs_stats.dir_fsync_calls = obs_stats.dir_fsync_calls.saturating_add(1);
+                }
 
                 last_write_at = Instant::now();
                 last_progress = bytes_extracted_total;
@@ -1911,6 +2078,9 @@ fn run_zip(
                         bytes_out: bytes_extracted_total,
                     });
                 }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
                 Ok(())
             }
         }
@@ -1923,7 +2093,7 @@ fn run_zip(
             // ExtractionStats shape the rest of the coordinator
             // returns. Some fields don't have a natural ZIP
             // counterpart and stay zero.
-            Ok(ExtractionStats {
+            let mut out = ExtractionStats {
                 bytes_in: total_size,
                 bytes_out: stats.bytes_written,
                 bytes_punched: stats.bytes_punched,
@@ -1934,7 +2104,10 @@ fn run_zip(
                 decode_time: Duration::default(),
                 write_time: Duration::default(),
                 punch_time: Duration::default(),
-            })
+                ..ExtractionStats::default()
+            };
+            obs_stats.merge_into(&mut out);
+            Ok(out)
         }
         Err(ZipPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
             Err(CoordinatorError::Aborted {
@@ -2434,6 +2607,58 @@ fn filename_from_url(url: &Url) -> Option<String> {
     }
 }
 
+#[derive(Debug, Default)]
+struct SourceReadMetrics {
+    sparse_read_bytes: AtomicU64,
+    sparse_read_time_ns: AtomicU64,
+    wait_time_ns: AtomicU64,
+    wait_count: AtomicU64,
+    poll_sleeps: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SourceReadMetricsSnapshot {
+    sparse_read_bytes: u64,
+    sparse_read_time: Duration,
+    wait_time: Duration,
+    wait_count: u64,
+    poll_sleeps: u64,
+}
+
+impl SourceReadMetrics {
+    fn record_sparse_read(&self, bytes: u64, elapsed: Duration) {
+        self.sparse_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.sparse_read_time_ns
+            .fetch_add(duration_nanos_u64(elapsed), Ordering::Relaxed);
+    }
+
+    fn record_wait(&self, elapsed: Duration) {
+        self.wait_count.fetch_add(1, Ordering::Relaxed);
+        self.wait_time_ns
+            .fetch_add(duration_nanos_u64(elapsed), Ordering::Relaxed);
+    }
+
+    fn record_poll_sleep(&self) {
+        self.poll_sleeps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SourceReadMetricsSnapshot {
+        SourceReadMetricsSnapshot {
+            sparse_read_bytes: self.sparse_read_bytes.load(Ordering::Relaxed),
+            sparse_read_time: Duration::from_nanos(
+                self.sparse_read_time_ns.load(Ordering::Relaxed),
+            ),
+            wait_time: Duration::from_nanos(self.wait_time_ns.load(Ordering::Relaxed)),
+            wait_count: self.wait_count.load(Ordering::Relaxed),
+            poll_sleeps: self.poll_sleeps.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// `Read` adapter that feeds the decoder from the sparse file,
 /// blocking when the chunk it needs hasn't been downloaded yet.
 ///
@@ -2460,6 +2685,9 @@ pub struct BlockingSparseReader {
     /// matcher maps it to [`CoordinatorError::Aborted`]
     /// (`PLAN_responsiveness.md` §2.1).
     kill_switch: Option<Arc<AtomicBool>>,
+    /// Optional passive counters used by throughput diagnostics to
+    /// split source-side sparse reads from bitmap waits.
+    source_metrics: Option<Arc<SourceReadMetrics>>,
 }
 
 impl BlockingSparseReader {
@@ -2489,6 +2717,7 @@ impl BlockingSparseReader {
             poll_interval,
             progress_state: None,
             kill_switch: None,
+            source_metrics: None,
         }
     }
 
@@ -2513,6 +2742,13 @@ impl BlockingSparseReader {
     #[must_use]
     fn with_kill_switch(mut self, kill: Arc<AtomicBool>) -> Self {
         self.kill_switch = Some(kill);
+        self
+    }
+
+    /// Attach passive source-read instrumentation for diagnostics.
+    #[must_use]
+    fn with_source_metrics(mut self, metrics: Arc<SourceReadMetrics>) -> Self {
+        self.source_metrics = Some(metrics);
         self
     }
 }
@@ -2561,6 +2797,7 @@ impl Read for BlockingSparseReader {
         let read_started = Instant::now();
         let mut last_dump_at: Option<Instant> = None;
         let dump_interval = Duration::from_secs(30);
+        let mut wait_started: Option<Instant> = None;
         loop {
             let pos = self.cursor.load(Ordering::Acquire);
             if pos >= self.total_size {
@@ -2575,7 +2812,15 @@ impl Read for BlockingSparseReader {
             }
             let chunk_idx = (pos / self.chunk_size) as u32;
             if !self.bitmap.is_complete(ChunkIndex::new(chunk_idx)) {
+                if wait_started.is_none() {
+                    wait_started = Some(Instant::now());
+                }
                 if self.download_done.load(Ordering::Acquire) {
+                    if let (Some(metrics), Some(started)) =
+                        (self.source_metrics.as_ref(), wait_started.take())
+                    {
+                        metrics.record_wait(started.elapsed());
+                    }
                     if let Ok(mut slot) = self.download_outcome.lock() {
                         if let Some(Err(e)) = slot.take() {
                             // Wrap the typed scheduler error as the io::Error
@@ -2640,11 +2885,24 @@ impl Read for BlockingSparseReader {
                 // `poll_interval` (default 5 ms).
                 if let Some(flag) = self.kill_switch.as_ref() {
                     if flag.load(Ordering::Acquire) {
+                        if let (Some(metrics), Some(started)) =
+                            (self.source_metrics.as_ref(), wait_started.take())
+                        {
+                            metrics.record_wait(started.elapsed());
+                        }
                         return Err(io::Error::other(KILL_SENTINEL));
                     }
                 }
+                if let Some(metrics) = self.source_metrics.as_ref() {
+                    metrics.record_poll_sleep();
+                }
                 thread::sleep(self.poll_interval);
                 continue;
+            }
+            if let (Some(metrics), Some(started)) =
+                (self.source_metrics.as_ref(), wait_started.take())
+            {
+                metrics.record_wait(started.elapsed());
             }
 
             let want = self.total_size.saturating_sub(pos).min(buf.len() as u64) as usize;
@@ -2660,10 +2918,14 @@ impl Read for BlockingSparseReader {
             if want == 0 {
                 return Ok(0);
             }
+            let sparse_read_started = Instant::now();
             let n = self
                 .sparse
                 .read_at(ByteOffset::new(pos), &mut buf[..want])
                 .map_err(|e| io::Error::other(format!("sparse read: {e}")))?;
+            if let Some(metrics) = self.source_metrics.as_ref() {
+                metrics.record_sparse_read(n as u64, sparse_read_started.elapsed());
+            }
             if n == 0 {
                 // Defensive: the sparse file is sized to total_size, so
                 // a short read of zero here is unexpected. Surface as

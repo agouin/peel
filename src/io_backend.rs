@@ -158,6 +158,33 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     /// Returns the underlying [`io::Error`] for any OS-level failure.
     fn sync_all(&self, fd: BorrowedFd<'_>) -> io::Result<()>;
 
+    /// Order pending writes against a subsequent durability event,
+    /// without forcing a device-level flush.
+    ///
+    /// `PLAN_checkpoint_cadence_throughput.md` Phase 1. The contract:
+    /// when this call returns, every `pwrite` issued before it on the
+    /// same file is guaranteed to hit stable storage *no later than*
+    /// any write issued after it. The pre-barrier writes may not be
+    /// on disk yet — only the *ordering* against post-barrier writes
+    /// is guaranteed.
+    ///
+    /// On macOS (APFS) this is `fcntl(F_BARRIERFSYNC)`. On Linux this
+    /// is `fdatasync(2)`, which omits the metadata flush a full
+    /// `fsync` would issue (safe for our pwrite-only workload where
+    /// file size and mode don't change between syncs). The default
+    /// impl falls through to [`Self::sync_all`] for backends that
+    /// don't have a cheaper ordering primitive.
+    ///
+    /// Callers that need a literal device flush (e.g. a clean-run
+    /// completion sweep) must keep using [`Self::sync_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] for any OS-level failure.
+    fn order_writes(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        self.sync_all(fd)
+    }
+
     /// Open a TCP connection to `addr` and return a [`NetStream`]
     /// honoring `config`'s timeouts and `nodelay`.
     ///
@@ -369,6 +396,10 @@ impl IoBackend for BlockingBackend {
         with_file(fd, File::sync_all)
     }
 
+    fn order_writes(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        order_writes_blocking(fd)
+    }
+
     fn connect(&self, addr: SocketAddr, config: &SocketConfig) -> io::Result<Box<dyn NetStream>> {
         let tcp = TcpStream::connect_timeout(&addr, config.connect_timeout)?;
         tcp.set_read_timeout(config.read_timeout)?;
@@ -396,6 +427,70 @@ fn with_file<R>(fd: BorrowedFd<'_>, f: impl FnOnce(&File) -> R) -> R {
     // `File`, so it cannot escape the wrapper.
     let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
     f(&file)
+}
+
+/// Platform-specific implementation of the
+/// [`IoBackend::order_writes`] contract for the blocking backend.
+///
+/// macOS: `fcntl(fd, F_BARRIERFSYNC)`. APFS guarantees that pre-barrier
+/// writes hit stable storage before post-barrier writes; the call
+/// returns without waiting for the pre-barrier writes to finish, so it
+/// is dramatically cheaper than `F_FULLFSYNC` (the syscall `File::sync_all`
+/// issues on Darwin).
+///
+/// Linux: `fdatasync(fd)`. We never change file size or mode between
+/// publication points (workers `pwrite_all_at` into a pre-fallocated
+/// sparse region; the checkpoint `.tmp` is opened, written, then
+/// renamed without truncation), so dropping the metadata flush a full
+/// `fsync` would do is safe.
+///
+/// Other Unix: full `sync_all`.
+pub(crate) fn order_writes_blocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin: F_BARRIERFSYNC = 85. Defined in
+        // <sys/fcntl.h>; we declare the constant locally rather than
+        // pulling in `libc`, matching the same pattern
+        // `src/punch.rs::macos::F_PUNCHHOLE` uses.
+        const F_BARRIERFSYNC: i32 = 85;
+        // SAFETY: `fcntl` is variadic at the C level. Darwin's
+        // F_BARRIERFSYNC takes no extra arguments, so the variadic
+        // slot is unused. `BorrowedFd<'_>` guarantees the descriptor
+        // is open for the duration of the call.
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        let rc = unsafe { fcntl(fd.as_raw_fd(), F_BARRIERFSYNC) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            // EINVAL on filesystems that don't implement the barrier
+            // (some non-APFS volumes, network mounts). Fall back to a
+            // full sync so the publication contract still holds.
+            if err.raw_os_error() == Some(22) {
+                return with_file(fd, File::sync_all);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn fdatasync(fd: i32) -> i32;
+        }
+        // SAFETY: `BorrowedFd<'_>` guarantees the descriptor is open
+        // for the duration of the call. `fdatasync` takes only the
+        // fd; on success it returns 0, on failure -1 with errno set.
+        let rc = unsafe { fdatasync(fd.as_raw_fd()) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        with_file(fd, File::sync_all)
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +602,31 @@ mod tests {
         let (file, _cleanup) = open_temp("sync_all", 32);
         let backend = BlockingBackend::new();
         backend.sync_all(file.as_fd()).expect("sync_all");
+    }
+
+    #[test]
+    fn order_writes_succeeds_on_regular_file() {
+        // `PLAN_checkpoint_cadence_throughput.md` Phase 1: the
+        // blocking backend's `order_writes` resolves to
+        // `F_BARRIERFSYNC` on macOS, `fdatasync` on Linux, and a
+        // full `sync_all` elsewhere. All three paths must succeed
+        // on a freshly-truncated regular file.
+        let (file, _cleanup) = open_temp("order_writes", 32);
+        let backend = BlockingBackend::new();
+        backend.order_writes(file.as_fd()).expect("order_writes");
+    }
+
+    #[test]
+    fn order_writes_succeeds_after_pwrite() {
+        // Same as `order_writes_succeeds_on_regular_file` but with a
+        // pwrite first, exercising the realistic "publish recent
+        // writes" code path.
+        let (file, _cleanup) = open_temp("order_writes_after_pwrite", 64);
+        let backend = BlockingBackend::new();
+        backend
+            .pwrite_all_at(file.as_fd(), 0, b"hello world\n")
+            .expect("pwrite");
+        backend.order_writes(file.as_fd()).expect("order_writes");
     }
 
     #[test]

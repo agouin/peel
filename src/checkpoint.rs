@@ -93,7 +93,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -169,6 +169,34 @@ const SINK_TAG_ZIP: u8 = 2;
 /// a hostile checkpoint can trigger before
 /// [`Checkpoint::deserialize`] checks the body checksum.
 pub const MAX_DECODER_STATE_LEN: u32 = (1 << 27) + 32 * 1024;
+
+/// Per-step wall-clock timings for one [`Checkpoint::write_timed`]
+/// call.
+///
+/// Each field measures one stage of the atomic-write sequence so
+/// `PLAN_checkpoint_cadence_throughput.md` Phase 0 can attribute the
+/// per-checkpoint stall to a specific syscall. The fields are
+/// non-overlapping; their sum is the wall-clock spent inside
+/// `write_timed`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CheckpointWriteTimings {
+    /// Time to serialize the [`Checkpoint`] body into a `Vec<u8>`.
+    pub serialize_time: Duration,
+    /// Time from `OpenOptions::open(.tmp)` through the final
+    /// `write_all` (no `fsync`).
+    pub tmp_write_time: Duration,
+    /// Time spent inside `File::sync_all` on the `.tmp` file.
+    pub tmp_fsync_time: Duration,
+    /// Time spent inside `fs::rename(.tmp, path)`.
+    pub rename_time: Duration,
+    /// Time spent inside `File::sync_all` on the parent directory.
+    /// Zero when [`Self::dir_fsync_called`] is `false` (parent open
+    /// failed, parent path was empty, or we're on a platform that
+    /// can't fsync directories).
+    pub dir_fsync_time: Duration,
+    /// Whether the parent-directory `sync_all` was attempted.
+    pub dir_fsync_called: bool,
+}
 
 /// Errors produced by [`Checkpoint::read`] / [`Checkpoint::write`] and
 /// the in-memory [`Checkpoint::deserialize`] / [`Checkpoint::serialize`]
@@ -983,9 +1011,48 @@ impl Checkpoint {
     /// `path` set to the file involved (the temp file or the parent
     /// directory, as appropriate).
     pub fn write(&self, path: &Path) -> Result<(), CheckpointError> {
+        self.write_timed(path).map(drop)
+    }
+
+    /// Same contract as [`Self::write`], but returns a per-step timing
+    /// breakdown for diagnostics. `PLAN_checkpoint_cadence_throughput.md`
+    /// Phase 0 uses this to attribute the per-checkpoint stall to a
+    /// specific syscall (serialize / `pwrite` of `.tmp` / `fsync` of
+    /// `.tmp` / `rename` / parent-directory `fsync`).
+    ///
+    /// Phase 1 changed two stages:
+    ///
+    /// * The `.tmp` file is published with
+    ///   [`crate::io_backend::order_writes_blocking`] (macOS:
+    ///   `F_BARRIERFSYNC`; Linux: `fdatasync`) instead of a full
+    ///   `File::sync_all`. The barrier guarantees that pre-barrier
+    ///   writes hit stable storage *no later than* the subsequent
+    ///   `rename`, which is what publication needs: if a future run
+    ///   sees the renamed `path`, the body bytes the rename promotes
+    ///   are at least as durable as the rename itself.
+    /// * The parent-directory `fsync` only fires when this rename
+    ///   *creates* a new directory entry (i.e. `path` did not exist
+    ///   before the call). Subsequent writes target an existing entry
+    ///   that the rename replaces atomically; the directory inode the
+    ///   first write made durable doesn't need another flush.
+    pub fn write_timed(&self, path: &Path) -> Result<CheckpointWriteTimings, CheckpointError> {
+        let mut t = CheckpointWriteTimings::default();
+
+        let serialize_start = Instant::now();
         let bytes = self.serialize();
+        t.serialize_time = serialize_start.elapsed();
+
         let tmp_path = tmp_path_for(path);
 
+        // Snapshot existence *before* the rename so we know whether
+        // this call creates the directory entry or replaces an
+        // existing one. `try_exists()` keeps races and permission
+        // errors observable; on either kind of error we err on the
+        // side of doing the parent-dir fsync (correct, just not
+        // optimal).
+        let path_existed_before = path.try_exists().unwrap_or(false);
+
+        let tmp_write_start = Instant::now();
         // Open the temp file: create or truncate so a stale .tmp from
         // a previous crash is overwritten cleanly.
         let mut file = OpenOptions::new()
@@ -1003,35 +1070,69 @@ impl Checkpoint {
                 path: tmp_path.clone(),
                 source,
             })?;
-        file.sync_all().map_err(|source| CheckpointError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
+        t.tmp_write_time = tmp_write_start.elapsed();
+
+        let tmp_fsync_start = Instant::now();
+        // Phase 1: barrier instead of full fsync. Ordered against
+        // the subsequent `rename`, which is exactly what publication
+        // needs. On Unix this resolves to `F_BARRIERFSYNC` (macOS) or
+        // `fdatasync` (Linux); on platforms without an ordering
+        // primitive we fall back to `File::sync_all` so the
+        // publication contract still holds.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            crate::io_backend::order_writes_blocking(file.as_fd()).map_err(|source| {
+                CheckpointError::Io {
+                    path: tmp_path.clone(),
+                    source,
+                }
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            file.sync_all().map_err(|source| CheckpointError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        }
+        t.tmp_fsync_time = tmp_fsync_start.elapsed();
         // Drop the file handle before renaming. On POSIX the rename
         // works either way, but closing first matches the canonical
         // sequence and keeps the resource lifetime obvious.
         drop(file);
 
+        let rename_start = Instant::now();
         fs::rename(&tmp_path, path).map_err(|source| CheckpointError::Io {
             path: path.to_path_buf(),
             source,
         })?;
+        t.rename_time = rename_start.elapsed();
 
-        // Best-effort fsync of the parent directory so the rename is
-        // also durable. Filesystems differ on whether this is required
-        // — ext4 with `data=ordered`, xfs, etc. — and on platforms
-        // where opening a directory for fsync is unsupported (Windows)
-        // we skip silently. A failure here is non-fatal: the data is
-        // durable; only the directory entry's flush is at stake.
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Ok(dir) = File::open(parent) {
-                    let _ = dir.sync_all();
+        // Phase 1: only fsync the parent directory when this rename
+        // creates a new entry. Subsequent writes promote a `.tmp` over
+        // an existing entry; the directory inode the prior write
+        // already made durable doesn't need another flush.
+        //
+        // On platforms where opening a directory for fsync is
+        // unsupported (Windows) the open silently fails and we skip,
+        // matching the pre-Phase-1 best-effort behaviour. A failure
+        // here is non-fatal: the data is durable; only the directory
+        // entry's flush is at stake.
+        if !path_existed_before {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Ok(dir) = File::open(parent) {
+                        let dir_fsync_start = Instant::now();
+                        let _ = dir.sync_all();
+                        t.dir_fsync_time = dir_fsync_start.elapsed();
+                        t.dir_fsync_called = true;
+                    }
                 }
             }
         }
 
-        Ok(())
+        Ok(t)
     }
 
     /// Read a checkpoint from `path` if one exists.
@@ -2347,6 +2448,38 @@ mod tests {
 
         let parsed = Checkpoint::read(&path).expect("read").expect("present");
         assert_eq!(parsed, second);
+    }
+
+    #[test]
+    fn write_timed_fsyncs_parent_dir_only_on_first_write() {
+        // `PLAN_checkpoint_cadence_throughput.md` Phase 1: the
+        // parent-directory `fsync` is only required when the rename
+        // creates a new directory entry. Subsequent writes promote a
+        // `.tmp` over an existing entry; the directory inode is
+        // already durable. This test pins that contract.
+        let path = unique_temp("dir_fsync_first_only");
+        let _g = CleanupOnDrop(path.clone());
+
+        let first = sample_raw();
+        let t1 = first.write_timed(&path).expect("first write");
+        assert!(
+            t1.dir_fsync_called,
+            "first write should fsync the parent dir to make the new entry durable"
+        );
+
+        let second = sample_tar();
+        let t2 = second.write_timed(&path).expect("second write");
+        assert!(
+            !t2.dir_fsync_called,
+            "subsequent writes target an existing entry; parent-dir fsync skipped"
+        );
+        assert_eq!(t2.dir_fsync_time, std::time::Duration::ZERO);
+
+        // And a third write to confirm the skip is permanent for
+        // this path, not a one-shot toggle.
+        let third = sample_raw();
+        let t3 = third.write_timed(&path).expect("third write");
+        assert!(!t3.dir_fsync_called);
     }
 
     #[test]

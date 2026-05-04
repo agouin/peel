@@ -579,6 +579,56 @@ impl SparseFile {
             }
         }
     }
+
+    /// Order pending writes against a subsequent durability event,
+    /// without forcing a device-level flush.
+    ///
+    /// `PLAN_checkpoint_cadence_throughput.md` Phase 1 publication
+    /// path. Used by the checkpoint observer to declare that every
+    /// `pwrite` issued before this call hits stable storage no later
+    /// than any `pwrite` issued after it. The pre-barrier writes may
+    /// not be on disk yet when this returns — only the *ordering*
+    /// against post-barrier writes is guaranteed. That is the contract
+    /// a future resume relies on: if it observes the renamed
+    /// `.peel.ckpt`, every page that checkpoint claims durable in the
+    /// bitmap is at least as durable as the checkpoint itself.
+    ///
+    /// In `pwrite` mode this dispatches through
+    /// [`IoBackend::order_writes`]: macOS gets `fcntl(F_BARRIERFSYNC)`,
+    /// Linux gets `fdatasync(2)`, other platforms fall back to a
+    /// full `sync_all`. In `mmap` mode this delegates to the same
+    /// `msync(MS_ASYNC)` that [`Self::sync_all`] uses — the mapping
+    /// has no cheaper ordering primitive, and `msync(MS_ASYNC)` is
+    /// already non-blocking.
+    ///
+    /// Callers that need a literal device flush (the clean-completion
+    /// sweep) keep using [`Self::sync_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error wrapped in [`SparseFileError::Io`] with
+    /// `offset = 0` and `len = total_size`.
+    pub fn order_writes(&self) -> Result<(), SparseFileError> {
+        match &self.storage {
+            Storage::Pwrite { backend } => {
+                backend
+                    .order_writes(self.file.as_fd())
+                    .map_err(|source| SparseFileError::Io {
+                        offset: 0,
+                        len: self.total_size,
+                        source,
+                    })
+            }
+            #[cfg(target_os = "linux")]
+            Storage::Mmap { region } => {
+                region.msync_async().map_err(|source| SparseFileError::Io {
+                    offset: 0,
+                    len: self.total_size,
+                    source,
+                })
+            }
+        }
+    }
 }
 
 /// Open `path` `O_RDWR | O_CREAT` and `ftruncate` it to `total_size`.
@@ -666,6 +716,30 @@ mod tests {
         let payload: Vec<u8> = (0u8..32).collect();
         f.pwrite_at(ByteOffset::new(64), &payload).expect("write");
 
+        let mut buf = vec![0u8; payload.len()];
+        f.read_exact_at(ByteOffset::new(64), &mut buf)
+            .expect("read");
+        assert_eq!(buf, payload);
+    }
+
+    #[test]
+    fn order_writes_succeeds_after_pwrite() {
+        // `PLAN_checkpoint_cadence_throughput.md` Phase 1: the
+        // publication-side ordering primitive must succeed after
+        // realistic worker traffic. Default backend on this build —
+        // pwrite mode on macOS, mmap mode on Linux when the §9
+        // backend selects it — should both wire through the
+        // platform-appropriate primitive.
+        let path = unique_temp_path("order_writes");
+        let _cleanup = CleanupOnDrop(path.clone());
+        let f = SparseFile::open_or_create(&path, 1024).expect("open");
+
+        let payload: Vec<u8> = (0u8..32).collect();
+        f.pwrite_at(ByteOffset::new(64), &payload).expect("write");
+        f.order_writes().expect("order_writes");
+
+        // Bytes are still readable after the barrier — the call has
+        // no observable effect on the page cache or the file's view.
         let mut buf = vec![0u8; payload.len()];
         f.read_exact_at(ByteOffset::new(64), &mut buf)
             .expect("read");

@@ -279,11 +279,14 @@ pub struct CheckpointInfo {
 
 /// Wall-clock and byte-volume statistics for one extraction.
 ///
-/// Times overlap inside the decode loop only inasmuch as
-/// [`Self::write_time`] is *subtracted out* of [`Self::decode_time`]
-/// when the sink write happens inside `decode_step`. The three time
-/// fields are therefore disjoint and can be summed for "useful time"
-/// without double-counting.
+/// The main extraction times overlap inside the decode loop only
+/// inasmuch as [`Self::write_time`] is *subtracted out* of
+/// [`Self::decode_time`] when the sink write happens inside
+/// `decode_step`. `decode_time`, `write_time`, and `punch_time` are
+/// therefore disjoint and can be summed for "useful time" without
+/// double-counting. The `source_*` fields are lower-level diagnostics
+/// from the coordinator's streaming reader and may overlap
+/// `decode_time`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExtractionStats {
     /// Total bytes the decoder reported as consumed from the source
@@ -312,6 +315,22 @@ pub struct ExtractionStats {
     /// [`Sink::is_quiescent`]; these are usually but not always
     /// 1:1 with frame boundaries.
     pub quiescent_checkpoints: u64,
+    /// Bytes the streaming source read back from the sparse part
+    /// file. Only coordinator-driven runs populate this; direct
+    /// extractor use leaves it at zero.
+    pub source_sparse_read_bytes: u64,
+    /// Wall-clock time spent in sparse-file `read_at` calls on the
+    /// streaming source path.
+    pub source_sparse_read_time: Duration,
+    /// Wall-clock time the streaming source spent waiting for the
+    /// needed chunk bitmap bit to become complete.
+    pub source_wait_time: Duration,
+    /// Number of source-read calls that had to wait for at least one
+    /// missing chunk.
+    pub source_wait_count: u64,
+    /// Number of poll sleeps taken by the streaming source while
+    /// waiting for incomplete chunks.
+    pub source_poll_sleeps: u64,
     /// Wall-clock time spent inside [`StreamingDecoder::decode_step`],
     /// minus the time the decoder spent calling the sink.
     pub decode_time: Duration,
@@ -320,6 +339,40 @@ pub struct ExtractionStats {
     pub write_time: Duration,
     /// Wall-clock time spent inside [`PunchHole::punch`].
     pub punch_time: Duration,
+    /// Wall-clock time spent in `SparseFile::sync_all` from the
+    /// checkpoint observer (publication-side fsync of `.peel.part`).
+    /// Populated only by coordinator-driven runs;
+    /// [`Extractor::extract`] / [`Extractor::extract_with_callback`]
+    /// leave this at zero. `PLAN_checkpoint_cadence_throughput.md`
+    /// Phase 0.
+    pub ckpt_sparse_sync_time: Duration,
+    /// Number of `SparseFile::sync_all` calls the observer made.
+    pub ckpt_sparse_sync_calls: u64,
+    /// Wall-clock time spent constructing the [`crate::checkpoint::Checkpoint`]
+    /// — bitmap clone, fingerprints clone, sink-state clone, hash-state
+    /// snapshot, decoder-state clone, plus the binary serialize.
+    /// Coordinator-only.
+    pub ckpt_serialize_time: Duration,
+    /// Wall-clock time from `OpenOptions::open(.tmp)` through the
+    /// final `write_all` (no fsync). Coordinator-only.
+    pub ckpt_tmp_write_time: Duration,
+    /// Wall-clock time spent in `File::sync_all` on the `.tmp` file.
+    /// Coordinator-only.
+    pub ckpt_tmp_fsync_time: Duration,
+    /// Wall-clock time spent in `fs::rename(.tmp, ckpt)`.
+    /// Coordinator-only.
+    pub ckpt_rename_time: Duration,
+    /// Wall-clock time spent in `File::sync_all` on the parent
+    /// directory. Coordinator-only.
+    pub ckpt_dir_fsync_time: Duration,
+    /// Number of parent-directory `sync_all` calls the observer
+    /// made (one per checkpoint write on platforms that support it).
+    pub ckpt_dir_fsync_calls: u64,
+    /// Total wall-clock spent inside the checkpoint observer closure
+    /// (sum of every observer invocation, success and error). Used
+    /// to assert that the per-step counters above add up to the
+    /// observed observer time within noise.
+    pub ckpt_observer_time: Duration,
 }
 
 /// Coordinator that ties decoder, sink, and puncher into one loop.

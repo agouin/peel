@@ -392,6 +392,11 @@ pub struct DownloadStats {
     /// Bytes written to the sparse file during this call (excludes
     /// chunks already complete on entry).
     pub bytes_downloaded: u64,
+    /// Bytes passed to [`SparseFile::pwrite_at`] during this call,
+    /// including probe writes.
+    pub pwrite_bytes: u64,
+    /// Wall-clock time spent inside [`SparseFile::pwrite_at`] calls.
+    pub pwrite_time: Duration,
     /// Total chunks completed by this call.
     pub chunks_completed: u32,
     /// Total chunks already complete on entry (resume case).
@@ -1047,108 +1052,114 @@ fn run_parallel(
                 .retries
                 .saturating_add(u64::from(msg.attempts.saturating_sub(1)));
             match msg.result {
-                Ok(()) => match msg.kind {
-                    DispatchKind::Fetch => {
-                        let end = msg.first.get().saturating_add(msg.count);
-                        // §3.3 (PLAN_responsiveness.md): record the
-                        // per-chunk CRC-32C fingerprints **before**
-                        // marking the bitmap. The
-                        // [`ChunkFingerprints`] module documents
-                        // exactly this ordering ("a worker records
-                        // the CRC-32C with `Ordering::Release`
-                        // before its `ChunkBitmap` mark"); the prior
-                        // arrangement (bitmap-first) opened a window
-                        // where a reader could observe a chunk
-                        // marked complete but with `fingerprints.get
-                        // == 0`, which the §3.1 cursor audit would
-                        // misinterpret as "no fingerprint to compare
-                        // against" and silently skip. Recording
-                        // first preserves the documented happens-
-                        // before edge.
-                        if let Some(fps) = config.fingerprints.as_deref() {
-                            for (i, crc) in msg.crcs.iter().enumerate().take(msg.count as usize) {
-                                let idx = msg.first.get().saturating_add(i as u32);
-                                if idx < total_chunks {
-                                    fps.record(ChunkIndex::new(idx), *crc);
+                Ok(()) => {
+                    stats_local.pwrite_bytes = stats_local.pwrite_bytes.saturating_add(msg.bytes);
+                    stats_local.pwrite_time =
+                        stats_local.pwrite_time.saturating_add(msg.pwrite_time);
+                    match msg.kind {
+                        DispatchKind::Fetch => {
+                            let end = msg.first.get().saturating_add(msg.count);
+                            // §3.3 (PLAN_responsiveness.md): record the
+                            // per-chunk CRC-32C fingerprints **before**
+                            // marking the bitmap. The
+                            // [`ChunkFingerprints`] module documents
+                            // exactly this ordering ("a worker records
+                            // the CRC-32C with `Ordering::Release`
+                            // before its `ChunkBitmap` mark"); the prior
+                            // arrangement (bitmap-first) opened a window
+                            // where a reader could observe a chunk
+                            // marked complete but with `fingerprints.get
+                            // == 0`, which the §3.1 cursor audit would
+                            // misinterpret as "no fingerprint to compare
+                            // against" and silently skip. Recording
+                            // first preserves the documented happens-
+                            // before edge.
+                            if let Some(fps) = config.fingerprints.as_deref() {
+                                for (i, crc) in msg.crcs.iter().enumerate().take(msg.count as usize)
+                                {
+                                    let idx = msg.first.get().saturating_add(i as u32);
+                                    if idx < total_chunks {
+                                        fps.record(ChunkIndex::new(idx), *crc);
+                                    }
                                 }
                             }
-                        }
-                        bitmap.complete_range(msg.first, ChunkIndex::new(end));
-                        stats_local.bytes_downloaded =
-                            stats_local.bytes_downloaded.saturating_add(msg.bytes);
-                        stats_local.chunks_completed =
-                            stats_local.chunks_completed.saturating_add(msg.count);
-                        completed = completed.saturating_add(msg.count);
-                        if let Some(policy) = config.policy.as_deref() {
-                            policy.record(Sample {
-                                at: Instant::now(),
-                                elapsed: msg.elapsed,
-                                retried: msg.attempts > 1,
-                            });
-                            let remaining = u64::from(total_chunks.saturating_sub(completed));
-                            let _ = policy.evaluate(Instant::now(), remaining, workers);
-                        }
+                            bitmap.complete_range(msg.first, ChunkIndex::new(end));
+                            stats_local.bytes_downloaded =
+                                stats_local.bytes_downloaded.saturating_add(msg.bytes);
+                            stats_local.chunks_completed =
+                                stats_local.chunks_completed.saturating_add(msg.count);
+                            completed = completed.saturating_add(msg.count);
+                            if let Some(policy) = config.policy.as_deref() {
+                                policy.record(Sample {
+                                    at: Instant::now(),
+                                    elapsed: msg.elapsed,
+                                    retried: msg.attempts > 1,
+                                });
+                                let remaining = u64::from(total_chunks.saturating_sub(completed));
+                                let _ = policy.evaluate(Instant::now(), remaining, workers);
+                            }
 
-                        // §11 probe scheduler: every Nth Fetch
-                        // completion, pick a random already-complete
-                        // chunk and queue a Probe re-fetch. Skip when
-                        // fingerprints are off, when interval is 0,
-                        // or when there is no chunk to probe yet.
-                        completions_since_probe = completions_since_probe.saturating_add(1);
-                        if let (Some(fps), Some(probe)) =
-                            (config.fingerprints.as_deref(), Some(&config.probe))
-                        {
-                            if probe.interval > 0
-                                && completions_since_probe >= probe.interval
-                                && completed > 0
+                            // §11 probe scheduler: every Nth Fetch
+                            // completion, pick a random already-complete
+                            // chunk and queue a Probe re-fetch. Skip when
+                            // fingerprints are off, when interval is 0,
+                            // or when there is no chunk to probe yet.
+                            completions_since_probe = completions_since_probe.saturating_add(1);
+                            if let (Some(fps), Some(probe)) =
+                                (config.fingerprints.as_deref(), Some(&config.probe))
                             {
-                                completions_since_probe = 0;
-                                if let Some(probe_dispatch) = pick_probe_dispatch(
-                                    bitmap,
-                                    fps,
-                                    total_chunks,
-                                    config.chunk_size,
-                                    info.total_size,
-                                    &mut probe_rng,
-                                ) {
-                                    // Best-effort enqueue: a full
-                                    // channel just defers the probe
-                                    // to the next cadence tick.
-                                    if task_tx.try_send(probe_dispatch).is_ok() {
-                                        in_flight += 1;
+                                if probe.interval > 0
+                                    && completions_since_probe >= probe.interval
+                                    && completed > 0
+                                {
+                                    completions_since_probe = 0;
+                                    if let Some(probe_dispatch) = pick_probe_dispatch(
+                                        bitmap,
+                                        fps,
+                                        total_chunks,
+                                        config.chunk_size,
+                                        info.total_size,
+                                        &mut probe_rng,
+                                    ) {
+                                        // Best-effort enqueue: a full
+                                        // channel just defers the probe
+                                        // to the next cadence tick.
+                                        if task_tx.try_send(probe_dispatch).is_ok() {
+                                            in_flight += 1;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    DispatchKind::Probe { expected: _ } => {
-                        // Probe success: the worker already verified
-                        // CRC-32C in-line. No bitmap update — the chunk
-                        // was already complete before the probe.
-                        //
-                        // PLAN_decoder_freeze.md: the worker's
-                        // [`read_with_progress`] credits `add_downloaded`
-                        // on every socket read regardless of dispatch
-                        // kind, which means a probe's bytes ARE counted
-                        // again in `bytes_downloaded` — even though the
-                        // chunk's bytes were already counted by the
-                        // original Fetch. Without a refund here the
-                        // counter inflates by one chunk per probe, so
-                        // after enough probes the throttle equation
-                        // `downloaded - decoded ≥ max_disk_buffer`
-                        // engages on phantom bytes. Workers stop
-                        // dispatching, the decoder reaches an
-                        // undispatched chunk, and the run wedges with
-                        // every counter flat at the cap — the
-                        // production freeze documented in §2.5.
-                        //
-                        // Refund the probe's bytes here so the gross
-                        // counter tracks real on-disk lookahead.
-                        if let Some(p) = config.progress.as_ref() {
-                            p.sub_downloaded(msg.bytes);
+                        DispatchKind::Probe { expected: _ } => {
+                            // Probe success: the worker already verified
+                            // CRC-32C in-line. No bitmap update — the chunk
+                            // was already complete before the probe.
+                            //
+                            // PLAN_decoder_freeze.md: the worker's
+                            // [`read_with_progress`] credits `add_downloaded`
+                            // on every socket read regardless of dispatch
+                            // kind, which means a probe's bytes ARE counted
+                            // again in `bytes_downloaded` — even though the
+                            // chunk's bytes were already counted by the
+                            // original Fetch. Without a refund here the
+                            // counter inflates by one chunk per probe, so
+                            // after enough probes the throttle equation
+                            // `downloaded - decoded ≥ max_disk_buffer`
+                            // engages on phantom bytes. Workers stop
+                            // dispatching, the decoder reaches an
+                            // undispatched chunk, and the run wedges with
+                            // every counter flat at the cap — the
+                            // production freeze documented in §2.5.
+                            //
+                            // Refund the probe's bytes here so the gross
+                            // counter tracks real on-disk lookahead.
+                            if let Some(p) = config.progress.as_ref() {
+                                p.sub_downloaded(msg.bytes);
+                            }
                         }
                     }
-                },
+                }
                 Err(err) => {
                     cancel.store(true, Ordering::Relaxed);
                     let mapped = match err {
@@ -1280,12 +1291,14 @@ fn worker_loop(
         let msg = match outcome {
             Ok(ChunkOutcome {
                 bytes,
+                pwrite_time,
                 attempts,
                 crcs,
             }) => Completion {
                 first: dispatch.first,
                 count: dispatch.count,
                 bytes,
+                pwrite_time,
                 attempts,
                 elapsed,
                 kind: dispatch.kind,
@@ -1296,6 +1309,7 @@ fn worker_loop(
                 first: dispatch.first,
                 count: dispatch.count,
                 bytes: 0,
+                pwrite_time: Duration::ZERO,
                 attempts,
                 elapsed,
                 kind: dispatch.kind,
@@ -1439,9 +1453,13 @@ fn run_single_stream(
                 actual: written,
             });
         }
+        let pwrite_started = Instant::now();
         sparse
             .pwrite_at(ByteOffset::new(written), &slice[..n])
             .map_err(SchedulerError::SparseFile)?;
+        let pwrite_time = pwrite_started.elapsed();
+        stats.pwrite_bytes = stats.pwrite_bytes.saturating_add(n as u64);
+        stats.pwrite_time = stats.pwrite_time.saturating_add(pwrite_time);
         if let Some(p) = config.progress.as_ref() {
             p.add_downloaded(n as u64);
         }
@@ -1609,6 +1627,7 @@ struct Completion {
     first: ChunkIndex,
     count: u32,
     bytes: u64,
+    pwrite_time: Duration,
     attempts: u32,
     elapsed: Duration,
     kind: DispatchKind,

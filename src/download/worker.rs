@@ -309,6 +309,8 @@ impl Default for RetryConfig {
 pub struct ChunkOutcome {
     /// Bytes written to the sparse file.
     pub bytes: u64,
+    /// Wall-clock time spent inside the sparse-file `pwrite_at`.
+    pub pwrite_time: Duration,
     /// Number of attempts taken (1 = first attempt succeeded).
     pub attempts: u32,
     /// CRC-32C per bitmap chunk in the dispatch, in chunk order
@@ -513,7 +515,7 @@ pub fn download_dispatch(
         let outcome = try_once(ctx, mirror_idx, &dispatch, cancel);
         let elapsed = started.elapsed();
         let err = match outcome {
-            Ok((bytes, crcs)) => {
+            Ok((bytes, crcs, pwrite_time)) => {
                 ctx.mirrors.record_success(mirror_idx, elapsed);
                 // Probe dispatches verify in-line and never bubble
                 // CRCs up to the scheduler — they're already
@@ -532,12 +534,14 @@ pub fn download_dispatch(
                     }
                     return Ok(ChunkOutcome {
                         bytes,
+                        pwrite_time,
                         attempts: attempt,
                         crcs: Vec::new(),
                     });
                 }
                 return Ok(ChunkOutcome {
                     bytes,
+                    pwrite_time,
                     attempts: attempt,
                     crcs,
                 });
@@ -609,7 +613,7 @@ fn try_once(
     mirror_idx: usize,
     dispatch: &Dispatch,
     cancel: &AtomicBool,
-) -> Result<(u64, Vec<u32>), WorkerError> {
+) -> Result<(u64, Vec<u32>, Duration), WorkerError> {
     let chunk = dispatch.first;
     let range = dispatch.range;
     let mirror = ctx.mirrors.mirror(mirror_idx);
@@ -679,9 +683,11 @@ fn try_once(
         return Err(WorkerError::BodyIo { chunk, source });
     }
 
+    let pwrite_started = Instant::now();
     ctx.sparse
         .pwrite_at(range.start(), &buf)
         .map_err(|source| WorkerError::SparseFile { chunk, source })?;
+    let pwrite_time = pwrite_started.elapsed();
 
     // hyper-util's connection pool reclaims the connection when the
     // body is dropped at end of scope; no explicit release step.
@@ -702,7 +708,7 @@ fn try_once(
     }
 
     refund.disarm();
-    Ok((range.len(), crcs))
+    Ok((range.len(), crcs, pwrite_time))
 }
 
 /// RAII guard that refunds partial download-counter increments on any
