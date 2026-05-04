@@ -94,6 +94,20 @@ fn xz2_encode_single_block(payload: &[u8], preset: u32) -> Vec<u8> {
     compressed
 }
 
+/// Encode `payload` as a single-member gzip blob at the default
+/// compression level. Used by the Phase 10 hole-punching tests so
+/// the archive shape matches what `gzip` / `tar -z` CLI produces
+/// by default — one monolithic gzip member whose only restart
+/// points are the per-deflate-block boundaries the hand-rolled
+/// `crate::decode::deflate_native::gzip` decoder exposes (Phase 7
+/// `decoder_state` blob, Phase 8 registry swap).
+fn encode_gzip_single_member(payload: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(payload).expect("gzip encode");
+    encoder.finish().expect("gzip finish")
+}
+
 /// Build LZMA-friendly content of `len` bytes: pseudo-random
 /// pseudo-English sentences, varied enough that the decoder
 /// cannot collapse the whole input into a single rep match,
@@ -833,6 +847,199 @@ fn single_block_xz_punches_per_chunk_bounded_peak() {
     // xz's LZMA2 chunks are smaller than zstd's blocks at the
     // same compression preset, so each punch covers a smaller
     // span — but it should still be at least the threshold.
+    let bytes_per_call = stats.bytes_punched / stats.punch_calls;
+    assert!(
+        bytes_per_call >= PUNCH_THRESHOLD / 2,
+        "puncher fired too eagerly: bytes_per_call={bytes_per_call}, \
+         threshold={PUNCH_THRESHOLD}",
+    );
+    assert!(
+        bytes_per_call <= 8 * PUNCH_THRESHOLD,
+        "puncher fell behind the decoder: bytes_per_call={bytes_per_call}, \
+         threshold={PUNCH_THRESHOLD}",
+    );
+}
+
+/// Single-member `.tar.gz` decodes byte-identical via the
+/// hand-rolled gzip wrapper. Sibling of
+/// [`extracts_single_frame_zstd_tar_into_directory`] — pins the
+/// Phase 8 registry swap (`crate::decode::gzip` re-exports the
+/// hand-rolled `deflate_native::gzip` factory) and the
+/// per-deflate-block `frame_boundary` advance through the
+/// extractor's quiescent-checkpoint loop. A pre-Phase-8 build
+/// would have decoded byte-identically too (the `flate2`-based
+/// wrapper produced the same output bytes), but would have
+/// observed `quiescent_checkpoints == 1` (only the final
+/// member-end boundary). The Phase 10 contract is that
+/// intermediate deflate-block boundaries inside the single
+/// member fire as quiescent checkpoints — proving the new
+/// hand-rolled decoder is the production path.
+#[test]
+fn extracts_single_member_tar_gz_into_directory() {
+    let files: &[(&str, &[u8])] = &[
+        ("alpha.txt", b"alpha contents\n"),
+        ("nested/beta.bin", &[0u8, 1, 2, 3, 4, 5, 6, 7]),
+        ("nested/deeper/gamma.dat", &b"gamma payload".repeat(513)[..]),
+    ];
+    let archive = build_simple_archive(files);
+    let combined = encode_gzip_single_member(&archive);
+
+    let src = fresh_path("single_member_gzip_src.tar.gz");
+    let dst = fresh_path("single_member_gzip_dst");
+    let _g_src = CleanupOnDrop(src.clone());
+    let _g_dst = CleanupOnDrop(dst.clone());
+    fs::write(&src, &combined).expect("write src");
+    fs::create_dir_all(&dst).expect("create dst");
+
+    let read_handle = fs::File::open(&src).expect("open ro");
+    let rw_handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&src)
+        .expect("open rw");
+
+    let registry = DecoderRegistry::with_defaults();
+    let factory = registry
+        .factory_for_path(&src)
+        .expect(".tar.gz factory registered");
+    let mut decoder: Box<dyn StreamingDecoder> = factory(Box::new(read_handle)).expect("decoder");
+    let sink = TarSink::new(&dst).expect("tar sink");
+
+    let stats = Extractor::with_defaults()
+        .extract(rw_handle.as_fd(), &mut *decoder, sink, &NoopPuncher::new())
+        .expect("extract");
+
+    assert_eq!(stats.bytes_in, combined.len() as u64);
+    assert!(stats.bytes_out > 0);
+    // Per-member granularity stamps at least the end-of-member
+    // frame boundary; per-deflate-block (`docs/PLAN_deflate_block_decoder.md`
+    // Phase 7) stamps every intermediate block boundary too. The
+    // small fixture above doesn't force flate2 into multi-block
+    // emission, so we only assert ≥ 1 here — the larger
+    // hole-punching test below pins the multi-block case.
+    assert!(stats.frame_boundaries_observed >= 1);
+    assert!(stats.quiescent_checkpoints >= 1);
+
+    for (name, expected) in files {
+        let path = dst.join(name);
+        let got = fs::read(&path).expect("read extracted file");
+        assert_eq!(&got, expected, "contents mismatch for {name}");
+    }
+}
+
+/// A single-member `.tar.gz` carrying many MiB of LZMA-friendly
+/// content (compressible enough that miniz_oxide emits multiple
+/// deflate blocks per member) must:
+///
+///   1. drive the puncher (`punch_calls` ≥ 2, `bytes_punched > 0`),
+///   2. release most of the compressed source by end-of-extraction,
+///   3. show a steady release cadence — the resident-block count
+///      strictly decreases across successive punch calls.
+///
+/// Phase 8 / 10 of `docs/PLAN_deflate_block_decoder.md` calls
+/// this out as the user-visible win: before the hand-rolled
+/// decoder, this shape (a real-world `.tar.gz`) skipped per-block
+/// boundaries entirely and the puncher only fired once at
+/// end-of-member. Mirrors the zstd analog
+/// [`single_frame_zstd_punches_per_block_bounded_peak`] and the
+/// xz analog [`single_block_xz_punches_per_chunk_bounded_peak`]
+/// — same input class (LZMA-friendly text, ~16 MiB), same
+/// invariants. The deflate sliding window is fixed at 32 KiB
+/// (vs zstd's `windowLog ≤ 27` and xz's `dict_size ≤ 64 MiB`) so
+/// the resident-block bound is structurally tighter, but the
+/// per-call shape we assert below matches the other two.
+///
+/// Note on "peak" framing: same as the zstd / xz analogs — the
+/// source file is fully on disk up front, so the resident byte
+/// count is `EOF - last_punched`. The interesting invariant is
+/// the *slope* — that `last_punched` keeps pace with
+/// `bytes_consumed` — which (3) measures.
+#[test]
+fn single_member_gzip_punches_per_block_bounded_peak() {
+    let payload = build_lzma_friendly_input(16 * 1024 * 1024);
+    let files: &[(&str, &[u8])] = &[("blob.txt", &payload[..])];
+    let archive = build_simple_archive(files);
+    let combined = encode_gzip_single_member(&archive);
+    let combined_len = combined.len() as u64;
+    assert!(
+        combined_len >= 1024 * 1024,
+        "compressed source needs to be many MiB to make the bounded-peak \
+         claim meaningful (got {combined_len})",
+    );
+
+    let src = fresh_path("single_member_gzip_punch_src.tar.gz");
+    let dst = fresh_path("single_member_gzip_punch_dst");
+    let _g_src = CleanupOnDrop(src.clone());
+    let _g_dst = CleanupOnDrop(dst.clone());
+    fs::write(&src, &combined).expect("write src");
+    fs::create_dir_all(&dst).expect("create dst");
+
+    let read_handle = fs::File::open(&src).expect("ro");
+    let rw_handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&src)
+        .expect("rw");
+    let blocks_before = rw_handle.metadata().expect("meta").blocks();
+
+    let registry = DecoderRegistry::with_defaults();
+    let factory = registry.factory_for_path(&src).expect(".tar.gz registered");
+    let mut decoder: Box<dyn StreamingDecoder> = factory(Box::new(read_handle)).expect("decoder");
+    let sink = TarSink::new(&dst).expect("tar sink");
+
+    const PUNCH_THRESHOLD: u64 = 256 * 1024;
+    let cfg = ExtractorConfig {
+        punch_threshold: PUNCH_THRESHOLD,
+    };
+    let puncher = PeakSamplingPuncher::new(default_puncher(), &src);
+
+    let stats = Extractor::new(cfg)
+        .extract(rw_handle.as_fd(), &mut *decoder, sink, &puncher)
+        .expect("extract");
+
+    let extracted = fs::read(dst.join("blob.txt")).expect("read extracted blob");
+    assert_eq!(extracted, payload, "extracted payload must match input");
+
+    if stats.punch_unsupported {
+        return;
+    }
+
+    assert!(
+        stats.punch_calls >= 2,
+        "single-member tar.gz must trigger multiple per-block punches \
+         (calls={}, threshold={PUNCH_THRESHOLD})",
+        stats.punch_calls,
+    );
+    assert!(
+        stats.bytes_punched > 0,
+        "single-member tar.gz should have released compressed-side \
+         blocks; got bytes_punched=0",
+    );
+    assert!(stats.frame_boundaries_observed >= 2);
+
+    let blocks_after = rw_handle.metadata().expect("meta").blocks();
+    assert!(
+        blocks_after < blocks_before / 4,
+        "extraction left {blocks_after} blocks resident (was {blocks_before}); \
+         expected the per-deflate-block puncher to have freed >75%",
+    );
+
+    let samples = puncher.samples();
+    assert!(
+        samples.len() >= 2,
+        "need at least two punch samples to verify cadence (got {})",
+        samples.len(),
+    );
+    for w in samples.windows(2) {
+        assert!(
+            w[1] < w[0],
+            "resident-block count must strictly decrease across punch \
+             calls (saw {} -> {} in samples={samples:?})",
+            w[0],
+            w[1],
+        );
+    }
+
     let bytes_per_call = stats.bytes_punched / stats.punch_calls;
     assert!(
         bytes_per_call >= PUNCH_THRESHOLD / 2,

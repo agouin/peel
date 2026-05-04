@@ -445,6 +445,23 @@ impl StreamingDecoder for GzipDecoder {
     }
 
     fn frame_boundary(&self) -> Option<ByteOffset> {
+        // While the inner deflate decoder owns the bit reader,
+        // its per-deflate-block boundary is the latest restart
+        // point inside the current member — strictly more recent
+        // than the previous member's end (which is what
+        // `last_frame_boundary` carries here). Delegate to the
+        // inner so the extractor's quiescent-checkpoint loop
+        // fires the puncher at every block boundary within a
+        // single-member archive (Phase 10 of
+        // `docs/PLAN_deflate_block_decoder.md`). The blob this
+        // wrapper emits at the same checkpoint
+        // ([`Self::decoder_state`]) carries the running CRC32 +
+        // ISIZE counter the resume needs.
+        if let Some(inner) = &self.inner {
+            if let Some(b) = inner.frame_boundary() {
+                return Some(b);
+            }
+        }
         self.last_frame_boundary
     }
 
