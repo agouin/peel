@@ -177,38 +177,71 @@ pub struct ExtractorConfig {
     /// when the unpunched-but-checkpointed prefix is at least this
     /// large.
     pub punch_threshold: u64,
+
+    /// Minimum source-byte progress between successive
+    /// [`Extractor::extract_with_callback`] observer invocations.
+    ///
+    /// The extractor measures progress against the most recently
+    /// persisted boundary and gates the observer call when *both*
+    /// this floor *and* [`Self::checkpoint_min_interval`] have not
+    /// been cleared. Throttled steps skip both the
+    /// [`StreamingDecoder::decoder_state`] call and the
+    /// [`CheckpointInfo`] allocation, which is load-bearing for
+    /// decoders whose `decoder_state()` serializes a non-trivial
+    /// sliding window (xz_native: ~8 MiB per call).
+    /// See `docs/PLAN_lazy_decoder_state.md`.
+    ///
+    /// `0` means "no byte-progress floor" — every quiescent advance
+    /// fires the observer. This is the [`Self::default`] so that
+    /// library callers using [`Extractor::extract`] /
+    /// [`Extractor::with_defaults`] get the historical
+    /// "observer-per-advance" behavior. Production callers (the
+    /// [`crate::coordinator`]) explicitly set the
+    /// [`crate::coordinator::CoordinatorConfig::checkpoint_min_bytes`]
+    /// value here.
+    ///
+    /// The very first persist-eligible advance always fires
+    /// regardless of these floors, so a clean cadence config
+    /// doesn't strand a run with no checkpoints.
+    pub checkpoint_min_bytes: u64,
+
+    /// Minimum wall-clock time between successive observer
+    /// invocations. Pairs with [`Self::checkpoint_min_bytes`] —
+    /// throttle gates a call only when *both* the byte floor *and*
+    /// the time floor have not been cleared.
+    ///
+    /// `Duration::ZERO` (the [`Self::default`]) means "no
+    /// time-based floor". As with `checkpoint_min_bytes`, the very
+    /// first persist-eligible advance always fires.
+    pub checkpoint_min_interval: Duration,
 }
 
 impl Default for ExtractorConfig {
     fn default() -> Self {
         Self {
             punch_threshold: DEFAULT_PUNCH_THRESHOLD,
+            checkpoint_min_bytes: 0,
+            checkpoint_min_interval: Duration::ZERO,
         }
     }
 }
 
-/// Acknowledgement returned by the [`Extractor::extract_with_callback`]
-/// observer.
-///
-/// The extractor must not punch source bytes past a position the
-/// coordinator has not durably persisted: a crash between the punch
-/// and the next persisted checkpoint would otherwise leave the
-/// resumed run reading zeroed bytes from the offset its own
-/// checkpoint points at. The observer signals back which is which.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckpointAck {
-    /// The position has been durably persisted (or the caller has no
-    /// resume contract — `Extractor::extract`'s no-op observer
-    /// returns this). The extractor may advance hole-punching up to
-    /// this position.
-    Persisted,
-    /// The observer chose not to persist this position — typically
-    /// because a cadence throttle skipped the write. The extractor
-    /// must continue to bound hole-punching at the most recent
-    /// `Persisted` position so a crash before the next persisted
-    /// write can resume cleanly from there.
-    Throttled,
-}
+// `CheckpointAck` was removed in `PLAN_lazy_decoder_state.md` Phase 1.
+//
+// The throttle that the coordinator's observer used to apply (returning
+// `CheckpointAck::Throttled` to skip a write) now lives inside the
+// extractor's run loop, gated by [`ExtractorConfig::checkpoint_min_bytes`]
+// and [`ExtractorConfig::checkpoint_min_interval`]. The observer's only
+// signal to the extractor is now its `io::Result<()>` return: `Ok` means
+// "persisted; advance hole-punching up to this position", `Err` means
+// "abort the extraction with this error".
+//
+// The punch-bounded-by-last-persisted invariant
+// (`tests::throttled_observer_does_not_advance_punch_past_persisted_position`)
+// continues to hold: the extractor's throttle skips the observer call and
+// does *not* update `last_persisted_quiescent_at`, so a crash between a
+// throttled step and the next durable write resumes from the most recent
+// observer-acknowledged position.
 
 /// Snapshot passed to the [`Extractor::extract_with_callback`]
 /// observer on every quiescent advance.
@@ -382,28 +415,29 @@ impl Extractor {
         sink: S,
         puncher: &dyn PunchHole,
     ) -> Result<ExtractionStats, ExtractorError> {
-        self.extract_with_callback(source_fd, decoder, sink, puncher, |_| {
-            Ok(CheckpointAck::Persisted)
-        })
+        self.extract_with_callback(source_fd, decoder, sink, puncher, |_| Ok(()))
     }
 
     /// Like [`Self::extract`] but invokes `on_checkpoint` whenever the
-    /// extractor advances its quiescent-checkpoint position.
+    /// extractor advances its quiescent-checkpoint position *and* the
+    /// configured cadence floors
+    /// ([`ExtractorConfig::checkpoint_min_bytes`] /
+    /// [`ExtractorConfig::checkpoint_min_interval`]) have been cleared.
     ///
-    /// The callback returns a [`CheckpointAck`] reporting whether it
-    /// durably persisted the position. The extractor only advances
-    /// hole-punching up to the most recently-persisted position, so a
-    /// throttled write does not orphan the bytes the still-current
-    /// durable checkpoint points at:
+    /// Throttled steps skip the observer call entirely — including the
+    /// [`StreamingDecoder::decoder_state`] invocation that builds the
+    /// resume blob. This is load-bearing for decoders whose
+    /// `decoder_state()` is non-trivial (xz_native: ~8 MiB per call); see
+    /// `docs/PLAN_lazy_decoder_state.md` for the diagnosis.
     ///
-    /// 1. Decoder + sink report a quiescent boundary.
-    /// 2. Coordinator chooses to persist (or throttle) the checkpoint.
-    /// 3. Extractor punches the source up to the **last persisted**
-    ///    boundary.
-    ///
-    /// If the callback returns `Err`, the extractor stops and surfaces
-    /// the failure as [`ExtractorError::Observer`]; no further bytes
-    /// are written and no further punches issued.
+    /// On a successful observer return (`Ok(())`) the extractor advances
+    /// hole-punching up to the now-persisted position. On `Err`, the
+    /// extractor stops and surfaces [`ExtractorError::Observer`]; no
+    /// further bytes are written and no further punches issued. The
+    /// punch-bounded-by-last-persisted invariant is preserved:
+    /// throttled steps do *not* update the persisted-position cursor,
+    /// so a crash between a throttled step and the next observer call
+    /// resumes from the most recent observer-acknowledged position.
     ///
     /// # Errors
     ///
@@ -419,7 +453,7 @@ impl Extractor {
     ) -> Result<ExtractionStats, ExtractorError>
     where
         S: Sink,
-        F: FnMut(CheckpointInfo) -> std::io::Result<CheckpointAck>,
+        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
     {
         let stats = self.run_loop(source_fd, decoder, &mut sink, puncher, on_checkpoint)?;
         sink.close().map_err(ExtractorError::Sink)?;
@@ -439,7 +473,7 @@ impl Extractor {
     ) -> Result<ExtractionStats, ExtractorError>
     where
         S: Sink,
-        F: FnMut(CheckpointInfo) -> std::io::Result<CheckpointAck>,
+        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
     {
         // Align to the puncher's preferred block boundary or 4 KiB,
         // whichever is larger. Misaligned tails are silently retained
@@ -461,6 +495,12 @@ impl Extractor {
         let mut last_persisted_quiescent_at: u64 = 0;
         let mut last_observed_boundary: Option<u64> = None;
         let mut punch_disabled = false;
+        // Throttle bookkeeping (Phase 1 of `PLAN_lazy_decoder_state.md`).
+        // `None` until the first persist-eligible advance — the very
+        // first call always fires regardless of the cadence floors so
+        // a clean run produces at least one durable checkpoint even
+        // when both floors are wide.
+        let mut last_persist_time: Option<Instant> = None;
 
         let mut adapter = SinkAdapter {
             sink,
@@ -594,17 +634,37 @@ impl Extractor {
                 if let Some(b) = boundary {
                     if adapter.sink.is_quiescent() && b > last_quiescent_at {
                         last_quiescent_at = b;
-                        stats.quiescent_checkpoints = stats.quiescent_checkpoints.saturating_add(1);
-                        let info = CheckpointInfo {
-                            source_position: b,
-                            bytes_in: stats.bytes_in,
-                            bytes_out: adapter.bytes_out,
-                            quiescent_index: stats.quiescent_checkpoints,
-                            decoder_state: decoder.decoder_state(),
-                            sink_state: adapter.sink.sink_state(),
+                        // Throttle gate (Phase 1 of
+                        // `PLAN_lazy_decoder_state.md`). The gate
+                        // sits *before* both `decoder.decoder_state()`
+                        // and the `CheckpointInfo` allocation so a
+                        // throttled step pays neither cost. The very
+                        // first persist-eligible advance bypasses the
+                        // gate (`last_persist_time == None`); after
+                        // that, a step is throttled iff *both* the
+                        // byte floor and the time floor are
+                        // un-cleared.
+                        let throttled = if let Some(prev) = last_persist_time {
+                            let bytes_progressed = b.saturating_sub(last_persisted_quiescent_at);
+                            let time_progressed = prev.elapsed();
+                            bytes_progressed < self.config.checkpoint_min_bytes
+                                && time_progressed < self.config.checkpoint_min_interval
+                        } else {
+                            false
                         };
-                        let ack = on_checkpoint(info).map_err(ExtractorError::Observer)?;
-                        if ack == CheckpointAck::Persisted {
+                        if !throttled {
+                            stats.quiescent_checkpoints =
+                                stats.quiescent_checkpoints.saturating_add(1);
+                            let info = CheckpointInfo {
+                                source_position: b,
+                                bytes_in: stats.bytes_in,
+                                bytes_out: adapter.bytes_out,
+                                quiescent_index: stats.quiescent_checkpoints,
+                                decoder_state: decoder.decoder_state(),
+                                sink_state: adapter.sink.sink_state(),
+                            };
+                            on_checkpoint(info).map_err(ExtractorError::Observer)?;
+                            last_persist_time = Some(Instant::now());
                             last_persisted_quiescent_at = b;
                         }
                     }
@@ -788,7 +848,7 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::os::fd::AsFd;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     use crate::decode::zstd::ZstdDecoder;
     use crate::punch::NoopPuncher;
@@ -1245,6 +1305,7 @@ mod tests {
 
         let cfg = ExtractorConfig {
             punch_threshold: 4096, // small enough to fire mid-loop
+            ..ExtractorConfig::default()
         };
         let stats = Extractor::new(cfg)
             .extract(punch_handle.as_fd(), &mut decoder, sink, &puncher)
@@ -1305,6 +1366,7 @@ mod tests {
 
         let cfg = ExtractorConfig {
             punch_threshold: 4096,
+            ..ExtractorConfig::default()
         };
         let stats = Extractor::new(cfg)
             .extract(rw.as_fd(), &mut decoder, sink, &UnsupportedPuncher)
@@ -1360,6 +1422,7 @@ mod tests {
 
         let cfg = ExtractorConfig {
             punch_threshold: 4096,
+            ..ExtractorConfig::default()
         };
         let result = Extractor::new(cfg).extract(rw.as_fd(), &mut decoder, sink, &BrokenPuncher);
         match result {
@@ -1370,14 +1433,224 @@ mod tests {
         }
     }
 
-    /// Regression test for the throttle/punch race that broke
-    /// mid-frame lz4 resume: a checkpoint observer that throttles
-    /// (returns `CheckpointAck::Throttled`) must NOT cause the
-    /// extractor to advance hole-punching past the boundary the
-    /// previous *persisted* observer call recorded. If it does, a
-    /// crash before the next persisted write leaves the durable
-    /// checkpoint pointing at zeroed bytes and resume cannot
-    /// continue.
+    /// Mock [`StreamingDecoder`] that emits a fixed-size payload of
+    /// `0xCD` bytes per `decode_step`, surfaces a fresh frame
+    /// boundary at each emission, and counts `decoder_state()`
+    /// invocations into a shared `Arc<AtomicU32>` so tests can
+    /// assert the extractor's throttle gate sits *before* blob
+    /// construction (Phase 1 of `PLAN_lazy_decoder_state.md`).
+    ///
+    /// `decoder_state()` returns a small distinguishable blob so
+    /// observer-side assertions can verify that the extractor
+    /// *forwards* the captured state when it does fire — i.e. the
+    /// laziness applies only to throttled steps, not to the persist
+    /// path.
+    struct CountingDecoder {
+        frame_size: u64,
+        remaining_frames: u32,
+        bytes_consumed: u64,
+        last_boundary: Option<u64>,
+        decoder_state_calls: Arc<AtomicU32>,
+    }
+
+    impl StreamingDecoder for CountingDecoder {
+        fn decode_step(&mut self, sink: &mut dyn Write) -> Result<DecodeStatus, DecodeError> {
+            if self.remaining_frames == 0 {
+                return Ok(DecodeStatus::Eof);
+            }
+            // Stream one "frame" worth of bytes per call. The
+            // payload byte (0xCD) is arbitrary — we never inspect it.
+            let payload = vec![0xCDu8; self.frame_size as usize];
+            sink.write_all(&payload).map_err(DecodeError::Write)?;
+            self.bytes_consumed = self.bytes_consumed.saturating_add(self.frame_size);
+            self.last_boundary = Some(self.bytes_consumed);
+            self.remaining_frames -= 1;
+            Ok(DecodeStatus::MoreData)
+        }
+        fn bytes_consumed(&self) -> ByteOffset {
+            ByteOffset::new(self.bytes_consumed)
+        }
+        fn frame_boundary(&self) -> Option<ByteOffset> {
+            self.last_boundary.map(ByteOffset::new)
+        }
+        fn decoder_state(&self) -> Option<Vec<u8>> {
+            self.decoder_state_calls.fetch_add(1, Ordering::Relaxed);
+            // Sentinel byte pattern — distinct enough to be
+            // recognisable in observer-side asserts.
+            Some(vec![0xABu8; 64])
+        }
+    }
+
+    /// File-backed punch handle for the mock-decoder tests. The
+    /// extractor needs a writable fd for hole-punch syscalls; we
+    /// open a small zero-padded scratch file (sized at
+    /// `frame_size * frames`) so any in-loop punches hit a real
+    /// page rather than failing.
+    fn open_scratch_punch_handle(byte_len: u64) -> (PathBuf, std::fs::File) {
+        let path = unique_temp("counting-decoder");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open scratch");
+        f.set_len(byte_len).expect("set_len");
+        (path, f)
+    }
+
+    /// With the default [`ExtractorConfig`] (no throttle), every
+    /// quiescent boundary fires the observer and triggers a
+    /// `decoder_state()` call. Establishes the baseline against
+    /// which the next test's throttle skip is measured.
+    #[test]
+    fn no_throttle_calls_decoder_state_on_every_quiescent_advance() {
+        const FRAMES: u32 = 4;
+        const FRAME_SIZE: u64 = 1024;
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut decoder = CountingDecoder {
+            frame_size: FRAME_SIZE,
+            remaining_frames: FRAMES,
+            bytes_consumed: 0,
+            last_boundary: None,
+            decoder_state_calls: Arc::clone(&calls),
+        };
+        let sink = VecSink {
+            bytes: Vec::new(),
+            fail_at: None,
+            is_quiescent: true,
+        };
+        let (path, scratch) = open_scratch_punch_handle(FRAME_SIZE * u64::from(FRAMES));
+        let _g = CleanupOnDrop(path);
+
+        let observer_calls = std::cell::Cell::new(0u32);
+        let observer_saw_blob = std::cell::Cell::new(0u32);
+
+        // Default config: punch enabled, no checkpoint throttle.
+        let stats = Extractor::with_defaults()
+            .extract_with_callback(
+                scratch.as_fd(),
+                &mut decoder,
+                sink,
+                &NoopPuncher::new(),
+                |info| {
+                    observer_calls.set(observer_calls.get() + 1);
+                    if info.decoder_state.is_some() {
+                        observer_saw_blob.set(observer_saw_blob.get() + 1);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("extract");
+
+        // Each frame produces one quiescent advance → one observer
+        // call → one `decoder_state()` invocation.
+        assert_eq!(observer_calls.get(), FRAMES);
+        assert_eq!(observer_saw_blob.get(), FRAMES);
+        assert_eq!(calls.load(Ordering::Relaxed), FRAMES);
+        // `quiescent_checkpoints` counts only persist-eligible
+        // advances now, but with no throttle every advance is
+        // persist-eligible.
+        assert_eq!(stats.quiescent_checkpoints, u64::from(FRAMES));
+        assert_eq!(stats.frame_boundaries_observed, u64::from(FRAMES));
+    }
+
+    /// With `checkpoint_min_bytes = u64::MAX` and a long
+    /// `checkpoint_min_interval`, only the very first
+    /// persist-eligible advance fires (`last_persist_time = None`
+    /// bypass). All subsequent quiescent advances are throttled
+    /// inside the extractor — proving that
+    /// `decoder.decoder_state()` is gated by the throttle, not
+    /// invoked unconditionally.
+    ///
+    /// This is the load-bearing assertion for `PLAN_lazy_decoder_state.md`
+    /// Phase 1: an xz_native pipeline run that throttles 99 % of
+    /// its quiescent advances now pays the (~8 MiB) blob cost only
+    /// on the 1 % that persist.
+    #[test]
+    fn throttle_gates_decoder_state_invocation() {
+        const FRAMES: u32 = 4;
+        const FRAME_SIZE: u64 = 1024;
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut decoder = CountingDecoder {
+            frame_size: FRAME_SIZE,
+            remaining_frames: FRAMES,
+            bytes_consumed: 0,
+            last_boundary: None,
+            decoder_state_calls: Arc::clone(&calls),
+        };
+        let sink = VecSink {
+            bytes: Vec::new(),
+            fail_at: None,
+            is_quiescent: true,
+        };
+        let (path, scratch) = open_scratch_punch_handle(FRAME_SIZE * u64::from(FRAMES));
+        let _g = CleanupOnDrop(path);
+
+        let observer_calls = std::cell::Cell::new(0u32);
+
+        let cfg = ExtractorConfig {
+            // Floors set so wide that only the first-call bypass
+            // can let the observer fire. Subsequent advances are
+            // gated by both floors simultaneously and skip the
+            // observer + the `decoder_state()` invocation.
+            checkpoint_min_bytes: u64::MAX,
+            checkpoint_min_interval: Duration::from_secs(60 * 60),
+            ..ExtractorConfig::default()
+        };
+        let stats = Extractor::new(cfg)
+            .extract_with_callback(
+                scratch.as_fd(),
+                &mut decoder,
+                sink,
+                &NoopPuncher::new(),
+                |_info| {
+                    observer_calls.set(observer_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect("extract");
+
+        assert_eq!(
+            observer_calls.get(),
+            1,
+            "expected exactly the first-call bypass to fire; got {}",
+            observer_calls.get(),
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "decoder_state() must be called only on persist-eligible advances; \
+             got {} (a regression in the throttle gate would surface here)",
+            calls.load(Ordering::Relaxed),
+        );
+        // Three of the four quiescent advances were throttled
+        // inside the extractor; only the first one increments the
+        // counter.
+        assert_eq!(stats.quiescent_checkpoints, 1);
+        // Frame boundaries are still observed even when throttled.
+        assert_eq!(stats.frame_boundaries_observed, u64::from(FRAMES));
+    }
+
+    /// Regression test for the throttle/punch race that originally
+    /// broke mid-frame lz4 resume: when the cadence-throttle skips
+    /// observer calls, the extractor must NOT advance hole-punching
+    /// past the boundary the previous *persisted* observer call
+    /// recorded. If it does, a crash before the next persisted write
+    /// leaves the durable checkpoint pointing at zeroed bytes and
+    /// resume cannot continue.
+    ///
+    /// Phase 1 of `PLAN_lazy_decoder_state.md` moved the throttle
+    /// from the observer into the extractor; this test exercises
+    /// the same invariant under the new shape. We configure
+    /// `checkpoint_min_bytes = u64::MAX` and a long
+    /// `checkpoint_min_interval` so only the very first
+    /// persist-eligible advance fires (`last_persist_time = None`
+    /// bypass), and every subsequent quiescent advance is throttled
+    /// inside the extractor — exactly the scenario the prior
+    /// `CheckpointAck::Throttled`-driven version simulated.
     #[test]
     fn throttled_observer_does_not_advance_punch_past_persisted_position() {
         // Three frames so we get at least three quiescent boundaries
@@ -1430,29 +1703,41 @@ mod tests {
             is_quiescent: true,
         };
 
-        // Observer policy: persist the *first* call, throttle every
-        // call after it. Records the persisted source_position so
-        // the assertion can check no punch reached past it.
+        // Records the source_position the (one and only) observer
+        // call sees — that's the boundary durable on disk after the
+        // throttle starts firing. The assertion below cross-checks
+        // that no in-loop punch reached past it.
         let persisted = std::cell::Cell::new(None::<u64>);
-        let throttle_after_first = std::cell::Cell::new(false);
+        let observer_calls = std::cell::Cell::new(0u32);
 
         let cfg = ExtractorConfig {
-            // Small enough to fire mid-loop. Without the bug fix,
-            // throttled calls would still advance the punch past
-            // the first persisted boundary.
+            // Small enough to fire mid-loop. Without the
+            // throttle-respects-persisted-bound invariant, throttled
+            // steps would still advance the punch past the first
+            // persisted boundary.
             punch_threshold: 4096,
+            // Both floors set so wide that only the
+            // `last_persist_time = None` bypass on the very first
+            // advance lets the observer fire once. Every advance
+            // after that is throttled inside the extractor.
+            checkpoint_min_bytes: u64::MAX,
+            checkpoint_min_interval: Duration::from_secs(60 * 60),
         };
         let stats = Extractor::new(cfg)
             .extract_with_callback(punch_handle.as_fd(), &mut decoder, sink, &puncher, |info| {
-                if throttle_after_first.get() {
-                    return Ok(CheckpointAck::Throttled);
-                }
-                throttle_after_first.set(true);
+                observer_calls.set(observer_calls.get() + 1);
                 persisted.set(Some(info.source_position));
-                Ok(CheckpointAck::Persisted)
+                Ok(())
             })
             .expect("extract");
 
+        assert_eq!(
+            observer_calls.get(),
+            1,
+            "extractor-side throttle should let exactly the first persist-eligible \
+             advance fire; got {} calls",
+            observer_calls.get(),
+        );
         let durable = persisted.get().expect("at least one persisted call");
         let calls = puncher.calls.lock().unwrap().clone();
         assert!(

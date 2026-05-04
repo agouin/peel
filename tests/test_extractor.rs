@@ -331,6 +331,7 @@ fn punching_shrinks_or_preserves_source_footprint() {
     // fires for a multi-MiB source.
     let cfg = ExtractorConfig {
         punch_threshold: 64 * 1024,
+        ..ExtractorConfig::default()
     };
     let stats: ExtractionStats = Extractor::new(cfg)
         .extract(rw_handle.as_fd(), &mut *decoder, sink, &*puncher)
@@ -483,6 +484,7 @@ fn single_frame_zstd_punches_per_block_bounded_peak() {
     const PUNCH_THRESHOLD: u64 = 256 * 1024;
     let cfg = ExtractorConfig {
         punch_threshold: PUNCH_THRESHOLD,
+        ..ExtractorConfig::default()
     };
     let puncher = PeakSamplingPuncher::new(default_puncher(), &src);
 
@@ -655,6 +657,7 @@ fn fatal_punch_error_aborts_extraction() {
 
     let cfg = ExtractorConfig {
         punch_threshold: 4096,
+        ..ExtractorConfig::default()
     };
     let result = Extractor::new(cfg).extract(rw.as_fd(), &mut *decoder, sink, &Boom);
     match result {
@@ -786,6 +789,7 @@ fn single_block_xz_punches_per_chunk_bounded_peak() {
     const PUNCH_THRESHOLD: u64 = 256 * 1024;
     let cfg = ExtractorConfig {
         punch_threshold: PUNCH_THRESHOLD,
+        ..ExtractorConfig::default()
     };
     let puncher = PeakSamplingPuncher::new(default_puncher(), &src);
 
@@ -990,6 +994,7 @@ fn single_member_gzip_punches_per_block_bounded_peak() {
     const PUNCH_THRESHOLD: u64 = 256 * 1024;
     let cfg = ExtractorConfig {
         punch_threshold: PUNCH_THRESHOLD,
+        ..ExtractorConfig::default()
     };
     let puncher = PeakSamplingPuncher::new(default_puncher(), &src);
 

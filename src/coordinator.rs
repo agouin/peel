@@ -162,7 +162,7 @@ use crate::download::{
     ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 use crate::extractor::{
-    CheckpointAck, CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
+    CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
     DEFAULT_PUNCH_THRESHOLD,
 };
 use crate::http::{Client, ClientError, Url, UrlError};
@@ -1156,6 +1156,18 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 let extractor = {
                     let base = Extractor::new(ExtractorConfig {
                         punch_threshold: config.punch_threshold,
+                        // PLAN_lazy_decoder_state.md Phase 1: throttle
+                        // moved from the observer closure into the
+                        // extractor's run loop so a throttled step
+                        // skips both `decoder.decoder_state()` (8 MiB
+                        // per call on xz_native) and the
+                        // `CheckpointInfo` allocation. The user-facing
+                        // CLI knobs (`--checkpoint-min-bytes` /
+                        // `--checkpoint-min-secs`) keep their names
+                        // and meanings; the coordinator just plumbs
+                        // them through.
+                        checkpoint_min_bytes: config.checkpoint_min_bytes,
+                        checkpoint_min_interval: config.checkpoint_min_interval,
                     });
                     let base = match progress_state.clone() {
                         Some(state) => base.with_progress(state),
@@ -1187,7 +1199,6 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &bitmap,
                             &fingerprints,
                             chunk_size,
-                            &config,
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
@@ -1208,7 +1219,6 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &bitmap,
                             &fingerprints,
                             chunk_size,
-                            &config,
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
@@ -1538,15 +1548,10 @@ fn run_one<S: Sink>(
     bitmap: &ChunkBitmap,
     fingerprints: &ChunkFingerprints,
     chunk_size: u64,
-    config: &CoordinatorConfig,
     progress: Option<&mut ProgressFn>,
     kill_switch: Option<&Arc<AtomicBool>>,
     hasher_for_ckpt: Option<&crate::hash::SharedHasher>,
 ) -> Result<ExtractionStats, CoordinatorError> {
-    let mut last_write_at = Instant::now()
-        .checked_sub(config.checkpoint_min_interval)
-        .unwrap_or_else(Instant::now);
-    let mut last_position: u64 = 0;
     let mut progress_inner = progress;
     let mut checkpoints_written: u64 = 0;
 
@@ -1555,21 +1560,13 @@ fn run_one<S: Sink>(
         decoder,
         sink,
         puncher,
-        |info_cb: CheckpointInfo| -> io::Result<CheckpointAck> {
-            // Throttle: write at most once per cadence floor. A
-            // throttled call is reported back to the extractor as
-            // `Throttled` so it does not advance hole-punching past
-            // the most recently *persisted* position — punching past
-            // a non-persisted boundary would otherwise zero the
-            // bytes the still-current durable checkpoint references
-            // and break resume.
-            let elapsed = last_write_at.elapsed();
-            let progressed = info_cb.source_position.saturating_sub(last_position);
-            if progressed < config.checkpoint_min_bytes && elapsed < config.checkpoint_min_interval
-            {
-                return Ok(CheckpointAck::Throttled);
-            }
-
+        |info_cb: CheckpointInfo| -> io::Result<()> {
+            // Throttle moved into the extractor in Phase 1 of
+            // `PLAN_lazy_decoder_state.md`; this closure now only
+            // runs when the extractor has decided the cadence floor
+            // is cleared. Each call corresponds to a durable
+            // checkpoint write.
+            //
             // Crash-test hook. We test the kill switch *before*
             // writing so the count of durable checkpoints exactly
             // matches the value the caller observed.
@@ -1611,8 +1608,6 @@ fn run_one<S: Sink>(
             ckpt.write(ckpt_path)
                 .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
 
-            last_write_at = Instant::now();
-            last_position = info_cb.source_position;
             checkpoints_written = checkpoints_written.saturating_add(1);
             if let Some(cb) = progress_inner.as_deref_mut() {
                 cb(ProgressEvent::CheckpointWritten {
@@ -1621,7 +1616,7 @@ fn run_one<S: Sink>(
                     bytes_out: info_cb.bytes_out,
                 });
             }
-            Ok(CheckpointAck::Persisted)
+            Ok(())
         },
     );
 

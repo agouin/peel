@@ -152,6 +152,7 @@ fn run(args: Args) -> Result<(), String> {
     let puncher = default_puncher();
     let cfg = ExtractorConfig {
         punch_threshold: args.punch_threshold,
+        ..ExtractorConfig::default()
     };
     let extractor = Extractor::new(cfg);
 

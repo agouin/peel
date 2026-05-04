@@ -861,6 +861,133 @@ fn diag_plain_tar_breakdown() {
     }
 }
 
+// ---- diagnostic: tar.xz pipeline overhead breakdown ------------------
+
+/// Phase 0b of `docs/PLAN_xz_throughput.md`. Same shape as
+/// `diag_plain_tar_breakdown` above but on the tar.xz fixture, and
+/// with two extra columns and one extra variant aimed at
+/// pinpointing the ~14× pipeline-overhead gap that Phase 0
+/// surfaced (decode-only is at 29.4 MiB/s on this machine; the
+/// full bench-grid xz row at 1 Gbps is ~2.4 MB/s).
+///
+/// Extra columns:
+///
+/// * `frames` — `frame_boundaries_observed` from
+///   [`peel::extractor::ExtractionStats`]. For xz_native this
+///   advances per LZMA2 chunk (~64 KiB of decoded output), so on a
+///   256 MiB single-Block fixture we expect ~4096.
+/// * `quiesc` — `quiescent_checkpoints`, the count of times the
+///   extractor decided "boundary advanced AND sink quiescent" and
+///   called the observer with a [`CheckpointInfo`]. **Crucially,
+///   this fires once per `decoder_state()` call**: every quiescent
+///   advance constructs the resume blob *before* the observer's
+///   throttle decision runs (`src/extractor.rs:594-606`,
+///   `src/coordinator.rs:1568-1571`). For an xz Block at preset 6
+///   that's ~8 MiB of dict serialization per quiescent advance.
+/// * `overlap` — `total - download - decode - write - punch`. The
+///   three timed phases are disjoint
+///   ([`peel::extractor::ExtractionStats`] docstring); whatever's
+///   left is the streaming-overlap budget *plus* anything the
+///   timing didn't capture (the per-iteration boundary check, the
+///   `decoder_state()` call, the observer's `Throttled` returns).
+///   On the plain-tar fixture this is healthy "we waited on the
+///   network while the decoder ran"; on tar.xz a fast-decoder
+///   suspect would expect overlap to be small. If overlap is
+///   *large* on tar.xz, that's the smoking gun for blob-
+///   construction overhead.
+///
+/// Extra variant:
+///
+/// * `no_punch` — `punch_threshold = u64::MAX` so the puncher
+///   never fires inside the loop (the final sweep still runs but
+///   is cheap on the 256 MiB fixture). Isolates per-loop punch
+///   syscall cost from the rest.
+#[test]
+#[ignore = "diagnostic; opt-in via --ignored"]
+fn diag_tar_xz_breakdown() {
+    let archive = build_tar_payload();
+    let body = encode_xz(&archive);
+    let suffix = "bundle.tar.xz";
+    let server = MockServer::start(ok_handler(body.clone()));
+
+    let body_len = body.len() as u64;
+    type VariantBuilder = fn(u64) -> CoordinatorConfig;
+    let variants: &[(&str, VariantBuilder)] = &[
+        ("default                ", |_| coord_config()),
+        ("single_worker_one_chunk", |body| {
+            let mut c = coord_config();
+            c.workers = 1;
+            c.chunk_size = body;
+            c.adaptive_chunk_size = false;
+            c
+        }),
+        ("no_checkpoints         ", |_| {
+            let mut c = coord_config();
+            c.checkpoint_min_bytes = u64::MAX;
+            c.checkpoint_min_interval = Duration::from_secs(60 * 60);
+            c
+        }),
+        ("no_punch               ", |_| {
+            let mut c = coord_config();
+            c.punch_threshold = u64::MAX;
+            c
+        }),
+        ("tight_reader_poll      ", |_| {
+            let mut c = coord_config();
+            c.reader_poll_interval = Duration::ZERO;
+            c
+        }),
+    ];
+
+    println!(
+        "[diag-xz] {:24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}  {:>7} {:>7} {:>7}",
+        "variant",
+        "download",
+        "decode",
+        "write",
+        "punch",
+        "total",
+        "overlap",
+        "chunks",
+        "frames",
+        "quiesc",
+    );
+    for (label, build) in variants {
+        let work = unique_dir(&format!("diag_xz_{}", label.trim()));
+        let _g = CleanupDir(work.clone());
+        let args = RunArgs {
+            url: format!("{}/{suffix}", server.base_url()),
+            output: OutputTarget::Dir(work.clone()),
+            config: build(body_len),
+            client: build_client(),
+            registry: DecoderRegistry::with_defaults(),
+            progress: None,
+            progress_state: None,
+            kill_switch: None,
+            io_backend: None,
+        };
+        let stats = run(args).expect("peel run succeeds");
+        let chunks = stats.download.chunks_completed;
+        let frames = stats.extraction.frame_boundaries_observed;
+        let quiesc = stats.extraction.quiescent_checkpoints;
+        let dl = stats.download.elapsed.as_secs_f64();
+        let dec = stats.extraction.decode_time.as_secs_f64();
+        let wr = stats.extraction.write_time.as_secs_f64();
+        let pn = stats.extraction.punch_time.as_secs_f64();
+        let tot = stats.elapsed.as_secs_f64();
+        // overlap = whatever is not in any of the timed phases.
+        // Negative values are possible if download and decode raced;
+        // we clamp at 0 for a clean printout.
+        let overlap = (tot - dl - dec - wr - pn).max(0.0);
+        println!(
+            "[diag-xz] {label} {dl:>8.3}s {dec:>8.3}s {wr:>8.3}s {pn:>8.3}s {tot:>8.3}s {ov:>8.3}s  \
+             {chunks:>7} {frames:>7} {quiesc:>7}",
+            ov = overlap,
+        );
+        assert_extracted_tar_matches(&work, &archive);
+    }
+}
+
 // ---- diagnostic: IO backend A/B (blocking vs mmap vs uring) ----------
 
 /// Run the plain-tar payload under each IO backend and print a
@@ -962,40 +1089,185 @@ fn diag_plain_tar_io_backends() {
     }
 }
 
-// ---- diagnostic: same workload under a 50 MB/s bandwidth cap --------
+// ---- benchmark: realistic-WAN-rate grid (peel vs curl|tool) ----------
 
-/// Re-run the plain-tar comparison with both sides throttled to a
-/// realistic-ish wide-area rate (50 MB/s aggregate). The expectation
-/// is that peel's structural overhead — the part-file double-hop and
-/// the lack of overlap visible at loopback speeds — disappears once
-/// the network is the bottleneck, leaving peel's wall-clock close to
-/// `curl|tar`'s.
+/// Compare `peel` against `curl | <decompressor> | tar` at four
+/// representative WAN rates: 10 Mbps, 100 Mbps, 1 Gbps, 10 Gbps. Both
+/// sides share the same cap (peel via [`CoordinatorConfig::max_bandwidth_bps`],
+/// curl via `--limit-rate` in bytes/sec).
 ///
-/// Both sides use the same cap:
-/// * `peel` via [`CoordinatorConfig::max_bandwidth_bps`] (aggregate
-///   across workers — see `download/rate_limit.rs`).
-/// * `curl` via `--limit-rate 50M`.
+/// The hypothesis: at sub-WAN-saturating rates, peel's per-byte
+/// overhead is hidden inside the network wait, so peel and the shell
+/// pipe finish within noise of each other for fast codecs. As the
+/// rate climbs into multi-gigabit territory the slower decoders (here:
+/// peel's single-threaded xz, then peel itself for any codec) become
+/// the bottleneck and peel falls behind.
 ///
-/// At 50 MB/s the 256 MiB payload takes ≥ 5 seconds, so this test is
-/// noticeably slower than the others.
+/// Payload sizes are scaled per rate so each row's wall-clock budget
+/// stays near 5 s of network wait — long enough to drown out
+/// connection setup, short enough that the whole grid finishes in a
+/// few minutes.
 #[test]
-#[ignore = "diagnostic; opt-in via --ignored"]
-fn diag_plain_tar_throttled_50mbps() {
-    if !tool_present("curl") || !tool_present("tar") {
-        skip("tar.50mbps", "curl/tar");
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_throttled_realistic_grid() {
+    if !tool_present("curl") {
+        skip("net", "curl");
         return;
     }
 
-    let archive = build_tar_payload();
-    let suffix = "bundle.tar";
-    let server = MockServer::start(ok_handler(archive.clone()));
+    let rates = &[
+        Rate {
+            label: "10 Mbps",
+            bytes_per_sec: 10_000_000 / 8,
+            payload_bytes: 8 * 1024 * 1024,
+        },
+        Rate {
+            label: "100 Mbps",
+            bytes_per_sec: 100_000_000 / 8,
+            payload_bytes: 32 * 1024 * 1024,
+        },
+        Rate {
+            label: "1 Gbps",
+            bytes_per_sec: 1_000_000_000 / 8,
+            payload_bytes: 128 * 1024 * 1024,
+        },
+        Rate {
+            label: "10 Gbps",
+            bytes_per_sec: 10_000_000_000 / 8,
+            payload_bytes: 256 * 1024 * 1024,
+        },
+    ];
+
+    println!(
+        "[net] {:>10}  {:>9}  {:<8}  {:>9}  {:>13}  {:>6}  {}",
+        "rate", "payload", "format", "peel", "curl|tool", "ratio", "tools"
+    );
+
+    for rate in rates {
+        let (archive, entries) = build_tar_payload_sized(rate.payload_bytes);
+        let mib = (rate.payload_bytes as f64) / (1024.0 * 1024.0);
+
+        // ---- plain tar -------------------------------------------------
+        if tool_present("tar") {
+            run_throttled_case(
+                rate,
+                mib,
+                "tar",
+                "curl|tar",
+                &archive,
+                &archive,
+                &entries,
+                "bundle.tar",
+                |dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} "$URL" | tar -xf - -C {dir}"#,
+                        limit = rate.bytes_per_sec,
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.zst ---------------------------------------------------
+        if tool_present("tar") && tool_present("zstd") {
+            let body = encode_zstd(&archive);
+            run_throttled_case(
+                rate,
+                mib,
+                "tar.zst",
+                "curl|zstd|tar",
+                &body,
+                &archive,
+                &entries,
+                "bundle.tar.zst",
+                |dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} "$URL" | zstd -d -q | tar -xf - -C {dir}"#,
+                        limit = rate.bytes_per_sec,
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.xz ----------------------------------------------------
+        if tool_present("tar") && tool_present("xz") {
+            let body = encode_xz(&archive);
+            run_throttled_case(
+                rate,
+                mib,
+                "tar.xz",
+                "curl|xz|tar",
+                &body,
+                &archive,
+                &entries,
+                "bundle.tar.xz",
+                |dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} "$URL" | xz -d -q | tar -xf - -C {dir}"#,
+                        limit = rate.bytes_per_sec,
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.lz4 (uncompressed frame; framing-only test) ----------
+        if tool_present("tar") && tool_present("lz4") {
+            let body = encode_lz4_uncompressed_frame(&archive);
+            run_throttled_case(
+                rate,
+                mib,
+                "tar.lz4",
+                "curl|lz4|tar",
+                &body,
+                &archive,
+                &entries,
+                "bundle.tar.lz4",
+                |dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} "$URL" | lz4 -d -q | tar -xf - -C {dir}"#,
+                        limit = rate.bytes_per_sec,
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+    }
+}
+
+/// One throttled (peel, curl|tool) comparison row.
+///
+/// `body` is the on-the-wire bytes (post-encoding); `archive` is the
+/// raw tar bytes used for the post-extraction integrity check via
+/// `entries` (the same `(path, content)` pairs that built the archive).
+struct Rate {
+    label: &'static str,
+    bytes_per_sec: u64,
+    #[allow(dead_code)]
+    payload_bytes: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_throttled_case(
+    rate: &Rate,
+    payload_mib: f64,
+    format_label: &str,
+    tools_label: &str,
+    body: &[u8],
+    archive: &[u8],
+    entries: &[(String, Vec<u8>)],
+    suffix: &str,
+    baseline_pipeline: impl Fn(&std::path::Path) -> String,
+) {
+    let server = MockServer::start(ok_handler(body.to_vec()));
     let url = format!("{}/{suffix}", server.base_url());
 
-    // ---- peel with a 50 MB/s aggregate cap --------------------------
-    let work_p = unique_dir("tar_throttled_peel");
+    // ---- peel ----
+    let work_p = unique_dir(&format!("net_{format_label}_peel"));
     let _g_p = CleanupDir(work_p.clone());
     let mut config = coord_config();
-    config.max_bandwidth_bps = Some(50_000_000);
+    config.max_bandwidth_bps = Some(rate.bytes_per_sec);
     let args = RunArgs {
         url: url.clone(),
         output: OutputTarget::Dir(work_p.clone()),
@@ -1011,27 +1283,61 @@ fn diag_plain_tar_throttled_50mbps() {
     let stats = run(args).expect("peel run succeeds");
     let peel_elapsed = started.elapsed();
     assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
-    assert_extracted_tar_matches(&work_p, &archive);
+    assert_dir_matches(&work_p, entries);
 
-    // ---- curl --limit-rate 50M | tar --------------------------------
-    let work_b = unique_dir("tar_throttled_curl");
+    // ---- curl|tool ----
+    let work_b = unique_dir(&format!("net_{format_label}_curl"));
     let _g_b = CleanupDir(work_b.clone());
-    let pipeline = format!(
-        r#"curl -sS --limit-rate 50M "$URL" | tar -xf - -C {}"#,
-        shell_quote(&work_b)
-    );
+    let pipeline = baseline_pipeline(&work_b);
     let base_elapsed = time_pipeline(&url, &pipeline);
-    assert_extracted_tar_matches(&work_b, &archive);
+    assert_dir_matches(&work_b, entries);
 
-    let mib = (archive.len() as f64) / (1024.0 * 1024.0);
     let peel_s = peel_elapsed.as_secs_f64();
     let base_s = base_elapsed.as_secs_f64();
     println!(
-        "[diag] tar @ 50MB/s  payload={mib:5.1} MiB  peel={peel_s:6.3}s  curl|tar={base_s:6.3}s  ratio={ratio:.2}x  | peel-internal: download={dl:.3}s decode={dec:.3}s",
+        "[net] {rate:>10}  {payload:>6.1} MiB  {fmt:<8}  {peel:>7.3}s  {base:>11.3}s  {ratio:>5.2}x  {tools}",
+        rate = rate.label,
+        payload = payload_mib,
+        fmt = format_label,
+        peel = peel_s,
+        base = base_s,
         ratio = peel_s / base_s.max(1e-9),
-        dl = stats.download.elapsed.as_secs_f64(),
-        dec = stats.extraction.decode_time.as_secs_f64(),
+        tools = tools_label,
     );
+}
+
+/// Like [`build_tar_payload`] but takes a target raw-byte total. Files
+/// are split evenly into `FILES` (8) entries; deterministic content
+/// per-index so the post-extraction check can re-derive the bodies.
+///
+/// Returns `(archive_bytes, entries)` where `entries` is the
+/// `(path, content)` list used by [`assert_dir_matches`].
+fn build_tar_payload_sized(approx_total: usize) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+    const FILES: usize = 8;
+    let per = approx_total / FILES;
+    let entries: Vec<(String, Vec<u8>)> = (0..FILES)
+        .map(|i| {
+            (
+                format!("data/file_{i:02}.bin"),
+                random_bytes(0xBEEF + i as u64, per),
+            )
+        })
+        .collect();
+    let pairs: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    let archive = build_simple_archive(&pairs);
+    (archive, entries)
+}
+
+fn assert_dir_matches(dir: &std::path::Path, entries: &[(String, Vec<u8>)]) {
+    for (name, body) in entries {
+        let path = dir.join(name);
+        let actual = fs::read(&path).expect("read extracted file");
+        assert_eq!(actual.len(), body.len(), "size mismatch on {name}");
+        assert_eq!(actual, *body, "contents mismatch on {name}");
+    }
 }
 
 // ---- shell quoting (POSIX single-quote) -------------------------------
