@@ -98,6 +98,15 @@ your workload starts.
 **CI runners and ephemeral disks.** Same story: bounded disk, resumable
 on flaky networks, no scratch space gymnastics.
 
+**Streaming `.zip` over HTTP at all.** `curl | unzip` does not work:
+the central directory lives at the end of the file, so a stdin-only
+unzipper has to buffer the entire archive before it can decode the
+first byte. Workarounds (download fully, then extract) defeat the
+whole point of streaming. `peel` uses a ranged GET to fetch the
+central directory first, then streams entries in order while the rest
+of the archive is still arriving — same hole-punching, same resume
+guarantees as the tar formats.
+
 ## Benchmarks: peel vs `curl | <decompressor> | tar`
 
 The fair worry is "doesn't all that machinery — parallel ranged GETs,
@@ -128,14 +137,14 @@ Lower is better; **bold** = `peel` is faster than the shell pipe.
 
 | Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
 | --- | --- | --- | --- | --- |
-| `tar` | 1.08× | **0.94×** | **0.78×** | **0.88×** |
-| `tar.zst` | 1.08× | **0.94×** | **0.78×** | **0.81×** |
-| `tar.lz4` | 1.10× | **0.94×** | **0.79×** | **0.88×** |
-| `tar.xz` | 1.13× | 1.13× | 2.38× | 2.38× |
+| `tar` | **0.96×** | **0.94×** | **0.78×** | **0.83×** |
+| `tar.zst` | 1.06× | **0.94×** | **0.79×** | **0.84×** |
+| `tar.lz4` | 1.07× | **0.94×** | **0.79×** | **0.86×** |
+| `tar.xz` | 1.13× | 1.07× | 1.97× | 1.91× |
 
 Absolute wall-clock for the 10 Gbps · 256 MiB column, for scale:
-`tar` 0.20 s vs 0.23 s · `tar.zst` 0.19 s vs 0.24 s · `tar.lz4`
-0.21 s vs 0.24 s · `tar.xz` 14.4 s vs 6.0 s.
+`tar` 0.20 s vs 0.24 s · `tar.zst` 0.20 s vs 0.24 s · `tar.lz4`
+0.20 s vs 0.24 s · `tar.xz` 11.8 s vs 6.1 s.
 
 ### Reading the grid
 
@@ -146,14 +155,23 @@ TCP connection, which more than pays for the part-file double-hop and
 checkpoint syncs. Wins of 5–20 % are real and stable run-to-run.
 
 **xz, everyday WAN.** Stays in line with the other codecs through the
-100 Mbps cell. The 2.38× ratio at 1 Gbps and above is the residual
+100 Mbps cell. The ~1.91× ratio at 1 Gbps and above is the residual
 gap between `peel`'s clean-room single-threaded LZMA decoder and
 system `xz`'s 20+-year-old hand-tuned C path; it is the single-largest
 item on the post-MVP perf backlog (see `docs/PLAN_xz_throughput.md`).
 Earlier `peel` releases sat at ~20× here because of a coordinator-side
 issue that called the resume-blob serializer on every LZMA2 chunk
 boundary; that path now fires only on durable-checkpoint boundaries
-(see `docs/PLAN_lazy_decoder_state.md`).
+(see `docs/PLAN_lazy_decoder_state.md`). The most recent cut
+(`docs/PLAN_checkpoint_blob_dedup.md`) takes the row from ~2.38× to
+~1.91× by dropping a redundant inner CRC32 from the xz resume blob
+and threading the resume-blob bytes from the decoder ring buffer
+into the `Checkpoint` body buffer with **one** memcpy instead of
+four — combined per-checkpoint cost on `tar.xz` falls from ~28 ms to
+~13 ms. The remaining gap is the LZMA decoder's single-threaded
+floor; multi-Block parallel decode
+(`docs/PLAN_xz_parallel_block_decode.md`) is the next step toward
+≤ 1×.
 
 **10 Gbps, fast codecs.** As of `PLAN_checkpoint_cadence_throughput.md`
 the fast-codec rows beat `curl | tar` at 10 Gbps too: the per-checkpoint
@@ -163,8 +181,8 @@ scales with realized download throughput so the bench's 32 checkpoints
 collapse to 2–3. Combined with parallel ranged GETs, `peel` finishes
 ahead of the shell pipe across the whole streaming-codec range.
 
-**xz at 10 Gbps** still trails `curl | xz | tar` by the same 2.38× —
-the network is no longer in the budget; the gap is the LZMA decoder
+**xz at 10 Gbps** still trails `curl | xz | tar` by ~1.91× — the
+network is no longer in the budget; the gap is the LZMA decoder
 itself.
 
 ### When to reach for `peel`
