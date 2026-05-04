@@ -1424,8 +1424,8 @@ fn bench_throttled_realistic_grid() {
     ];
 
     println!(
-        "[net] {:>10}  {:>9}  {:<8}  {:>9}  {:>13}  {:>6}  {}",
-        "rate", "payload", "format", "peel", "curl|tool", "ratio", "tools"
+        "[net] {:>10}  {:>9}  {:<8}  {:>9}  {:>13}  {:>6}  tools",
+        "rate", "payload", "format", "peel", "curl|tool", "ratio"
     );
 
     for rate in rates {
