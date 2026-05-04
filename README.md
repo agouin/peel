@@ -3,12 +3,16 @@
 **Sick of downloading an archive just to extract it and delete it?**
 **Tired of provisioning disk for *both* the compressed file and the
 extracted contents — only to throw ~half of it away?**
+**Tired of restarting a half-finished multi-gigabyte download from
+scratch every time the connection drops or the process gets killed?**
 
-`peel` downloads, decompresses, and extracts in a single pass. The
-compressed bytes never fully land on disk: as the decoder consumes them,
-the download buffer is hole-punched out from underneath. Your archive
-and your extracted tree never coexist at full size, the pipeline
-survives `kill -9`, and resumption is byte-identical to a clean run.
+`peel` downloads, decompresses, and extracts in a single pass — and
+resumes exactly where it left off after any interruption: dropped
+connection, `kill -9`, power loss, OOM. The compressed bytes never
+fully land on disk: as the decoder consumes them, the download buffer
+is hole-punched out from underneath. Your archive and your extracted
+tree never coexist at full size, and a resumed run produces output
+byte-identical to a clean run.
 
 ```
 peel https://example.com/dataset.tar.zst -C ./out
