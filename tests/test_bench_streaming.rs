@@ -148,6 +148,21 @@ fn encode_xz(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Single-member gzip blob at the default compression level — the
+/// shape `gzip` / `tar -z` CLI produces, and which peel's hand-rolled
+/// [`peel::decode::deflate_native::gzip`] backend decodes.
+fn encode_gzip(payload: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(
+        Vec::with_capacity(payload.len() / 2 + 256),
+        Compression::default(),
+    );
+    encoder.write_all(payload).expect("encode gzip");
+    encoder.finish().expect("finish gzip")
+}
+
 /// Single-frame, single-block, *uncompressed* LZ4 archive — the
 /// minimum-viable shape `peel::decode::lz4` accepts and which `lz4 -d`
 /// also decodes. Re-implemented here (rather than depending on a
@@ -306,6 +321,15 @@ fn build_client() -> Client {
 }
 
 fn coord_config() -> CoordinatorConfig {
+    // Mirrors `CoordinatorConfig::default()` for the cadence-relevant
+    // fields (`checkpoint_min_bytes` = 8 MiB, `checkpoint_min_interval`
+    // = 2 s, `checkpoint_target_interval` = 200 ms) so the bench grid
+    // measures production behavior. An earlier revision used a 50 ms
+    // time floor to stress resume granularity; the result was up to
+    // ~189 checkpoints on long-running tar.xz runs (vs ~26 in
+    // production) and a corresponding inflation of the bench's
+    // `tar.xz` ratio. `PLAN_xz_bench_profile.md` Phase 1 + the
+    // bench cadence audit walk through the math.
     CoordinatorConfig {
         chunk_size: 1 << 20, // 1 MiB
         adaptive_chunk_size: true,
@@ -317,7 +341,7 @@ fn coord_config() -> CoordinatorConfig {
         },
         punch_threshold: 1 << 20,
         checkpoint_min_bytes: 8 * 1024 * 1024,
-        checkpoint_min_interval: Duration::from_millis(50),
+        checkpoint_min_interval: Duration::from_secs(2),
         checkpoint_target_interval: Duration::from_millis(200),
         workdir: None,
         reader_poll_interval: Duration::from_millis(2),
@@ -1097,6 +1121,11 @@ fn diag_streaming_source_pipeline_10gbps() {
             suffix: "bundle.tar.xz",
             encode: encode_xz,
         },
+        HotLaneFormat {
+            label: "tar.gz",
+            suffix: "bundle.tar.gz",
+            encode: encode_gzip,
+        },
     ];
 
     let variants = vec![
@@ -1497,6 +1526,28 @@ fn bench_throttled_realistic_grid() {
                 |dir| {
                     format!(
                         r#"curl -sS --limit-rate {limit} "$URL" | xz -d -q | tar -xf - -C {dir}"#,
+                        limit = rate.bytes_per_sec,
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.gz ----------------------------------------------------
+        if tool_present("tar") && tool_present("gzip") {
+            let body = encode_gzip(&archive);
+            run_throttled_case(
+                rate,
+                mib,
+                "tar.gz",
+                "curl|gzip|tar",
+                &body,
+                &archive,
+                &entries,
+                "bundle.tar.gz",
+                |dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} "$URL" | gzip -d -q | tar -xf - -C {dir}"#,
                         limit = rate.bytes_per_sec,
                         dir = shell_quote(dir),
                     )
