@@ -1160,9 +1160,10 @@ fn diag_streaming_source_pipeline_10gbps() {
     // emitted alongside each `[diag-hot]` row.
     // `PLAN_checkpoint_cadence_throughput.md` Phase 0.
     println!(
-        "[ckpt-hot] {:7} {:18} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7} {:>9} {:>9} {:>7}",
+        "[ckpt-hot] {:7} {:18} {:>9} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7} {:>9} {:>9} {:>7}",
         "format",
         "variant",
+        "decstate",
         "obs",
         "spsync",
         "serial",
@@ -1242,22 +1243,28 @@ fn diag_streaming_source_pipeline_10gbps() {
             );
             // Per-checkpoint cost decomposition. The per-step
             // columns are non-overlapping; `sum` is their total
-            // and should match `obs` within syscall-noise. A
-            // material gap means a stage isn't being timed.
-            // `PLAN_checkpoint_cadence_throughput.md` Phase 0.
+            // and should match `decstate + obs` within
+            // syscall-noise. A material gap means a stage isn't
+            // being timed. `PLAN_checkpoint_cadence_throughput.md`
+            // Phase 0; `decstate` column added in
+            // `PLAN_xz_bench_profile.md` Phase 1 to attribute the
+            // `decoder_state()` call which fires *outside* the
+            // observer closure.
             let e = &stats.extraction;
-            let sum = e.ckpt_sparse_sync_time
+            let sum = e.ckpt_decoder_state_time
+                + e.ckpt_sparse_sync_time
                 + e.ckpt_serialize_time
                 + e.ckpt_tmp_write_time
                 + e.ckpt_tmp_fsync_time
                 + e.ckpt_rename_time
                 + e.ckpt_dir_fsync_time;
             println!(
-                "[ckpt-hot] {fmt:7} {var:18} {obs:>7.3}s {spsync:>8.3}s \
+                "[ckpt-hot] {fmt:7} {var:18} {decstate:>8.3}s {obs:>7.3}s {spsync:>8.3}s \
                  {serial:>8.3}s {tmpwr:>8.3}s {tmpfs:>8.3}s {rename:>8.3}s \
                  {dfs_n:>7} {dfs:>8.3}s {sum:>8.3}s {ckpts:>7}",
                 fmt = format.label,
                 var = variant.label,
+                decstate = e.ckpt_decoder_state_time.as_secs_f64(),
                 obs = e.ckpt_observer_time.as_secs_f64(),
                 spsync = e.ckpt_sparse_sync_time.as_secs_f64(),
                 serial = e.ckpt_serialize_time.as_secs_f64(),

@@ -231,6 +231,21 @@ fn bench_xz_native_tar_xz_64mib_single_block() {
     );
 }
 
+/// 128 MiB single-Block tar.xz — matches the `1 Gbps · 128 MiB` cell of
+/// the README's `bench_throttled_realistic_grid`. Used by Phase 0 of
+/// `docs/PLAN_xz_bench_profile.md` as the "no-pipeline floor": the
+/// difference between this elapsed time and the same cell's `decode`
+/// column in `diag_tar_xz_breakdown` is the cost of the extractor
+/// inner loop and source plumbing on this fixture size.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_xz_native_tar_xz_128mib_single_block() {
+    bench_at_size(
+        128 * 1024 * 1024,
+        "tar.xz · 128 MiB · single-Block · preset 6",
+    );
+}
+
 /// 256 MiB single-Block tar.xz — the regression-gate fixture
 /// referenced by `docs/PLAN_xz_throughput.md` §Targets. Same shape
 /// as the 1 Gbps · 128 MiB cell of the README's bench grid scaled

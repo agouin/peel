@@ -373,6 +373,19 @@ pub struct ExtractionStats {
     /// to assert that the per-step counters above add up to the
     /// observed observer time within noise.
     pub ckpt_observer_time: Duration,
+    /// Wall-clock time spent in [`StreamingDecoder::decoder_state`]
+    /// during persist-eligible advances — i.e. the call that builds
+    /// the resume blob immediately before the observer is invoked.
+    /// For xz_native this serializes the LZMA dictionary; for other
+    /// decoders it's a sliding-window snapshot. Lives outside both
+    /// the timed phases and `ckpt_observer_time`, so without this
+    /// counter the cost was unattributed in the diagnostic table.
+    /// `PLAN_xz_bench_profile.md` Phase 1.
+    pub ckpt_decoder_state_time: Duration,
+    /// Number of [`StreamingDecoder::decoder_state`] calls. Equals
+    /// `quiescent_checkpoints` exactly (one per persist-eligible
+    /// advance). `PLAN_xz_bench_profile.md` Phase 1.
+    pub ckpt_decoder_state_calls: u64,
 }
 
 /// Coordinator that ties decoder, sink, and puncher into one loop.
@@ -778,12 +791,26 @@ impl Extractor {
                         if !throttled {
                             stats.quiescent_checkpoints =
                                 stats.quiescent_checkpoints.saturating_add(1);
+                            // Time `decoder_state()` separately
+                            // (`PLAN_xz_bench_profile.md` Phase 1).
+                            // For xz_native this builds an 8 MiB LZMA
+                            // dict snapshot and lives outside both
+                            // the timed phases and the observer
+                            // closure; without this counter the cost
+                            // showed up as unattributed "overlap".
+                            let ds_start = Instant::now();
+                            let decoder_state = decoder.decoder_state();
+                            stats.ckpt_decoder_state_time = stats
+                                .ckpt_decoder_state_time
+                                .saturating_add(ds_start.elapsed());
+                            stats.ckpt_decoder_state_calls =
+                                stats.ckpt_decoder_state_calls.saturating_add(1);
                             let info = CheckpointInfo {
                                 source_position: b,
                                 bytes_in: stats.bytes_in,
                                 bytes_out: adapter.bytes_out,
                                 quiescent_index: stats.quiescent_checkpoints,
-                                decoder_state: decoder.decoder_state(),
+                                decoder_state,
                                 sink_state: adapter.sink.sink_state(),
                             };
                             on_checkpoint(info).map_err(ExtractorError::Observer)?;
