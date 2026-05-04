@@ -255,8 +255,8 @@ pub trait StreamingDecoder: Send {
     /// the body's pre-decoder_state floor (~bitmap + sink_state)
     /// up to that small cap is one cheap doubling. xz_native
     /// overrides this to return the dict's `recent_len(capacity)`
-    /// + a small overhead. `PLAN_checkpoint_blob_dedup.md`
-    /// Phase 2.
+    /// plus a small overhead.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
     fn decoder_state_size_hint(&self) -> usize {
         0
     }
