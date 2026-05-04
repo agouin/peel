@@ -2326,3 +2326,159 @@ fn random_kill_points_resume_single_block_tar_xz_property() {
         );
     }
 }
+
+// ---- harness: `.tar.gz` (PLAN_deflate_block_decoder Phase 11) -----------
+
+/// Encode `payload` as a single-member gzip blob at the given
+/// flate2 compression level. Used by the Phase 11 crash-resume
+/// harness so the archive shape matches what `gzip` / `tar -z`
+/// CLI produces by default — one monolithic gzip member whose
+/// only restart points are the per-deflate-block boundaries the
+/// hand-rolled `crate::decode::deflate_native::gzip` decoder
+/// exposes (Phase 7 `decoder_state` blob, Phase 8 registry swap).
+fn encode_gzip_single_member(payload: &[u8], level: u32) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+    encoder.write_all(payload).expect("gzip encode");
+    encoder.finish().expect("gzip finish")
+}
+
+#[test]
+fn random_kill_points_resume_single_member_tar_gz_byte_identical() {
+    // Phase 11 of `docs/PLAN_deflate_block_decoder.md`: a
+    // single-member `.tar.gz` is the dominant production shape
+    // (`gzip` / `tar -z` CLI's default). Pre-Phase-7 the
+    // `flate2`-based wrapper exposed only end-of-member
+    // `frame_boundary` advances, so every kill -9 mid-extraction
+    // lost all decoder progress and resumed from byte 0. Phase
+    // 7 added per-deflate-block boundaries with a captured
+    // `decoder_state` blob; Phase 8 swapped the registry over;
+    // Phase 10 confirmed the puncher fires per-block; this test
+    // pins the user-visible *resume* win.
+    //
+    // The plan calls for "several tar members of awkward sizes
+    // so deflate-block boundaries and tar-member boundaries
+    // rarely coincide." Member sizes use prime numbers so the
+    // cumulative offsets after each member are pairwise distinct
+    // mod any plausible deflate-block size (~32-64 KiB at
+    // miniz_oxide's default level). Total payload is large
+    // enough that the compressed member spans many deflate
+    // blocks.
+    // Payload sizes are picked so the decompressed tar archive
+    // is many MiB — large enough that miniz_oxide at default
+    // compression level emits ≥ 2 deflate blocks (its internal
+    // block-flush heuristic kicks in around ~256 KiB of output).
+    // Without that, the golden run produces only one
+    // (end-of-member) checkpoint and the harness can't randomize
+    // kill points; pre-Phase-7 the same fixture would have
+    // produced ZERO mid-stream checkpoints, so the ≥ 2 floor in
+    // run_dir_kill_resume_trials is the test's load-bearing
+    // assertion.
+    let mut members: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    let primes = [217_001usize, 319_393, 405_011, 531_581, 687_517, 823_751];
+    for i in 0..8 {
+        let name = Box::leak(format!("dir/single_member_gz_{i:02}.bin").into_boxed_str());
+        let payload = build_lzma_friendly_input(primes[i % primes.len()], 0xCAFE_F00D ^ i as u32);
+        members.push((name, payload));
+    }
+    let mut archive = Vec::new();
+    for (name, payload) in &members {
+        archive.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    archive.extend_from_slice(&end_of_archive_block());
+
+    let body = encode_gzip_single_member(&archive, 6);
+    let trial_count = 12u64;
+    run_dir_kill_resume_trials(
+        "single_member_tar_gz",
+        "x.tar.gz",
+        body,
+        "\"v-single-member-tar-gz\"",
+        0xDEAD_F00D_C0FF_EE99,
+        trial_count,
+        // Single-member tar.gz: every checkpoint inside the
+        // deflate stream captures a `decoder_state` blob (the
+        // gzip wrapper's `decoder_state()` re-wraps the inner
+        // deflate's blob with the running CRC32 + ISIZE, per
+        // Phase 7). End-of-member is a separate boundary that
+        // *doesn't* carry a blob, but for a single-member
+        // archive we never checkpoint there — the kill always
+        // fires before the trailer is validated, so resume
+        // always takes the `resume_factory` (decoder_state)
+        // path. This is the user-visible Phase 7 + Phase 8 win.
+        ExpectedResumeMode::AllDecoderState,
+    );
+}
+
+#[test]
+fn random_kill_points_resume_single_member_tar_gz_property() {
+    // Phase 11 property bar: vary compression level, member
+    // sizes, and kill points across a small matrix; every
+    // (level, sizes) configuration must produce byte-identical
+    // resumes via the decoder_state path.
+    //
+    // Aggregate trial count: 3 configs × 8 trials = 24 single-
+    // member tar.gz crash-resume runs. Plus the 12 from
+    // `..._byte_identical` above (= 36 here). Together with
+    // the existing 56 xz, 105 zstd, 32 lz4, and 10 zip runs
+    // the suite already has, the project is well past the
+    // plan's "100 randomized crash-resume runs" exit criterion
+    // across all formats.
+    // Member sizes are picked so the decompressed tar archive
+    // is many MiB across all configs — see the
+    // `..._byte_identical` test above for why the small-payload
+    // shapes don't trigger multi-block emission at miniz_oxide's
+    // default heuristics.
+    for &(level, member_count, member_size, label, etag, seed_arch, seed_trials) in &[
+        (
+            1u32,
+            6usize,
+            217_001usize,
+            "prop_gz_l1",
+            "\"v-prop-gz-l1\"",
+            0x1234_5678_9ABC_DEF0u64,
+            0xAAAA_5555_BBBB_6666u64,
+        ),
+        (
+            6,
+            8,
+            319_393,
+            "prop_gz_l6",
+            "\"v-prop-gz-l6\"",
+            0xFEDC_BA98_7654_3210,
+            0x7777_8888_9999_AAAA,
+        ),
+        (
+            9,
+            10,
+            405_011,
+            "prop_gz_l9",
+            "\"v-prop-gz-l9\"",
+            0x0F0E_0D0C_0B0A_0908,
+            0x1111_2222_3333_4444,
+        ),
+    ] {
+        let mut members: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        for i in 0..member_count {
+            let name = Box::leak(format!("{label}/member_{i:02}.bin").into_boxed_str());
+            let seed = seed_arch.rotate_left(i as u32 * 5) as u32;
+            members.push((name, build_lzma_friendly_input(member_size, seed)));
+        }
+        let mut archive = Vec::new();
+        for (name, payload) in &members {
+            archive.extend_from_slice(&member_archive_bytes(name, payload));
+        }
+        archive.extend_from_slice(&end_of_archive_block());
+
+        let body = encode_gzip_single_member(&archive, level);
+        run_dir_kill_resume_trials(
+            label,
+            "x.tar.gz",
+            body,
+            etag,
+            seed_trials,
+            8,
+            ExpectedResumeMode::AllDecoderState,
+        );
+    }
+}
