@@ -94,6 +94,94 @@ your workload starts.
 **CI runners and ephemeral disks.** Same story: bounded disk, resumable
 on flaky networks, no scratch space gymnastics.
 
+## Benchmarks: peel vs `curl | <decompressor> | tar`
+
+The fair worry is "doesn't all that machinery — parallel ranged GETs,
+sparse part-file, frame-aligned checkpoints, hole-punching — make
+`peel` slower than just `curl | zstd -d | tar -xf -`?" At realistic
+network speeds, no. The decoder side is faster than the wire side, so
+the structural overhead disappears into the network wait, and `peel`
+actually wins by a small margin from ranged-GET parallelism. The one
+exception is pipes faster than ~3 Gbps, where `peel`'s decoder pipeline
+becomes the bottleneck.
+
+Both sides share the same rate cap (`peel --max-bandwidth`,
+`curl --limit-rate`). Payload size scales per row so wire-time stays
+in the 0.2–7 s range (long enough to drown out connection setup,
+short enough that the whole grid finishes in ~6 minutes). 4 workers,
+blocking IO backend, in-process mock server on loopback. Apple M4
+Max / macOS 26.3, two consecutive runs averaged (variance ≤ 5 %).
+Reproduce with:
+
+```sh
+cargo test --release --test test_bench_streaming \
+  bench_throttled_realistic_grid -- --ignored --nocapture --test-threads=1
+```
+
+### Wall-clock ratio: `peel` ÷ `curl | tool`
+
+Lower is better; **bold** = `peel` is faster than the shell pipe.
+
+| Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
+| --- | --- | --- | --- | --- |
+| `tar` | 1.08× | **0.94×** | **0.78×** | **0.88×** |
+| `tar.zst` | 1.08× | **0.94×** | **0.78×** | **0.81×** |
+| `tar.lz4` | 1.10× | **0.94×** | **0.79×** | **0.88×** |
+| `tar.xz` | 1.13× | 1.13× | 2.38× | 2.38× |
+
+Absolute wall-clock for the 10 Gbps · 256 MiB column, for scale:
+`tar` 0.20 s vs 0.23 s · `tar.zst` 0.19 s vs 0.24 s · `tar.lz4`
+0.21 s vs 0.24 s · `tar.xz` 14.4 s vs 6.0 s.
+
+### Reading the grid
+
+**10 Mbps – 1 Gbps, fast codecs (tar / zstd / lz4).** `peel` ties or
+beats the shell pipe across the whole everyday-WAN range. Four
+parallel ranged GETs put more bandwidth in flight than curl's single
+TCP connection, which more than pays for the part-file double-hop and
+checkpoint syncs. Wins of 5–20 % are real and stable run-to-run.
+
+**xz, everyday WAN.** Stays in line with the other codecs through the
+100 Mbps cell. The 2.38× ratio at 1 Gbps and above is the residual
+gap between `peel`'s clean-room single-threaded LZMA decoder and
+system `xz`'s 20+-year-old hand-tuned C path; it is the single-largest
+item on the post-MVP perf backlog (see `docs/PLAN_xz_throughput.md`).
+Earlier `peel` releases sat at ~20× here because of a coordinator-side
+issue that called the resume-blob serializer on every LZMA2 chunk
+boundary; that path now fires only on durable-checkpoint boundaries
+(see `docs/PLAN_lazy_decoder_state.md`).
+
+**10 Gbps, fast codecs.** As of `PLAN_checkpoint_cadence_throughput.md`
+the fast-codec rows beat `curl | tar` at 10 Gbps too: the per-checkpoint
+publication path now uses `fcntl(F_BARRIERFSYNC)` on macOS / `fdatasync`
+on Linux instead of full `fsync` (~5× cheaper), and the cadence floor
+scales with realized download throughput so the bench's 32 checkpoints
+collapse to 2–3. Combined with parallel ranged GETs, `peel` finishes
+ahead of the shell pipe across the whole streaming-codec range.
+
+**xz at 10 Gbps** still trails `curl | xz | tar` by the same 2.38× —
+the network is no longer in the budget; the gap is the LZMA decoder
+itself.
+
+### When to reach for `peel`
+
+Use `peel` when **any** of these hold (which is most of the time):
+
+- The link is a real network — 10 Mbps residential through 10 Gbps
+  WAN. `peel` is at-or-better on every fast-codec row (within 15 %
+  for xz at low rates) and you get the full feature set for free.
+- Disk for `archive_size + extracted_size` doesn't fit — PVCs,
+  ephemeral runners, TB-scale datasets.
+- A `kill -9`, network drop, or pod restart shouldn't cost you the
+  run.
+- You want `--sha256` verified inline, `--mirror` fan-out across
+  sources, or `--max-bandwidth` capping.
+
+Use `curl | tool | tar` when **all** of these hold:
+
+- The archive is `tar.xz` and decode time dominates.
+- You don't need resume / integrity / multi-mirror.
+
 ## Usage
 
 ```sh

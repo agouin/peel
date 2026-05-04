@@ -90,6 +90,8 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         punch_threshold: 4096,
         checkpoint_min_bytes: 1,
         checkpoint_min_interval: Duration::from_millis(0),
+        // Disable rate-aware scaling so the byte floor stays at 1.
+        checkpoint_target_interval: Duration::ZERO,
         workdir: None,
         reader_poll_interval: Duration::from_millis(2),
         forced_format: None,

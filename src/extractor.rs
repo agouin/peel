@@ -386,13 +386,42 @@ pub struct ExtractionStats {
 /// Optionally pairs with a [`ProgressState`] (via
 /// [`Self::with_progress`]) so the per-write byte counter feeds the
 /// `PLAN_v2.md` §6 progress UI.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Extractor {
     config: ExtractorConfig,
     progress: Option<Arc<ProgressState>>,
     /// Optional run-wide kill switch, polled once per `decode_step`
     /// iteration of the inner loop. See [`Self::with_kill_switch`].
     kill_switch: Option<Arc<AtomicBool>>,
+    /// Optional dynamic checkpoint byte-floor provider
+    /// (`PLAN_checkpoint_cadence_throughput.md` Phase 2). When set,
+    /// the cadence throttle calls this on each persist-eligible
+    /// advance and uses the returned value as the byte floor instead
+    /// of [`ExtractorConfig::checkpoint_min_bytes`]. The provider is
+    /// expected to return *at least* the configured floor — the
+    /// coordinator wires it up so the configured value is the lower
+    /// bound and the rate-aware term is the upper bound.
+    checkpoint_floor_provider: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Extractor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extractor")
+            .field("config", &self.config)
+            .field("progress", &self.progress.as_ref().map(|_| "ProgressState"))
+            .field(
+                "kill_switch",
+                &self.kill_switch.as_ref().map(|_| "AtomicBool"),
+            )
+            .field(
+                "checkpoint_floor_provider",
+                &self
+                    .checkpoint_floor_provider
+                    .as_ref()
+                    .map(|_| "FloorProvider"),
+            )
+            .finish()
+    }
 }
 
 impl Extractor {
@@ -403,6 +432,7 @@ impl Extractor {
             config,
             progress: None,
             kill_switch: None,
+            checkpoint_floor_provider: None,
         }
     }
 
@@ -435,6 +465,35 @@ impl Extractor {
     #[must_use]
     pub fn with_kill_switch(mut self, kill: Arc<AtomicBool>) -> Self {
         self.kill_switch = Some(kill);
+        self
+    }
+
+    /// Attach a dynamic byte-floor provider for the checkpoint
+    /// cadence throttle (`PLAN_checkpoint_cadence_throughput.md`
+    /// Phase 2).
+    ///
+    /// On each persist-eligible advance the throttle calls
+    /// `provider()` and uses the returned value as the byte floor
+    /// instead of [`ExtractorConfig::checkpoint_min_bytes`]. The
+    /// coordinator uses this to scale the floor with realized
+    /// download throughput: at high rates the realized term raises
+    /// the floor so cadence is paced by the OS's ability to durably
+    /// publish, not by raw byte progress; at low rates the
+    /// configured byte floor still wins.
+    ///
+    /// The contract: the provider returns *at least* the configured
+    /// `checkpoint_min_bytes` value (the coordinator enforces this
+    /// via `max(configured, rate * target_interval)`); the throttle
+    /// does not double-check. The time floor
+    /// ([`ExtractorConfig::checkpoint_min_interval`]) still bounds
+    /// resume granularity from above regardless of the dynamic
+    /// floor.
+    #[must_use]
+    pub fn with_checkpoint_floor_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        self.checkpoint_floor_provider = Some(provider);
         self
     }
 
@@ -700,7 +759,18 @@ impl Extractor {
                         let throttled = if let Some(prev) = last_persist_time {
                             let bytes_progressed = b.saturating_sub(last_persisted_quiescent_at);
                             let time_progressed = prev.elapsed();
-                            bytes_progressed < self.config.checkpoint_min_bytes
+                            // Phase 2: sample the dynamic floor when
+                            // a provider is attached; otherwise use
+                            // the static configured floor. The
+                            // provider's contract is to return at
+                            // least the configured floor, so the
+                            // throttle never relaxes below the
+                            // user-set lower bound.
+                            let bytes_floor = self
+                                .checkpoint_floor_provider
+                                .as_ref()
+                                .map_or(self.config.checkpoint_min_bytes, |p| p());
+                            bytes_progressed < bytes_floor
                                 && time_progressed < self.config.checkpoint_min_interval
                         } else {
                             false

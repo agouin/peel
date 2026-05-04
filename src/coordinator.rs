@@ -229,10 +229,31 @@ pub struct CoordinatorConfig {
     pub retry: RetryConfig,
     /// Extractor-side: minimum gap between in-loop punch syscalls.
     pub punch_threshold: u64,
-    /// Minimum source-byte progress between checkpoint writes.
+    /// Minimum source-byte progress between checkpoint writes. Acts
+    /// as a floor: at high realized download rates the live floor
+    /// scales up (see [`Self::checkpoint_target_interval`]) so the
+    /// cadence does not spam checkpoints faster than the OS can
+    /// durably publish them.
     pub checkpoint_min_bytes: u64,
     /// Minimum wall-clock time between checkpoint writes.
     pub checkpoint_min_interval: Duration,
+    /// Target wall-clock interval between checkpoints, used to scale
+    /// the byte floor at high download rates
+    /// (`PLAN_checkpoint_cadence_throughput.md` Phase 2).
+    ///
+    /// On every observer call the live byte floor is recomputed as
+    /// `max(checkpoint_min_bytes, realized_bps * checkpoint_target_interval)`
+    /// where `realized_bps` is the EWMA of recently downloaded bytes.
+    /// At low rates the configured byte floor wins (cadence is
+    /// rate-invariant); at high rates the realized term wins so each
+    /// checkpoint represents at least this much wall-clock progress.
+    /// [`Self::checkpoint_min_interval`] still bounds resume
+    /// granularity from above regardless of rate.
+    ///
+    /// `Duration::ZERO` disables rate-aware scaling entirely (the
+    /// pre-Phase-2 behaviour: only the configured byte floor and
+    /// time floor are used).
+    pub checkpoint_target_interval: Duration,
     /// Override the .peel.part / .peel.ckpt anchor (defaults to the
     /// output path itself). Set this for tests that point inputs and
     /// outputs at different temp directories.
@@ -313,6 +334,7 @@ impl Default for CoordinatorConfig {
             punch_threshold: DEFAULT_PUNCH_THRESHOLD,
             checkpoint_min_bytes: 8 * 1024 * 1024,
             checkpoint_min_interval: Duration::from_secs(2),
+            checkpoint_target_interval: Duration::from_millis(200),
             workdir: None,
             reader_poll_interval: Duration::from_millis(5),
             forced_format: None,
@@ -1183,9 +1205,38 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     // §2.3: attach the kill switch so the extractor
                     // polls it once per decode_step iteration even when
                     // the decoder isn't reading source.
-                    match kill_switch.clone() {
+                    let base = match kill_switch.clone() {
                         Some(flag) => base.with_kill_switch(flag),
                         None => base,
+                    };
+                    // PLAN_checkpoint_cadence_throughput.md Phase 2:
+                    // when rate-aware scaling is enabled and a
+                    // ProgressState is available, attach a dynamic
+                    // floor provider so the cadence paces itself by
+                    // realized download throughput. The provider is
+                    // cheap — one atomic load and one division per
+                    // quiescent advance.
+                    if config.checkpoint_target_interval.is_zero() || progress_state.is_none() {
+                        base
+                    } else {
+                        let provider_state = progress_state
+                            .as_ref()
+                            .map(Arc::clone)
+                            .expect("progress_state checked above");
+                        let configured_floor = config.checkpoint_min_bytes;
+                        let target_interval = config.checkpoint_target_interval;
+                        let rate = RealizedRate::new(
+                            Instant::now(),
+                            provider_state.snapshot().bytes_downloaded,
+                        );
+                        base.with_checkpoint_floor_provider(Arc::new({
+                            let provider_state = Arc::clone(&provider_state);
+                            move || {
+                                let bytes = provider_state.snapshot().bytes_downloaded;
+                                let bps = rate.rate(Instant::now(), bytes);
+                                rate_aware_floor(configured_floor, bps, target_interval)
+                            }
+                        }))
                     }
                 };
 
@@ -1546,6 +1597,91 @@ fn build_tar_sink(path: &Path, plan: &ResumePlan) -> Result<TarSink, Coordinator
     TarSink::new(path).map_err(CoordinatorError::Sink)
 }
 
+/// Pure-function helper for the Phase 2 rate-aware byte floor.
+///
+/// `live_floor = max(configured_floor, realized_bps * target_interval)`.
+/// Saturates on overflow. Returns the configured floor unchanged
+/// when `target_interval` is zero (the disable signal).
+///
+/// `PLAN_checkpoint_cadence_throughput.md` Phase 2.
+fn rate_aware_floor(configured_floor: u64, realized_bps: f64, target_interval: Duration) -> u64 {
+    if target_interval.is_zero() {
+        return configured_floor;
+    }
+    if !realized_bps.is_finite() || realized_bps <= 0.0 {
+        return configured_floor;
+    }
+    let scaled = realized_bps * target_interval.as_secs_f64();
+    let scaled_u64 = if scaled.is_finite() && scaled > 0.0 {
+        // Saturate at u64::MAX rather than wrapping; an absurd
+        // scaled value still produces the largest possible floor.
+        if scaled >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            scaled as u64
+        }
+    } else {
+        0
+    };
+    configured_floor.max(scaled_u64)
+}
+
+/// Internal helper that estimates the realized download rate for
+/// the Phase 2 rate-aware byte floor.
+///
+/// The estimator returns a running average over the run lifetime
+/// (`bytes_downloaded / elapsed_since_start`) rather than an EWMA.
+/// Three reasons:
+///
+/// 1. **Convergence in one sample.** Cadence at 10 Gbps fires the
+///    observer every few ms; an EWMA with a 1-second time constant
+///    spends most of its weight on samples that haven't happened
+///    yet, so the smoothed value lags far below the asymptote on
+///    short fast runs (the bench, and any production run < ~3 s).
+///    A running average is correct from the first sample for
+///    constant-rate runs.
+/// 2. **Stable against bursty completion.** Worker chunks complete
+///    in batches; the instantaneous `(dbytes / dt)` over any single
+///    observer interval is high-variance. The running average
+///    integrates over the whole run and is monotone-stable.
+/// 3. **Slow to react is fine here.** The cadence target is 200 ms
+///    and the time floor caps resume granularity from above; a
+///    slow-reacting rate estimate matches the cadence's natural
+///    timescale and avoids oscillation.
+///
+/// On long-running variable-rate downloads the average lags the
+/// current rate, but the cadence still tracks aggregate progress
+/// honestly: each checkpoint represents the run's average bytes per
+/// 200 ms of wall-clock so far. The
+/// [`CoordinatorConfig::checkpoint_min_interval`] (`2 s` by default)
+/// remains the upper bound on resume granularity regardless.
+#[derive(Debug, Clone, Copy)]
+struct RealizedRate {
+    started_at: Instant,
+    started_bytes: u64,
+}
+
+impl RealizedRate {
+    fn new(now: Instant, bytes: u64) -> Self {
+        Self {
+            started_at: now,
+            started_bytes: bytes,
+        }
+    }
+
+    /// Return the average bytes-per-second from the constructor
+    /// instant through `(now, bytes)`. Returns `0.0` for any
+    /// non-positive elapsed window.
+    fn rate(&self, now: Instant, bytes: u64) -> f64 {
+        let dt = now.saturating_duration_since(self.started_at).as_secs_f64();
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        let dbytes = bytes.saturating_sub(self.started_bytes) as f64;
+        dbytes / dt
+    }
+}
+
 /// Per-step accumulator for the checkpoint observer's wall-clock cost.
 ///
 /// `PLAN_checkpoint_cadence_throughput.md` Phase 0 needs the per-step
@@ -1850,6 +1986,33 @@ fn run_zip(
     let mut entries_extracted_this_run: u64 = 0;
     let mut checkpoints_written: u64 = 0;
     let mut obs_stats = CheckpointObserverStats::default();
+    // Phase 2: rate-aware byte floor. Same shape as `run_one`'s
+    // floor provider, but the ZIP path's throttle is inline so the
+    // EWMA lives here directly. `Some` only when scaling is enabled
+    // and a `ProgressState` is wired up; falls back to the
+    // configured floor otherwise.
+    let zip_rate = if !config.checkpoint_target_interval.is_zero() && progress_state.is_some() {
+        let initial_bytes = progress_state
+            .map(|p| p.snapshot().bytes_downloaded)
+            .unwrap_or(0);
+        Some(RealizedRate::new(Instant::now(), initial_bytes))
+    } else {
+        None
+    };
+    let live_floor = || -> u64 {
+        match (zip_rate, progress_state) {
+            (Some(r), Some(p)) => {
+                let bytes = p.snapshot().bytes_downloaded;
+                let bps = r.rate(Instant::now(), bytes);
+                rate_aware_floor(
+                    config.checkpoint_min_bytes,
+                    bps,
+                    config.checkpoint_target_interval,
+                )
+            }
+            _ => config.checkpoint_min_bytes,
+        }
+    };
 
     let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
         // Kill-switch fires before any state mutation so the
@@ -1886,9 +2049,11 @@ fn run_zip(
                 let elapsed = last_write_at.elapsed();
                 let in_flight_progress = bytes_extracted_total.saturating_add(*bytes_written);
                 let progressed = in_flight_progress.saturating_sub(last_progress);
-                if progressed < config.checkpoint_min_bytes
-                    && elapsed < config.checkpoint_min_interval
-                {
+                // Phase 2: live (rate-aware) floor. Falls back to
+                // the configured floor when scaling is disabled or
+                // no ProgressState is attached.
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
                     return Ok(());
                 }
                 let observer_start = Instant::now();
@@ -1988,9 +2153,8 @@ fn run_zip(
                 // close to what a user would expect.
                 let elapsed = last_write_at.elapsed();
                 let progressed = bytes_extracted_total.saturating_sub(last_progress);
-                if progressed < config.checkpoint_min_bytes
-                    && elapsed < config.checkpoint_min_interval
-                {
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
                     return Ok(());
                 }
 
@@ -3178,6 +3342,91 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
         }
+    }
+
+    // ---- Phase 2: rate-aware byte floor ------------------------------
+
+    #[test]
+    fn rate_aware_floor_returns_configured_at_low_rate() {
+        // 10 Mbps = 1.25 MB/s. Target 200 ms ⇒ scaled = 250 KiB.
+        // Configured floor 8 MiB ⇒ configured wins.
+        let floor = rate_aware_floor(
+            8 * 1024 * 1024,
+            10_000_000.0 / 8.0,
+            Duration::from_millis(200),
+        );
+        assert_eq!(floor, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rate_aware_floor_returns_scaled_at_high_rate() {
+        // 10 Gbps = 1.25 GB/s. Target 200 ms ⇒ scaled = 250 MB ≈
+        // 238 MiB. Configured floor 8 MiB ⇒ scaled wins by ~30x.
+        let bps = 10_000_000_000.0 / 8.0;
+        let floor = rate_aware_floor(8 * 1024 * 1024, bps, Duration::from_millis(200));
+        assert!(
+            floor > 200 * 1024 * 1024 && floor < 260 * 1024 * 1024,
+            "floor={floor}, expected ~250 MB",
+        );
+        assert!(
+            floor > 8 * 1024 * 1024,
+            "scaled floor must exceed the configured floor at 10 Gbps",
+        );
+    }
+
+    #[test]
+    fn rate_aware_floor_disabled_by_zero_target() {
+        let bps = 10_000_000_000.0 / 8.0;
+        let floor = rate_aware_floor(8 * 1024 * 1024, bps, Duration::ZERO);
+        assert_eq!(floor, 8 * 1024 * 1024, "ZERO target disables scaling");
+    }
+
+    #[test]
+    fn rate_aware_floor_handles_zero_and_negative_rates() {
+        // Implausible rates should not relax the floor below the
+        // configured value.
+        assert_eq!(
+            rate_aware_floor(8 * 1024 * 1024, 0.0, Duration::from_millis(200)),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(
+            rate_aware_floor(8 * 1024 * 1024, -1.0, Duration::from_millis(200)),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(
+            rate_aware_floor(8 * 1024 * 1024, f64::NAN, Duration::from_millis(200)),
+            8 * 1024 * 1024,
+        );
+    }
+
+    #[test]
+    fn realized_rate_returns_average_since_start() {
+        // Constant 1 GB/s stream: rate over any window equals bps.
+        let t0 = Instant::now();
+        let rate = RealizedRate::new(t0, 0);
+        let bps = 1_000_000_000.0;
+        for i in 1..=10u64 {
+            let now = t0 + Duration::from_millis(100 * i);
+            let bytes = (bps * (i as f64) * 0.1) as u64;
+            let measured = rate.rate(now, bytes);
+            let rel_err = (measured - bps).abs() / bps;
+            assert!(
+                rel_err < 0.001,
+                "sample {i}: measured={measured} expected={bps} rel_err={rel_err:.6}",
+            );
+        }
+    }
+
+    #[test]
+    fn realized_rate_handles_zero_elapsed() {
+        // Sampling at the constructor instant must not produce
+        // NaN/Inf — return 0.0 so the rate-aware floor falls back
+        // to the configured value.
+        let t0 = Instant::now();
+        let rate = RealizedRate::new(t0, 0);
+        let bps = rate.rate(t0, 1_000_000);
+        assert!(bps.is_finite());
+        assert_eq!(bps, 0.0);
     }
 
     #[test]

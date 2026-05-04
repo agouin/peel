@@ -101,6 +101,11 @@ fn coord_config(chunk_size: u64) -> CoordinatorConfig {
         // switch has many "fault lines" to trip at.
         checkpoint_min_bytes: 1,
         checkpoint_min_interval: Duration::from_millis(0),
+        // Disable rate-aware scaling: the kill harness wants a
+        // checkpoint per advance, and a fast loopback bench would
+        // otherwise scale the live floor up to multi-MiB and
+        // suppress most checkpoints.
+        checkpoint_target_interval: Duration::ZERO,
         workdir: None,
         reader_poll_interval: Duration::from_millis(2),
         forced_format: None,

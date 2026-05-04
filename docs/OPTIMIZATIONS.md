@@ -577,6 +577,47 @@ that the MVP explicitly defers.
 
 ---
 
+### O.32 Barrier-style checkpoint publication
+
+**Status: delivered in `PLAN_checkpoint_cadence_throughput.md` Phase 1
+(2026-05-04).** The per-checkpoint `SparseFile::sync_all` and `.tmp`
+file `File::sync_all` were two `F_FULLFSYNC` calls on macOS (~9 ms
+and ~5 ms respectively); plus a parent-directory `sync_all` on every
+write. Replaced with [`SparseFile::order_writes`](../src/download/sparse_file.rs)
+and a tmp-file barrier path in [`Checkpoint::write_timed`](../src/checkpoint.rs):
+macOS uses `fcntl(F_BARRIERFSYNC)`, Linux uses `fdatasync(2)`, other
+Unix falls back to full `sync_all`. The barrier guarantees that
+pre-barrier writes hit stable storage *no later than* the subsequent
+`rename`, which is exactly what publication needs (resume contract:
+"if the renamed `.peel.ckpt` is observed by a future run, every page
+the bitmap claims durable is at least as durable as the checkpoint").
+Parent-directory `fsync` only fires when the rename creates a new
+entry. Fast-row 10 Gbps `Pwrite` improved 75–84 %; observer-time
+fsync subtotal dropped 81–85 %.
+
+---
+
+### O.33 Rate-aware checkpoint cadence floor
+
+**Status: delivered in `PLAN_checkpoint_cadence_throughput.md` Phase 2
+(2026-05-04).** Pre-Phase-2, the cadence throttle used a fixed
+`checkpoint_min_bytes = 8 MiB` floor. At 10 Gbps that floor clears
+every ~6 ms, so the bench produced 32 checkpoints in a 0.7 s run —
+faster than the OS could durably publish them. The new
+[`CoordinatorConfig::checkpoint_target_interval`](../src/coordinator.rs)
+(default 200 ms) scales the live floor with realized download
+throughput: `live_floor = max(configured_floor, realized_bps × target_interval)`.
+At 10 Gbps the realized term raises the floor to ~250 MB and the
+bench drops to 2–3 checkpoints (10–16× reduction). At low rates the
+configured floor still wins (cadence is rate-invariant under everyday
+WAN). `checkpoint_min_interval` (`2 s` default) remains the upper
+bound on resume granularity regardless. Combined with `O.32`, the
+fast-codec rows on the README grid dropped from a 3× peel:`curl|tar`
+ratio at 10 Gbps to **<1×** — peel now beats `curl | tool` across the
+whole 10 Mbps – 10 Gbps range for streaming codecs.
+
+---
+
 ### O.31 zstd differential fuzz harness
 
 **What**: a `cargo-fuzz` target driving the

@@ -96,6 +96,14 @@ pub struct Cli {
     #[arg(long = "checkpoint-min-secs", default_value_t = 2.0)]
     pub checkpoint_min_secs: f64,
 
+    /// Target wall-clock interval between checkpoints, in seconds.
+    /// Used to scale the byte floor up at high download rates so the
+    /// cadence stays below this target wall-clock interval. `0`
+    /// disables rate-aware scaling.
+    /// (`PLAN_checkpoint_cadence_throughput.md` Phase 2.)
+    #[arg(long = "checkpoint-target-secs", default_value_t = 0.2)]
+    pub checkpoint_target_secs: f64,
+
     /// Force a specific decoder by name, bypassing both URL-suffix
     /// and magic-byte detection. Use this when the URL has no
     /// usable suffix (e.g. opaque query-string downloads). Mutually
@@ -375,6 +383,9 @@ impl Cli {
                 punch_threshold: self.punch_threshold,
                 checkpoint_min_bytes: self.checkpoint_min_bytes,
                 checkpoint_min_interval: Duration::from_secs_f64(self.checkpoint_min_secs.max(0.0)),
+                checkpoint_target_interval: Duration::from_secs_f64(
+                    self.checkpoint_target_secs.max(0.0),
+                ),
                 workdir: self.workdir,
                 reader_poll_interval: Duration::from_millis(5),
                 forced_format: self.forced_format,

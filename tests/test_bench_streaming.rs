@@ -318,6 +318,7 @@ fn coord_config() -> CoordinatorConfig {
         punch_threshold: 1 << 20,
         checkpoint_min_bytes: 8 * 1024 * 1024,
         checkpoint_min_interval: Duration::from_millis(50),
+        checkpoint_target_interval: Duration::from_millis(200),
         workdir: None,
         reader_poll_interval: Duration::from_millis(2),
         forced_format: None,
@@ -1186,6 +1187,13 @@ fn diag_streaming_source_pipeline_10gbps() {
                 variant.label
             ));
             let _g = CleanupDir(work.clone());
+            // Phase 2 of `PLAN_checkpoint_cadence_throughput.md`:
+            // wire up a ProgressState so the rate-aware byte floor
+            // can read realized download throughput. The
+            // production CLI does the same (`src/main.rs`); the
+            // diagnostic must mirror that for its numbers to track
+            // production behavior.
+            let progress_state = std::sync::Arc::new(peel::progress::ProgressState::new());
             let args = RunArgs {
                 url: format!("{}/{}", server.base_url(), format.suffix),
                 output: OutputTarget::Dir(work.clone()),
@@ -1193,7 +1201,7 @@ fn diag_streaming_source_pipeline_10gbps() {
                 client: build_client(),
                 registry: DecoderRegistry::with_defaults(),
                 progress: None,
-                progress_state: None,
+                progress_state: Some(std::sync::Arc::clone(&progress_state)),
                 kill_switch: None,
                 io_backend: None,
             };
@@ -1545,6 +1553,12 @@ fn run_throttled_case(
     let _g_p = CleanupDir(work_p.clone());
     let mut config = coord_config();
     config.max_bandwidth_bps = Some(rate.bytes_per_sec);
+    // Phase 2 of `PLAN_checkpoint_cadence_throughput.md`: the
+    // rate-aware byte floor only activates when a `ProgressState`
+    // is wired up. The production CLI does so unconditionally
+    // (`src/main.rs`); mirror that here so the grid numbers track
+    // production behavior.
+    let progress_state = std::sync::Arc::new(peel::progress::ProgressState::new());
     let args = RunArgs {
         url: url.clone(),
         output: OutputTarget::Dir(work_p.clone()),
@@ -1552,7 +1566,7 @@ fn run_throttled_case(
         client: build_client(),
         registry: DecoderRegistry::with_defaults(),
         progress: None,
-        progress_state: None,
+        progress_state: Some(std::sync::Arc::clone(&progress_state)),
         kill_switch: None,
         io_backend: None,
     };
