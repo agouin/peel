@@ -44,13 +44,26 @@
 //! blob shape leaves room for it via a future `format_version`
 //! bump.
 //!
-//! # Wire format (`format_version = 1`)
+//! # Wire format
 //!
-//! Every multi-byte integer is little-endian.
+//! Two formats coexist: V2 (current) is what every fresh
+//! [`XzResumeState::serialize`] writes; V1 (legacy) is read-only,
+//! retained for users with `.peel.ckpt` files written before
+//! `PLAN_checkpoint_blob_dedup.md` Phase 1.
+//!
+//! V1 carried a trailing CRC32 over the whole blob. The
+//! surrounding `Checkpoint` body's outer fnv1a64
+//! ([`crate::checkpoint`]) already covered every byte the inner
+//! CRC32 covered, plus more (URL, bitmap, sink_state); the inner
+//! hash was redundant and accounted for ~9.5 ms of the 28.5 ms
+//! per-checkpoint cost on `tar.xz default_10gbps_cap`. V2 drops
+//! the trailer; integrity for the resume blob bytes lives in
+//! the outer body hash.
+//!
+//! Every multi-byte integer is little-endian. Body layout
+//! (identical between V1 and V2):
 //!
 //! ```text
-//!  4 B    magic                 = b"XDR1"
-//!  1 B    format_version        = 1
 //!  1 B    stream_check          (raw CheckId nibble)
 //!  4 B    records_seen          (u32 LE)
 //!  records_seen * 16 B
@@ -79,9 +92,10 @@
 //!  N B    probs (per LzmaProbs::serialize_slots)
 //!  4 B    check_state_len (u32 LE)
 //!  N B    check_state (per BlockCheckHasher::serialize_state)
-//!  4 B    crc32 over every byte from offset 0 through the byte
-//!         immediately preceding this trailer
 //! ```
+//!
+//! V2 prepends `b"XDR2"` + `0x02`; V1 prepended `b"XDR1"` + `0x01`
+//! and appended a 4 B CRC32 over everything earlier in the blob.
 
 use crate::hash::crc32::Crc32;
 
@@ -93,13 +107,19 @@ use super::lzma2::Lzma2State;
 use super::probs::LzmaProbs;
 use super::stream::CheckId;
 
-/// Magic at the head of every Phase 6 blob. ASCII for
-/// `XDR1` — "Xz Decoder Resume version 1." Bumps to v2 happen by
-/// changing the magic plus the format-version byte.
-pub const MAGIC: &[u8; 4] = b"XDR1";
+/// Magic at the head of every freshly written V2 blob. ASCII for
+/// `XDR2` — "Xz Decoder Resume version 2."
+pub const MAGIC: &[u8; 4] = b"XDR2";
 
-/// `format_version` byte for the v1 layout.
-pub const FORMAT_VERSION: u8 = 1;
+/// `format_version` byte for the V2 layout (no trailing CRC32).
+pub const FORMAT_VERSION: u8 = 2;
+
+/// Magic at the head of legacy V1 blobs. Read-only; never
+/// produced by `serialize`.
+pub const MAGIC_V1: &[u8; 4] = b"XDR1";
+
+/// `format_version` byte for the V1 layout (trailing CRC32).
+pub const FORMAT_VERSION_V1: u8 = 1;
 
 /// Captured state at an LZMA2 chunk boundary; everything needed
 /// to resume the decoder byte-identically at that source offset.
@@ -227,70 +247,86 @@ impl XzResumeState {
         }
     }
 
-    /// Encode `self` as a Phase 6 resume blob (see module docs).
+    /// Encode `self` as a V2 resume blob (see module docs).
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.estimated_size());
         out.extend_from_slice(MAGIC);
         out.push(FORMAT_VERSION);
-        out.push(self.stream_check.raw());
-        out.extend_from_slice(&(self.stream_block_records.len() as u32).to_le_bytes());
-        for &(u, c) in &self.stream_block_records {
+        Self::write_body(&mut out, self);
+        out
+    }
+
+    /// Body shared by V1 and V2 wire formats. Header (`magic` +
+    /// `format_version`) and any version-specific trailer live in
+    /// the wrappers.
+    fn write_body(out: &mut Vec<u8>, s: &Self) {
+        out.push(s.stream_check.raw());
+        out.extend_from_slice(&(s.stream_block_records.len() as u32).to_le_bytes());
+        for &(u, c) in &s.stream_block_records {
             out.extend_from_slice(&u.to_le_bytes());
             out.extend_from_slice(&c.to_le_bytes());
         }
-        out.extend_from_slice(&self.block_header_size_bytes.to_le_bytes());
+        out.extend_from_slice(&s.block_header_size_bytes.to_le_bytes());
         let mut flags = 0u8;
-        if self.block_compressed_size_declared.is_some() {
+        if s.block_compressed_size_declared.is_some() {
             flags |= Self::FLAG_COMPRESSED_DECLARED;
         }
-        if self.block_uncompressed_size_declared.is_some() {
+        if s.block_uncompressed_size_declared.is_some() {
             flags |= Self::FLAG_UNCOMPRESSED_DECLARED;
         }
-        if self.block_seen_first_chunk {
+        if s.block_seen_first_chunk {
             flags |= Self::FLAG_SEEN_FIRST_CHUNK;
         }
-        if self.block_lzma2_finished {
+        if s.block_lzma2_finished {
             flags |= Self::FLAG_LZMA2_FINISHED;
         }
         out.push(flags);
+        out.extend_from_slice(&s.block_compressed_size_declared.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(
-            &self
-                .block_compressed_size_declared
+            &s.block_uncompressed_size_declared
                 .unwrap_or(0)
                 .to_le_bytes(),
         );
-        out.extend_from_slice(
-            &self
-                .block_uncompressed_size_declared
-                .unwrap_or(0)
-                .to_le_bytes(),
-        );
-        out.extend_from_slice(&self.block_dict_size.to_le_bytes());
-        out.extend_from_slice(&self.block_lzma2_start_offset.to_le_bytes());
-        out.extend_from_slice(&self.block_decompressed_so_far.to_le_bytes());
-        out.extend_from_slice(&[self.lc, self.lp, self.pb, self.lzma_state]);
-        out.extend_from_slice(&self.rep0.to_le_bytes());
-        out.extend_from_slice(&self.rep1.to_le_bytes());
-        out.extend_from_slice(&self.rep2.to_le_bytes());
-        out.extend_from_slice(&self.rep3.to_le_bytes());
-        out.extend_from_slice(&self.dict_capacity.to_le_bytes());
-        out.extend_from_slice(&self.dict_total.to_le_bytes());
-        out.extend_from_slice(&(self.dict_data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.dict_data);
-        out.extend_from_slice(&(self.probs.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.probs);
-        out.extend_from_slice(&(self.check_state.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.check_state);
-        // Trailing CRC32 over everything before this point.
+        out.extend_from_slice(&s.block_dict_size.to_le_bytes());
+        out.extend_from_slice(&s.block_lzma2_start_offset.to_le_bytes());
+        out.extend_from_slice(&s.block_decompressed_so_far.to_le_bytes());
+        out.extend_from_slice(&[s.lc, s.lp, s.pb, s.lzma_state]);
+        out.extend_from_slice(&s.rep0.to_le_bytes());
+        out.extend_from_slice(&s.rep1.to_le_bytes());
+        out.extend_from_slice(&s.rep2.to_le_bytes());
+        out.extend_from_slice(&s.rep3.to_le_bytes());
+        out.extend_from_slice(&s.dict_capacity.to_le_bytes());
+        out.extend_from_slice(&s.dict_total.to_le_bytes());
+        out.extend_from_slice(&(s.dict_data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&s.dict_data);
+        out.extend_from_slice(&(s.probs.len() as u32).to_le_bytes());
+        out.extend_from_slice(&s.probs);
+        out.extend_from_slice(&(s.check_state.len() as u32).to_le_bytes());
+        out.extend_from_slice(&s.check_state);
+    }
+
+    /// Encode `self` as a V1 resume blob (legacy, with trailing
+    /// CRC32). Test-only — kept so the V1 read path can be
+    /// exercised by round-trip tests without freezing a hex
+    /// fixture.
+    #[cfg(test)]
+    #[must_use]
+    pub fn serialize_v1(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.estimated_size() + 4);
+        out.extend_from_slice(MAGIC_V1);
+        out.push(FORMAT_VERSION_V1);
+        Self::write_body(&mut out, self);
         let mut crc = Crc32::new();
         crc.update(&out);
         out.extend_from_slice(&crc.finalize().to_le_bytes());
         out
     }
 
-    /// Decode a Phase 6 resume blob. The reverse of
-    /// [`Self::serialize`].
+    /// Decode a resume blob (V1 or V2). The reverse of
+    /// [`Self::serialize`] for V2; legacy V1 blobs (with trailing
+    /// CRC32) are accepted via the same entry point and the CRC32
+    /// is verified before the body is parsed.
     ///
     /// # Errors
     ///
@@ -300,34 +336,53 @@ impl XzResumeState {
     /// - [`XzError::ResumeBlobLength`] when a declared field
     ///   length disagrees with the size implied by the
     ///   surrounding properties.
-    /// - [`XzError::ResumeBlobCrc`] when the trailing CRC32 does
-    ///   not match the computed hash.
+    /// - [`XzError::ResumeBlobCrc`] when a V1 blob's trailing
+    ///   CRC32 does not match the computed hash. V2 blobs delegate
+    ///   integrity to the surrounding `Checkpoint` body's
+    ///   fnv1a64.
     /// - [`XzError::ReservedCheckId`] / property errors via
     ///   [`LzmaProbs::deserialize`] when the embedded values are
     ///   out of spec range.
     pub fn deserialize(blob: &[u8]) -> Result<Self, XzError> {
-        // Trailing CRC32: 4 bytes at the end.
-        if blob.len() < 4 + MAGIC.len() + 1 {
-            return Err(XzError::ResumeBlobTruncated("magic+version+CRC trailer"));
+        // Need at least 5 bytes (magic + version) to dispatch.
+        if blob.len() < MAGIC.len() + 1 {
+            return Err(XzError::ResumeBlobTruncated("magic+version"));
         }
-        let crc_off = blob.len() - 4;
-        let body = &blob[..crc_off];
-        let mut crc = Crc32::new();
-        crc.update(body);
-        let got = crc.finalize();
-        let expected = u32::from_le_bytes(blob[crc_off..].try_into().expect("len 4"));
-        if expected != got {
-            return Err(XzError::ResumeBlobCrc { expected, got });
-        }
+        let header_magic: &[u8; 4] = blob[..4].try_into().expect("len 4");
+        let body: &[u8] = match header_magic {
+            // V2: no trailing CRC32; body covers magic + version +
+            // payload. Integrity for the resume bytes lives in the
+            // outer Checkpoint body fnv1a64.
+            // `PLAN_checkpoint_blob_dedup.md` Phase 1.
+            m if m == MAGIC => blob,
+            // V1: trailing 4 B CRC32 over every byte before the
+            // trailer. Verify, then drop the trailer for the
+            // body parse.
+            m if m == MAGIC_V1 => {
+                if blob.len() < MAGIC.len() + 1 + 4 {
+                    return Err(XzError::ResumeBlobTruncated("v1 CRC trailer"));
+                }
+                let crc_off = blob.len() - 4;
+                let body = &blob[..crc_off];
+                let mut crc = Crc32::new();
+                crc.update(body);
+                let got = crc.finalize();
+                let expected = u32::from_le_bytes(blob[crc_off..].try_into().expect("len 4"));
+                if expected != got {
+                    return Err(XzError::ResumeBlobCrc { expected, got });
+                }
+                body
+            }
+            _ => return Err(XzError::ResumeBlobMagic),
+        };
 
         let mut r = Reader::new(body);
         let magic = r.take(4, "magic")?;
-        if magic != MAGIC {
-            return Err(XzError::ResumeBlobMagic);
-        }
         let version = r.read_u8("format_version")?;
-        if version != FORMAT_VERSION {
-            return Err(XzError::ResumeBlobMagic);
+        match (magic, version) {
+            (m, FORMAT_VERSION) if m == MAGIC => {}
+            (m, FORMAT_VERSION_V1) if m == MAGIC_V1 => {}
+            _ => return Err(XzError::ResumeBlobMagic),
         }
         let stream_check = CheckId::from_raw(r.read_u8("stream_check")?)?;
         let records_seen = r.read_u32_le("records_seen")?;
@@ -398,6 +453,8 @@ impl XzResumeState {
         })
     }
 
+    /// Conservative size estimate for the V2 layout (no trailing
+    /// CRC32). `serialize_v1` adds 4 B on top.
     fn estimated_size(&self) -> usize {
         4 + 1
             + 1
@@ -420,7 +477,6 @@ impl XzResumeState {
             + self.probs.len()
             + 4
             + self.check_state.len()
-            + 4
     }
 
     /// Reconstruct an [`Lzma2State`] from this blob.
@@ -587,54 +643,68 @@ mod tests {
         })
     }
 
-    /// Round-trip serialize → deserialize matches every captured
-    /// field.
+    /// Assert every captured field in `a` matches `b`. Shared by
+    /// the V1 and V2 round-trip tests so they pin the same
+    /// invariant.
+    fn assert_states_eq(a: &XzResumeState, b: &XzResumeState) {
+        assert_eq!(a.stream_check, b.stream_check);
+        assert_eq!(a.stream_block_records, b.stream_block_records);
+        assert_eq!(a.block_header_size_bytes, b.block_header_size_bytes);
+        assert_eq!(
+            a.block_compressed_size_declared,
+            b.block_compressed_size_declared
+        );
+        assert_eq!(
+            a.block_uncompressed_size_declared,
+            b.block_uncompressed_size_declared
+        );
+        assert_eq!(a.block_dict_size, b.block_dict_size);
+        assert_eq!(a.block_lzma2_start_offset, b.block_lzma2_start_offset);
+        assert_eq!(a.block_decompressed_so_far, b.block_decompressed_so_far);
+        assert_eq!(a.block_seen_first_chunk, b.block_seen_first_chunk);
+        assert_eq!(a.lc, b.lc);
+        assert_eq!(a.lp, b.lp);
+        assert_eq!(a.pb, b.pb);
+        assert_eq!(a.lzma_state, b.lzma_state);
+        assert_eq!(a.rep0, b.rep0);
+        assert_eq!(a.rep1, b.rep1);
+        assert_eq!(a.rep2, b.rep2);
+        assert_eq!(a.rep3, b.rep3);
+        assert_eq!(a.dict_capacity, b.dict_capacity);
+        assert_eq!(a.dict_total, b.dict_total);
+        assert_eq!(a.dict_data, b.dict_data);
+        assert_eq!(a.probs, b.probs);
+        assert_eq!(a.check_state, b.check_state);
+    }
+
+    /// V2 round-trip (the format this code writes).
     #[test]
     fn serialize_round_trip_preserves_all_fields() {
         let captured = fixture_state();
         let blob = captured.serialize();
+        // V2 magic + no trailing CRC32: blob is exactly the body.
+        assert_eq!(&blob[..4], MAGIC);
+        assert_eq!(blob[4], FORMAT_VERSION);
         let restored = XzResumeState::deserialize(&blob).expect("deserialize");
+        assert_states_eq(&captured, &restored);
+    }
 
-        assert_eq!(captured.stream_check, restored.stream_check);
-        assert_eq!(captured.stream_block_records, restored.stream_block_records);
-        assert_eq!(
-            captured.block_header_size_bytes,
-            restored.block_header_size_bytes
-        );
-        assert_eq!(
-            captured.block_compressed_size_declared,
-            restored.block_compressed_size_declared
-        );
-        assert_eq!(
-            captured.block_uncompressed_size_declared,
-            restored.block_uncompressed_size_declared
-        );
-        assert_eq!(captured.block_dict_size, restored.block_dict_size);
-        assert_eq!(
-            captured.block_lzma2_start_offset,
-            restored.block_lzma2_start_offset
-        );
-        assert_eq!(
-            captured.block_decompressed_so_far,
-            restored.block_decompressed_so_far
-        );
-        assert_eq!(
-            captured.block_seen_first_chunk,
-            restored.block_seen_first_chunk
-        );
-        assert_eq!(captured.lc, restored.lc);
-        assert_eq!(captured.lp, restored.lp);
-        assert_eq!(captured.pb, restored.pb);
-        assert_eq!(captured.lzma_state, restored.lzma_state);
-        assert_eq!(captured.rep0, restored.rep0);
-        assert_eq!(captured.rep1, restored.rep1);
-        assert_eq!(captured.rep2, restored.rep2);
-        assert_eq!(captured.rep3, restored.rep3);
-        assert_eq!(captured.dict_capacity, restored.dict_capacity);
-        assert_eq!(captured.dict_total, restored.dict_total);
-        assert_eq!(captured.dict_data, restored.dict_data);
-        assert_eq!(captured.probs, restored.probs);
-        assert_eq!(captured.check_state, restored.check_state);
+    /// V1 round-trip — pins the legacy read path forever. A blob
+    /// produced by `serialize_v1` must still decode to a
+    /// byte-identical state via the same `deserialize` entry
+    /// point. `PLAN_checkpoint_blob_dedup.md` Phase 1.
+    #[test]
+    fn resume_blob_v1_still_decodes() {
+        let captured = fixture_state();
+        let blob = captured.serialize_v1();
+        // Sanity-check the V1 envelope so a future drift in
+        // `serialize_v1` is loud rather than silent.
+        assert_eq!(&blob[..4], MAGIC_V1);
+        assert_eq!(blob[4], FORMAT_VERSION_V1);
+        // 4 bytes shorter without the trailer would mean a V2 blob.
+        assert_eq!(blob.len(), captured.serialize().len() + 4);
+        let restored = XzResumeState::deserialize(&blob).expect("v1 deserialize");
+        assert_states_eq(&captured, &restored);
     }
 
     /// `build_lzma2_state` produces a state whose dict / probs /
@@ -656,33 +726,40 @@ mod tests {
         assert_eq!(restored_state.probs.pb, captured.pb);
     }
 
-    /// Deserialize rejects bad magic.
+    /// Deserialize rejects bad magic (V2 path).
     #[test]
     fn deserialize_rejects_bad_magic() {
         let captured = fixture_state();
         let mut blob = captured.serialize();
+        // Flip first byte to something neither MAGIC nor MAGIC_V1.
         blob[0] = b'B';
-        // Need to recompute the trailing CRC since we changed
-        // the body.
-        let crc_off = blob.len() - 4;
-        let mut crc = Crc32::new();
-        crc.update(&blob[..crc_off]);
-        let new_crc = crc.finalize().to_le_bytes();
-        blob[crc_off..].copy_from_slice(&new_crc);
         match XzResumeState::deserialize(&blob).unwrap_err() {
             XzError::ResumeBlobMagic => {}
             other => panic!("expected ResumeBlobMagic, got {other:?}"),
         }
     }
 
-    /// Deserialize rejects a bit-flipped blob via the trailing
-    /// CRC32 check — even when the magic, version, and lengths
-    /// are still valid.
+    /// Deserialize rejects an unknown format-version byte even
+    /// when the magic matches.
     #[test]
-    fn deserialize_rejects_corrupted_body() {
+    fn deserialize_rejects_unknown_format_version() {
         let captured = fixture_state();
         let mut blob = captured.serialize();
-        // Corrupt one byte in the middle.
+        blob[4] = 0x42;
+        match XzResumeState::deserialize(&blob).unwrap_err() {
+            XzError::ResumeBlobMagic => {}
+            other => panic!("expected ResumeBlobMagic, got {other:?}"),
+        }
+    }
+
+    /// V1 still rejects bit-flipped bodies via its trailing
+    /// CRC32. V2 deliberately delegates body integrity to the
+    /// outer Checkpoint body fnv1a64, so a V2 equivalent of this
+    /// test would not pin a behavior we still own.
+    #[test]
+    fn v1_deserialize_rejects_corrupted_body() {
+        let captured = fixture_state();
+        let mut blob = captured.serialize_v1();
         let mid = blob.len() / 2;
         blob[mid] ^= 0x42;
         match XzResumeState::deserialize(&blob).unwrap_err() {

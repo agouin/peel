@@ -355,14 +355,17 @@ pub enum XzError {
         expected: u64,
     },
 
-    /// Phase 6 resume blob's leading magic / version did not
-    /// match `b"XDR1"` + version byte 1.
+    /// Resume blob's leading magic / version did not match
+    /// `b"XDR2"` + version byte 2 (current) or `b"XDR1"` +
+    /// version byte 1 (legacy, read-only).
     #[error("xz: resume blob has bad magic or unsupported format version")]
     ResumeBlobMagic,
 
-    /// Phase 6 resume blob's trailing CRC32 did not match the
-    /// hash over the rest of the blob — the blob was corrupted
-    /// in storage / transit.
+    /// V1 resume blob's trailing CRC32 did not match the hash
+    /// over the rest of the blob — the blob was corrupted in
+    /// storage / transit. V2 blobs do not carry a trailing CRC32
+    /// and never raise this error; their integrity is checked by
+    /// the surrounding `Checkpoint` body's fnv1a64.
     #[error("xz: resume blob CRC32 mismatch (expected 0x{expected:08X}, got 0x{got:08X})")]
     ResumeBlobCrc {
         /// CRC32 stored in the blob trailer.

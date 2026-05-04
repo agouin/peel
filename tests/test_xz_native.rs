@@ -510,8 +510,13 @@ fn resume_property_random_kill_points_across_seeds() {
     }
 }
 
-/// Phase 6: a corrupted resume blob surfaces a typed
-/// `DecodeError::Construct` rather than panicking.
+/// A misshapen resume blob (here: mangled magic) surfaces a
+/// typed `DecodeError::Construct` rather than panicking. V2 no
+/// longer carries an inner CRC32 — `PLAN_checkpoint_blob_dedup.md`
+/// Phase 1 — so mid-body bit flips are delegated to the outer
+/// `Checkpoint` body fnv1a64 (validated above this layer); this
+/// test pins the structural rejection paths the resume layer
+/// still owns.
 #[test]
 fn corrupted_resume_blob_surfaces_typed_error() {
     let input = b"resume-corruption-test".repeat(512);
@@ -527,12 +532,119 @@ fn corrupted_resume_blob_surfaces_typed_error() {
         }
     };
 
-    // Flip a bit somewhere in the middle of the blob.
+    // Mangle the magic so the parser rejects deterministically.
     let mut corrupted = blob.clone();
-    let mid = corrupted.len() / 2;
-    corrupted[mid] ^= 0x42;
+    corrupted[0] ^= 0x42;
 
     // Resume should fail before the first decode_step.
     let result = resume_factory(Box::new(Cursor::new(Vec::new())), &corrupted, 0);
     assert!(result.is_err(), "expected resume rejection on corruption");
+}
+
+/// Wrap a current (V2) resume blob's bytes in a V1 envelope so
+/// the legacy read path can be exercised end-to-end through
+/// `resume_factory`. V1's wire shape is `b"XDR1" || 0x01 || body
+/// || crc32_le(body)`; V2's is `b"XDR2" || 0x02 || body`. The
+/// body bytes are identical between versions, so we copy them
+/// verbatim and re-wrap.
+///
+/// `PLAN_checkpoint_blob_dedup.md` Phase 1 — exercises the
+/// upgrade-from-pre-Phase-1 case where an existing `.peel.ckpt`
+/// file holds a V1 blob inside its `decoder_state` field.
+fn v1_envelope_around_v2_body(v2_blob: &[u8]) -> Vec<u8> {
+    use peel::hash::crc32::Crc32;
+    assert_eq!(&v2_blob[..4], b"XDR2", "expected current writer to emit V2");
+    assert_eq!(v2_blob[4], 0x02);
+    let body = &v2_blob[5..];
+    let mut out = Vec::with_capacity(v2_blob.len() + 4);
+    out.extend_from_slice(b"XDR1");
+    out.push(0x01);
+    out.extend_from_slice(body);
+    let mut crc = Crc32::new();
+    crc.update(&out);
+    out.extend_from_slice(&crc.finalize().to_le_bytes());
+    out
+}
+
+/// V1 fixture round-trip — hands a hand-crafted V1 envelope to
+/// `resume_factory` and asserts the decoded suffix matches a
+/// clean run byte-for-byte. This is the upgrade path: a user on
+/// pre-Phase-1 peel has a `.peel.ckpt` containing a V1
+/// `decoder_state`, then upgrades to a Phase-1 binary. The new
+/// reader must accept the old blob.
+#[test]
+fn resume_blob_v1_envelope_resumes_byte_identically() {
+    let input = build_lzma_friendly_input(1024 * 1024);
+    let stream = xz2_compress(&input, 6);
+
+    // Clean run: capture every chunk-boundary snapshot (offset,
+    // V2 blob, output_len).
+    let mut decoder = Decoder::new(Box::new(Cursor::new(stream.clone()))).expect("clean");
+    let mut out = Vec::new();
+    let mut snapshots: Vec<(u64, Vec<u8>, usize)> = Vec::new();
+    loop {
+        let status = decoder.decode_step(&mut out).expect("step");
+        if let Some(blob) = decoder.decoder_state() {
+            snapshots.push((decoder.bytes_consumed().get(), blob, out.len()));
+        }
+        if status == DecodeStatus::Eof {
+            break;
+        }
+    }
+    let clean_output = out;
+    assert!(
+        !snapshots.is_empty(),
+        "no chunk-boundary snapshots — fixture too small?"
+    );
+
+    // Resume from the middle snapshot via a V1 envelope.
+    let mid = snapshots.len() / 2;
+    let (offset, v2_blob, output_len) = &snapshots[mid];
+    let v1_blob = v1_envelope_around_v2_body(v2_blob);
+    assert_eq!(v1_blob.len(), v2_blob.len() + 4, "V1 adds 4 B trailer");
+
+    let suffix_src: Vec<u8> = stream[*offset as usize..].to_vec();
+    let mut resumed =
+        resume_factory(Box::new(Cursor::new(suffix_src)), &v1_blob, *offset).expect("v1 resume");
+    let mut suffix_out = Vec::new();
+    loop {
+        match resumed.decode_step(&mut suffix_out).expect("resumed step") {
+            DecodeStatus::Eof => break,
+            DecodeStatus::MoreData => continue,
+        }
+    }
+    assert_eq!(
+        suffix_out,
+        clean_output[*output_len..],
+        "V1 envelope suffix mismatch (offset={offset}, output_len={output_len})"
+    );
+}
+
+/// V1 envelope's trailing CRC32 is still verified — flip a byte
+/// in the middle of a hand-crafted V1 blob and watch
+/// `resume_factory` reject it.
+#[test]
+fn v1_envelope_rejects_corrupted_body_via_trailing_crc() {
+    let input = b"resume-corruption-test".repeat(512);
+    let stream = xz2_compress(&input, 6);
+
+    let mut decoder = Decoder::new(Box::new(Cursor::new(stream.clone()))).expect("walk");
+    let mut out = Vec::new();
+    let v2_blob = loop {
+        let _ = decoder.decode_step(&mut out).expect("step");
+        if let Some(b) = decoder.decoder_state() {
+            break b;
+        }
+    };
+
+    let mut v1_blob = v1_envelope_around_v2_body(&v2_blob);
+    // Flip a byte in the body (after magic+version, before
+    // trailing CRC). The V1 trailer must reject.
+    let mid = v1_blob.len() / 2;
+    v1_blob[mid] ^= 0x42;
+    let result = resume_factory(Box::new(Cursor::new(Vec::new())), &v1_blob, 0);
+    assert!(
+        result.is_err(),
+        "V1 envelope should reject body corruption via trailing CRC32"
+    );
 }
