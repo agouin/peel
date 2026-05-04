@@ -235,6 +235,23 @@ impl DflResumeState {
     }
 }
 
+/// Peek the blob's `source_byte_position` field without
+/// fully deserializing — useful for the zip pipeline, which
+/// needs to know where in the compressed stream the resumed
+/// codec expects to pick up so it can position its source
+/// reader. Returns `None` if the blob is too short to carry the
+/// field; in that case the caller surfaces a typed error via the
+/// regular [`DflResumeState::deserialize`] path.
+#[must_use]
+pub fn peek_source_byte_position(blob: &[u8]) -> Option<u64> {
+    if blob.len() < FIXED_PREFIX_LEN || blob[..4] != RESUME_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes([
+        blob[7], blob[8], blob[9], blob[10], blob[11], blob[12], blob[13], blob[14],
+    ]))
+}
+
 /// Convenience: deserialize a blob and translate any error into
 /// [`DecodeError::Construct`] with a leading "deflate resume blob
 /// rejected:" prefix. Used by the resume factories so callers see

@@ -141,7 +141,9 @@ pub const LFH_FIXED_LEN: usize = 30;
 pub enum CompressionMethod {
     /// `0` — no compression; entry data is the raw bytes.
     Stored,
-    /// `8` — DEFLATE (RFC 1951). Decoded via `flate2`.
+    /// `8` — DEFLATE (RFC 1951). Decoded via the hand-rolled
+    /// [`crate::decode::deflate_native::Decoder`] since Phase 9a
+    /// of `docs/PLAN_deflate_block_decoder.md`.
     Deflate,
     /// `93` — zstd. Decoded via the existing `zstd` crate binding.
     Zstd,

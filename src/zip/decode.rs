@@ -5,9 +5,15 @@
 //!
 //! - **STORED (0)** — passthrough; bytes flow from source to sink
 //!   verbatim.
-//! - **DEFLATE (8)** — RFC 1951 raw deflate via the `flate2` crate's
-//!   `rust_backend` (pure-Rust miniz_oxide). ZIP uses raw deflate, so
-//!   we wrap with [`flate2::read::DeflateDecoder`] (no zlib header).
+//! - **DEFLATE (8)** — RFC 1951 raw deflate via the hand-rolled
+//!   [`crate::decode::deflate_native::Decoder`]. Phase 9a of
+//!   `docs/PLAN_deflate_block_decoder.md` swapped this off
+//!   `flate2`'s `miniz_oxide` backend; the entry's compressed
+//!   bytes are buffered into an owned [`std::io::Cursor`] before
+//!   handoff so the existing `'static`-source decoder API works
+//!   unchanged. Memory peak per call = entry's `compressed_size`
+//!   from the central directory; Phase 11 may stream this for the
+//!   pathologically-large-entry case.
 //! - **zstd (93)** — via the existing `zstd` crate binding, the
 //!   same backend [`crate::decode::zstd`] uses. Per the APPNOTE,
 //!   ZIP-zstd entries are wrapped in a single zstd frame.
@@ -40,10 +46,11 @@
 //! - unsupported methods map to [`EntryDecodeError::Zip`] with the
 //!   inner [`ZipError::UnsupportedFeature`].
 
-use std::io::Read;
+use std::io::{Cursor, Read};
 
 use thiserror::Error;
 
+use crate::decode::{deflate_native, DecodeError, DecodeStatus, StreamingDecoder};
 use crate::sink::{SinkError, ZipSink};
 use crate::zip::format::CompressionMethod;
 use crate::zip::ZipError;
@@ -64,9 +71,12 @@ pub const COPY_BUFFER_LEN: usize = 64 * 1024;
 pub enum EntryDecodeError {
     /// Reading from the source or interpreting compressed bytes
     /// failed. The codec's [`std::io::Error`]s funnel through here
-    /// — `flate2`'s decoder surfaces format violations as
-    /// [`std::io::ErrorKind::InvalidData`] which round-trips into
-    /// the wrapped [`std::io::Error`].
+    /// — Phase 9a swapped DEFLATE off `flate2` onto the hand-rolled
+    /// [`crate::decode::deflate_native::Decoder`], whose format
+    /// violations (`MalformedHuffman`, `BackReferenceUnderflow`,
+    /// etc.) surface as [`std::io::ErrorKind::Other`] with a
+    /// human-readable message preserved through the wrapped
+    /// [`std::io::Error`].
     #[error("failed to read or decompress entry {entry_name:?}")]
     Read {
         /// Entry name from the central directory.
@@ -93,13 +103,41 @@ pub enum EntryDecodeError {
     Zip(#[from] ZipError),
 }
 
+/// Resume context carried through [`decompress_entry`] for
+/// codec-aware mid-entry resume.
+///
+/// `blob` is the opaque decoder-state blob captured by a previous
+/// run's mid-entry checkpoint
+/// (`SinkState::Zip::current_entry_decoder_state`). `compressed`
+/// must already be positioned at `source_byte_offset` within the
+/// entry's compressed payload — typically the caller has done
+/// `entry_reader.take(compressed_size - source_byte_offset)`
+/// after seeking past the prefix.
+#[derive(Debug)]
+pub struct DecompressResume<'a> {
+    /// Opaque codec-resume blob.
+    pub blob: &'a [u8],
+    /// Byte offset within the entry's compressed payload where
+    /// `compressed` starts delivering bytes.
+    pub source_byte_offset: u64,
+}
+
+/// Per-progress hook fired periodically inside
+/// [`decompress_entry`]'s decode loop. Receives the cumulative
+/// bytes written into the sink for the in-flight entry plus the
+/// codec's most-recent snapshotable state (when one is
+/// available). Returning `Err` aborts the decode with
+/// [`EntryDecodeError::Read`] carrying the IO error.
+pub type InEntryProgressCallback<'a> =
+    &'a mut dyn FnMut(u64, Option<Vec<u8>>) -> std::io::Result<()>;
+
 /// Decompress one entry's compressed bytes into the sink.
 ///
 /// `compressed` is a `Read` that yields exactly the entry's
 /// compressed payload — typically `entry_reader.take(compressed_size)`
 /// constructed by the caller. `sink` must already have an entry in
 /// flight (via [`ZipSink::begin_entry`] or
-/// [`ZipSink::begin_entry_resume_stored`]). On return the entry's
+/// [`ZipSink::begin_entry_resume`]). On return the entry's
 /// bytes have been fully fed into the sink and the caller can
 /// [`ZipSink::end_entry`] to validate the CRC.
 ///
@@ -112,20 +150,45 @@ pub fn decompress_entry<R: Read>(
     sink: &mut ZipSink,
     entry_name: &str,
 ) -> Result<u64, EntryDecodeError> {
+    decompress_entry_with_resume(method, compressed, sink, entry_name, None, &mut |_, _| {
+        Ok(())
+    })
+}
+
+/// Like [`decompress_entry`] but additionally:
+///
+/// - Honors `resume` (when `Some`) by constructing the codec
+///   from the captured state blob via the codec's
+///   `resume_factory`. The caller must have already positioned
+///   `compressed` at `resume.source_byte_offset` and called
+///   [`ZipSink::begin_entry_resume`] so the sink picks up at the
+///   matching output offset.
+/// - Fires `progress` periodically inside the decode loop with
+///   the cumulative bytes-written-this-entry and (when the codec
+///   supports mid-entry resume) the latest decoder-state blob.
+///   Returning `Err` from the callback aborts the decode with
+///   [`EntryDecodeError::Read`] carrying the IO error.
+///
+/// Used by the zip pipeline's
+/// [`crate::download::zip_pipeline::ZipPipeline::run`] to thread
+/// Phase 9b's `current_entry_decoder_state` through.
+pub fn decompress_entry_with_resume<R: Read>(
+    method: CompressionMethod,
+    compressed: R,
+    sink: &mut ZipSink,
+    entry_name: &str,
+    resume: Option<DecompressResume<'_>>,
+    progress: InEntryProgressCallback<'_>,
+) -> Result<u64, EntryDecodeError> {
     match method {
-        CompressionMethod::Stored => copy_into_sink(compressed, sink, entry_name),
+        CompressionMethod::Stored => {
+            copy_into_sink_with_progress(compressed, sink, entry_name, progress)
+        }
         CompressionMethod::Deflate => {
-            let decoder = flate2::read::DeflateDecoder::new(compressed);
-            copy_into_sink(decoder, sink, entry_name)
+            decompress_deflate_entry_with_resume(compressed, sink, entry_name, resume, progress)
         }
         CompressionMethod::Zstd => {
-            let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|source| {
-                EntryDecodeError::Read {
-                    entry_name: entry_name.to_string(),
-                    source,
-                }
-            })?;
-            copy_into_sink(decoder, sink, entry_name)
+            decompress_zstd_entry_with_resume(compressed, sink, entry_name, resume, progress)
         }
         CompressionMethod::Other(_) => Err(EntryDecodeError::Zip(ZipError::UnsupportedFeature {
             feature: format!(
@@ -137,11 +200,196 @@ pub fn decompress_entry<R: Read>(
     }
 }
 
-/// Copy `src` to `sink` in fixed-size chunks until EOF.
-fn copy_into_sink<R: Read>(
+/// Decode one DEFLATE-compressed entry through the hand-rolled
+/// [`deflate_native::Decoder`].
+///
+/// When `resume` is `Some`, the decoder is reconstructed via
+/// [`deflate_native::resume_factory`] from the captured blob, the
+/// sliding window is pre-seeded, and the bit cursor is advanced
+/// to the saved `(byte, bit)` position. When `resume` is `None`,
+/// a fresh decoder reads from byte 0.
+///
+/// Reads the (remaining) compressed bytes off `compressed` into
+/// an owned [`Cursor`] so the decoder's `'static`-source API
+/// works unchanged, then drives the
+/// [`StreamingDecoder::decode_step`] loop, copying decompressed
+/// bytes into the sink in [`COPY_BUFFER_LEN`]-bounded batches.
+/// `progress` fires after each `decode_step` with the cumulative
+/// bytes-written-this-entry and the codec's
+/// [`StreamingDecoder::decoder_state`] blob (when available).
+///
+/// Memory peak per call is the entry's *remaining* compressed size
+/// (compressed_size minus `resume.source_byte_offset`); Phase 11
+/// of `docs/PLAN_deflate_block_decoder.md` may swap this for a
+/// streaming variant once real-world archives need it.
+fn decompress_deflate_entry_with_resume<R: Read>(
+    mut compressed: R,
+    sink: &mut ZipSink,
+    entry_name: &str,
+    resume: Option<DecompressResume<'_>>,
+    progress: InEntryProgressCallback<'_>,
+) -> Result<u64, EntryDecodeError> {
+    // Buffer the entry's (remaining) compressed bytes into memory.
+    // The caller's bounded source caps this at the central
+    // directory's `compressed_size` (or its remainder past the
+    // resume point).
+    let mut compressed_buf = Vec::new();
+    compressed
+        .read_to_end(&mut compressed_buf)
+        .map_err(|source| EntryDecodeError::Read {
+            entry_name: entry_name.to_string(),
+            source,
+        })?;
+    let cursor: Box<dyn Read + Send> = Box::new(Cursor::new(compressed_buf));
+
+    // Construct fresh-or-resumed decoder.
+    let mut decoder: Box<dyn StreamingDecoder> = if let Some(r) = resume.as_ref() {
+        deflate_native::resume_factory(cursor, r.blob, r.source_byte_offset).map_err(|e| {
+            let source = decode_err_to_io(e);
+            EntryDecodeError::Read {
+                entry_name: entry_name.to_string(),
+                source,
+            }
+        })?
+    } else {
+        deflate_native::factory(cursor).map_err(|e| {
+            let source = decode_err_to_io(e);
+            EntryDecodeError::Read {
+                entry_name: entry_name.to_string(),
+                source,
+            }
+        })?
+    };
+
+    drive_streaming_decoder(decoder.as_mut(), sink, entry_name, progress)
+}
+
+/// Decode one zstd-compressed entry through the hand-rolled
+/// [`crate::decode::zstd::Decoder`] when a resume blob is
+/// supplied; otherwise fall back to the upstream `zstd` crate
+/// binding (matching the pre-Phase-9b behaviour for fresh
+/// entries — Phase 11 may unify both paths once the hand-rolled
+/// decoder's throughput matches `zstd`'s for short single-frame
+/// inputs).
+fn decompress_zstd_entry_with_resume<R: Read>(
+    mut compressed: R,
+    sink: &mut ZipSink,
+    entry_name: &str,
+    resume: Option<DecompressResume<'_>>,
+    progress: InEntryProgressCallback<'_>,
+) -> Result<u64, EntryDecodeError> {
+    if let Some(r) = resume {
+        // Buffer remaining compressed bytes for the resume path —
+        // the resume_factory's `Box<dyn Read + Send>` source
+        // demands `'static`. Memory cost mirrors the deflate
+        // case above.
+        let mut compressed_buf = Vec::new();
+        compressed
+            .read_to_end(&mut compressed_buf)
+            .map_err(|source| EntryDecodeError::Read {
+                entry_name: entry_name.to_string(),
+                source,
+            })?;
+        let cursor: Box<dyn Read + Send> = Box::new(Cursor::new(compressed_buf));
+        let mut decoder = crate::decode::zstd::resume_factory(cursor, r.blob, r.source_byte_offset)
+            .map_err(|e| {
+                let source = decode_err_to_io(e);
+                EntryDecodeError::Read {
+                    entry_name: entry_name.to_string(),
+                    source,
+                }
+            })?;
+        drive_streaming_decoder(decoder.as_mut(), sink, entry_name, progress)
+    } else {
+        // Fresh entry: stream through the upstream zstd binding,
+        // matching the pre-Phase-9b path. The progress callback
+        // still fires after each chunk, just without a
+        // decoder_state blob (the upstream binding doesn't expose
+        // mid-stream state; only the hand-rolled decoder does).
+        let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|source| {
+            EntryDecodeError::Read {
+                entry_name: entry_name.to_string(),
+                source,
+            }
+        })?;
+        copy_into_sink_with_progress(decoder, sink, entry_name, progress)
+    }
+}
+
+/// Drive a [`StreamingDecoder`] until clean EOF, writing each
+/// step's output to `sink` and firing `progress` with the
+/// cumulative bytes-written-this-entry and the codec's resume
+/// blob (when one is available). Shared by the deflate path and
+/// the zstd-with-resume path.
+fn drive_streaming_decoder(
+    decoder: &mut dyn StreamingDecoder,
+    sink: &mut ZipSink,
+    entry_name: &str,
+    progress: InEntryProgressCallback<'_>,
+) -> Result<u64, EntryDecodeError> {
+    let mut staging: Vec<u8> = Vec::with_capacity(COPY_BUFFER_LEN);
+    let mut total: u64 = 0;
+    loop {
+        let status = decoder.decode_step(&mut staging).map_err(|e| {
+            let source = decode_err_to_io(e);
+            EntryDecodeError::Read {
+                entry_name: entry_name.to_string(),
+                source,
+            }
+        })?;
+        if !staging.is_empty() {
+            sink.write_entry(&staging)
+                .map_err(|source| EntryDecodeError::Sink {
+                    entry_name: entry_name.to_string(),
+                    source,
+                })?;
+            total = total.saturating_add(staging.len() as u64);
+            staging.clear();
+        }
+        // Pull a snapshotable resume blob if the codec exposes
+        // one at this step (returns `None` mid-block / at EOF for
+        // hand-rolled decoders that only checkpoint at boundaries).
+        let blob = decoder.decoder_state();
+        progress(total, blob).map_err(|source| EntryDecodeError::Read {
+            entry_name: entry_name.to_string(),
+            source,
+        })?;
+        if matches!(status, DecodeStatus::Eof) {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Translate a [`DecodeError`] from the hand-rolled deflate
+/// decoder into an [`std::io::Error`] so the callers'
+/// [`EntryDecodeError::Read`] / [`EntryDecodeError::Sink`]
+/// discrimination stays clean. Source / format errors funnel
+/// through `Read`; sink errors funnel through the
+/// `EntryDecodeError::Sink` arm at the call site (the decoder's
+/// internal sink path can't surface here because we pass it a
+/// `Vec<u8>` whose `write_all` is infallible).
+fn decode_err_to_io(e: DecodeError) -> std::io::Error {
+    match e {
+        DecodeError::Read { source, .. } => source,
+        DecodeError::Write(source) => source,
+        DecodeError::Construct(source) => source,
+        DecodeError::ResumeMismatch { expected, actual } => std::io::Error::other(format!(
+            "deflate resume seam mismatch: expected {expected}, actual {actual}"
+        )),
+    }
+}
+
+/// Copy `src` to `sink` in fixed-size chunks until EOF, firing
+/// `progress` after each chunk write. STORED entries (and the
+/// upstream-zstd fresh path) use this — neither has a
+/// snapshotable codec state, so the `decoder_state` argument to
+/// `progress` is always `None`.
+fn copy_into_sink_with_progress<R: Read>(
     mut src: R,
     sink: &mut ZipSink,
     entry_name: &str,
+    progress: InEntryProgressCallback<'_>,
 ) -> Result<u64, EntryDecodeError> {
     let mut buf = vec![0u8; COPY_BUFFER_LEN];
     let mut total: u64 = 0;
@@ -163,6 +411,10 @@ fn copy_into_sink<R: Read>(
                 source,
             })?;
         total += n as u64;
+        progress(total, None).map_err(|source| EntryDecodeError::Read {
+            entry_name: entry_name.to_string(),
+            source,
+        })?;
     }
     Ok(total)
 }

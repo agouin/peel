@@ -42,20 +42,6 @@ zstd = { version = "0.13", default-features = false }
 # need at runtime, so it stays disabled. `safe-decode` keeps malformed
 # input from triggering panics inside the block decompressor.
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
-# DEFLATE backend for ZIP entries (PLAN_v2.md §5 / docs/ENGINEERING_STANDARDS.md §2.2).
-# `rust_backend` selects the pure-Rust miniz_oxide backend per the
-# allowlist note — no C dependency, smaller audit surface than the
-# default zlib-ng backend, throughput well above what the network
-# bottleneck makes us care about.
-#
-# Phase 8 of `docs/PLAN_deflate_block_decoder.md` swapped the gzip
-# streaming path off `flate2` and over to the hand-rolled
-# [`crate::decode::deflate_native`] backend, but the zip-DEFLATE
-# entry path (`src/zip/decode.rs`) still uses `flate2`. Phase 9
-# wires the hand-rolled decoder through the zip pipeline too;
-# after that, this dependency moves to `[dev-dependencies]` for
-# the differential test suite only.
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # docs/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }
@@ -109,6 +95,15 @@ sha2 = "0.10"
 # decode path; it stays here so the differential corpus keeps a real
 # liblzma reference implementation in the loop.
 xz2 = "0.1"
+# Dev-only: pure-Rust DEFLATE / gzip codec used to encode round-trip
+# fixtures for the `decode::deflate_native` differential tests and
+# the `zip::decode` round-trip tests. Phase 9a of
+# `docs/PLAN_deflate_block_decoder.md` swapped the production
+# DEFLATE / gzip / zip-DEFLATE paths off this crate; it stays here
+# so the differential corpus keeps a real `miniz_oxide` reference
+# implementation in the loop. `rust_backend` selects the pure-Rust
+# variant — no C dependency, no zlib link.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Dev-only: enable hyper's `server` feature for an in-process H2
 # (h2c, plaintext prior-knowledge) test server in
 # `tests/support/h2c_server.rs`. The `[dependencies]` block already

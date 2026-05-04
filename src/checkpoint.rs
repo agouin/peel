@@ -137,7 +137,15 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   essentially never satisfied. v6 readers parse v1 / v2 / v3 /
 ///   v4 / v5 files transparently with `in_flight = None`. Older
 ///   binaries refuse v6 with [`CheckpointError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 6;
+/// - **v7** — extends [`SinkState::Zip`] with an optional opaque
+///   `current_entry_decoder_state` blob carrying the in-flight zip
+///   entry's codec state (`docs/PLAN_deflate_block_decoder.md`
+///   Phase 9b). v7 readers parse v1..=v6 files transparently
+///   with `current_entry_decoder_state = None` (which fall through
+///   to the existing per-entry "restart from byte 0" path for
+///   DEFLATE / zstd entries). Older binaries refuse v7 with
+///   [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -426,10 +434,14 @@ pub enum SinkState {
     /// order. The checkpoint records which entries are durable on
     /// disk via `entries_completed`, and (when a crash interrupts an
     /// entry) the in-flight entry index plus the byte offset within
-    /// it. STORED entries can resume from `current_entry_offset`;
-    /// DEFLATE / zstd entries truncate back to zero on resume because
-    /// neither codec exposes a serializable mid-stream state. See
-    /// `docs/PLAN_v2.md` §5 step 7.
+    /// it. STORED entries resume from `current_entry_offset`;
+    /// DEFLATE / zstd entries resume from `current_entry_offset` *and*
+    /// the codec's `current_entry_decoder_state` blob (Phase 9b of
+    /// `docs/PLAN_deflate_block_decoder.md`). When the blob is
+    /// `None` for a DEFLATE / zstd entry — either because the
+    /// checkpoint was captured at byte 0 or the v6 reader couldn't
+    /// see it — the pipeline falls back to "restart entry from byte
+    /// 0", matching the pre-Phase-9b behaviour.
     Zip {
         /// Indices (within the central directory) of entries that
         /// finished extracting before this checkpoint was written.
@@ -442,6 +454,13 @@ pub enum SinkState {
         /// Bytes already written into the in-flight entry. `0` when
         /// `current_entry` is `None`.
         current_entry_offset: u64,
+        /// Opaque decoder-state blob captured at the most recent
+        /// in-entry checkpoint. `None` when the in-flight entry is
+        /// at byte 0, when the entry uses STORED (no codec state),
+        /// or when the checkpoint was written by a pre-v7 binary.
+        /// Added in checkpoint format v7; v6 readers see `None` and
+        /// fall through to the per-entry "restart from byte 0" path.
+        current_entry_decoder_state: Option<Vec<u8>>,
     },
 }
 
@@ -565,6 +584,7 @@ impl Checkpoint {
                 entries_completed,
                 current_entry,
                 current_entry_offset,
+                current_entry_decoder_state,
             } => {
                 body.push(SINK_TAG_ZIP);
                 let count = u32::try_from(entries_completed.len()).unwrap_or(u32::MAX);
@@ -580,6 +600,18 @@ impl Checkpoint {
                     None => body.push(0),
                 }
                 write_u64(&mut body, *current_entry_offset);
+                // v7: optional in-flight codec state blob. v6
+                // readers stop at the previous field and see the
+                // blob as absent, which matches the field's default.
+                match current_entry_decoder_state {
+                    Some(blob) => {
+                        body.push(1);
+                        let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+                        write_u32(&mut body, len);
+                        body.extend_from_slice(&blob[..len as usize]);
+                    }
+                    None => body.push(0),
+                }
             }
         }
 
@@ -709,7 +741,7 @@ impl Checkpoint {
         // version so it can decide whether to read each trailer;
         // future versions that *change* the layout will branch
         // here.
-        debug_assert!(matches!(format_version, 1..=6));
+        debug_assert!(matches!(format_version, 1..=7));
         Self::decode_body(body, format_version)
     }
 
@@ -784,10 +816,53 @@ impl Checkpoint {
                     }
                 };
                 let current_entry_offset = cursor.read_u64("sink.zip.current_entry_offset")?;
+                // v7: optional in-flight codec state blob. v6 and
+                // earlier files have no further bytes here; the
+                // remaining body (hash_state / chunk_crc32c /
+                // decoder_state) reads correctly because each of
+                // those fields is its own length-prefixed
+                // optional field.
+                let current_entry_decoder_state = if format_version >= 7 {
+                    let presence =
+                        cursor.read_u8("sink.zip.current_entry_decoder_state.is_some")?;
+                    match presence {
+                        0 => None,
+                        1 => {
+                            let len =
+                                cursor.read_u32("sink.zip.current_entry_decoder_state.len")?;
+                            // Bound the allocation; reuse the same
+                            // ceiling as `Checkpoint::decoder_state`
+                            // since the deflate / gzip / zstd-in-zip
+                            // resume blobs all stay well under it.
+                            if len > MAX_DECODER_STATE_LEN {
+                                return Err(CheckpointError::Truncated {
+                                    reason: format!(
+                                        "sink.zip.current_entry_decoder_state length {len} \
+                                         exceeds cap {MAX_DECODER_STATE_LEN}",
+                                    ),
+                                });
+                            }
+                            let bytes = cursor.require(
+                                len as usize,
+                                "sink.zip.current_entry_decoder_state.bytes",
+                            )?;
+                            Some(bytes.to_vec())
+                        }
+                        other => {
+                            return Err(CheckpointError::InvalidPresence {
+                                field: "sink.zip.current_entry_decoder_state",
+                                value: other,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
                 SinkState::Zip {
                     entries_completed: entries,
                     current_entry,
                     current_entry_offset,
+                    current_entry_decoder_state,
                 }
             }
             other => {
@@ -1556,6 +1631,7 @@ mod tests {
                 entries_completed: vec![0, 1, 2, 5, 7],
                 current_entry: current,
                 current_entry_offset: current_offset,
+                current_entry_decoder_state: None,
             },
             hash_state: None,
             chunk_crc32c: None,
@@ -1595,14 +1671,16 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_six() {
+    fn checkpoint_format_version_is_seven() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
-        // OPTIMIZATIONS.md §O.7b (v5), and the tar mid-member
-        // resume work (v6) each bump this when an optional trailer
-        // lands. If a future change resets it, this guards against
-        // silently dropping the upgrade-required signal older
-        // readers depend on.
-        assert_eq!(FORMAT_VERSION, 6);
+        // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
+        // work (v6), and `docs/PLAN_deflate_block_decoder.md`
+        // Phase 9b's zip per-entry decoder-state field (v7) each
+        // bumped this when an optional trailer landed. If a
+        // future change resets it, this guards against silently
+        // dropping the upgrade-required signal older readers
+        // depend on.
+        assert_eq!(FORMAT_VERSION, 7);
     }
 
     fn build_legacy_body_raw_sink() -> Vec<u8> {
@@ -1727,6 +1805,58 @@ mod tests {
         match parsed.sink_state {
             SinkState::Tar { in_flight, .. } => assert!(in_flight.is_none()),
             other => panic!("expected Tar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v6_zip_body_parses_with_decoder_state_none() {
+        // Hand-build a v6 Zip body (with current_entry mid-flight,
+        // no v7 decoder-state trailer) and verify the v7 reader
+        // fills `current_entry_decoder_state: None`. Pins
+        // backward-compat for the Phase-9b format bump.
+        let mut body = Vec::new();
+        write_string(&mut body, "https://example.com/x.zip");
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        write_u64(&mut body, 1024);
+        write_u64(&mut body, 64);
+        write_u64(&mut body, 0);
+        write_byte_array(&mut body, &[0xFFu8; 4]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_ZIP);
+        // entries_completed = [0, 1]
+        write_u32(&mut body, 2);
+        write_u32(&mut body, 0);
+        write_u32(&mut body, 1);
+        // current_entry = Some(2)
+        body.push(1);
+        write_u32(&mut body, 2);
+        // current_entry_offset = 12_345
+        write_u64(&mut body, 12_345);
+        // v6 ends here for Zip (no v7 decoder_state trailer).
+        // Trailing v3 / v4 / v5 optionals.
+        body.push(0); // hash_state
+        body.push(0); // chunk_crc32c
+        body.push(0); // checkpoint-level decoder_state
+
+        let bytes = frame_legacy_body(&body, 6);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v6 zip parses under v7 reader");
+        match parsed.sink_state {
+            SinkState::Zip {
+                current_entry,
+                current_entry_offset,
+                current_entry_decoder_state,
+                ..
+            } => {
+                assert_eq!(current_entry, Some(2));
+                assert_eq!(current_entry_offset, 12_345);
+                assert!(
+                    current_entry_decoder_state.is_none(),
+                    "v6 readers shouldn't conjure a decoder-state blob"
+                );
+            }
+            other => panic!("expected Zip, got {other:?}"),
         }
     }
 
@@ -2374,10 +2504,22 @@ mod tests {
                     } else {
                         None
                     };
+                    let blob_present = rng.next_u32() & 1 == 0;
+                    let current_entry_decoder_state = if blob_present {
+                        let len = (rng.next_u32() % 64) as usize;
+                        let mut blob = Vec::with_capacity(len);
+                        for _ in 0..len {
+                            blob.push((rng.next_u32() & 0xFF) as u8);
+                        }
+                        Some(blob)
+                    } else {
+                        None
+                    };
                     SinkState::Zip {
                         entries_completed: entries,
                         current_entry: current,
                         current_entry_offset: rng.next_u64(),
+                        current_entry_decoder_state,
                     }
                 }
             };

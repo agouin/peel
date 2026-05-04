@@ -1,11 +1,12 @@
 //! Hand-rolled, pure-Rust DEFLATE streaming decoder.
 //!
-//! Phases 1–5 of `docs/PLAN_deflate_block_decoder.md` — currently
-//! shipped behind the cargo feature flag `peel_deflate_native`. The
-//! existing [`crate::decode::gzip`] wrapper around `flate2` remains
-//! the production gzip path; this module is built up phase-by-phase
-//! and Phase 8 swaps it in as the production gzip / zip-DEFLATE
-//! backend.
+//! Phases 1–9 of `docs/PLAN_deflate_block_decoder.md`. Phase 8
+//! swapped this module in as the production gzip path
+//! ([`crate::decode::gzip`] is now a thin re-export of [`gzip`]
+//! below); Phase 9a swapped the production zip-DEFLATE path off
+//! `flate2` and onto [`Decoder::new`]. The `flate2` crate is now
+//! a dev-dependency only — the differential test suite uses it to
+//! encode round-trip fixtures.
 //!
 //! # What's working in Phase 1
 //!
@@ -669,9 +670,10 @@ impl StreamingDecoder for Decoder {
 /// [`crate::decode::DecoderFactory`] adapter for [`Decoder`].
 ///
 /// Not registered by [`crate::decode::DecoderRegistry::with_defaults`]
-/// in Phase 1 — the production gzip path still goes through
-/// [`crate::decode::gzip::factory`] / `flate2`. Phase 8 swaps the
-/// registration once the decoder is feature-complete.
+/// — raw deflate streams (no gzip framing) are not a registered
+/// archive format. The factory is still public so the zip
+/// pipeline can reach it for `CompressionMethod::Deflate` entries
+/// (see [`crate::zip::decode::decompress_entry`]).
 ///
 /// # Errors
 ///

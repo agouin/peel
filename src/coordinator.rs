@@ -1694,10 +1694,12 @@ fn run_zip(
                 entries_completed,
                 current_entry,
                 current_entry_offset,
+                current_entry_decoder_state,
             } => ZipResumeState {
                 entries_completed: entries_completed.clone(),
                 current_entry: *current_entry,
                 current_entry_offset: *current_entry_offset,
+                current_entry_decoder_state: current_entry_decoder_state.clone(),
             },
             SinkState::Raw { .. } | SinkState::Tar { .. } => {
                 return Err(CoordinatorError::SourceChanged {
@@ -1757,7 +1759,77 @@ fn run_zip(
             }
         }
         match event {
-            ZipPipelineEvent::Started { .. } | ZipPipelineEvent::InEntryProgress { .. } => Ok(()),
+            ZipPipelineEvent::Started { .. } => Ok(()),
+            ZipPipelineEvent::InEntryProgress {
+                index,
+                bytes_written,
+                decoder_state,
+            } => {
+                // Phase 9b: write a throttled checkpoint that
+                // captures the in-flight entry's codec state. The
+                // resumed run picks the entry up at this offset +
+                // blob and continues without restarting from
+                // byte 0.
+                //
+                // Throttle vs entry-finished: same cadence
+                // (checkpoint_min_bytes / _min_interval), measured
+                // against the same `bytes_extracted_total` proxy.
+                // We don't update `bytes_extracted_total` here
+                // because the entry isn't finished yet; the
+                // checkpoint records `bytes_extracted_total +
+                // bytes_written` indirectly via the on-disk file
+                // sizes (the resumed sink's begin_entry_resume
+                // truncates the file to `bytes_written` and
+                // re-CRCs it).
+                let elapsed = last_write_at.elapsed();
+                let in_flight_progress = bytes_extracted_total.saturating_add(*bytes_written);
+                let progressed = in_flight_progress.saturating_sub(last_progress);
+                if progressed < config.checkpoint_min_bytes
+                    && elapsed < config.checkpoint_min_interval
+                {
+                    return Ok(());
+                }
+                sparse
+                    .sync_all()
+                    .map_err(|e| io::Error::other(format!("sparse sync_all: {e}")))?;
+                let chunk_crc32c = if fingerprints.is_empty() {
+                    None
+                } else {
+                    Some(fingerprints.to_vec())
+                };
+                let ckpt = Checkpoint {
+                    url: requested_url.to_string(),
+                    etag: info.fingerprint.etag.clone(),
+                    last_modified: info.fingerprint.last_modified.clone(),
+                    total_size: info.total_size,
+                    chunk_size,
+                    decoder_position: ByteOffset::new(0),
+                    bitmap_completed: bitmap.to_bytes(),
+                    created_at: SystemTime::now(),
+                    sink_state: SinkState::Zip {
+                        entries_completed: entries_completed.clone(),
+                        current_entry: Some(*index),
+                        current_entry_offset: *bytes_written,
+                        current_entry_decoder_state: decoder_state.clone(),
+                    },
+                    hash_state: None,
+                    chunk_crc32c,
+                    decoder_state: None,
+                };
+                ckpt.write(ckpt_path)
+                    .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+                last_write_at = Instant::now();
+                last_progress = in_flight_progress;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: in_flight_progress,
+                        bytes_out: in_flight_progress,
+                    });
+                }
+                Ok(())
+            }
             ZipPipelineEvent::EntryFinished {
                 index,
                 bytes_written,
@@ -1812,14 +1884,23 @@ fn run_zip(
                         entries_completed: entries_completed.clone(),
                         current_entry: None,
                         current_entry_offset: 0,
+                        // EntryFinished — the just-finished entry is
+                        // durable on disk; no in-flight codec state
+                        // to preserve. Mid-entry checkpoints
+                        // (Phase 9b's `InEntryProgress` path) emit
+                        // their own blob via the separate code path
+                        // below.
+                        current_entry_decoder_state: None,
                     },
                     // Integrity tracking is implemented for the
                     // streaming pipeline only; ZIP runs leave it
                     // unset (`PLAN_v2.md` §10 + §5).
                     hash_state: None,
                     chunk_crc32c,
-                    // ZIP entries don't carry decoder state — they
-                    // resume per-entry via `current_entry`/_offset.
+                    // ZIP entries carry their codec state in
+                    // `SinkState::Zip::current_entry_decoder_state`,
+                    // not in the streaming-pipeline-shaped
+                    // [`Checkpoint::decoder_state`] field. Phase 9b.
                     decoder_state: None,
                 };
                 ckpt.write(ckpt_path)

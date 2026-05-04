@@ -299,16 +299,38 @@ impl ZipSink {
     ///
     /// Truncates the existing on-disk file to `resume_at`, re-reads
     /// those bytes to seed the running CRC, and leaves the sink
-    /// ready to accept writes that pick up at `resume_at`. Used
-    /// only for STORED — DEFLATE/zstd cannot resume mid-stream
-    /// (the codec state is not part of the checkpoint), so the
-    /// pipeline calls [`Self::begin_entry`] for those.
+    /// ready to accept writes that pick up at `resume_at`. The
+    /// underlying file-IO is codec-agnostic — Phase 9b of
+    /// `docs/PLAN_deflate_block_decoder.md` swapped DEFLATE / zstd
+    /// onto this same path via [`Self::begin_entry_resume`]. The
+    /// `_stored` suffix is preserved for compatibility with
+    /// pre-Phase-9b callers.
     ///
     /// # Errors
     ///
     /// - [`SinkError::Io`] when the on-disk file cannot be opened
     ///   for read+write, truncated, or re-read.
     /// - [`SinkError::PathEscape`] if the entry name is unsafe.
+    pub fn begin_entry_resume(
+        &mut self,
+        index: u32,
+        entry_name: &str,
+        expected_size: u64,
+        expected_crc: u32,
+        resume_at: u64,
+    ) -> Result<BeginEntryOutcome, SinkError> {
+        // Phase 9b generalised the resume path: STORED, DEFLATE,
+        // and zstd entries all use the same file-IO sequence
+        // (truncate → replay-CRC → seek). The body is identical
+        // to the historical `begin_entry_resume_stored`; the
+        // codec-specific bits live in the pipeline's
+        // [`crate::zip::decode::decompress_entry_with_resume`].
+        self.begin_entry_resume_stored(index, entry_name, expected_size, expected_crc, resume_at)
+    }
+
+    /// Pre-Phase-9b spelling of [`Self::begin_entry_resume`] —
+    /// retained for tests and for the existing call sites in the
+    /// pipeline that pre-date the rename.
     pub fn begin_entry_resume_stored(
         &mut self,
         index: u32,

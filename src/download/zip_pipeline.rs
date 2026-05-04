@@ -59,8 +59,8 @@ use crate::sink::{BeginEntryOutcome, SinkError, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
 use crate::zip::format::LFH_FIXED_LEN;
 use crate::zip::{
-    decompress_entry, find_eocd, parse_central_directory, CentralDirectoryEntry, EntryDecodeError,
-    LocalFileHeader, ZipError, MAX_EOCD_TAIL_BYTES,
+    find_eocd, parse_central_directory, CentralDirectoryEntry, EntryDecodeError, LocalFileHeader,
+    ZipError, MAX_EOCD_TAIL_BYTES,
 };
 
 /// Configuration for a [`ZipPipeline::run`] invocation.
@@ -104,6 +104,17 @@ pub struct ZipResumeState {
     pub current_entry: Option<u32>,
     /// Bytes already written into the in-flight entry.
     pub current_entry_offset: u64,
+    /// Opaque decoder-state blob captured at the most recent
+    /// in-entry checkpoint. `None` when the in-flight entry is at
+    /// byte 0, when the entry uses STORED (resumes per-byte
+    /// without a blob), or when the prior run wrote the
+    /// checkpoint via a pre-v7 format. Phase 9b of
+    /// `docs/PLAN_deflate_block_decoder.md` introduced this field;
+    /// the resumed pipeline funnels it through
+    /// [`crate::decode::deflate_native::resume_factory`] (DEFLATE)
+    /// or [`crate::decode::zstd::resume_factory`] (zstd) when the
+    /// entry's compression method matches what the blob captured.
+    pub current_entry_decoder_state: Option<Vec<u8>>,
 }
 
 /// Diagnostic events the pipeline emits during a run.
@@ -134,16 +145,27 @@ pub enum ZipPipelineEvent {
         /// Source byte range the pipeline punched after this entry.
         bytes_punched: u64,
     },
-    /// One entry just had bytes flowed into it. Emitted at most
-    /// once per [`ZipPipelineConfig::progress_interval_bytes`] of
-    /// extracted output (currently fixed at the COPY_BUFFER_LEN
-    /// granularity inside [`decompress_entry`]).
+    /// One entry just had bytes flowed into it. Emitted whenever
+    /// the inner codec yields between deflate-block / zstd-block
+    /// boundaries with a snapshotable resume point. The
+    /// coordinator throttles the checkpoint write per its
+    /// `checkpoint_min_bytes` / `checkpoint_min_interval` policy
+    /// and persists `bytes_written` as `current_entry_offset`
+    /// alongside the `decoder_state` blob — together those two
+    /// fields let the next run resume the in-flight entry without
+    /// restarting from byte 0.
     InEntryProgress {
         /// Entry's index in central-directory order.
         index: u32,
         /// Bytes written so far into the in-flight entry. The
         /// coordinator records this as `current_entry_offset`.
         bytes_written: u64,
+        /// Opaque decoder-state blob captured at this checkpoint
+        /// opportunity. `None` for STORED entries (no codec state
+        /// to capture), or when the codec has not yet reached a
+        /// snapshotable boundary inside the entry. Phase 9b of
+        /// `docs/PLAN_deflate_block_decoder.md`.
+        decoder_state: Option<Vec<u8>>,
     },
 }
 
@@ -315,8 +337,20 @@ impl<'a> ZipPipeline<'a> {
             } else {
                 0
             };
-            let (bytes_written, bytes_punched) =
-                self.extract_entry(entry, idx, resume_offset, sink, puncher, &mut callback)?;
+            let resume_blob: Option<&[u8]> = if Some(idx) == resume.current_entry {
+                resume.current_entry_decoder_state.as_deref()
+            } else {
+                None
+            };
+            let (bytes_written, bytes_punched) = self.extract_entry(
+                entry,
+                idx,
+                resume_offset,
+                resume_blob,
+                sink,
+                puncher,
+                &mut callback,
+            )?;
             stats.entries_extracted = stats.entries_extracted.saturating_add(1);
             stats.bytes_written = stats.bytes_written.saturating_add(bytes_written);
             stats.bytes_punched = stats.bytes_punched.saturating_add(bytes_punched);
@@ -339,11 +373,22 @@ impl<'a> ZipPipeline<'a> {
     }
 
     /// Extract one entry; returns `(bytes_written, bytes_punched)`.
+    ///
+    /// `resume_offset` and `resume_blob` come together: when both
+    /// are populated and the entry's `method` matches what the
+    /// blob captured, the codec is reconstructed via its
+    /// `resume_factory` (DEFLATE / zstd) and the sink picks up at
+    /// `resume_offset` via [`ZipSink::begin_entry_resume`]. When
+    /// `resume_blob` is `None` but `resume_offset > 0`, only
+    /// STORED entries can resume mid-entry; DEFLATE / zstd
+    /// entries restart from byte 0 (the pre-Phase-9b behaviour).
+    #[allow(clippy::too_many_arguments)]
     fn extract_entry<F>(
         &self,
         entry: &CentralDirectoryEntry,
         index: u32,
         resume_offset: u64,
+        resume_blob: Option<&[u8]>,
         sink: &mut ZipSink,
         puncher: &dyn PunchHole,
         callback: &mut F,
@@ -391,26 +436,42 @@ impl<'a> ZipPipeline<'a> {
         }
         self.wait_for_range(data_start, data_end)?;
 
-        // Resume-stored is only safe for STORED entries; for
-        // DEFLATE/zstd we truncate back to zero (codec state isn't
-        // serialized in the checkpoint).
-        let outcome =
-            if resume_offset > 0 && matches!(entry.method, crate::zip::CompressionMethod::Stored) {
-                sink.begin_entry_resume_stored(
-                    index,
-                    &entry.name,
-                    entry.uncompressed_size,
-                    entry.crc32,
-                    resume_offset,
-                )
+        // Phase 9b: figure out whether this entry can mid-resume,
+        // and how. STORED entries always can (sink-side resume);
+        // DEFLATE / zstd entries can only when a codec blob was
+        // captured at the saved offset.
+        let is_stored = matches!(entry.method, crate::zip::CompressionMethod::Stored);
+        let can_codec_resume = matches!(
+            entry.method,
+            crate::zip::CompressionMethod::Deflate | crate::zip::CompressionMethod::Zstd
+        ) && resume_blob.is_some();
+        let resume_mid_entry = resume_offset > 0 && (is_stored || can_codec_resume);
+
+        let outcome = if resume_mid_entry {
+            sink.begin_entry_resume(
+                index,
+                &entry.name,
+                entry.uncompressed_size,
+                entry.crc32,
+                resume_offset,
+            )
+            .map_err(ZipPipelineError::Sink)?
+        } else {
+            sink.begin_entry(index, &entry.name, entry.uncompressed_size, entry.crc32)
                 .map_err(ZipPipelineError::Sink)?
-            } else {
-                sink.begin_entry(index, &entry.name, entry.uncompressed_size, entry.crc32)
-                    .map_err(ZipPipelineError::Sink)?
-            };
+        };
 
         // Stream the entry's compressed bytes through the codec.
-        // For STORED resume: skip the bytes already on disk.
+        // For STORED resume, skip the bytes already on disk; for
+        // DEFLATE / zstd codec-resume, position the source at
+        // the compressed-stream offset the blob captured.
+        let codec_resume_byte_offset = if can_codec_resume {
+            resume_blob
+                .and_then(crate::decode::deflate_native::resume::peek_source_byte_position)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let stream_start = if matches!(outcome, BeginEntryOutcome::Directory { .. }) {
             // Defensive: shouldn't happen — entry.is_directory()
             // returned false. Bail rather than risk silent
@@ -422,9 +483,10 @@ impl<'a> ZipPipeline<'a> {
                     entry.name
                 )),
             }));
-        } else if matches!(entry.method, crate::zip::CompressionMethod::Stored) && resume_offset > 0
-        {
+        } else if is_stored && resume_offset > 0 {
             data_start.saturating_add(resume_offset)
+        } else if can_codec_resume {
+            data_start.saturating_add(codec_resume_byte_offset)
         } else {
             data_start
         };
@@ -440,8 +502,73 @@ impl<'a> ZipPipeline<'a> {
             self.config.poll_interval,
         );
 
-        decompress_entry(entry.method, reader, sink, &entry.name)
+        // Build the decompress_entry resume context, if any.
+        // The blob carries `source_byte_position`, which is the
+        // compressed-stream offset the resumed codec expects.
+        // We forward that to the decompress helper so it can
+        // anchor the bit reader's byte-counter accounting; the
+        // codec's resume_factory then re-skips the captured bit
+        // offset of the already-consumed prefix.
+        let resume_ctx = if can_codec_resume {
+            resume_blob.map(|blob| crate::zip::decode::DecompressResume {
+                blob,
+                source_byte_offset:
+                    crate::decode::deflate_native::resume::peek_source_byte_position(blob)
+                        .unwrap_or(0),
+            })
+        } else {
+            None
+        };
+
+        // Wire the in-entry progress callback so the codec's
+        // mid-block decoder_state captures fire as
+        // ZipPipelineEvent::InEntryProgress events. The closure
+        // we hand to `decompress_entry_with_resume` cannot
+        // capture the outer `&mut callback` (Rust's borrow rules
+        // would forbid the resulting two-level mutable borrow),
+        // so we collect (bytes_written, decoder_state) tuples
+        // into a local Vec and replay them as
+        // [`ZipPipelineEvent::InEntryProgress`] events
+        // post-decode. The coordinator throttles per its
+        // `checkpoint_min_bytes` / `_min_interval` policy, so the
+        // replay-vs-streaming distinction doesn't change the
+        // checkpoint cadence the user observes for
+        // single-decode-step entries; for entries that yield
+        // multiple times, the replay coalesces all the
+        // boundaries into one batch at end-of-decode (the
+        // checkpoint observer still picks the latest blob, which
+        // is what we want for resume-correctness). Phase 11 may
+        // refactor to thread the callback through directly.
+        let collected_progress: std::cell::RefCell<Vec<(u64, Option<Vec<u8>>)>> =
+            std::cell::RefCell::new(Vec::new());
+        {
+            let collected_ref = &collected_progress;
+            let mut tee =
+                move |bytes_written: u64, decoder_state: Option<Vec<u8>>| -> std::io::Result<()> {
+                    collected_ref
+                        .borrow_mut()
+                        .push((bytes_written, decoder_state));
+                    Ok(())
+                };
+            crate::zip::decode::decompress_entry_with_resume(
+                entry.method,
+                reader,
+                sink,
+                &entry.name,
+                resume_ctx,
+                &mut tee,
+            )
             .map_err(ZipPipelineError::EntryDecode)?;
+        }
+        // Replay collected progress as InEntryProgress events.
+        for (bytes_written, decoder_state) in collected_progress.into_inner() {
+            callback(&ZipPipelineEvent::InEntryProgress {
+                index,
+                bytes_written,
+                decoder_state,
+            })
+            .map_err(ZipPipelineError::Aborted)?;
+        }
 
         let fin = sink.end_entry().map_err(ZipPipelineError::Sink)?;
         // Defensive: the sink already validates against
@@ -987,6 +1114,7 @@ mod tests {
             entries_completed: vec![0],
             current_entry: None,
             current_entry_offset: 0,
+            current_entry_decoder_state: None,
         };
         let stats = pipeline
             .run(&mut sink, &puncher, resume, |_| Ok(()))
@@ -1038,6 +1166,7 @@ mod tests {
             entries_completed: vec![],
             current_entry: Some(0),
             current_entry_offset: 10,
+            current_entry_decoder_state: None,
         };
         pipeline
             .run(&mut sink, &puncher, resume, |_| Ok(()))
