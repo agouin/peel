@@ -19,14 +19,6 @@ path = "src/lib.rs"
 name = "peel"
 path = "src/main.rs"
 
-[features]
-# Hand-rolled DEFLATE decoder under construction
-# (`docs/PLAN_deflate_block_decoder.md`). Phases 1–7 ship behind this
-# feature; Phase 8 swaps it in as the production gzip path and drops
-# the gate. Off by default so `cargo test` against `main` exercises the
-# `flate2` wrapper at `src/decode/gzip.rs` exactly as before.
-peel_deflate_native = []
-
 [dependencies]
 thiserror = "2"
 # TLS dependencies are pre-approved per docs/ENGINEERING_STANDARDS.md §2.4.
@@ -55,6 +47,14 @@ lz4_flex = { version = "0.11", default-features = false, features = ["safe-decod
 # allowlist note — no C dependency, smaller audit surface than the
 # default zlib-ng backend, throughput well above what the network
 # bottleneck makes us care about.
+#
+# Phase 8 of `docs/PLAN_deflate_block_decoder.md` swapped the gzip
+# streaming path off `flate2` and over to the hand-rolled
+# [`crate::decode::deflate_native`] backend, but the zip-DEFLATE
+# entry path (`src/zip/decode.rs`) still uses `flate2`. Phase 9
+# wires the hand-rolled decoder through the zip pipeline too;
+# after that, this dependency moves to `[dev-dependencies]` for
+# the differential test suite only.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # docs/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.

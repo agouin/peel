@@ -74,13 +74,12 @@ pub mod xz;
 pub mod xz_native;
 pub mod zstd;
 
-// Hand-rolled DEFLATE decoder under construction
-// (`docs/PLAN_deflate_block_decoder.md`). Phase 1 ships behind the
-// `peel_deflate_native` cargo feature so default builds keep using
-// the existing `flate2`-based [`gzip`] wrapper unchanged. Phase 8
-// drops the gate and registers this module as the production gzip /
-// zip-DEFLATE backend.
-#[cfg(feature = "peel_deflate_native")]
+// Hand-rolled DEFLATE decoder (`docs/PLAN_deflate_block_decoder.md`).
+// Phase 8 swapped the production gzip path over to this module —
+// `crate::decode::gzip` is now a thin re-export of
+// [`deflate_native::gzip`]. The `flate2` crate stays in runtime
+// dependencies for the moment because the zip-DEFLATE pipeline
+// (`src/zip/decode.rs`) still uses it; Phase 9 swaps that too.
 pub mod deflate_native;
 
 /// Status returned by [`StreamingDecoder::decode_step`].
@@ -400,19 +399,24 @@ impl DecoderRegistry {
             lz4::factory,
         );
         // Mid-frame resume hook: lz4 (per-block), zstd (per-block
-        // inside a frame), and xz (per-LZMA2-chunk inside a Block,
+        // inside a frame), xz (per-LZMA2-chunk inside a Block,
         // since Phase 7 of `docs/PLAN_xz_block_decoder.md` swapped
-        // the wrapper out for the hand-rolled decoder) all stamp
+        // the wrapper out for the hand-rolled decoder), and gzip
+        // (per-deflate-block inside a member, since Phase 8 of
+        // `docs/PLAN_deflate_block_decoder.md` swapped the
+        // `flate2`-based wrapper for the hand-rolled
+        // [`deflate_native::gzip`] backend) all stamp
         // `frame_boundary` at points where a fresh decoder cannot
         // pick up from the source offset alone — the captured
         // `decoder_state` blob carries the sliding-window /
-        // repeat-offset / probability-table state needed to
-        // produce byte-identical output past the boundary. gzip
-        // and identity (tar) restart cleanly from `frame_boundary`
-        // and so do not need this hook.
+        // repeat-offset / probability-table / running-CRC state
+        // needed to produce byte-identical output past the
+        // boundary. identity (tar) restarts cleanly from
+        // `frame_boundary` and so does not need this hook.
         r.register_resume_factory("lz4", lz4::resume_factory);
         r.register_resume_factory("zstd", zstd::resume_factory);
         r.register_resume_factory("xz", xz::resume_factory);
+        r.register_resume_factory("gzip", gzip::resume_factory);
         r.register_format(
             "gzip",
             &[".gz", ".tar.gz"],
@@ -954,11 +958,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_with_defaults_registers_resume_factories_for_lz4_zstd_and_xz() {
+    fn registry_with_defaults_registers_resume_factories_for_lz4_zstd_xz_and_gzip() {
         // lz4 (per-block mid-frame), zstd (per-block mid-frame),
-        // and xz (per-LZMA2-chunk inside a Block, since Phase 7
-        // of `docs/PLAN_xz_block_decoder.md` swapped the wrapper
-        // out for the hand-rolled decoder) all stamp
+        // xz (per-LZMA2-chunk inside a Block, since Phase 7 of
+        // `docs/PLAN_xz_block_decoder.md` swapped the wrapper out
+        // for the hand-rolled decoder), and gzip (per-deflate-block
+        // inside a member, since Phase 8 of
+        // `docs/PLAN_deflate_block_decoder.md` swapped the
+        // `flate2`-based wrapper for the hand-rolled
+        // [`deflate_native::gzip`] backend) all stamp
         // `frame_boundary` at points whose `decoder_state` blob
         // is required to resume byte-identically. Other formats
         // fall through to the generic `factory(source)` path.
@@ -984,13 +992,22 @@ mod tests {
             xz_resume,
             xz::resume_factory as DecoderResumeFactory,
         ));
+        let gzip_resume = r
+            .resume_factory_for_name("gzip")
+            .expect("gzip resume registered");
+        assert!(std::ptr::fn_addr_eq(
+            gzip_resume,
+            gzip::resume_factory as DecoderResumeFactory,
+        ));
         // Case-insensitive lookup matches the rest of the registry.
         assert!(r.resume_factory_for_name("LZ4").is_some());
         assert!(r.resume_factory_for_name("ZSTD").is_some());
         assert!(r.resume_factory_for_name("XZ").is_some());
+        assert!(r.resume_factory_for_name("GZIP").is_some());
 
-        // No other format registers a resume factory yet.
-        for name in ["gzip", "tar", "zip"] {
+        // identity (tar) and zip restart cleanly from
+        // `frame_boundary` and don't need a resume factory.
+        for name in ["tar", "zip"] {
             assert!(
                 r.resume_factory_for_name(name).is_none(),
                 "{name} unexpectedly has a resume factory",
