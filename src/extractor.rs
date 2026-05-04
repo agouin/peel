@@ -250,8 +250,13 @@ impl Default for ExtractorConfig {
 /// at exactly the right moment: the decoder has just completed a frame
 /// **and** the sink reports it is at a member boundary, so the source
 /// position recorded here is a restart-safe point for resume.
-#[derive(Debug, Clone)]
-pub struct CheckpointInfo {
+///
+/// The `'a` lifetime ties the borrowed `decoder` reference to the
+/// extractor's run loop — observers cannot outlive a single
+/// invocation, which matches the §10 coordinator's "write the
+/// checkpoint synchronously, then return" shape.
+/// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+pub struct CheckpointInfo<'a> {
     /// Source byte offset immediately past the most recently completed
     /// frame. Resume seeks the decoder back to this offset.
     pub source_position: u64,
@@ -262,14 +267,19 @@ pub struct CheckpointInfo {
     /// Running count of quiescent checkpoints observed in this run,
     /// inclusive of this one. Useful for throttling cadence.
     pub quiescent_index: u64,
-    /// Opaque per-decoder state captured at the same step the
-    /// boundary advanced, when the decoder needs more than the offset
-    /// alone to resume cleanly. See
-    /// [`StreamingDecoder::decoder_state`]. `None` for decoders whose
+    /// Borrow of the live decoder so the observer can populate the
+    /// resume blob with one memcpy via
+    /// [`StreamingDecoder::decoder_state_into`]. Decoders whose
     /// frame boundaries are restartable from the offset alone (the
-    /// historical contract; everything but lz4's mid-frame boundaries
-    /// today).
-    pub decoder_state: Option<Vec<u8>>,
+    /// historical contract; everything but lz4 / xz_native / zstd /
+    /// deflate_native mid-frame boundaries today) leave `out`
+    /// untouched and return `false`.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2 replaces the prior
+    /// `decoder_state: Option<Vec<u8>>` field; the old field forced
+    /// a 4-stage clone-and-copy chain, the borrow lets the observer
+    /// thread the blob bytes straight into the `Checkpoint` body
+    /// buffer.
+    pub decoder: &'a dyn StreamingDecoder,
     /// Live sink state captured at the same step. The coordinator
     /// persists this verbatim into the checkpoint; the sink's
     /// resume constructor consumes it to restart from the exact
@@ -373,18 +383,19 @@ pub struct ExtractionStats {
     /// to assert that the per-step counters above add up to the
     /// observed observer time within noise.
     pub ckpt_observer_time: Duration,
-    /// Wall-clock time spent in [`StreamingDecoder::decoder_state`]
-    /// during persist-eligible advances — i.e. the call that builds
-    /// the resume blob immediately before the observer is invoked.
-    /// For xz_native this serializes the LZMA dictionary; for other
-    /// decoders it's a sliding-window snapshot. Lives outside both
-    /// the timed phases and `ckpt_observer_time`, so without this
-    /// counter the cost was unattributed in the diagnostic table.
-    /// `PLAN_xz_bench_profile.md` Phase 1.
+    /// Wall-clock time spent inside
+    /// [`StreamingDecoder::decoder_state_into`] during
+    /// persist-eligible advances — the call that streams the
+    /// resume blob into the `Checkpoint` body buffer. After
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2 this call lives
+    /// inside the observer's `serialize` phase; the observer
+    /// times it separately and the merge subtracts it from
+    /// `ckpt_serialize_time` so the diagnostic columns stay
+    /// non-overlapping.
     pub ckpt_decoder_state_time: Duration,
-    /// Number of [`StreamingDecoder::decoder_state`] calls. Equals
-    /// `quiescent_checkpoints` exactly (one per persist-eligible
-    /// advance). `PLAN_xz_bench_profile.md` Phase 1.
+    /// Number of [`StreamingDecoder::decoder_state_into`] calls.
+    /// Equals `quiescent_checkpoints` exactly (one per
+    /// persist-eligible advance).
     pub ckpt_decoder_state_calls: u64,
 }
 
@@ -578,7 +589,7 @@ impl Extractor {
     ) -> Result<ExtractionStats, ExtractorError>
     where
         S: Sink,
-        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
+        F: for<'a> FnMut(CheckpointInfo<'a>) -> std::io::Result<()>,
     {
         let stats = self.run_loop(source_fd, decoder, &mut sink, puncher, on_checkpoint)?;
         sink.close().map_err(ExtractorError::Sink)?;
@@ -598,7 +609,7 @@ impl Extractor {
     ) -> Result<ExtractionStats, ExtractorError>
     where
         S: Sink,
-        F: FnMut(CheckpointInfo) -> std::io::Result<()>,
+        F: for<'a> FnMut(CheckpointInfo<'a>) -> std::io::Result<()>,
     {
         // Align to the puncher's preferred block boundary or 4 KiB,
         // whichever is larger. Misaligned tails are silently retained
@@ -791,26 +802,24 @@ impl Extractor {
                         if !throttled {
                             stats.quiescent_checkpoints =
                                 stats.quiescent_checkpoints.saturating_add(1);
-                            // Time `decoder_state()` separately
-                            // (`PLAN_xz_bench_profile.md` Phase 1).
-                            // For xz_native this builds an 8 MiB LZMA
-                            // dict snapshot and lives outside both
-                            // the timed phases and the observer
-                            // closure; without this counter the cost
-                            // showed up as unattributed "overlap".
-                            let ds_start = Instant::now();
-                            let decoder_state = decoder.decoder_state();
-                            stats.ckpt_decoder_state_time = stats
-                                .ckpt_decoder_state_time
-                                .saturating_add(ds_start.elapsed());
-                            stats.ckpt_decoder_state_calls =
-                                stats.ckpt_decoder_state_calls.saturating_add(1);
+                            // Phase 2 of
+                            // `PLAN_checkpoint_blob_dedup.md`: the
+                            // observer (the §10 coordinator) calls
+                            // `decoder_state_into(&mut body)` directly
+                            // through the borrowed decoder ref, so
+                            // the resume blob bytes flow into the
+                            // `Checkpoint` body buffer with one
+                            // memcpy. Per-call cost is timed inside
+                            // the observer and merged into
+                            // `ckpt_decoder_state_time` /
+                            // `ckpt_decoder_state_calls` via the
+                            // observer-stats merge.
                             let info = CheckpointInfo {
                                 source_position: b,
                                 bytes_in: stats.bytes_in,
                                 bytes_out: adapter.bytes_out,
                                 quiescent_index: stats.quiescent_checkpoints,
-                                decoder_state,
+                                decoder,
                                 sink_state: adapter.sink.sink_state(),
                             };
                             on_checkpoint(info).map_err(ExtractorError::Observer)?;
@@ -1623,11 +1632,12 @@ mod tests {
         fn frame_boundary(&self) -> Option<ByteOffset> {
             self.last_boundary.map(ByteOffset::new)
         }
-        fn decoder_state(&self) -> Option<Vec<u8>> {
+        fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
             self.decoder_state_calls.fetch_add(1, Ordering::Relaxed);
             // Sentinel byte pattern — distinct enough to be
             // recognisable in observer-side asserts.
-            Some(vec![0xABu8; 64])
+            out.extend_from_slice(&[0xABu8; 64]);
+            true
         }
     }
 
@@ -1686,7 +1696,14 @@ mod tests {
                 &NoopPuncher::new(),
                 |info| {
                     observer_calls.set(observer_calls.get() + 1);
-                    if info.decoder_state.is_some() {
+                    // `decoder_state_into` is the load-bearing
+                    // call site after Phase 2; we probe with
+                    // a throwaway buffer here so the test still
+                    // counts boundaries that *would* emit a blob
+                    // without forcing the production observer
+                    // pattern.
+                    let mut probe = Vec::new();
+                    if info.decoder.decoder_state_into(&mut probe) {
                         observer_saw_blob.set(observer_saw_blob.get() + 1);
                     }
                     Ok(())
@@ -1710,14 +1727,19 @@ mod tests {
     /// `checkpoint_min_interval`, only the very first
     /// persist-eligible advance fires (`last_persist_time = None`
     /// bypass). All subsequent quiescent advances are throttled
-    /// inside the extractor — proving that
-    /// `decoder.decoder_state()` is gated by the throttle, not
-    /// invoked unconditionally.
+    /// inside the extractor — proving that the observer (and the
+    /// `decoder.decoder_state_into()` call inside it) is gated
+    /// by the throttle, not invoked unconditionally.
     ///
     /// This is the load-bearing assertion for `PLAN_lazy_decoder_state.md`
     /// Phase 1: an xz_native pipeline run that throttles 99 % of
     /// its quiescent advances now pays the (~8 MiB) blob cost only
-    /// on the 1 % that persist.
+    /// on the 1 % that persist. After
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2 the
+    /// `decoder_state_into` call lives inside the observer; the
+    /// observer in this test calls it explicitly so the
+    /// `CountingDecoder` counter still mirrors the throttle's
+    /// behavior.
     #[test]
     fn throttle_gates_decoder_state_invocation() {
         const FRAMES: u32 = 4;
@@ -1756,8 +1778,16 @@ mod tests {
                 &mut decoder,
                 sink,
                 &NoopPuncher::new(),
-                |_info| {
+                |info| {
                     observer_calls.set(observer_calls.get() + 1);
+                    // Mirror the production observer's shape:
+                    // the resume-blob bytes get pulled via
+                    // `decoder_state_into` as part of building
+                    // the `Checkpoint` body. We use a throwaway
+                    // buffer here since the test only cares
+                    // about the per-call counter.
+                    let mut probe = Vec::new();
+                    let _ = info.decoder.decoder_state_into(&mut probe);
                     Ok(())
                 },
             )
@@ -1772,7 +1802,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::Relaxed),
             1,
-            "decoder_state() must be called only on persist-eligible advances; \
+            "decoder_state_into() must run only on persist-eligible advances; \
              got {} (a regression in the throttle gate would surface here)",
             calls.load(Ordering::Relaxed),
         );

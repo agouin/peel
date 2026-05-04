@@ -245,30 +245,25 @@ impl LzmaDict {
         self.total = 0;
     }
 
-    /// Snapshot the most recent up-to-`n` bytes (capped at
-    /// `min(total, capacity)`), in chronological order.
-    ///
-    /// Used by Phase 6's resume blob: when paused at an LZMA2
-    /// chunk boundary, the dict contents up to `dict_size` bytes
-    /// (or however many have been pushed, if smaller) are the
-    /// minimum state needed to resume byte-identically.
-    ///
-    /// Phase 2 of `docs/PLAN_lazy_decoder_state.md`: implemented
-    /// as one or two `extend_from_slice` calls split at the wrap
-    /// point (mirroring
-    /// [`crate::decode::zstd::window::Window::recent_in_order`]
-    /// and
-    /// [`crate::decode::deflate_native::window::Window::recent_in_order`]).
-    /// The previous byte-by-byte walk through [`Self::byte_at`]
-    /// was ~10–20 ms per call at `dict_size = 8 MiB`; the memcpy
-    /// version drops that to ~50 µs (memory-bandwidth bound).
+    /// Number of bytes the next [`Self::recent`] /
+    /// [`Self::write_recent_into`] call would emit when asked for
+    /// `n` bytes — i.e. `min(n, capacity, total)`.
     #[must_use]
-    pub fn recent(&self, n: usize) -> Vec<u8> {
+    pub fn recent_len(&self, n: usize) -> usize {
         let avail = std::cmp::min(self.total, self.buf.len() as u64) as usize;
-        let take = std::cmp::min(n, avail);
-        let mut out = Vec::with_capacity(take);
+        std::cmp::min(n, avail)
+    }
+
+    /// Append the most recent up-to-`n` bytes (capped at
+    /// `min(total, capacity)`), in chronological order, into
+    /// `out`. The fast-path companion to [`Self::recent`] used by
+    /// the resume-blob writer to flow dict bytes straight from the
+    /// ring into the `Checkpoint` body buffer with one memcpy.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    pub fn write_recent_into(&self, n: usize, out: &mut Vec<u8>) {
+        let take = self.recent_len(n);
         if take == 0 {
-            return out;
+            return;
         }
         let cap = self.buf.len();
         // The most-recent `take` bytes end at `head` (exclusive,
@@ -294,6 +289,26 @@ impl LzmaDict {
             out.extend_from_slice(&self.buf[start..]);
             out.extend_from_slice(&self.buf[..take - tail]);
         }
+    }
+
+    /// Snapshot the most recent up-to-`n` bytes (capped at
+    /// `min(total, capacity)`), in chronological order. Owned-`Vec`
+    /// convenience over [`Self::write_recent_into`]; callers on
+    /// the hot path should prefer the in-place variant.
+    ///
+    /// Phase 2 of `docs/PLAN_lazy_decoder_state.md`: implemented
+    /// as one or two `extend_from_slice` calls split at the wrap
+    /// point (mirroring
+    /// [`crate::decode::zstd::window::Window::recent_in_order`]
+    /// and
+    /// [`crate::decode::deflate_native::window::Window::recent_in_order`]).
+    /// The previous byte-by-byte walk through [`Self::byte_at`]
+    /// was ~10–20 ms per call at `dict_size = 8 MiB`; the memcpy
+    /// version drops that to ~50 µs (memory-bandwidth bound).
+    #[must_use]
+    pub fn recent(&self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.recent_len(n));
+        self.write_recent_into(n, &mut out);
         out
     }
 

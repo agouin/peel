@@ -202,25 +202,63 @@ pub trait StreamingDecoder: Send {
     /// `decoder_state` blob).
     fn frame_boundary(&self) -> Option<ByteOffset>;
 
-    /// Opaque per-decoder state needed to resume from
-    /// [`Self::frame_boundary`] when the offset alone is *not*
-    /// sufficient.
+    /// Append the resume blob's bytes directly to `out` and return
+    /// `true` when this boundary needs more than the offset alone
+    /// to resume cleanly, or `false` when the offset alone
+    /// suffices (and `out` was left untouched).
     ///
-    /// Returns `None` for boundaries where a freshly constructed
-    /// decoder reading the source from `frame_boundary` onward
-    /// produces byte-identical output to a clean run. This is correct
-    /// for end-of-frame boundaries in every container format we ship
-    /// (zstd frame end, xz Stream end, gzip member end, lz4 frame
-    /// EndMark), and is the default for decoders that do not override
-    /// it.
+    /// Returning `false` is the default for end-of-frame boundaries
+    /// in every container format we ship (zstd frame end, xz Stream
+    /// end, gzip member end, lz4 frame EndMark): a freshly
+    /// constructed decoder reading the source from `frame_boundary`
+    /// onward produces byte-identical output to a clean run.
     ///
-    /// Returns `Some(blob)` when the boundary is restart-safe only if
-    /// the resuming decoder is seeded with the captured state. Today
-    /// `lz4` and `zstd` use this path for mid-frame block boundaries.
-    /// The blob is opaque to the rest of the crate: only the
-    /// originating decoder module knows the layout.
+    /// Returning `true` covers mid-frame boundaries (today `lz4`,
+    /// `zstd`, `xz_native`, and the resume-equipped `deflate_native`
+    /// path). The bytes appended to `out` are opaque to the rest of
+    /// the crate; only the originating decoder module knows the
+    /// layout.
+    ///
+    /// The "into" shape lets the caller (the extractor's checkpoint
+    /// observer) thread the blob bytes straight into the
+    /// `Checkpoint` body buffer with one memcpy instead of the
+    /// previous decoder→Vec→clone→extend chain.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
+        let _ = out;
+        false
+    }
+
+    /// Owned-`Vec` convenience over [`Self::decoder_state_into`].
+    ///
+    /// Returns `Some(blob)` when the boundary is restart-safe only
+    /// if the resuming decoder is seeded with the captured state,
+    /// `None` otherwise. Allocates a fresh `Vec`; callers on the
+    /// hot path should prefer [`Self::decoder_state_into`].
     fn decoder_state(&self) -> Option<Vec<u8>> {
-        None
+        let mut out = Vec::with_capacity(self.decoder_state_size_hint());
+        if self.decoder_state_into(&mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Upper bound on the next [`Self::decoder_state_into`] call's
+    /// payload size, in bytes. Lets callers (the streaming-pipeline
+    /// observer in particular) pre-reserve capacity on the
+    /// `Checkpoint` body buffer so the closure call does not pay
+    /// amortized-doubling memcpies as the Vec grows from 0 to
+    /// ~9 MiB on `tar.xz` preset 6. The default `0` is safe for
+    /// formats whose blob is small (lz4: ~120 B fixed; zstd /
+    /// deflate-native: ≤ 64 KiB) — the resulting Vec growth from
+    /// the body's pre-decoder_state floor (~bitmap + sink_state)
+    /// up to that small cap is one cheap doubling. xz_native
+    /// overrides this to return the dict's `recent_len(capacity)`
+    /// + a small overhead. `PLAN_checkpoint_blob_dedup.md`
+    /// Phase 2.
+    fn decoder_state_size_hint(&self) -> usize {
+        0
     }
 }
 

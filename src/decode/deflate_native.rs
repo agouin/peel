@@ -643,16 +643,18 @@ impl StreamingDecoder for Decoder {
         self.last_frame_boundary
     }
 
-    fn decoder_state(&self) -> Option<Vec<u8>> {
+    fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // Snapshotable iff we're between blocks (just past EOB /
         // end-of-stored-payload) and we've decoded at least one
         // block — the initial `AwaitingBlockType` (no decoding
         // done yet) is covered by the regular factory at
         // offset 0.
         if !matches!(self.state, State::AwaitingBlockType) {
-            return None;
+            return false;
         }
-        self.last_frame_boundary?;
+        if self.last_frame_boundary.is_none() {
+            return false;
+        }
         let (byte_pos, bit_off) = self.bits.byte_position();
         let blob = resume::DflResumeState {
             container: resume::Container::RawDeflate,
@@ -663,7 +665,10 @@ impl StreamingDecoder for Decoder {
             running_crc32: 0,
             bfinal_seen: false,
         };
-        Some(blob.serialize())
+        // 32 KiB sliding-window blob — small enough that the
+        // staging Vec is a non-issue versus xz_native's 8 MiB.
+        out.extend_from_slice(&blob.serialize());
+        true
     }
 }
 

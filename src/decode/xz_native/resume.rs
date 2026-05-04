@@ -306,6 +306,74 @@ impl XzResumeState {
         out.extend_from_slice(&s.check_state);
     }
 
+    /// Direct-write fast path: append a V2 resume blob into `out`
+    /// without ever constructing a [`Self`]. Skips two 8 MiB-class
+    /// memcpies on `tar.xz` versus the
+    /// [`Self::capture`]+[`Self::serialize`] chain by streaming
+    /// the dict bytes directly from the ring buffer into `out`,
+    /// and lets the caller (the checkpoint observer) point `out`
+    /// at the `Checkpoint` body buffer so the resume bytes flow
+    /// through with **one** memcpy total.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    pub fn write_capture_into(out: &mut Vec<u8>, args: CaptureArgs<'_>) {
+        out.extend_from_slice(MAGIC);
+        out.push(FORMAT_VERSION);
+        out.push(args.stream_check.raw());
+        out.extend_from_slice(&(args.stream_block_records.len() as u32).to_le_bytes());
+        for &(u, c) in args.stream_block_records {
+            out.extend_from_slice(&u.to_le_bytes());
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        out.extend_from_slice(&(args.block_header.header_size_bytes as u32).to_le_bytes());
+        let mut flags = 0u8;
+        if args.block_header.compressed_size.is_some() {
+            flags |= Self::FLAG_COMPRESSED_DECLARED;
+        }
+        if args.block_header.uncompressed_size.is_some() {
+            flags |= Self::FLAG_UNCOMPRESSED_DECLARED;
+        }
+        if args.block_seen_first_chunk {
+            flags |= Self::FLAG_SEEN_FIRST_CHUNK;
+        }
+        if args.block_lzma2_finished {
+            flags |= Self::FLAG_LZMA2_FINISHED;
+        }
+        out.push(flags);
+        out.extend_from_slice(&args.block_header.compressed_size.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(
+            &args
+                .block_header
+                .uncompressed_size
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&args.block_header.dict_size.to_le_bytes());
+        out.extend_from_slice(&args.block_lzma2_start_offset.to_le_bytes());
+        out.extend_from_slice(&args.block_decompressed_so_far.to_le_bytes());
+        let probs = &args.lzma_state.probs;
+        out.extend_from_slice(&[probs.lc, probs.lp, probs.pb, args.lzma_state.state]);
+        out.extend_from_slice(&args.lzma_state.rep0.to_le_bytes());
+        out.extend_from_slice(&args.lzma_state.rep1.to_le_bytes());
+        out.extend_from_slice(&args.lzma_state.rep2.to_le_bytes());
+        out.extend_from_slice(&args.lzma_state.rep3.to_le_bytes());
+        let dict = &args.lzma_state.dict;
+        let dict_capacity = dict.capacity();
+        out.extend_from_slice(&(dict_capacity as u32).to_le_bytes());
+        out.extend_from_slice(&dict.total().to_le_bytes());
+        let dict_data_len = dict.recent_len(dict_capacity);
+        out.extend_from_slice(&(dict_data_len as u32).to_le_bytes());
+        dict.write_recent_into(dict_capacity, out);
+        // probs and check_state both expose `serialize_*` methods
+        // that already write into a caller-supplied `&mut Vec<u8>`,
+        // so no intermediate Vec is needed for either.
+        let probs_len = probs.serialized_byte_len() as u32;
+        out.extend_from_slice(&probs_len.to_le_bytes());
+        probs.serialize_slots(out);
+        let check_state_len = args.check_hasher.serialized_state_len() as u32;
+        out.extend_from_slice(&check_state_len.to_le_bytes());
+        args.check_hasher.serialize_state(out);
+    }
+
     /// Encode `self` as a V1 resume blob (legacy, with trailing
     /// CRC32). Test-only — kept so the V1 read path can be
     /// exercised by round-trip tests without freezing a hex
@@ -675,6 +743,75 @@ mod tests {
         assert_eq!(a.dict_data, b.dict_data);
         assert_eq!(a.probs, b.probs);
         assert_eq!(a.check_state, b.check_state);
+    }
+
+    /// Same fixture as [`fixture_state`] but threaded through the
+    /// direct-write fast path in addition to the existing
+    /// capture+serialize chain. Returns `(args_bytes, struct_bytes)`
+    /// so the caller asserts byte-equality.
+    fn fixture_with_args<F: FnOnce(CaptureArgs<'_>)>(use_args: F) -> (XzResumeState, Lzma2State) {
+        let mut state = Lzma2State::new(64 * 1024, 3, 0, 2).expect("alloc state");
+        for &b in b"resume-fixture-payload" {
+            state.dict.push(b);
+        }
+        state.state = 4;
+        state.rep0 = 7;
+        state.rep1 = 1;
+        state.rep2 = 2;
+        state.rep3 = 3;
+        let mut hasher = BlockCheckHasher::new(CheckId::Crc64);
+        hasher.update(b"hashed-bytes");
+        let header = BlockHeader {
+            compressed_size: Some(123),
+            uncompressed_size: Some(456),
+            dict_size: 64 * 1024,
+            header_size_bytes: 12,
+        };
+        let args = CaptureArgs {
+            stream_check: CheckId::Crc64,
+            stream_block_records: &[(40, 100)],
+            block_header: &header,
+            block_lzma2_start_offset: 12 + 12,
+            block_decompressed_so_far: 22,
+            block_seen_first_chunk: true,
+            block_lzma2_finished: false,
+            lzma_state: &state,
+            check_hasher: &hasher,
+        };
+        use_args(args);
+        // Re-build args because the closure consumed them. The
+        // fixture is small so re-capture is cheap; the goal is just
+        // to hand the same logical state back to the caller.
+        let captured = XzResumeState::capture(CaptureArgs {
+            stream_check: CheckId::Crc64,
+            stream_block_records: &[(40, 100)],
+            block_header: &header,
+            block_lzma2_start_offset: 12 + 12,
+            block_decompressed_so_far: 22,
+            block_seen_first_chunk: true,
+            block_lzma2_finished: false,
+            lzma_state: &state,
+            check_hasher: &hasher,
+        });
+        (captured, state)
+    }
+
+    /// `write_capture_into` (Phase 2 fast path) and
+    /// `capture(args).serialize()` (legacy chain) must produce
+    /// byte-identical V2 blobs. Pins the contract that the
+    /// direct-write path is a pure perf optimization, not a wire
+    /// format change.
+    #[test]
+    fn write_capture_into_matches_capture_then_serialize() {
+        let mut direct = Vec::new();
+        let (captured, _state) = fixture_with_args(|args| {
+            XzResumeState::write_capture_into(&mut direct, args);
+        });
+        let from_struct = captured.serialize();
+        assert_eq!(
+            direct, from_struct,
+            "direct-write fast path drifted from capture+serialize"
+        );
     }
 
     /// V2 round-trip (the format this code writes).

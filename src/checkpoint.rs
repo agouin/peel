@@ -569,7 +569,55 @@ impl Checkpoint {
     /// trip through this pair without touching the filesystem.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(self.estimated_body_size());
+        // Default writer: copy the decoder_state field's bytes
+        // verbatim. The hot path
+        // (`PLAN_checkpoint_blob_dedup.md` Phase 2) calls
+        // `serialize_with` instead so the decoder writes the
+        // blob bytes directly into the body buffer with one
+        // memcpy.
+        let hint = self.decoder_state.as_ref().map_or(0, Vec::len);
+        self.serialize_with(hint, |out| match &self.decoder_state {
+            Some(blob) => {
+                out.extend_from_slice(blob);
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Serialize, but populate the `decoder_state` field by
+    /// invoking `write_decoder_state` to append bytes directly into
+    /// the body buffer.
+    ///
+    /// The closure should append a complete resume blob and return
+    /// `true`, or leave `out` untouched and return `false`. Length
+    /// prefix and presence byte are managed by the caller (this
+    /// function); the closure only writes the blob payload bytes.
+    /// The appended length is capped at [`MAX_DECODER_STATE_LEN`];
+    /// excess bytes are discarded with a `truncate`.
+    ///
+    /// `decoder_state_size_hint` lets the caller pre-reserve body
+    /// capacity so the closure's `extend_from_slice` of ~9 MiB
+    /// (xz_native) does not pay amortized-doubling memcpies as
+    /// the Vec grows from 0 to its final size. Pass `0` if no
+    /// upper bound is known; the caller then absorbs the growth
+    /// cost of the Vec doublings.
+    ///
+    /// Wire-format equivalence with [`Self::serialize`] is
+    /// pinned by the round-trip tests.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    pub fn serialize_with<F>(
+        &self,
+        decoder_state_size_hint: usize,
+        write_decoder_state: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce(&mut Vec<u8>) -> bool,
+    {
+        let mut body = Vec::with_capacity(
+            self.estimated_body_size()
+                .saturating_add(decoder_state_size_hint),
+        );
         write_string(&mut body, &self.url);
         write_optional_string(&mut body, self.etag.as_deref());
         write_optional_string(&mut body, self.last_modified.as_deref());
@@ -663,20 +711,40 @@ impl Checkpoint {
             None => body.push(0),
         }
 
-        match &self.decoder_state {
-            Some(blob) => {
-                body.push(1);
-                // The encode side enforces the same cap the decode
-                // side enforces; longer blobs would round-trip but
-                // the cap on read would reject them, which would be
-                // confusing.
-                let len = u32::try_from(blob.len())
-                    .unwrap_or(u32::MAX)
-                    .min(MAX_DECODER_STATE_LEN);
-                write_u32(&mut body, len);
-                body.extend_from_slice(&blob[..len as usize]);
+        // Reserve the presence byte + length placeholder, run the
+        // closure to append the blob bytes, then backpatch length
+        // (or rewind if the closure declined).
+        //
+        // Two-pass writing avoids the previous Vec→clone→extend
+        // chain: the closure (in the streaming-pipeline observer)
+        // passes `body` straight to the decoder's
+        // `decoder_state_into`, so the dict bytes flow ring →
+        // body with one memcpy. `PLAN_checkpoint_blob_dedup.md`
+        // Phase 2.
+        let presence_pos = body.len();
+        body.push(1);
+        let len_pos = body.len();
+        write_u32(&mut body, 0);
+        let bytes_start = body.len();
+        let wrote = write_decoder_state(&mut body);
+        if wrote {
+            let written = body.len() - bytes_start;
+            // Encode-side cap mirrors the decode-side cap; a
+            // longer blob would round-trip but the cap on read
+            // would reject it, which would be confusing.
+            let capped = u32::try_from(written)
+                .unwrap_or(u32::MAX)
+                .min(MAX_DECODER_STATE_LEN);
+            if (capped as usize) < written {
+                body.truncate(bytes_start + capped as usize);
             }
-            None => body.push(0),
+            body[len_pos..len_pos + 4].copy_from_slice(&capped.to_le_bytes());
+        } else {
+            // Closure didn't append anything; rewrite the slot as
+            // "absent" (a single 0 byte) and drop the length
+            // placeholder.
+            body.truncate(presence_pos);
+            body.push(0);
         }
 
         let body_len = body.len() as u64;
@@ -1036,10 +1104,40 @@ impl Checkpoint {
     ///   that the rename replaces atomically; the directory inode the
     ///   first write made durable doesn't need another flush.
     pub fn write_timed(&self, path: &Path) -> Result<CheckpointWriteTimings, CheckpointError> {
+        // Default closure: copy `self.decoder_state`'s bytes
+        // verbatim, mirroring the existing field-driven shape.
+        // Hot-path callers reach for `write_timed_with` instead so
+        // the resume blob bytes flow into the body buffer with one
+        // memcpy. `PLAN_checkpoint_blob_dedup.md` Phase 2.
+        let hint = self.decoder_state.as_ref().map_or(0, Vec::len);
+        self.write_timed_with(path, hint, |out| match &self.decoder_state {
+            Some(blob) => {
+                out.extend_from_slice(blob);
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Same contract as [`Self::write_timed`], but the
+    /// `decoder_state` field is populated by the supplied
+    /// closure. The closure runs once during `serialize_time`.
+    /// `decoder_state_size_hint` is forwarded to
+    /// [`Self::serialize_with`] for body-capacity pre-reservation.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    pub fn write_timed_with<F>(
+        &self,
+        path: &Path,
+        decoder_state_size_hint: usize,
+        write_decoder_state: F,
+    ) -> Result<CheckpointWriteTimings, CheckpointError>
+    where
+        F: FnOnce(&mut Vec<u8>) -> bool,
+    {
         let mut t = CheckpointWriteTimings::default();
 
         let serialize_start = Instant::now();
-        let bytes = self.serialize();
+        let bytes = self.serialize_with(decoder_state_size_hint, write_decoder_state);
         t.serialize_time = serialize_start.elapsed();
 
         let tmp_path = tmp_path_for(path);

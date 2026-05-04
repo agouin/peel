@@ -1694,6 +1694,14 @@ struct CheckpointObserverStats {
     sparse_sync_time: Duration,
     sparse_sync_calls: u64,
     serialize_time: Duration,
+    /// Wall-clock time spent in
+    /// [`StreamingDecoder::decoder_state_into`]. Lives inside
+    /// `serialize_time` (the closure runs inside
+    /// `Checkpoint::serialize_with`); the merge subtracts it back
+    /// out of `ckpt_serialize_time` so the diagnostic columns stay
+    /// non-overlapping. `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    decoder_state_time: Duration,
+    decoder_state_calls: u64,
     tmp_write_time: Duration,
     tmp_fsync_time: Duration,
     rename_time: Duration,
@@ -1710,9 +1718,19 @@ impl CheckpointObserverStats {
         stats.ckpt_sparse_sync_calls = stats
             .ckpt_sparse_sync_calls
             .saturating_add(self.sparse_sync_calls);
+        // Subtract decoder_state_time so `ckpt_serialize_time`
+        // reflects fnv1a64 + body building only — decstate stays
+        // a separate column for diagnostic clarity even though
+        // it now physically runs inside the serialize phase.
         stats.ckpt_serialize_time = stats
             .ckpt_serialize_time
-            .saturating_add(self.serialize_time);
+            .saturating_add(self.serialize_time.saturating_sub(self.decoder_state_time));
+        stats.ckpt_decoder_state_time = stats
+            .ckpt_decoder_state_time
+            .saturating_add(self.decoder_state_time);
+        stats.ckpt_decoder_state_calls = stats
+            .ckpt_decoder_state_calls
+            .saturating_add(self.decoder_state_calls);
         stats.ckpt_tmp_write_time = stats
             .ckpt_tmp_write_time
             .saturating_add(self.tmp_write_time);
@@ -1803,6 +1821,13 @@ fn run_one<S: Sink>(
             } else {
                 Some(fingerprints.to_vec())
             };
+            // Phase 2 of `PLAN_checkpoint_blob_dedup.md`: the
+            // `decoder_state` field is no longer pre-cloned into
+            // the `Checkpoint` struct. Instead, `write_timed_with`
+            // invokes a closure that calls
+            // `info_cb.decoder.decoder_state_into(&mut body)`
+            // directly, so the resume blob bytes flow into the
+            // body buffer with one memcpy.
             let ckpt = Checkpoint {
                 url: requested_url.to_string(),
                 etag: info.fingerprint.etag.clone(),
@@ -1815,12 +1840,30 @@ fn run_one<S: Sink>(
                 sink_state,
                 hash_state,
                 chunk_crc32c,
-                decoder_state: info_cb.decoder_state.clone(),
+                decoder_state: None,
             };
             let prep_time = serialize_prep_start.elapsed();
+            let mut decstate_time = Duration::ZERO;
+            let mut decstate_called = false;
+            // Pre-reserve body capacity for the (typically 8 MiB
+            // xz_native dict) blob so the closure's
+            // `extend_from_slice` doesn't pay amortized-doubling
+            // memcpies. `PLAN_checkpoint_blob_dedup.md` Phase 2.
+            let decstate_hint = info_cb.decoder.decoder_state_size_hint();
             let write_timings = ckpt
-                .write_timed(ckpt_path)
+                .write_timed_with(ckpt_path, decstate_hint, |body| {
+                    let t = Instant::now();
+                    let r = info_cb.decoder.decoder_state_into(body);
+                    decstate_time = t.elapsed();
+                    decstate_called = true;
+                    r
+                })
                 .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+            obs_stats.decoder_state_time =
+                obs_stats.decoder_state_time.saturating_add(decstate_time);
+            if decstate_called {
+                obs_stats.decoder_state_calls = obs_stats.decoder_state_calls.saturating_add(1);
+            }
             // Bucket the prep clones together with the body
             // serialize so the diagnostic's `serialize` column
             // reflects everything that pre-builds the on-disk image,

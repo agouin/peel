@@ -1038,7 +1038,31 @@ impl StreamingDecoder for Decoder {
         self.last_frame_boundary
     }
 
-    fn decoder_state(&self) -> Option<Vec<u8>> {
+    fn decoder_state_size_hint(&self) -> usize {
+        // xz_native's blob is dominated by the LZMA dict
+        // (`recent_len(capacity)`) plus a fixed-size header
+        // (~120 B for stream/block fields, probs, check_state).
+        // Returning a slight over-estimate lets the caller
+        // pre-reserve enough so `decoder_state_into`'s
+        // `extend_from_slice` of ~8 MiB doesn't re-grow the body.
+        //
+        // We use the dict's *capacity* rather than `recent_len`
+        // here because the resume blob caps the dict bytes at
+        // capacity regardless of how full it is, and the
+        // capacity is known up-front from the Block Header.
+        // `PLAN_checkpoint_blob_dedup.md` Phase 2.
+        match &self.state {
+            State::InBlock { ctx, .. } => {
+                let dict_capacity = ctx.lzma_state.as_ref().map_or(0, |s| s.dict.capacity());
+                // 4 KiB headroom for the fixed-shape fields
+                // (header + probs + check_state).
+                dict_capacity + 4096
+            }
+            _ => 0,
+        }
+    }
+
+    fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // The blob is meaningful only at an LZMA2 chunk boundary
         // inside a Block where the LZMA model has been
         // allocated *with real properties* (i.e. at least one
@@ -1048,27 +1072,38 @@ impl StreamingDecoder for Decoder {
         // observed. Any other position falls back to the regular
         // factory at the last per-Stream `frame_boundary`.
         let State::InBlock { flags, ctx, .. } = &self.state else {
-            return None;
+            return false;
         };
         if !ctx.seen_first_lzma_chunk {
-            return None;
+            return false;
         }
-        let lzma_state = ctx.lzma_state.as_ref()?;
+        let Some(lzma_state) = ctx.lzma_state.as_ref() else {
+            return false;
+        };
         if ctx.lzma2_finished {
-            return None;
+            return false;
         }
-        let blob = self::resume::XzResumeState::capture(self::resume::CaptureArgs {
-            stream_check: flags.check,
-            stream_block_records: &self.stream_block_records,
-            block_header: &ctx.header,
-            block_lzma2_start_offset: ctx.lzma2_start_offset,
-            block_decompressed_so_far: ctx.decompressed_so_far,
-            block_seen_first_chunk: ctx.seen_first_chunk,
-            block_lzma2_finished: ctx.lzma2_finished,
-            lzma_state,
-            check_hasher: &ctx.check_hasher,
-        });
-        Some(blob.serialize())
+        // Fast path (`PLAN_checkpoint_blob_dedup.md` Phase 2):
+        // stream the resume blob directly into the caller's
+        // buffer (the `Checkpoint` body) instead of allocating a
+        // staging `Vec` and the intermediate `XzResumeState`
+        // struct's `dict_data: Vec<u8>`. One memcpy of the 8 MiB
+        // dict instead of two-plus-one-clone.
+        self::resume::XzResumeState::write_capture_into(
+            out,
+            self::resume::CaptureArgs {
+                stream_check: flags.check,
+                stream_block_records: &self.stream_block_records,
+                block_header: &ctx.header,
+                block_lzma2_start_offset: ctx.lzma2_start_offset,
+                block_decompressed_so_far: ctx.decompressed_so_far,
+                block_seen_first_chunk: ctx.seen_first_chunk,
+                block_lzma2_finished: ctx.lzma2_finished,
+                lzma_state,
+                check_hasher: &ctx.check_hasher,
+            },
+        );
+        true
     }
 }
 

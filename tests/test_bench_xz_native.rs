@@ -259,6 +259,99 @@ fn bench_xz_native_tar_xz_256mib_single_block() {
     );
 }
 
+/// Microbench: per-call cost of [`StreamingDecoder::decoder_state_into`]
+/// on a fully-warmed xz_native decoder. After
+/// `PLAN_checkpoint_blob_dedup.md` Phase 2 this is the call the
+/// streaming-pipeline observer makes to populate the resume blob
+/// bytes inside the `Checkpoint` body buffer with one memcpy
+/// (decoder ring → body), so the per-call cost is the load-bearing
+/// number for "how much does each persist-eligible advance cost?".
+///
+/// The bench:
+/// 1. encodes a 64 MiB fixture (forces the dict past the 8 MiB cap
+///    so `decoder_state_into` actually exercises the full dict
+///    memcpy),
+/// 2. drives `peel::decode::xz_native::Decoder` until it reaches
+///    a snapshotable LZMA2 chunk boundary (where
+///    `decoder_state_into` returns `true`),
+/// 3. loops `PEEL_DECSTATE_ITERS` calls (default 10000) into a
+///    reused `Vec<u8>` so the allocation cost is amortised,
+/// 4. asserts the per-call wall-clock is ≤ **2 ms** — the
+///    plan's Phase 2 exit-criterion floor.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_xz_native_decoder_state_into_microbench() {
+    use peel::decode::xz_native::Decoder;
+    use peel::decode::{DecodeStatus, StreamingDecoder};
+
+    let archive = build_tar_payload(64 * 1024 * 1024);
+    let compressed = encode_xz(&archive);
+
+    // Warm the decoder up to a snapshotable boundary. Between
+    // chunks `decoder_state_into` returns false; we keep stepping
+    // until we hit a chunk boundary inside a Block.
+    let mut decoder = Decoder::new(Box::new(Cursor::new(compressed.clone()))).expect("decoder");
+    let mut sink: Vec<u8> = Vec::with_capacity(compressed.len() * 2);
+    let mut probe = Vec::with_capacity(16 * 1024 * 1024);
+    let mut warmed_up = false;
+    for _ in 0..10_000 {
+        match decoder.decode_step(&mut sink).expect("decode_step") {
+            DecodeStatus::Eof => break,
+            DecodeStatus::MoreData => {}
+        }
+        probe.clear();
+        if decoder.decoder_state_into(&mut probe) {
+            warmed_up = true;
+            break;
+        }
+    }
+    assert!(
+        warmed_up,
+        "fixture did not reach a snapshotable LZMA2 chunk boundary; \
+         increase warmup iterations or shrink the fixture"
+    );
+    let blob_size = probe.len();
+    println!(
+        "[bench-xz] decoder_state_into microbench: warmed up; blob_size = {} bytes \
+         (dict at ~8 MiB cap means most of this is the LZMA dict)",
+        blob_size
+    );
+
+    let iters: u32 = std::env::var("PEEL_DECSTATE_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    // Reuse the same buffer across iterations so allocation
+    // doesn't dominate the measurement; clear() preserves the
+    // backing capacity.
+    let started = Instant::now();
+    for _ in 0..iters {
+        probe.clear();
+        let r = decoder.decoder_state_into(&mut probe);
+        debug_assert!(r, "decoder fell off the chunk boundary mid-loop");
+    }
+    let elapsed = started.elapsed();
+    let per_call = elapsed / iters;
+    let per_call_ms = per_call.as_secs_f64() * 1_000.0;
+    println!(
+        "[bench-xz] decoder_state_into microbench: iters={iters} \
+         total={total:.3}s  per_call={per_call_ms:.4} ms  blob={blob_size} B",
+        total = elapsed.as_secs_f64(),
+    );
+
+    // Phase 2 exit criterion: per-call cost ≤ 2 ms (down from
+    // ~15.5 ms in Phase 0; ~0.243 ms in Phase 1 already met it).
+    // Generous gate so noise on a busy laptop doesn't false-fail
+    // CI runs that opt in to the bench.
+    let gate_ms = 2.0;
+    assert!(
+        per_call_ms <= gate_ms,
+        "decoder_state_into per-call regressed: got {per_call_ms:.3} ms, \
+         Phase 2 floor is ≤ {gate_ms:.3} ms"
+    );
+}
+
 /// Profiling helper: encode the 64 MiB fixture once, then drive the
 /// peel decoder over it `PEEL_BENCH_ITERS` times (default 10). Use
 /// this to keep a `sample` / `dtrace` / `samply` profiler attached

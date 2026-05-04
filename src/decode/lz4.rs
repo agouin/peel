@@ -690,17 +690,17 @@ impl StreamingDecoder for Lz4Decoder {
         self.last_frame_boundary
     }
 
-    fn decoder_state(&self) -> Option<Vec<u8>> {
+    fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // The blob is only meaningful at a position where the
         // decoder is paused mid-frame, between blocks; resuming from
         // anywhere else either doesn't need a state seed (between
         // frames; the factory route works) or isn't a safe restart
         // point (mid-block, mid-skippable, mid-header).
         if !self.between_blocks {
-            return None;
+            return false;
         }
         let State::InFrame { ctx, .. } = &self.state else {
-            return None;
+            return false;
         };
         let resume = Lz4ResumeState {
             block_max_size: ctx.block_max_size,
@@ -710,7 +710,11 @@ impl StreamingDecoder for Lz4Decoder {
             bytes_decompressed: ctx.bytes_decompressed,
             content_hasher: ctx.content_hasher.clone(),
         };
-        Some(resume.serialize())
+        // Fixed-length blob (`RESUME_BLOB_LEN`, ~120 B); the
+        // intermediate Vec is irrelevant compared to xz_native's
+        // 8 MiB dict.
+        out.extend_from_slice(&resume.serialize());
+        true
     }
 }
 

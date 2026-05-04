@@ -465,7 +465,7 @@ impl StreamingDecoder for GzipDecoder {
         self.last_frame_boundary
     }
 
-    fn decoder_state(&self) -> Option<Vec<u8>> {
+    fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // Gzip blobs only round-trip mid-deflate-body, when the
         // inner decoder is at a deflate-block boundary. Between
         // members the per-member `frame_boundary` is restartable
@@ -473,10 +473,14 @@ impl StreamingDecoder for GzipDecoder {
         // mid-trailer have no clean restart point. Mirrors
         // `Lz4Decoder::between_blocks` and the zstd analogue.
         if !matches!(self.state, State::InDeflateBody) {
-            return None;
+            return false;
         }
-        let inner = self.inner.as_ref()?;
-        let inner_blob = inner.decoder_state()?;
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        let Some(inner_blob) = inner.decoder_state() else {
+            return false;
+        };
         // The inner blob's container is RawDeflate; rewrap as Gzip
         // and inject the wrapper's running CRC32 / ISIZE. Round-
         // tripping through deserialise + reserialise is a small
@@ -487,16 +491,17 @@ impl StreamingDecoder for GzipDecoder {
             Err(_) => {
                 // Inner blob shape is internal to our crate; a
                 // deserialize failure here would be a bug, not a
-                // legitimate caller error. Return None so the
+                // legitimate caller error. Return `false` so the
                 // coordinator falls back to the regular factory at
                 // the per-member frame_boundary.
-                return None;
+                return false;
             }
         };
         state.container = super::resume::Container::Gzip;
         state.running_crc32 = self.running_crc.current();
         state.total_decompressed = u64::from(self.running_isize);
-        Some(state.serialize())
+        out.extend_from_slice(&state.serialize());
+        true
     }
 }
 

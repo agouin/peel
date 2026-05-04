@@ -747,15 +747,26 @@ impl StreamingDecoder for Decoder {
         self.last_frame_boundary
     }
 
-    fn decoder_state(&self) -> Option<Vec<u8>> {
+    fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // The blob is meaningful only when paused at a block
         // boundary inside a regular frame. Between frames the
         // regular factory works (no state needed); mid-block /
         // mid-header / mid-skippable have no clean restart point.
         // The `between_blocks` flag, set just after a block's
         // payload has been consumed and committed, is the gate.
-        let state = resume::capture(self)?;
-        Some(state.serialize())
+        match resume::capture(self) {
+            Some(state) => {
+                // The zstd resume blob is small (≤ ~150 B), so
+                // building a temporary Vec via the existing
+                // `serialize()` and copying it into `out` is
+                // immaterial perf-wise. xz_native is the format
+                // that justifies a fully direct-write path
+                // (`PLAN_checkpoint_blob_dedup.md` Phase 2).
+                out.extend_from_slice(&state.serialize());
+                true
+            }
+            None => false,
+        }
     }
 }
 
