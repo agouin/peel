@@ -97,6 +97,7 @@ pub mod bitstream;
 pub mod block;
 pub mod dynamic;
 pub mod error;
+pub mod gzip;
 pub mod huffman;
 pub mod window;
 
@@ -242,7 +243,10 @@ enum HuffmanBodyOutcome {
 /// generic "bit stream" / "aligned-byte read" labels and the
 /// per-field labels the existing tests assert on
 /// (`block-type byte`, `stored-block LEN/NLEN`, etc.).
-fn relabel_eof<T>(r: Result<T, DeflateError>, label: &'static str) -> Result<T, DeflateError> {
+pub(super) fn relabel_eof<T>(
+    r: Result<T, DeflateError>,
+    label: &'static str,
+) -> Result<T, DeflateError> {
     r.map_err(|e| match e {
         DeflateError::UnexpectedEof(_) => DeflateError::UnexpectedEof(label),
         other => other,
@@ -259,15 +263,46 @@ impl Decoder {
     /// Currently never returns `Err`; the signature is fallible to
     /// match [`crate::decode::DecoderFactory`].
     pub fn new(src: Box<dyn Read + Send>) -> Result<Self, DecodeError> {
-        Ok(Self {
-            bits: BitReader::new(src),
+        Ok(Self::from_bits(BitReader::new(src)))
+    }
+
+    /// Construct a [`Decoder`] over a pre-existing [`BitReader`].
+    ///
+    /// Used by the [`gzip`] wrapper so it can hand off the same bit
+    /// reader to the deflate body for the duration of a member,
+    /// then recover it (via [`Self::into_bits`]) for trailer
+    /// parsing once the deflate stream ends. Construction does not
+    /// pull any bytes.
+    #[must_use]
+    pub fn from_bits(bits: BitReader) -> Self {
+        Self {
+            bits,
             state: State::AwaitingBlockType,
             window: RingWindow::new(),
             decoded_buf: Vec::new(),
             output_buf: vec![0u8; OUTPUT_CHUNK],
             dyn_lit: None,
             dyn_dist: None,
-        })
+        }
+    }
+
+    /// Recover the [`BitReader`] after the deflate stream has
+    /// reached [`DecodeStatus::Eof`] (i.e. after the `BFINAL=1`
+    /// block's EOB has been consumed).
+    ///
+    /// The bit cursor is left wherever the last symbol's bits
+    /// landed — generally mid-byte. Callers that need to read
+    /// byte-aligned bytes after the deflate stream (e.g. the gzip
+    /// trailer per RFC 1952 §2.2) must call
+    /// [`BitReader::align_to_byte`] before further reads, matching
+    /// RFC 1951's "any incomplete bits of the final byte … are
+    /// skipped" rule. Calling this before `Eof` yields a bit
+    /// reader still mid-decode; the deflate state and any
+    /// per-block tables are dropped with the rest of the
+    /// [`Decoder`].
+    #[must_use]
+    pub fn into_bits(self) -> BitReader {
+        self.bits
     }
 
     /// Flush the per-step decoded staging buffer to the sink and

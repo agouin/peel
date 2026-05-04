@@ -103,6 +103,63 @@ pub enum DeflateError {
         /// Bytes of decoded output available for the copy.
         available: u64,
     },
+
+    /// A gzip member's two-byte magic (`ID1 ID2` per RFC 1952
+    /// §2.3.1.1) was not `1F 8B`. Surfaced from the gzip wrapper
+    /// when a stream's first member has an invalid magic, or when
+    /// trailing bytes after a clean trailer don't form the start
+    /// of a new member.
+    #[error("gzip: bad magic bytes {id1:#04x} {id2:#04x} (expected 1F 8B)")]
+    GzipBadMagic {
+        /// First byte of the would-be magic.
+        id1: u8,
+        /// Second byte of the would-be magic.
+        id2: u8,
+    },
+
+    /// A gzip member declared a compression method other than 8
+    /// (`deflate`). RFC 1952 reserves all other values; round-one
+    /// rejects them with this variant rather than treating them
+    /// as malformed bytes.
+    #[error("gzip: unsupported compression method {cm} (only CM=8 / deflate is supported)")]
+    GzipUnsupportedCompressionMethod {
+        /// The unsupported method byte.
+        cm: u8,
+    },
+
+    /// A gzip member's FLG byte set one of the reserved bits
+    /// (5..=7 per RFC 1952 §2.3.1.2). Surface as a typed error
+    /// rather than silently ignoring; encoders that set these
+    /// bits are non-conformant.
+    #[error("gzip: reserved FLG bits set: {flg:#010b}")]
+    GzipReservedFlag {
+        /// The non-conformant FLG byte.
+        flg: u8,
+    },
+
+    /// A gzip member's trailing CRC32 (RFC 1952 §2.3.1.5) did not
+    /// match the CRC32 we computed over the decompressed bytes.
+    /// Indicates either source corruption or a decoder bug — the
+    /// output is not safe to consume.
+    #[error("gzip: CRC32 mismatch (expected {expected:#010x}, computed {computed:#010x})")]
+    GzipCrcMismatch {
+        /// CRC32 the trailer recorded.
+        expected: u32,
+        /// CRC32 we computed.
+        computed: u32,
+    },
+
+    /// A gzip member's trailing ISIZE (RFC 1952 §2.3.1.5) did not
+    /// match the low 32 bits of the decompressed byte count we
+    /// observed. Indicates source corruption or a decoder bug;
+    /// the output is not safe to consume.
+    #[error("gzip: ISIZE mismatch (expected {expected}, computed {computed})")]
+    GzipIsizeMismatch {
+        /// ISIZE the trailer recorded.
+        expected: u32,
+        /// Low 32 bits of the count we observed.
+        computed: u32,
+    },
 }
 
 impl DeflateError {
