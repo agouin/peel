@@ -149,17 +149,24 @@ planning.
 | | Streaming | Frame-granular resume | Magic-byte detect |
 | --- | --- | --- | --- |
 | `.tar` (uncompressed) | ✓ | per tar member | ✓ (offset 257) |
-| `.zst` / `.tar.zst` | ✓ | per zstd frame | ✓ |
-| `.xz` / `.tar.xz` | ✓ | per xz Stream¹ | ✓ |
+| `.zst` / `.tar.zst` | ✓ | per zstd block | ✓ |
+| `.xz` / `.tar.xz` | ✓ | per LZMA2 chunk | ✓ |
 | `.lz4` / `.tar.lz4` | ✓ | per lz4 block | ✓ |
-| `.gz` / `.tar.gz` | ✓ | per gzip member | ✓ |
-| `.zip` | per-entry² | per entry | ✓ |
+| `.gz` / `.tar.gz` | ✓ | per deflate block¹ | ✓ |
+| `.zip` | per-entry² | per entry + intra-entry³ | ✓ |
 
-¹ Default-encoded `.tar.xz` is single-Block; per-Block granularity is
-filed as `O.6b` for a future round.
+¹ Hand-rolled RFC 1951 inflate with a 32 KiB sliding-window snapshot
+plus running CRC32/ISIZE persisted in the checkpoint, so a `kill -9`
+mid-member resumes byte-identically without re-decoding the member from
+its start. `flate2` is a dev-dependency only (used in the differential
+test harness), not a runtime dependency.
 ² ZIP uses a separate per-entry pipeline because of the
 central-directory-at-the-end layout. STORED + DEFLATE + zstd entries
 in round one; AES, Zip64, multi-disk filed as `O.8b`.
+³ STORED entries resume byte-granular; DEFLATE entries resume per
+deflate block via the same 32 KiB-window snapshot used for `.gz`; zstd
+entries resume per zstd block. Encoded into the checkpoint format
+(version 7) under each in-progress entry.
 
 ## For contributors and AI agents
 
