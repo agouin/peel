@@ -252,19 +252,47 @@ impl LzmaDict {
     /// chunk boundary, the dict contents up to `dict_size` bytes
     /// (or however many have been pushed, if smaller) are the
     /// minimum state needed to resume byte-identically.
+    ///
+    /// Phase 2 of `docs/PLAN_lazy_decoder_state.md`: implemented
+    /// as one or two `extend_from_slice` calls split at the wrap
+    /// point (mirroring
+    /// [`crate::decode::zstd::window::Window::recent_in_order`]
+    /// and
+    /// [`crate::decode::deflate_native::window::Window::recent_in_order`]).
+    /// The previous byte-by-byte walk through [`Self::byte_at`]
+    /// was ~10–20 ms per call at `dict_size = 8 MiB`; the memcpy
+    /// version drops that to ~50 µs (memory-bandwidth bound).
     #[must_use]
     pub fn recent(&self, n: usize) -> Vec<u8> {
         let avail = std::cmp::min(self.total, self.buf.len() as u64) as usize;
         let take = std::cmp::min(n, avail);
         let mut out = Vec::with_capacity(take);
-        for i in 0..take {
-            // Walk back from `take - 1` slots to `0` slots so the
-            // output is chronological.
-            // INVARIANT: `take <= avail <= buf.len()`, so the
-            // index `take - 1 - i` always fits in u32 because
-            // `buf.len() <= u32::MAX`.
-            let n = (take - 1 - i) as u32;
-            out.push(self.byte_at(n));
+        if take == 0 {
+            return out;
+        }
+        let cap = self.buf.len();
+        // The most-recent `take` bytes end at `head` (exclusive,
+        // since `head` points at the next *write* position). Walk
+        // back `take` slots from `head`, wrapping at the buffer
+        // start.
+        //
+        // INVARIANT: `take <= avail <= cap`, so `take - self.head`
+        // (in the wrap branch) is non-negative and `cap - (take -
+        // head)` lands in `[0, cap)`.
+        let start = if take <= self.head {
+            self.head - take
+        } else {
+            cap - (take - self.head)
+        };
+        if start + take <= cap {
+            // Contiguous in `buf`: one slice copy.
+            out.extend_from_slice(&self.buf[start..start + take]);
+        } else {
+            // Wraps the ring: tail of the buffer first, then
+            // head segment.
+            let tail = cap - start;
+            out.extend_from_slice(&self.buf[start..]);
+            out.extend_from_slice(&self.buf[..take - tail]);
         }
         out
     }
@@ -465,6 +493,65 @@ mod tests {
         assert_eq!(recent[cap - 1], ((cap * 2 - 1) & 0xFF) as u8);
         // The oldest byte still in the ring is `cap` bytes back.
         assert_eq!(recent[0], (cap & 0xFF) as u8);
+    }
+
+    /// Phase 2 regression gate for `docs/PLAN_lazy_decoder_state.md`:
+    /// the memcpy-based [`LzmaDict::recent`] must produce the same
+    /// bytes as the byte-by-byte reference at every interesting
+    /// `(push_count, n)` cross-product. The reference is kept
+    /// inline so a future "let's just use the new one" clean-up
+    /// doesn't accidentally drop the diff-test.
+    ///
+    /// Coverage: empty dict, single-push, half-full, exactly-full
+    /// (cap), one-past-full (cap + 1), two-wraps, many-wraps with
+    /// odd offset. For each fixture, ask `recent(n)` for n
+    /// covering 0, 1, half, cap-1, cap, oversize. A bug in the
+    /// wrap-split arithmetic surfaces here as a one-byte
+    /// off-by-one and would silently corrupt every resume blob.
+    #[test]
+    fn recent_matches_byte_by_byte_reference() {
+        // Reference: same byte-by-byte walk the original
+        // implementation used. Lives in the test module so a
+        // future refactor doesn't lose it.
+        fn recent_reference(d: &LzmaDict, n: usize) -> Vec<u8> {
+            let avail = std::cmp::min(d.total(), d.capacity() as u64) as usize;
+            let take = std::cmp::min(n, avail);
+            let mut out = Vec::with_capacity(take);
+            for i in 0..take {
+                let k = (take - 1 - i) as u32;
+                out.push(d.byte_at(k));
+            }
+            out
+        }
+
+        let cap = MIN_DICT_SIZE; // 4096
+        let push_counts: &[usize] = &[
+            0,
+            1,
+            cap / 2,
+            cap - 1,
+            cap,
+            cap + 1,
+            2 * cap,
+            5 * cap + 17, // odd offset to force a non-aligned wrap
+        ];
+        let ns: &[usize] = &[0, 1, cap / 4, cap - 1, cap, 2 * cap, 10_000];
+        for &push_count in push_counts {
+            let mut d = LzmaDict::new(cap as u32);
+            // Distinct byte values per index so a wrong byte
+            // shows up at the right position in the assert.
+            for i in 0..push_count {
+                d.push((i & 0xFF) as u8);
+            }
+            for &n in ns {
+                let memcpy = d.recent(n);
+                let walk = recent_reference(&d, n);
+                assert_eq!(
+                    memcpy, walk,
+                    "recent(n={n}) mismatch after {push_count} pushes (cap={cap})",
+                );
+            }
+        }
     }
 
     /// MIN_DICT_SIZE floor honored even when caller asks for less.
