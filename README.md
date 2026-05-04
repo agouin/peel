@@ -137,14 +137,16 @@ Lower is better; **bold** = `peel` is faster than the shell pipe.
 
 | Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
 | --- | --- | --- | --- | --- |
-| `tar` | **0.96×** | **0.94×** | **0.78×** | **0.83×** |
-| `tar.zst` | 1.06× | **0.94×** | **0.79×** | **0.84×** |
-| `tar.lz4` | 1.07× | **0.94×** | **0.79×** | **0.86×** |
-| `tar.xz` | 1.13× | 1.07× | 1.97× | 1.91× |
+| `tar` | 1.10× | **0.94×** | **0.78×** | **0.88×** |
+| `tar.zst` | 1.11× | **0.94×** | **0.78×** | **0.89×** |
+| `tar.gz` | 1.02× | **0.95×** | **0.80×** | 2.81× |
+| `tar.lz4` | 1.09× | **0.94×** | **0.78×** | **0.88×** |
+| `tar.xz` | 1.14× | 1.04× | 1.64× | 1.60× |
 
 Absolute wall-clock for the 10 Gbps · 256 MiB column, for scale:
-`tar` 0.20 s vs 0.24 s · `tar.zst` 0.20 s vs 0.24 s · `tar.lz4`
-0.20 s vs 0.24 s · `tar.xz` 11.8 s vs 6.1 s.
+`tar` 0.21 s vs 0.24 s · `tar.zst` 0.21 s vs 0.24 s · `tar.lz4`
+0.21 s vs 0.24 s · `tar.gz` 0.67 s vs 0.24 s · `tar.xz` 9.68 s vs
+6.05 s.
 
 ### Reading the grid
 
@@ -155,23 +157,28 @@ TCP connection, which more than pays for the part-file double-hop and
 checkpoint syncs. Wins of 5–20 % are real and stable run-to-run.
 
 **xz, everyday WAN.** Stays in line with the other codecs through the
-100 Mbps cell. The ~1.91× ratio at 1 Gbps and above is the residual
+100 Mbps cell. The ~1.6× ratio at 1 Gbps and above is the residual
 gap between `peel`'s clean-room single-threaded LZMA decoder and
 system `xz`'s 20+-year-old hand-tuned C path; it is the single-largest
-item on the post-MVP perf backlog (see `docs/PLAN_xz_throughput.md`).
+item on the post-MVP perf backlog
+(see `docs/PLAN_xz_decoder_optimization.md`).
 Earlier `peel` releases sat at ~20× here because of a coordinator-side
 issue that called the resume-blob serializer on every LZMA2 chunk
 boundary; that path now fires only on durable-checkpoint boundaries
-(see `docs/PLAN_lazy_decoder_state.md`). The most recent cut
-(`docs/PLAN_checkpoint_blob_dedup.md`) takes the row from ~2.38× to
-~1.91× by dropping a redundant inner CRC32 from the xz resume blob
-and threading the resume-blob bytes from the decoder ring buffer
-into the `Checkpoint` body buffer with **one** memcpy instead of
-four — combined per-checkpoint cost on `tar.xz` falls from ~28 ms to
-~13 ms. The remaining gap is the LZMA decoder's single-threaded
-floor; multi-Block parallel decode
-(`docs/PLAN_xz_parallel_block_decode.md`) is the next step toward
-≤ 1×.
+(see `docs/PLAN_lazy_decoder_state.md`). A subsequent cut
+(`docs/PLAN_checkpoint_blob_dedup.md`) dropped a redundant inner
+CRC32 from the xz resume blob and threaded the resume-blob bytes
+from the decoder ring buffer into the `Checkpoint` body buffer with
+**one** memcpy instead of four — combined per-checkpoint cost on
+`tar.xz` falls from ~28 ms to ~13 ms. The bench's `coord_config`
+also moved from a 50 ms time-floor to the 2 s production default, so
+the published numbers reflect actual deployment behavior rather than
+stress-test cadence. The remaining gap is the LZMA decoder's
+single-threaded floor; planned decoder optimizations
+(`docs/PLAN_xz_decoder_optimization.md`) target ≥ 80 % of liblzma
+single-thread, after which multi-Block parallel decode
+(`docs/PLAN_xz_parallel_block_decode.md`) is the step that takes
+multi-Block fixtures below 1×.
 
 **10 Gbps, fast codecs.** As of `PLAN_checkpoint_cadence_throughput.md`
 the fast-codec rows beat `curl | tar` at 10 Gbps too: the per-checkpoint
@@ -181,9 +188,19 @@ scales with realized download throughput so the bench's 32 checkpoints
 collapse to 2–3. Combined with parallel ranged GETs, `peel` finishes
 ahead of the shell pipe across the whole streaming-codec range.
 
-**xz at 10 Gbps** still trails `curl | xz | tar` by ~1.91× — the
+**xz at 10 Gbps** still trails `curl | xz | tar` by ~1.60× — the
 network is no longer in the budget; the gap is the LZMA decoder
 itself.
+
+**gzip at 10 Gbps** is the one remaining trailing row at 2.81×.
+The deflate decoder is `peel`'s clean-room
+[`flate2`-free `inflate`](src/decode/deflate_native.rs) and runs at
+~380 MiB/s on Apple M4 Max — fast enough for everyday WAN
+(matches the fast-codec rows through 1 Gbps) but bottlenecked when
+the wire stops being the limit. The fix shape mirrors the xz row's
+multi-Block plan: parallel-frame decode for streams that have
+restart points, plus the same CRC-acceleration work the xz CRC64
+plan files. Filed as a follow-on; not blocking.
 
 ### When to reach for `peel`
 
@@ -201,7 +218,8 @@ Use `peel` when **any** of these hold (which is most of the time):
 
 Use `curl | tool | tar` when **all** of these hold:
 
-- The archive is `tar.xz` and decode time dominates.
+- The archive is `tar.xz` (or `tar.gz` over a > 1 Gbps link) and
+  decode time dominates.
 - You don't need resume / integrity / multi-mirror.
 
 ## Usage
