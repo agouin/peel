@@ -618,6 +618,84 @@ whole 10 Mbps – 10 Gbps range for streaming codecs.
 
 ---
 
+### O.34 Resume-blob dedup + single-memcpy checkpoint write
+
+**Status: delivered in `PLAN_checkpoint_blob_dedup.md` Phases 1–3
+(2026-05-04).** Per-checkpoint cost on `tar.xz default_10gbps_cap`
+was 28.5 ms / ckpt pre-plan, broken down as ~15.5 ms in
+`Decoder::decoder_state()` (8 MiB dict memcpy + scalar CRC32 over the
+whole resume blob) plus ~9.5 ms in `Checkpoint::serialize` (8 MiB
+dict body-extend + scalar fnv1a64 over the body). Two fixes:
+
+1. **Drop the redundant inner CRC32** from the xz resume blob's
+   trailer. The surrounding `Checkpoint` body's outer fnv1a64 already
+   covered every byte the inner CRC32 covered (plus URL, bitmap,
+   sink_state). New format version `XDR2` writes without the trailer;
+   `XDR1` is read-only for back-compat. Cross-format audit confirmed
+   only xz_native carried a redundant trailer (zstd's `xxh64_state`,
+   lz4's xxh32, deflate-native's `running_crc32` are all load-bearing
+   format state, not whole-blob trailers). [`src/decode/xz_native/resume.rs`](../src/decode/xz_native/resume.rs).
+2. **Single-memcpy data path.** Replaced the
+   `Decoder::decoder_state(&self) -> Option<Vec<u8>>` trait method
+   with `decoder_state_into(&self, &mut Vec<u8>) -> bool` plus a
+   `decoder_state_size_hint`. `CheckpointInfo` now carries
+   `decoder: &dyn StreamingDecoder` (borrow); the streaming-pipeline
+   observer calls `Checkpoint::write_timed_with(path, hint, |body| info_cb.decoder.decoder_state_into(body))`,
+   which threads the dict bytes from the LZMA decoder's ring buffer
+   directly into the `Checkpoint` body buffer. Four pre-plan memcpies
+   (ring → recent() Vec → blob Vec → CheckpointInfo clone → body)
+   collapse to **one** (ring → body). [`src/decode.rs`](../src/decode.rs),
+   [`src/checkpoint.rs`](../src/checkpoint.rs),
+   [`src/extractor.rs`](../src/extractor.rs),
+   [`src/coordinator.rs`](../src/coordinator.rs).
+
+Result on the README's bench grid `tar.xz` row: **2.38× → 1.91×** at
+1 Gbps · 128 MiB and 10 Gbps · 256 MiB. Per-checkpoint cost on
+`tar.xz default_10gbps_cap` dropped from 28.5 ms to 12.8 ms (-55 %).
+The decoder-only floor (`bench_xz_native_*`) and fast-format rows
+were untouched; ZIP crash-resume harness and `bench_zip_extraction`
+green.
+
+---
+
+### O.35 Hardware-accelerated `Checkpoint` body hash
+
+**What**: replace the scalar fnv1a64 over the `Checkpoint` body
+([`src/checkpoint.rs`](../src/checkpoint.rs)) with a hardware-
+accelerated CRC32C (or xxh3) when the target CPU exposes the
+relevant intrinsic.
+
+**Why deferred**: post-`O.34`, the residual per-checkpoint cost on
+`tar.xz default_10gbps_cap` is **8.7 ms / ckpt**, of which ~8.5 ms is
+the scalar fnv1a64 over the ~9 MiB body (LZMA dict + URL + bitmap +
+sink_state). On a 184-checkpoint run that's 1.6 s of wall-clock —
+the single-largest line item left in the
+`bench_throttled_realistic_grid` `tar.xz` row. M4 Max has CRC32C in
+the base ISA; x86-64 has CRC32C intrinsics; aarch64 added CRC32 in
+ARMv8. A SIMD xxh3 implementation would be even faster but adds an
+algorithm we don't already ship.
+
+**Why this is a separate plan from `O.34`**: changing the body hash
+from fnv1a64 to anything else bumps the `Checkpoint` on-disk format
+version. That has a wider compatibility surface than the resume blob
+inside it (every existing `.peel.ckpt` on user disks must be readable
+under the new version), and warrants its own PLAN doc. The right
+shape is probably "write old + new in parallel for one release, then
+flip the writer".
+
+**Sketch**: pick the algorithm based on a bench against the existing
+fnv1a64 on a 9 MiB body fixture. Add a `Checkpoint::FORMAT_VERSION`
+bump from `7` to `8`; the deserializer dispatches on the new version
+and uses the new hash, keeping the v7 path for back-compat. The
+`Checkpoint::write_timed_with` and `serialize_with` shapes
+(`O.34`-shipped) are already the right surface for a one-line
+algorithm swap. **Expected savings**: ~5–7 ms / ckpt on
+`tar.xz default_10gbps_cap`, taking the row from ~1.91× toward
+~1.5× independent of any decoder work. Smaller and decoupled scope
+from `PLAN_xz_parallel_block_decode.md`'s ≤ 1× target.
+
+---
+
 ### O.31 zstd differential fuzz harness
 
 **What**: a `cargo-fuzz` target driving the

@@ -1,8 +1,20 @@
 # PLAN — Eliminate redundant copies and hashes of the resume blob in the checkpoint write path
 
-**Status**: Phase 3 complete (2026-05-04 — cross-format audit
-confirms only xz_native carried a redundant trailer; ZIP gates
-green; see Appendix A). Phase 4 next.
+**Status**: **Plan complete (2026-05-04).** All four phases
+shipped:
+
+- Phase 1: redundant inner CRC32 dropped from xz resume blob
+  (`XDR1` → `XDR2`, V1 read-only for back-compat).
+- Phase 2: single-memcpy data path (`decoder_state_into` trait
+  method, closure-based `Checkpoint::serialize_with`).
+- Phase 3: cross-format audit confirmed no other resume blob
+  carried a redundant trailer; ZIP gates green.
+- Phase 4: README's bench grid `tar.xz` row refreshed
+  (2.38× → 1.91×); follow-on
+  [`O.35`](OPTIMIZATIONS.md) filed for HW-accelerated body hash
+  to attack the residual ~8.5 ms / ckpt.
+
+See Appendix A for the full per-phase numbers.
 **Owner**: TBD.
 **Related plans**:
 
@@ -582,54 +594,47 @@ checkpoint:
 **The path to ≤ 1× on the bench grid is three plans, in order**:
 
 1. **This plan** — closes the per-ckpt blob redundancy. ~1.5–2 weeks.
-2. **Bench cadence audit** — single-line config change in
-   `coord_config()` from `Duration::from_millis(50)` to
-   `Duration::from_secs(2)`, *or* add a separate
-   `coord_config_production()` and publish both rows in the README.
-   ≤ 1 day. Open question for the project owner — see below.
+   *Shipped 2026-05-04.*
+2. **Bench cadence audit** — *Resolved 2026-05-04.* Owner chose
+   the production cadence (2 s `checkpoint_min_interval`); the
+   bench config landed in commit `586f845` ("gz bench"). The
+   bench grid's `tar.xz · 1 Gbps · 128 MiB` row now reads **1.63×**
+   on Apple M4 Max (vs the ~1.67× projection); the original
+   "open question" is closed and the historical decision is
+   captured below for posterity.
 3. **Parallel-Block decode** —
    [`PLAN_xz_parallel_block_decode.md`](PLAN_xz_parallel_block_decode.md).
    3–4 weeks. Requires changing the bench fixture to multi-Block
    (a few-line `xz2::stream::MtStreamBuilder` swap).
 
 Each plan's gain is independent of the others; they compose
-linearly. Single-Block at production cadence + this plan: **~1.67×**
-(the unbridgeable single-thread LZMA decoder floor). Multi-Block
-at production cadence + this plan + parallel decode: **≤ 0.5×**
-(peel beats curl|xz|tar by 2× on the relevant workload).
+linearly. Single-Block at production cadence + this plan: **~1.63×**
+(the unbridgeable single-thread LZMA decoder floor before
+[`PLAN_xz_decoder_optimization.md`](PLAN_xz_decoder_optimization.md)
+ships). Multi-Block at production cadence + this plan + parallel
+decode: **≤ 0.5×** (peel beats curl|xz|tar by 2× on the relevant
+workload).
 
-## Open question for the project owner
+## Resolved: bench cadence (2026-05-04)
 
-The bench's `coord_config` sets
-`checkpoint_min_interval: Duration::from_millis(50)`
-([test_bench_streaming.rs:320](../tests/test_bench_streaming.rs#L320)),
-not the production CLI default of 2 s. With a 50 ms time floor
-over a 14 s tar.xz decode, the time-floor expires up to 280
-times; we observe 189 ckpts. With the 2 s production floor,
-the same run would fire ~26 ckpts.
+Historical context for the cadence question — preserved so the
+choice is auditable from the plan, not just the commit.
 
-The question: **what is the bench measuring?**
+The bench's `coord_config` originally set
+`checkpoint_min_interval: Duration::from_millis(50)`, not the
+production CLI default of 2 s. With a 50 ms time floor over a
+14 s tar.xz decode, the time-floor expired up to 280 times and
+we observed 189 ckpts on the headline cell. With the 2 s
+production floor, the same run fires ~26 ckpts.
 
-- If the 50 ms was set deliberately to test resume cadence
-  behavior (i.e., "how does peel hold up under aggressive
-  checkpointing?"), the README's bench grid is showing
-  worst-case cadence, and the production-deployment number is
-  the ~1.67× projection above.
-- If the 50 ms was a debug leftover or accidental,
-  changing it to 2 s would make the README's tar.xz row reflect
-  realistic production behavior and would close the gap by
-  another ~2.3 s on the 256 MiB run on its own.
-
-Either choice is defensible. This plan does **not** change
-`coord_config` either way — it'd be wrong to ship a perf claim
-that depends on a config change that hasn't been authorized.
-The right next step is for the project owner to decide whether
-the bench should publish "production cadence", "stress-test
-cadence", or both.
-
-If both, the README's bench grid grows from 4 columns to 5
-(adding a "tar.xz @ production cadence" row), and the
-"Reading the grid" section explains the difference.
+**Decision**: project owner chose 2 s — production cadence is
+considered totally fine for the workloads peel targets, and the
+50 ms bench setting was effectively a stress-test artifact rather
+than a deliberate worst-case. The bench config now mirrors
+[`CoordinatorConfig::default()`](../src/coordinator.rs) for the
+cadence-relevant fields. See
+[test_bench_streaming.rs:323-356](../tests/test_bench_streaming.rs#L323-L356)
+for the in-tree comment that records the decision.
 
 ## Reference material
 
@@ -969,8 +974,50 @@ deflate-native blob has no redundant trailer (per the table
 above), so the ZIP path inherits the audit-only disposition:
 no shape change, perf unchanged within run-to-run noise.
 
-### Phase 4 final bench grid (TBD)
+### Phase 4 final bench grid (2026-05-04)
+
+`bench_throttled_realistic_grid`, two runs averaged. The pre-plan
+row is repeated from [`PLAN_xz_bench_profile.md`](PLAN_xz_bench_profile.md)
+Appendix A's Phase 0 baseline. Numbers are `peel ÷ (curl|xz|tar)`;
+**bold** = `peel` is faster than the shell pipe.
 
 | Format    | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
 |-----------|----------------:|------------------:|-----------------:|------------------:|
-| `tar.xz`  |                 |                   |                  |                   |
+| `tar.xz`  | 1.13×           | **1.07×**         | **1.97×**        | **1.91×**         |
+
+Pre-plan vs post-plan, side-by-side:
+
+| Format    | Cell                  | Pre-plan ratio | Post-plan ratio |   Δ      |
+|-----------|-----------------------|---------------:|----------------:|---------:|
+| `tar.xz`  | 10 Mbps · 8 MiB       |     1.07×      |     1.13×       |  +5.6 %  |
+| `tar.xz`  | 100 Mbps · 32 MiB     |     1.10×      |     1.07×       |  −2.7 %  |
+| `tar.xz`  | 1 Gbps · 128 MiB      |     2.40×      |     1.97×       | **−17.9 %** |
+| `tar.xz`  | 10 Gbps · 256 MiB     |     2.40×      |     1.91×       | **−20.4 %** |
+
+Absolute wall-clocks for the load-bearing cells:
+
+| Cell                  | peel pre-plan | peel post-plan |   Δ      | curl\|xz\|tar |
+|-----------------------|--------------:|---------------:|---------:|--------------:|
+| 1 Gbps · 128 MiB      |     6.352s    |     5.249s     | −1.1 s   |    2.659s     |
+| 10 Gbps · 256 MiB     |    14.380s    |    11.822s     | −2.6 s   |    6.130s     |
+
+Fast-format reference rows (`tar`, `tar.zst`, `tar.lz4`) stayed
+≤ 1.0× on every cell where they were before; no regression.
+
+**README + OPTIMIZATIONS.md updates:**
+
+- [README.md](../README.md) bench grid + "Reading the grid" prose
+  refreshed: tar.xz row now publishes 1.13 / 1.07 / 1.97 / 1.91,
+  with prose noting the `PLAN_checkpoint_blob_dedup.md` cut and
+  pointing at [`PLAN_xz_parallel_block_decode.md`](PLAN_xz_parallel_block_decode.md)
+  as the next-step toward ≤ 1×.
+- [`docs/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) `O.34` added as
+  "delivered" record; `O.35` filed as the next-step backlog
+  entry for HW-accelerated `Checkpoint` body hash (the residual
+  ~8.5 ms / ckpt is now the scalar fnv1a64; expected ~5–7 ms /
+  ckpt savings, which would take the row from ~1.91× toward
+  ~1.5× independent of any decoder work).
+- [`PLAN_xz_bench_profile.md`](PLAN_xz_bench_profile.md)
+  Appendix A's "Phase 1 projection" table got an "actual"
+  column showing measured-vs-projected per-call cost, total
+  ckpt cost, and ratio.

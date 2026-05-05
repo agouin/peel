@@ -117,6 +117,154 @@ fn build_tar_payload(total_bytes: usize) -> Vec<u8> {
     build_simple_archive(&pairs)
 }
 
+/// "Log-like" deterministic payload that compresses ~2–3× under
+/// LZMA preset 6 — the typical real-world `.tar.xz` shape (kernel
+/// sources, distro images, structured ML datasets sit in this range).
+///
+/// Used by the `compressible_*` benches to exercise the match-copy /
+/// dictionary-access paths of the decoder, which see < 1 % of
+/// self-time on the LCG-random fixture but become top-3 on real-world
+/// archives. See `PLAN_xz_decoder_optimization.md` Phase 0.
+///
+/// Shape: lines of "timestamp · token · token · …" drawn from a small
+/// vocabulary (drives LZMA dictionary matches), peppered with short
+/// runs of pure-random bytes (raises the entropy floor so the model
+/// emits a realistic mix of literals and matches, not just matches).
+fn compressible_bytes(seed: u64, len: usize) -> Vec<u8> {
+    static TOKENS: &[&str] = &[
+        "INFO",
+        "WARN",
+        "DEBUG",
+        "ERROR",
+        "TRACE",
+        "FATAL",
+        "request",
+        "response",
+        "handler",
+        "worker",
+        "queue",
+        "scheduler",
+        "/api/v1/items",
+        "/api/v1/users",
+        "/api/v1/orders",
+        "/api/v1/sessions",
+        "/api/v2/health",
+        "/api/v2/metrics",
+        "/api/v2/probe",
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "PATCH",
+        "status=200",
+        "status=204",
+        "status=301",
+        "status=404",
+        "status=500",
+        "host=alpha.internal",
+        "host=beta.internal",
+        "host=gamma.internal",
+        "service=ingest",
+        "service=router",
+        "service=auth",
+        "service=billing",
+        "user_id=",
+        "request_id=",
+        "trace_id=",
+        "span_id=",
+        "tenant=",
+        "method=GET",
+        "method=POST",
+        "client=mobile",
+        "client=web",
+        "client=cli",
+        "region=us-east-1",
+        "region=us-west-2",
+        "region=eu-central-1",
+        "msg=\"ok\"",
+        "msg=\"retry scheduled\"",
+        "msg=\"cache miss\"",
+        "lat_ms=",
+        "bytes=",
+        "rows=",
+        "qps=",
+        "p99=",
+    ];
+
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next_u64 = || -> u64 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state
+    };
+
+    let mut out = Vec::with_capacity(len + 256);
+    while out.len() < len {
+        // Timestamp prefix — most bytes recur; subseconds are random.
+        let mins = next_u64() % 60;
+        let secs = next_u64() % 60;
+        let micros = next_u64() % 1_000_000;
+        out.extend_from_slice(
+            format!("2026-05-04T12:{mins:02}:{secs:02}.{micros:06}Z ").as_bytes(),
+        );
+
+        // 4–7 vocabulary tokens — gives the LZMA dictionary repeating
+        // n-grams to match against.
+        let n_tokens = 4 + (next_u64() % 4) as usize;
+        for i in 0..n_tokens {
+            let idx = (next_u64() as usize) % TOKENS.len();
+            if i > 0 {
+                out.push(b' ');
+            }
+            out.extend_from_slice(TOKENS[idx].as_bytes());
+            // For "key=" tokens, append a numeric tail.
+            if TOKENS[idx].ends_with('=') {
+                out.extend_from_slice(format!("{}", next_u64() % 1_000_000).as_bytes());
+            }
+        }
+
+        // High-entropy tail: 48–80 raw random bytes. This is the
+        // dominant entropy source. Without it the ratio runs > 6× and
+        // over-fits the match path; with it we sit in the realistic
+        // 2–3× band. We emit full 8-byte LCG outputs (truncated to
+        // the requested length) rather than `(next_u64() & 0xff)` —
+        // the low bits of an LCG cycle quickly, so byte-at-a-time
+        // truncation produces a stream LZMA can match aggressively.
+        out.push(b' ');
+        let blob_len = 28 + (next_u64() as usize % 28);
+        let mut emitted = 0usize;
+        while emitted < blob_len {
+            let bytes = next_u64().to_le_bytes();
+            let take = (blob_len - emitted).min(8);
+            out.extend_from_slice(&bytes[..take]);
+            emitted += take;
+        }
+        out.push(b'\n');
+    }
+    out.truncate(len);
+    out
+}
+
+/// Tar archive whose raw bytes are "log-like" structured text that
+/// compresses ~2–3× under LZMA. Same 8-file shape as
+/// [`build_tar_payload`] so the on-disk footprint, header overhead,
+/// and end-of-archive padding are comparable across the two fixtures.
+fn build_compressible_tar_payload(total_bytes: usize) -> Vec<u8> {
+    const FILES: usize = 8;
+    let per = total_bytes / FILES;
+    let names: Vec<String> = (0..FILES).map(|i| format!("data/log_{i:02}.txt")).collect();
+    let bodies: Vec<Vec<u8>> = (0..FILES)
+        .map(|i| compressible_bytes(0xC0DE + i as u64, per))
+        .collect();
+    let pairs: Vec<(&str, &[u8])> = names
+        .iter()
+        .zip(bodies.iter())
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    build_simple_archive(&pairs)
+}
+
 /// Compress `input` with `xz2` at default preset 6, single-threaded
 /// (so the result is single-Block). Mirrors
 /// [`tests/test_bench_streaming.rs::encode_xz`].
@@ -259,6 +407,68 @@ fn bench_xz_native_tar_xz_256mib_single_block() {
     );
 }
 
+/// 64 MiB compressible-payload sibling. Shape: `build_compressible_tar_payload`.
+/// Same Block layout, different per-symbol distribution — the literal hot
+/// path is no longer 99 % of self-time, so the match-copy / dict-access /
+/// RLE optimizations targeted by Phase 2 of
+/// [`docs/PLAN_xz_decoder_optimization.md`] become measurable.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_xz_native_compressible_64mib_single_block() {
+    bench_at_size_compressible(
+        64 * 1024 * 1024,
+        "tar.xz · 64 MiB · single-Block · preset 6 · compressible",
+    );
+}
+
+/// 128 MiB compressible-payload sibling — matches the
+/// `1 Gbps · 128 MiB` cell of the bench grid. The headline number
+/// for [`docs/PLAN_xz_decoder_optimization.md`] §Targets.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_xz_native_compressible_128mib_single_block() {
+    bench_at_size_compressible(
+        128 * 1024 * 1024,
+        "tar.xz · 128 MiB · single-Block · preset 6 · compressible",
+    );
+}
+
+/// 256 MiB compressible-payload sibling — the regression-gate
+/// counterpart to `bench_xz_native_tar_xz_256mib_single_block` on the
+/// realistic-distribution fixture.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_xz_native_compressible_256mib_single_block() {
+    bench_at_size_compressible(
+        256 * 1024 * 1024,
+        "tar.xz · 256 MiB · single-Block · preset 6 · compressible",
+    );
+}
+
+/// Sanity-gate: the compressible generator must produce a payload
+/// that LZMA preset 6 compresses at a 2.0–4.0× ratio. Outside that
+/// band, `bench_xz_native_compressible_*` is no longer measuring a
+/// realistic real-world tar.xz shape and the per-symbol attribution
+/// stops being representative.
+///
+/// Cheap to run (no decode), so it runs as a normal `cargo test`
+/// gate rather than `#[ignore]`. Keeps the generator from drifting
+/// silently.
+#[test]
+fn compressible_payload_ratio_in_band() {
+    let archive = build_compressible_tar_payload(8 * 1024 * 1024);
+    let compressed = encode_xz(&archive);
+    let ratio = (archive.len() as f64) / (compressed.len() as f64);
+    assert!(
+        (2.0..=4.0).contains(&ratio),
+        "compressible-fixture LZMA ratio drifted: archive={} B, \
+         compressed={} B, ratio={:.2}× (expected 2.0–4.0×)",
+        archive.len(),
+        compressed.len(),
+        ratio,
+    );
+}
+
 /// Microbench: per-call cost of [`StreamingDecoder::decoder_state_into`]
 /// on a fully-warmed xz_native decoder. After
 /// `PLAN_checkpoint_blob_dedup.md` Phase 2 this is the call the
@@ -375,12 +585,29 @@ fn bench_xz_native_decoder_state_into_microbench() {
 #[ignore = "profiling helper; opt-in via --ignored"]
 fn bench_xz_native_decode_loop_for_profiling() {
     let archive = build_tar_payload(64 * 1024 * 1024);
-    let compressed = encode_xz(&archive);
+    decode_loop_for_profiling("64 MiB single-Block · incompressible", &archive);
+}
+
+/// Compressible-fixture sibling — same shape as
+/// [`bench_xz_native_decode_loop_for_profiling`] but with the
+/// realistic `tar.xz` distribution. Use this to attribute
+/// match-copy / dict-access / RLE self-time, which sit at < 1 % on
+/// the incompressible fixture but become top-3 on real-world archives.
+/// See `PLAN_xz_decoder_optimization.md` Phase 0.
+#[test]
+#[ignore = "profiling helper; opt-in via --ignored"]
+fn bench_xz_native_decode_loop_for_profiling_compressible() {
+    let archive = build_compressible_tar_payload(64 * 1024 * 1024);
+    decode_loop_for_profiling("64 MiB single-Block · compressible", &archive);
+}
+
+fn decode_loop_for_profiling(label: &str, archive: &[u8]) {
+    let compressed = encode_xz(archive);
     let iters: u32 = std::env::var("PEEL_BENCH_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
-    println!("[bench-xz] profiling loop: {iters} iterations of 64 MiB single-Block decode",);
+    println!("[bench-xz] profiling loop ({label}): {iters} iterations");
     let started = Instant::now();
     let mut total_bytes: u64 = 0;
     for _ in 0..iters {
@@ -395,7 +622,7 @@ fn bench_xz_native_decode_loop_for_profiling() {
     let elapsed = started.elapsed();
     let mibps = (total_bytes as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     println!(
-        "[bench-xz] decode-loop done: total={tot:7.1} MiB  elapsed={el:6.3}s  avg={mibps:7.1} MiB/s",
+        "[bench-xz] decode-loop done ({label}): total={tot:7.1} MiB  elapsed={el:6.3}s  avg={mibps:7.1} MiB/s",
         tot = (total_bytes as f64) / (1024.0 * 1024.0),
         el = elapsed.as_secs_f64(),
     );
@@ -403,7 +630,16 @@ fn bench_xz_native_decode_loop_for_profiling() {
 
 fn bench_at_size(payload_bytes: usize, label: &str) {
     let archive = build_tar_payload(payload_bytes);
-    let compressed = encode_xz(&archive);
+    bench_archive(&archive, label);
+}
+
+fn bench_at_size_compressible(payload_bytes: usize, label: &str) {
+    let archive = build_compressible_tar_payload(payload_bytes);
+    bench_archive(&archive, label);
+}
+
+fn bench_archive(archive: &[u8], label: &str) {
+    let compressed = encode_xz(archive);
 
     let (peel_out, peel_elapsed) = run_peel(&compressed);
     assert_eq!(
@@ -435,6 +671,7 @@ fn bench_at_size(payload_bytes: usize, label: &str) {
 #[allow(dead_code)]
 fn _silence_unused() {
     let _ = (random_bytes(0, 0), build_tar_payload(0), encode_xz(&[]));
+    let _ = (compressible_bytes(0, 0), build_compressible_tar_payload(0));
     let _ = (
         run_peel as fn(&[u8]) -> (Vec<u8>, Duration),
         run_xz2 as fn(&[u8]) -> (Vec<u8>, Duration),
