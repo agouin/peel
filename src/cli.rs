@@ -506,8 +506,7 @@ mod tests {
     #[test]
     fn no_output_flags_derives_default_dir_from_url() {
         // `abcd.tar.xz` → `$(pwd)/abcd` (relative `PathBuf`).
-        let cli =
-            Cli::try_parse_from(["peel", "https://example.com/abcd.tar.xz"]).expect("parse");
+        let cli = Cli::try_parse_from(["peel", "https://example.com/abcd.tar.xz"]).expect("parse");
         assert!(cli.output_dir.is_none());
         assert!(cli.output_file.is_none());
         let args = cli.into_run_args().expect("run args");

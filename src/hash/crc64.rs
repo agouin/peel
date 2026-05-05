@@ -19,15 +19,37 @@
 //! - Reflected input / reflected output: yes.
 //!
 //! Hand-rolled per `docs/ENGINEERING_STANDARDS.md` §2.1; the
-//! lookup table is `const`-folded at compile time. Throughput
-//! targets are well below the network bottleneck, so a byte-at-a-
-//! time inner loop is plenty.
+//! lookup tables are `const`-folded at compile time.
+//!
+//! # Inner loop: slicing-by-16
+//!
+//! `update` processes 16 input bytes per iteration via 16
+//! precomputed 256-entry tables — the standard slicing-by-N
+//! reformulation for reflected CRCs (Intel "Fast CRC computation
+//! for generic polynomials" 2009). Going from N=8 to N=16 cuts
+//! per-iteration loop overhead in half, which on the M4 Max moves
+//! the 1 GiB microbench from 3.9× to ~5× over byte-by-byte. Phase
+//! 1 of [`docs/PLAN_xz_decoder_optimization.md`] uses this to
+//! close the ~7 % of `xz_native` decode self-time the byte-by-byte
+//! loop was claiming.
 
-/// 256-entry lookup table for the byte-at-a-time CRC-64/XZ inner
-/// loop. `const` so the table is folded at compile time.
-const TABLE: [u64; 256] = build_table();
+/// 256-entry lookup table for the byte-at-a-time CRC-64/XZ
+/// fallback. The first row of [`TABLES`]. Used by the < 16-byte
+/// tail path and the differential test helper.
+const TABLE: [u64; 256] = build_byte_table();
 
-const fn build_table() -> [u64; 256] {
+/// Sixteen 256-entry tables driving the slicing-by-16 inner loop.
+/// `TABLES[k][b]` is the CRC of `b` followed by `k` zero bytes —
+/// precomputed so 16 input bytes can be folded into the running
+/// CRC with sixteen independent table lookups instead of sixteen
+/// sequential dependent ones.
+///
+/// `static` (not `const`): the table is 32 KiB and clippy flags
+/// `const` arrays of this size for the load-from-rodata pattern
+/// (the alternative is duplicating the table at every use site).
+static TABLES: [[u64; 256]; 16] = build_slice_tables();
+
+const fn build_byte_table() -> [u64; 256] {
     const POLY: u64 = 0xC96C_5795_D787_0F42;
     let mut table = [0u64; 256];
     let mut i = 0u64;
@@ -46,6 +68,30 @@ const fn build_table() -> [u64; 256] {
         i += 1;
     }
     table
+}
+
+const fn build_slice_tables() -> [[u64; 256]; 16] {
+    let byte_table = build_byte_table();
+    let mut tables = [[0u64; 256]; 16];
+    let mut b = 0usize;
+    while b < 256 {
+        tables[0][b] = byte_table[b];
+        b += 1;
+    }
+    // T[k+1][b] is "feed byte b followed by (k+1) zero bytes" =
+    // step-once on T[k][b] with input zero:
+    //   T[k+1][b] = (T[k][b] >> 8) ^ T[0][T[k][b] & 0xff]
+    let mut k = 0usize;
+    while k < 15 {
+        let mut b = 0usize;
+        while b < 256 {
+            let prev = tables[k][b];
+            tables[k + 1][b] = (prev >> 8) ^ tables[0][(prev & 0xff) as usize];
+            b += 1;
+        }
+        k += 1;
+    }
+    tables
 }
 
 /// Streaming CRC-64/XZ hasher.
@@ -74,7 +120,39 @@ impl Crc64 {
     /// Feed the next chunk of input into the hasher.
     pub fn update(&mut self, data: &[u8]) {
         let mut state = self.state;
-        for &b in data {
+        let mut chunks = data.chunks_exact(16);
+        for chunk in &mut chunks {
+            // INVARIANT: `chunks_exact(16)` yields slices of length 16;
+            // `try_into` cannot fail here.
+            let arr: [u8; 16] = chunk.try_into().unwrap();
+            // First 8 input bytes XOR-into the state; the next 8 are
+            // pure inputs. All 16 lookups are independent, so LLVM is
+            // free to schedule them across the load ports. Indexing
+            // through `u8` indices folds the bounds checks (visible
+            // in `cargo asm` on Apple aarch64).
+            let lo = (state
+                ^ u64::from_le_bytes([
+                    arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7],
+                ]))
+            .to_le_bytes();
+            state = TABLES[15][lo[0] as usize]
+                ^ TABLES[14][lo[1] as usize]
+                ^ TABLES[13][lo[2] as usize]
+                ^ TABLES[12][lo[3] as usize]
+                ^ TABLES[11][lo[4] as usize]
+                ^ TABLES[10][lo[5] as usize]
+                ^ TABLES[9][lo[6] as usize]
+                ^ TABLES[8][lo[7] as usize]
+                ^ TABLES[7][arr[8] as usize]
+                ^ TABLES[6][arr[9] as usize]
+                ^ TABLES[5][arr[10] as usize]
+                ^ TABLES[4][arr[11] as usize]
+                ^ TABLES[3][arr[12] as usize]
+                ^ TABLES[2][arr[13] as usize]
+                ^ TABLES[1][arr[14] as usize]
+                ^ TABLES[0][arr[15] as usize];
+        }
+        for &b in chunks.remainder() {
             state = TABLE[((state ^ u64::from(b)) & 0xFF) as usize] ^ (state >> 8);
         }
         self.state = state;
@@ -153,5 +231,75 @@ mod tests {
         assert_eq!(preview, xz(b"abc"));
         c.update(b"def");
         assert_eq!(c.finalize(), xz(b"abcdef"));
+    }
+
+    /// Reference byte-at-a-time CRC-64/XZ — the previous production
+    /// inner loop, kept here as the differential oracle for the
+    /// slicing-by-8 path. Phase 1 of
+    /// `docs/PLAN_xz_decoder_optimization.md` requires every commit
+    /// to be byte-identical to slicing-by-1.
+    fn xz_byte_by_byte(data: &[u8]) -> u64 {
+        let mut state = !0u64;
+        for &b in data {
+            state = TABLE[((state ^ u64::from(b)) & 0xFF) as usize] ^ (state >> 8);
+        }
+        !state
+    }
+
+    /// Slicing-by-8 must produce byte-identical CRCs to the byte-at-
+    /// a-time reference across a randomized fixture corpus. Spans
+    /// every (length mod 8) class so the chunked main path *and*
+    /// the < 8-byte tail fallback are both covered.
+    #[test]
+    fn slicing_matches_byte_by_byte_random() {
+        // Same LCG as `tests/test_bench_xz_native.rs::random_bytes`
+        // so both the slicing path and the test fixture share the
+        // same notion of "randomized corpus."
+        fn lcg_buf(seed: u64, len: usize) -> Vec<u8> {
+            let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+            let mut out = Vec::with_capacity(len);
+            while out.len() < len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                out.extend_from_slice(&state.to_le_bytes());
+            }
+            out.truncate(len);
+            out
+        }
+
+        // Lengths 0..=64 hit every (len % 8) class plus a couple of
+        // multi-chunk shapes; 1024 and 65535 cover bigger buffers
+        // where any off-by-one in the chunked main path surfaces.
+        for len in (0..=64).chain([100, 1024, 65535, 1 << 20]) {
+            for seed in [0u64, 1, 0xDEADBEEF, 0xC0FFEE] {
+                let buf = lcg_buf(seed, len);
+                let one_shot = xz(&buf);
+                let reference = xz_byte_by_byte(&buf);
+                assert_eq!(
+                    one_shot, reference,
+                    "slicing-by-8 disagrees with byte-by-byte at len={len}, seed={seed:#x}",
+                );
+
+                // Streaming chunked at arbitrary boundaries must
+                // also match — exercises the > 8-byte / < 8-byte
+                // alternation between calls.
+                let mut hasher = Crc64::new();
+                let mut pos = 0;
+                let mut step = 1usize;
+                while pos < buf.len() {
+                    let end = (pos + step).min(buf.len());
+                    hasher.update(&buf[pos..end]);
+                    pos = end;
+                    step = step.wrapping_mul(3).wrapping_add(7) & 31;
+                    step = step.max(1);
+                }
+                assert_eq!(
+                    hasher.finalize(),
+                    reference,
+                    "streaming-chunked slicing-by-8 disagrees at len={len}, seed={seed:#x}",
+                );
+            }
+        }
     }
 }

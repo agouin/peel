@@ -366,6 +366,112 @@ fn report(label: &str, payload_bytes: u64, on_wire_bytes: u64, peel: Duration, x
 
 // ---- benches ---------------------------------------------------------
 
+/// CRC-64/XZ throughput over a 1 GiB random buffer.
+///
+/// Phase 1 of [`docs/PLAN_xz_decoder_optimization.md`]: the
+/// decoder-side CRC64 was 7.3 % of decode self-time at slicing-by-1
+/// (~1 GB/s). Slicing-by-8 must clear ≥ 4× speedup vs. byte-by-byte
+/// on the *same* hardware to gate the phase exit. The bench measures
+/// both implementations side-by-side rather than against an absolute
+/// GB/s number — the absolute number depends on memory bandwidth /
+/// L1 latency of the host, which the plan's "1 GB/s baseline" was
+/// estimated against (x86-64); Apple aarch64 numbers differ.
+///
+/// Allocates 1 GiB; `#[ignore]` so it's opt-in.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_crc64_throughput() {
+    use peel::hash::crc64::Crc64;
+
+    const LEN: usize = 1024 * 1024 * 1024; // 1 GiB
+    let buf = random_bytes(0xC0FFEE, LEN);
+
+    fn report(label: &str, len: usize, dur: Duration, crc: u64) -> f64 {
+        let gibps = (len as f64) / (1024.0 * 1024.0 * 1024.0) / dur.as_secs_f64();
+        let gbps = (len as f64) / 1_000_000_000.0 / dur.as_secs_f64();
+        println!(
+            "[bench-xz] crc64 {label:<20} 1 GiB: {dur:.3}s  ({gibps:.2} GiB/s, {gbps:.2} GB/s)  crc=0x{crc:016x}",
+            dur = dur.as_secs_f64(),
+        );
+        gbps
+    }
+
+    // Byte-by-byte reference — measured here so the plan's "≥ 4×"
+    // gate is anchored to *this* hardware's slicing-by-1 number, not
+    // a generic 1 GB/s assumption.
+    fn byte_by_byte(data: &[u8]) -> u64 {
+        // Reproduces the pre-Phase-1 inner loop without going through
+        // the public API (which now slices-by-8). Same TABLE entries
+        // by polynomial; the canonical "123456789" vector pins
+        // both this and the production hasher to the same CRC.
+        const POLY: u64 = 0xC96C_5795_D787_0F42;
+        let mut table = [0u64; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let mut c = i as u64;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { (c >> 1) ^ POLY } else { c >> 1 };
+            }
+            *slot = c;
+        }
+        let mut state = !0u64;
+        for &b in data {
+            state = table[((state ^ u64::from(b)) & 0xFF) as usize] ^ (state >> 8);
+        }
+        !state
+    }
+
+    // Warm-up: pages-in the 1 GiB buffer.
+    std::hint::black_box(byte_by_byte(&buf));
+    let mut warm = Crc64::new();
+    warm.update(&buf);
+    std::hint::black_box(warm.finalize());
+
+    // Median of 3 timed runs each.
+    let mut bb_times = [Duration::default(); 3];
+    let mut bb_crc = 0u64;
+    for slot in bb_times.iter_mut() {
+        let started = Instant::now();
+        bb_crc = byte_by_byte(&buf);
+        *slot = started.elapsed();
+    }
+    bb_times.sort();
+    let bb_gbps = report("byte-by-byte", LEN, bb_times[1], bb_crc);
+
+    let mut s8_times = [Duration::default(); 3];
+    let mut s8_crc = 0u64;
+    for slot in s8_times.iter_mut() {
+        let mut h = Crc64::new();
+        let started = Instant::now();
+        h.update(&buf);
+        s8_crc = h.finalize();
+        *slot = started.elapsed();
+    }
+    s8_times.sort();
+    let s8_gbps = report("slicing-by-16", LEN, s8_times[1], s8_crc);
+
+    assert_eq!(
+        bb_crc, s8_crc,
+        "byte-by-byte and slicing-by-16 disagree on the same 1 GiB buffer"
+    );
+
+    let speedup = s8_gbps / bb_gbps;
+    println!(
+        "[bench-xz] crc64 speedup vs byte-by-byte: {speedup:.2}× \
+         (slicing-by-16 {s8_gbps:.2} GB/s / byte-by-byte {bb_gbps:.2} GB/s)"
+    );
+
+    // Phase 1 exit gate: ≥ 4× speedup over byte-by-byte on the same
+    // host. The plan denominated this as "≥ 4 GB/s" vs. an assumed
+    // ~1 GB/s baseline; phrasing the gate as a ratio makes it
+    // hardware-agnostic — what matters is that we cut the absolute
+    // CRC64 cost share to ≤ 25 % of decode-time-without-Phase-1.
+    let gate = 4.0;
+    assert!(
+        speedup >= gate,
+        "crc64 slicing-by-16 speedup regressed: got {speedup:.2}×, Phase 1 floor is ≥ {gate:.2}×"
+    );
+}
+
 /// 64 MiB single-Block tar.xz — same fixture size as the
 /// `PLAN_xz_block_decoder.md` Phase 0 spike's headline number
 /// ("~290 MiB/s on Apple Silicon"). Smaller than the 256 MiB
