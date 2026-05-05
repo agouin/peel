@@ -33,6 +33,21 @@
 //! byte is overwritten on the next `push`, which matches LZMA's
 //! "history of at most `dict_size` bytes" guarantee.
 //!
+//! # Power-of-two ring
+//!
+//! Phase 2 of [`docs/PLAN_xz_decoder_optimization.md`] rounded the
+//! underlying buffer up to the next power of two. The user-visible
+//! [`Self::capacity`] returns this rounded size; back-distances
+//! beyond the original `dict_size` are still rejected by
+//! [`Self::match_copy`]'s validation. The benefit is that
+//! [`Self::byte_at`] / [`Self::push`] / `match_copy` replace
+//! `% capacity` with `& (capacity - 1)`, removing a modulo from
+//! the per-emitted-byte hot loop. Common preset dict sizes (4 KiB,
+//! 64 KiB, 1 MiB, 8 MiB, 64 MiB) are already powers of two, so
+//! this only allocates extra bytes for unusual encoder
+//! configurations (worst case 2×, bounded at 128 MiB by the
+//! `block.rs` 64 MiB cap).
+//!
 //! # The "before-start" convention
 //!
 //! Per the LZMA spec, when the decoder asks for a byte before the
@@ -53,17 +68,29 @@ pub const MIN_DICT_SIZE: usize = 4096;
 
 /// Sliding-window LZMA dictionary.
 ///
-/// Owns a `Box<[u8]>` of size `max(dict_size, MIN_DICT_SIZE)`,
-/// allocated once at construction. The cursor `head` points at
-/// the next position to write; `total` is the monotonic count of
-/// bytes pushed since construction or the last [`Self::reset`].
+/// Owns a `Box<[u8]>` of size `max(dict_size, MIN_DICT_SIZE)`
+/// rounded up to the next power of two, allocated once at
+/// construction. The cursor `head` points at the next position to
+/// write; `total` is the monotonic count of bytes pushed since
+/// construction or the last [`Self::reset`].
 #[derive(Debug)]
 pub struct LzmaDict {
     /// Ring buffer holding up to `buf.len()` bytes of history.
+    /// `buf.len()` is always a power of two ≥ `MIN_DICT_SIZE`.
     buf: Box<[u8]>,
+    /// `buf.len() - 1`. INVARIANT: `buf.len()` is a power of two
+    /// so `idx & mask` is equivalent to `idx % buf.len()`.
+    mask: usize,
     /// Position in `buf` where the next byte will be written
-    /// (`total % capacity`).
+    /// (`total & mask`).
     head: usize,
+    /// Maximum back-distance allowed by [`Self::match_copy`] —
+    /// the constructor's `max(dict_size, MIN_DICT_SIZE)`, *before*
+    /// the power-of-two rounding that bumped `buf.len()`. The LZMA
+    /// spec requires `dist < dict_size`; without this, the
+    /// power-of-two extension would silently expose older bytes
+    /// than the encoder declared.
+    declared_size: usize,
     /// Total bytes pushed since construction or last [`Self::reset`].
     total: u64,
 }
@@ -75,18 +102,32 @@ impl LzmaDict {
     /// honor the floor on the *runtime* allocation regardless of
     /// what the chunk declared, so the byte-at modulo math stays
     /// tractable.
+    ///
+    /// Phase 2 of [`docs/PLAN_xz_decoder_optimization.md`] also
+    /// rounds the allocation up to the next power of two so the
+    /// inner-loop indexing reduces to a mask. Common encoder
+    /// presets (4 KiB / 64 KiB / 1 MiB / 8 MiB / 64 MiB) are
+    /// already powers of two; arbitrary values consume up to 2×
+    /// their declared size.
     #[must_use]
     pub fn new(dict_size: u32) -> Self {
-        let capacity = std::cmp::max(dict_size as usize, MIN_DICT_SIZE);
+        let declared_size = std::cmp::max(dict_size as usize, MIN_DICT_SIZE);
+        let capacity = declared_size.next_power_of_two();
+        // INVARIANT: `declared_size >= MIN_DICT_SIZE >= 4096`, so
+        // `next_power_of_two` does not overflow before the
+        // `block.rs` 64 MiB cap; cap+1 (worst case) is still well
+        // below `usize::MAX`.
         Self {
             buf: vec![0u8; capacity].into_boxed_slice(),
+            mask: capacity - 1,
             head: 0,
+            declared_size,
             total: 0,
         }
     }
 
-    /// Capacity of the ring buffer in bytes. Always ≥
-    /// [`MIN_DICT_SIZE`].
+    /// Capacity of the ring buffer in bytes — power-of-two-rounded
+    /// from the constructor's `dict_size`. Always ≥ [`MIN_DICT_SIZE`].
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.buf.len()
@@ -112,14 +153,10 @@ impl LzmaDict {
     /// Wraps around the ring buffer when `head` reaches the end.
     /// Updates `total` monotonically.
     pub fn push(&mut self, b: u8) {
-        // INVARIANT: `self.head < self.buf.len()` is maintained
-        // because we modulo on every advance and the buffer is
-        // never empty (`MIN_DICT_SIZE > 0`).
+        // INVARIANT: `self.head < self.buf.len()` is maintained by
+        // the mask below; `buf.len()` is a power of two ≥ 4 KiB.
         self.buf[self.head] = b;
-        self.head += 1;
-        if self.head == self.buf.len() {
-            self.head = 0;
-        }
+        self.head = (self.head + 1) & self.mask;
         self.total = self.total.saturating_add(1);
     }
 
@@ -147,12 +184,10 @@ impl LzmaDict {
             // a fallback for fuzz-style probing.
             return 0;
         }
-        // Last-written byte is at `(head + cap - 1) % cap`.
-        // Walk back `n` further. INVARIANT:
-        // `self.head + cap - 1 - n` is non-negative because
-        // `n < cap` and `head >= 0`.
-        let cap = self.buf.len();
-        let idx = (self.head + cap - 1 - n) % cap;
+        // Last-written byte is at `(head - 1) & mask`. Walk back
+        // `n` further. The wrapping_sub keeps the math in `usize`
+        // — the `& mask` immediately re-bounds it.
+        let idx = self.head.wrapping_sub(1).wrapping_sub(n) & self.mask;
         self.buf[idx]
     }
 
@@ -167,6 +202,17 @@ impl LzmaDict {
     /// expansion (e.g. `dist=0, length=4` repeats the last byte
     /// four times).
     ///
+    /// Phase 2 of [`docs/PLAN_xz_decoder_optimization.md`]: the
+    /// non-overlap branch (`length <= dist + 1`) uses bulk
+    /// `copy_within` calls — one when the source range is
+    /// contiguous in the ring, two when it wraps. The
+    /// `dist == 0` overlap case (single-byte run) is specialized
+    /// with `slice::fill`. Other overlap cases (the LZMA RLE
+    /// pattern with `dist > 0` and `length > dist + 1`) keep the
+    /// byte-by-byte walk — these are rare and bulk-copying them
+    /// would require a periodic-pattern fold not worth the code
+    /// complexity given the per-symbol attribution.
+    ///
     /// # Errors
     ///
     /// - [`XzError::LzmaMatchOutOfRange`] if `dist + 1 > total`
@@ -174,21 +220,100 @@ impl LzmaDict {
     ///   capacity()` (back-reference past the ring buffer).
     pub fn match_copy(&mut self, dist: u32, length: u32, out: &mut Vec<u8>) -> Result<(), XzError> {
         let needed = u64::from(dist).saturating_add(1);
-        if needed > self.total || (dist as usize) >= self.buf.len() {
+        if needed > self.total || (dist as usize) >= self.declared_size {
             return Err(XzError::LzmaMatchOutOfRange {
                 dist,
                 total: self.total,
             });
         }
-        // Pre-reserve so the inner loop doesn't reallocate per
-        // byte; `out` is the chunk's staging buffer.
-        out.reserve(length as usize);
-        for _ in 0..length {
-            let b = self.byte_at(dist);
-            self.push(b);
-            out.push(b);
+        let length = length as usize;
+        let dist = dist as usize;
+        if length == 0 {
+            return Ok(());
+        }
+        // Pre-reserve once.
+        out.reserve(length);
+
+        // Source-range overlaps the destination range when
+        // `length > dist + 1`. For non-overlap, copy in bulk
+        // through `copy_within`. For `dist == 0` (RLE single-byte
+        // run), specialize via `slice::fill`. For other overlap
+        // shapes, fall back to the byte-by-byte walk.
+        if length <= dist + 1 {
+            self.bulk_copy_nonoverlap(dist, length, out);
+        } else if dist == 0 {
+            self.bulk_run_single_byte(length, out);
+        } else {
+            for _ in 0..length {
+                let b = self.byte_at(dist as u32);
+                self.push(b);
+                out.push(b);
+            }
         }
         Ok(())
+    }
+
+    /// Bulk match-copy fast path for the non-overlap case
+    /// (`length <= dist + 1`). The source range is `length` bytes
+    /// starting at `(head - 1 - dist) & mask` (inclusive) and
+    /// extending forward. Splits at the ring's wrap point so each
+    /// segment is contiguous in `buf`, then re-pushes the same
+    /// bytes through the cursor with another contiguous write.
+    fn bulk_copy_nonoverlap(&mut self, dist: usize, length: usize, out: &mut Vec<u8>) {
+        let cap = self.buf.len();
+        // Source's first byte index in the ring.
+        let src_start = self.head.wrapping_sub(1).wrapping_sub(dist) & self.mask;
+        // Destination's first byte index = current head.
+        let dst_start = self.head;
+
+        // Stage the source bytes into `out` first (one or two
+        // contiguous spans), then memcpy the same bytes back into
+        // the ring at `dst_start` (one or two spans). This keeps
+        // the dict consistent with its byte-by-byte fallback even
+        // when the source and dest spans both wrap.
+        let src_first_run = std::cmp::min(length, cap - src_start);
+        out.extend_from_slice(&self.buf[src_start..src_start + src_first_run]);
+        if src_first_run < length {
+            out.extend_from_slice(&self.buf[..length - src_first_run]);
+        }
+
+        // Now write `length` bytes from the just-staged tail of
+        // `out` back into the ring at `dst_start`.
+        let staged = &out[out.len() - length..];
+        let dst_first_run = std::cmp::min(length, cap - dst_start);
+        self.buf[dst_start..dst_start + dst_first_run].copy_from_slice(&staged[..dst_first_run]);
+        if dst_first_run < length {
+            self.buf[..length - dst_first_run].copy_from_slice(&staged[dst_first_run..]);
+        }
+
+        self.head = (self.head + length) & self.mask;
+        self.total = self.total.saturating_add(length as u64);
+    }
+
+    /// Bulk match-copy specialization for `dist == 0` (LZMA RLE
+    /// single-byte run): repeat `byte_at(0)` `length` times.
+    fn bulk_run_single_byte(&mut self, length: usize, out: &mut Vec<u8>) {
+        let cap = self.buf.len();
+        // The byte to repeat is the most recently pushed one,
+        // sitting at `(head - 1) & mask`. INVARIANT: `total > 0`
+        // is guaranteed by `match_copy`'s distance check (which
+        // rejects `dist + 1 > total`, i.e. `total == 0` here).
+        let byte = self.buf[self.head.wrapping_sub(1) & self.mask];
+
+        let prev_out_len = out.len();
+        out.resize(prev_out_len + length, byte);
+
+        // Fill the ring at `head` for `length` bytes, splitting
+        // at the wrap point.
+        let dst_start = self.head;
+        let dst_first_run = std::cmp::min(length, cap - dst_start);
+        self.buf[dst_start..dst_start + dst_first_run].fill(byte);
+        if dst_first_run < length {
+            self.buf[..length - dst_first_run].fill(byte);
+        }
+
+        self.head = (self.head + length) & self.mask;
+        self.total = self.total.saturating_add(length as u64);
     }
 
     /// Restore the dict from a chronological byte slice and
@@ -219,17 +344,18 @@ impl LzmaDict {
         );
         let cap = self.buf.len();
         self.total = total;
-        self.head = (total % cap as u64) as usize;
+        self.head = (total & self.mask as u64) as usize;
         if bytes.is_empty() {
             return;
         }
         // The cursor sits at slot `head`; the oldest of `bytes`
-        // is at slot `(head - bytes.len()) mod cap`. Walk
-        // forward `bytes.len()` slots from there.
-        let start_slot = (self.head + cap - bytes.len()) % cap;
-        for (k, &b) in bytes.iter().enumerate() {
-            let slot = (start_slot + k) % cap;
-            self.buf[slot] = b;
+        // is at slot `(head - bytes.len()) & mask`. Lay them down
+        // in two contiguous slice copies split at the wrap point.
+        let start_slot = self.head.wrapping_sub(bytes.len()) & self.mask;
+        let first_run = std::cmp::min(bytes.len(), cap - start_slot);
+        self.buf[start_slot..start_slot + first_run].copy_from_slice(&bytes[..first_run]);
+        if first_run < bytes.len() {
+            self.buf[..bytes.len() - first_run].copy_from_slice(&bytes[first_run..]);
         }
     }
 
@@ -269,16 +395,9 @@ impl LzmaDict {
         // The most-recent `take` bytes end at `head` (exclusive,
         // since `head` points at the next *write* position). Walk
         // back `take` slots from `head`, wrapping at the buffer
-        // start.
-        //
-        // INVARIANT: `take <= avail <= cap`, so `take - self.head`
-        // (in the wrap branch) is non-negative and `cap - (take -
-        // head)` lands in `[0, cap)`.
-        let start = if take <= self.head {
-            self.head - take
-        } else {
-            cap - (take - self.head)
-        };
+        // start. INVARIANT: `take <= cap`, so `head.wrapping_sub(take)
+        // & mask` lands in `[0, cap)`.
+        let start = self.head.wrapping_sub(take) & self.mask;
         if start + take <= cap {
             // Contiguous in `buf`: one slice copy.
             out.extend_from_slice(&self.buf[start..start + take]);
@@ -598,6 +717,111 @@ mod tests {
                 original.byte_at(n),
                 "byte_at({n}) mismatch"
             );
+        }
+    }
+
+    /// Phase 2 of `docs/PLAN_xz_decoder_optimization.md`: the
+    /// new bulk `match_copy` paths (non-overlap `copy_within`,
+    /// `dist == 0` RLE specialization) must produce byte-identical
+    /// output to the byte-by-byte reference across a randomized
+    /// fixture corpus. The reference is kept inline so a future
+    /// "let's just use the new one" refactor doesn't drop it.
+    #[test]
+    fn match_copy_matches_byte_by_byte_reference() {
+        // Reference: same per-byte loop the pre-Phase-2 implementation
+        // used. Note this needs its own dict copy so the original
+        // isn't advanced; we run a "shadow" walk through `byte_at`
+        // and `push` against a clone of the dict.
+        fn match_copy_reference(
+            d: &mut LzmaDict,
+            dist: u32,
+            length: u32,
+            out: &mut Vec<u8>,
+        ) -> Result<(), XzError> {
+            let needed = u64::from(dist).saturating_add(1);
+            if needed > d.total() || (dist as usize) >= d.declared_size {
+                return Err(XzError::LzmaMatchOutOfRange {
+                    dist,
+                    total: d.total(),
+                });
+            }
+            out.reserve(length as usize);
+            for _ in 0..length {
+                let b = d.byte_at(dist);
+                d.push(b);
+                out.push(b);
+            }
+            Ok(())
+        }
+
+        // Construct two dicts, run the prefix the same way through
+        // both (same pushes), then issue `match_copy` to one and
+        // the byte-by-byte reference to the other; compare both
+        // the emitted bytes and the post-call dict state.
+        fn make_dict(dict_size: u32, prefix_len: usize, seed: u64) -> LzmaDict {
+            let mut state = seed ^ 0x9E37_79B9_7F4A_7C15_u64;
+            let mut d = LzmaDict::new(dict_size);
+            for _ in 0..prefix_len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                d.push((state >> 32) as u8);
+            }
+            d
+        }
+
+        let cap = MIN_DICT_SIZE; // 4096 (also the power-of-two cap)
+                                 // Cover: empty (0 prefix; trivially can't match anything),
+                                 // single-byte, partial, near-cap, exactly-cap, past-cap,
+                                 // multi-wrap.
+        let prefix_lens: &[usize] = &[1, 16, 100, cap - 1, cap, cap + 1, 3 * cap + 19];
+        // Cover dist: 0 (RLE single-byte), 1 (alternating RLE),
+        // small dist, mid, near-cap-1.
+        let dists: &[u32] = &[0, 1, 2, 7, 31, 100, (cap as u32) - 1];
+        // Cover length: 0, 1, < dist (non-overlap), > dist
+        // (overlap RLE-style), much larger than dist.
+        let lengths: &[u32] = &[0, 1, 2, 5, 32, 1000, 4096];
+
+        for (k, &prefix_len) in prefix_lens.iter().enumerate() {
+            for &dist in dists {
+                for &length in lengths {
+                    let seed = 0xC0FFEE_u64.wrapping_add((k as u64) * 7919);
+
+                    let mut d_new = make_dict(cap as u32, prefix_len, seed);
+                    let mut d_ref = make_dict(cap as u32, prefix_len, seed);
+                    let mut out_new = Vec::new();
+                    let mut out_ref = Vec::new();
+
+                    let r_new = d_new.match_copy(dist, length, &mut out_new);
+                    let r_ref = match_copy_reference(&mut d_ref, dist, length, &mut out_ref);
+
+                    assert_eq!(
+                        r_new.is_ok(),
+                        r_ref.is_ok(),
+                        "match_copy ok/err divergence at prefix={prefix_len}, dist={dist}, length={length}",
+                    );
+                    if r_new.is_ok() {
+                        assert_eq!(
+                            out_new, out_ref,
+                            "match_copy output mismatch at prefix={prefix_len}, dist={dist}, length={length}",
+                        );
+                        // The dicts should also agree on every back
+                        // position within the ring.
+                        assert_eq!(
+                            d_new.total(),
+                            d_ref.total(),
+                            "match_copy total mismatch at prefix={prefix_len}, dist={dist}, length={length}",
+                        );
+                        for n in 0..(cap as u32 - 1).min(d_new.total() as u32) {
+                            assert_eq!(
+                                d_new.byte_at(n),
+                                d_ref.byte_at(n),
+                                "byte_at({n}) mismatch after match_copy(dist={dist}, length={length}, prefix={prefix_len})",
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

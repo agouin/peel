@@ -253,6 +253,20 @@ impl Lzma2State {
         // pushing.
         let mut staging: Vec<u8> = Vec::with_capacity(uncompressed_size as usize);
 
+        // Cache of the last-pushed byte. Phase 2 of
+        // `docs/PLAN_xz_decoder_optimization.md`: this avoids the
+        // `byte_at(0)` call at the top of every literal iteration —
+        // the value is already in scope from the prior `push`. The
+        // initial value matches the LZMA spec's "before-start"
+        // convention (`byte_at(0)` on an empty dict returns 0). For
+        // chunks that resume mid-Block (the dict is non-empty), we
+        // re-read it once before entering the loop.
+        let mut prev_byte: u8 = if self.dict.is_empty() {
+            0
+        } else {
+            self.dict.byte_at(0)
+        };
+
         let mut produced: u32 = 0;
         while produced < uncompressed_size {
             let pos = self.dict.total();
@@ -261,7 +275,6 @@ impl Lzma2State {
 
             if rc.decode_bit(&mut self.probs.is_match[state_pos_idx])? == 0 {
                 // ===== Literal =====
-                let prev_byte = self.dict.byte_at(0);
                 let match_byte = if lzma_state::is_literal_state(self.state) {
                     0 // unused on the plain path
                 } else {
@@ -277,6 +290,7 @@ impl Lzma2State {
                 )?;
                 self.dict.push(b);
                 staging.push(b);
+                prev_byte = b;
                 self.state = lzma_state::after_literal(self.state);
                 produced += 1;
                 continue;
@@ -313,6 +327,7 @@ impl Lzma2State {
                     let b = self.dict.byte_at(self.rep0);
                     self.dict.push(b);
                     staging.push(b);
+                    prev_byte = b;
                     self.state = lzma_state::after_short_rep(self.state);
                     produced += 1;
                     continue;
@@ -347,6 +362,10 @@ impl Lzma2State {
             }
             self.dict.match_copy(self.rep0, len, &mut staging)?;
             produced += len;
+            // INVARIANT: `match_copy` pushed `len > 0` bytes; the
+            // last one is now at `byte_at(0)`. We can read it from
+            // the staging tail to avoid touching the dict ring.
+            prev_byte = staging[staging.len() - 1];
         }
 
         // Per the spec: the range coder must be in the
