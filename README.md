@@ -228,6 +228,11 @@ Use `curl | tool | tar` when **all** of these hold:
 # Stream a tar archive into a directory
 peel https://example.com/linux-6.x.tar.xz -C ./linux
 
+# No -C / -o? Default extract dir is the URL basename with known
+# archive/compression suffixes stripped, in the current working
+# directory: this lands the contents in ./linux-6.x
+peel https://example.com/linux-6.x.tar.xz
+
 # Bare compressed file → single output file
 peel https://example.com/model.bin.zst -o ./model.bin
 
@@ -248,7 +253,7 @@ peel https://example.com/dataset.tar.zst --io-backend blocking -C ./out
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `-C, --output-dir <DIR>` | — | Extract a tar/zip archive into `DIR`. Mutually exclusive with `-o`. |
+| `-C, --output-dir <DIR>` | URL basename, suffixes stripped | Extract a tar/zip archive into `DIR`. When neither `-C` nor `-o` is given, defaults to `$(pwd)/<basename>` with known archive/compression extensions stripped (`abcd.tar.xz` → `./abcd`). Mutually exclusive with `-o`. |
 | `-o, --output-file <FILE>` | — | Stream the decoded bytes verbatim into `FILE`. |
 | `--workers <N>` | 8 | Parallel download workers. |
 | `--chunk-size <BYTES>` | 4 MiB | Bitmap unit. With adaptive sizing, dispatch may coalesce several. |

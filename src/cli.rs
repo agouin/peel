@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 
-use crate::coordinator::{CoordinatorConfig, OutputTarget, RunArgs};
+use crate::coordinator::{filename_from_url, CoordinatorConfig, OutputTarget, RunArgs};
 use crate::decode::DecoderRegistry;
 use crate::download::{
     parse_bandwidth, ParseBandwidthError, RetryConfig, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 use crate::extractor::DEFAULT_PUNCH_THRESHOLD;
 use crate::hash::sha256::{parse_hex_digest, ParseHexDigestError};
-use crate::http::{Client, ClientConfig, HttpVersion};
+use crate::http::{Client, ClientConfig, HttpVersion, Url, UrlError};
 use crate::io_backend::IoBackendChoice;
 
 /// Parsed CLI for the `peel` binary.
@@ -31,8 +31,11 @@ use crate::io_backend::IoBackendChoice;
     about = "Streaming, resumable, space-efficient extractor for compressed archives over HTTP."
 )]
 #[command(group(
+    // Both args are optional; when neither is set, the binary derives
+    // a default `OutputTarget::Dir` from the URL basename (with known
+    // compression/archive extensions stripped) in the current working
+    // directory. The group still rejects setting both at once.
     ArgGroup::new("output")
-        .required(true)
         .args(["output_dir", "output_file"]),
 ))]
 #[command(group(
@@ -311,6 +314,62 @@ pub enum CliError {
     /// parse as a recognized size or one of the disable sentinels.
     #[error("--max-disk-buffer value is not a valid size")]
     InvalidDiskBuffer(#[source] ParseBandwidthError),
+
+    /// Neither `-C/--output-dir` nor `-o/--output-file` was given,
+    /// and the URL did not parse as a valid URL — so no default
+    /// output directory could be derived.
+    #[error("URL is not valid; pass -C <DIR> or -o <FILE> explicitly")]
+    InvalidUrl(#[source] UrlError),
+
+    /// Neither `-C/--output-dir` nor `-o/--output-file` was given,
+    /// and the URL has no usable basename (e.g. it ends in `/`) so
+    /// no default output directory could be derived.
+    #[error("URL has no filename to derive a default output directory from; pass -C <DIR> or -o <FILE> explicitly")]
+    NoDefaultOutput,
+}
+
+/// Compression and archive suffixes stripped when deriving a default
+/// output-directory name from a URL basename.
+///
+/// Applied iteratively (case-insensitive), so `archive.tar.xz` becomes
+/// `archive` after `.xz` then `.tar` are stripped. `.tgz` / `.txz` /
+/// `.tzst` / `.tbz2` etc. are listed explicitly because they are not a
+/// suffix of `.tar` and would otherwise survive a single pass.
+const STRIPPABLE_EXTENSIONS: &[&str] = &[
+    ".tar", ".tgz", ".tzst", ".txz", ".tlz4", ".tbz2", ".tbz", ".gz", ".zst", ".zstd", ".xz",
+    ".lz4", ".bz2", ".zip", ".7z", ".rar",
+];
+
+fn strip_archive_extensions(name: &str) -> &str {
+    let mut s = name;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let mut stripped = false;
+        for ext in STRIPPABLE_EXTENSIONS {
+            if lower.ends_with(ext) && s.len() > ext.len() {
+                s = &s[..s.len() - ext.len()];
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            return s;
+        }
+    }
+}
+
+/// Derive the default output directory when neither `-C` nor `-o` is
+/// given: parse the URL, take its basename, strip known compression /
+/// archive extensions, and place the result in the current working
+/// directory (as a relative path).
+fn default_output_dir(url: &str) -> Result<PathBuf, CliError> {
+    let parsed = Url::parse(url).map_err(CliError::InvalidUrl)?;
+    let name = filename_from_url(&parsed).ok_or(CliError::NoDefaultOutput)?;
+    let stripped = strip_archive_extensions(&name);
+    if stripped.is_empty() {
+        return Err(CliError::NoDefaultOutput);
+    }
+    Ok(PathBuf::from(stripped))
 }
 
 /// Parse a `--max-disk-buffer` value into `Option<u64>` (bytes).
@@ -343,10 +402,11 @@ impl Cli {
         let output = match (self.output_dir, self.output_file) {
             (Some(d), None) => OutputTarget::Dir(d),
             (None, Some(f)) => OutputTarget::File(f),
-            // The clap ArgGroup guarantees one-of, so these two arms
-            // cannot fire in practice; the catch-all keeps the match
-            // exhaustive without `unreachable!`.
-            _ => OutputTarget::Dir(PathBuf::from(".")),
+            (None, None) => OutputTarget::Dir(default_output_dir(&self.url)?),
+            // The clap ArgGroup rejects setting both at once at parse
+            // time, so this arm cannot fire in practice; the catch-all
+            // keeps the match exhaustive without `unreachable!`.
+            (Some(d), Some(_)) => OutputTarget::Dir(d),
         };
         let expected_sha256 = match self.expected_sha256 {
             Some(hex) => Some(parse_hex_digest(&hex).map_err(CliError::InvalidSha256)?),
@@ -444,10 +504,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_no_output() {
-        let err = Cli::try_parse_from(["peel", "https://example.com/x.tar.zst"])
-            .expect_err("must require output");
-        let _ = err;
+    fn no_output_flags_derives_default_dir_from_url() {
+        // `abcd.tar.xz` → `$(pwd)/abcd` (relative `PathBuf`).
+        let cli =
+            Cli::try_parse_from(["peel", "https://example.com/abcd.tar.xz"]).expect("parse");
+        assert!(cli.output_dir.is_none());
+        assert!(cli.output_file.is_none());
+        let args = cli.into_run_args().expect("run args");
+        match args.output {
+            OutputTarget::Dir(p) => assert_eq!(p, PathBuf::from("abcd")),
+            OutputTarget::File(_) => panic!("expected Dir target"),
+        }
+    }
+
+    #[test]
+    fn no_output_flags_with_unstripped_basename() {
+        // No known archive/compression suffix → keep the basename as-is.
+        let cli = Cli::try_parse_from(["peel", "https://example.com/dataset"]).expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        match args.output {
+            OutputTarget::Dir(p) => assert_eq!(p, PathBuf::from("dataset")),
+            OutputTarget::File(_) => panic!("expected Dir target"),
+        }
+    }
+
+    #[test]
+    fn no_output_flags_rejects_url_without_basename() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/"]).expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::NoDefaultOutput));
+    }
+
+    #[test]
+    fn strip_archive_extensions_handles_double_suffix() {
+        assert_eq!(strip_archive_extensions("abcd.tar.xz"), "abcd");
+        assert_eq!(strip_archive_extensions("abcd.tar.gz"), "abcd");
+        assert_eq!(strip_archive_extensions("abcd.tar.zst"), "abcd");
+        assert_eq!(strip_archive_extensions("abcd.tgz"), "abcd");
+        assert_eq!(strip_archive_extensions("abcd.zip"), "abcd");
+        assert_eq!(strip_archive_extensions("abcd.TAR.XZ"), "abcd");
+        assert_eq!(strip_archive_extensions("abcd.bin"), "abcd.bin");
+        assert_eq!(strip_archive_extensions(".tar"), ".tar");
     }
 
     #[test]

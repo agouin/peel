@@ -2804,7 +2804,7 @@ fn ensure_parent_dir(path: &Path) -> Result<(), CoordinatorError> {
     Ok(())
 }
 
-fn filename_from_url(url: &Url) -> Option<String> {
+pub(crate) fn filename_from_url(url: &Url) -> Option<String> {
     let path = url.path().split('?').next()?;
     let last = path.rsplit('/').next()?;
     if last.is_empty() {
