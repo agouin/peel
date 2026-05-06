@@ -61,8 +61,12 @@ pub const MAX_WINDOW_LOG: u32 = 27;
 pub const MIN_FRAME_HEADER_LEN: usize = 5;
 
 /// Largest possible regular-frame header length: magic 4 + FHD 1 +
-/// WD 1 + DID 4 + FCS 8 = 14.
-pub const MAX_FRAME_HEADER_LEN: usize = 14;
+/// WD 1 + DID 4 + FCS 8 = 18. The streaming decoder allocates a
+/// buffer of this size for the FHD-driven tail read; an undersized
+/// constant causes an out-of-bounds slice when the producer picks
+/// max-width DID + FCS encodings (found by `cargo fuzz` target
+/// `frame_boundary`).
+pub const MAX_FRAME_HEADER_LEN: usize = 18;
 
 /// What kind of frame a 4-byte magic identifies.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -517,6 +521,34 @@ mod tests {
             let buf = vec![0u8; take];
             assert!(parse_skippable_frame_size(&buf).is_err());
         }
+    }
+
+    /// Regression test for a fuzz-discovered out-of-bounds slice: the
+    /// streaming decoder allocates `[0u8; MAX_FRAME_HEADER_LEN]` and
+    /// slices `full[5..5 + frame_header_tail_len(fhd)]` *before*
+    /// `parse_frame_header` rejects non-zero dict_id / reserved-bit
+    /// FHDs, so the constant must cover every FHD value, not just
+    /// the ones the parser accepts. Prior to the fix the constant
+    /// was 14 while the actual max (FHD=0xF7: SS+max-DID+max-FCS)
+    /// is 18.
+    #[test]
+    fn max_frame_header_len_covers_every_fhd_tail() {
+        let mut worst = 0usize;
+        let mut worst_fhd = 0u8;
+        for fhd in 0u8..=0xFF {
+            let total = 5 + frame_header_tail_len(fhd);
+            if total > worst {
+                worst = total;
+                worst_fhd = fhd;
+            }
+        }
+        assert!(
+            worst <= MAX_FRAME_HEADER_LEN,
+            "fhd=0x{worst_fhd:02X} needs {worst} header bytes but \
+             MAX_FRAME_HEADER_LEN={MAX_FRAME_HEADER_LEN}",
+        );
+        // Sanity: the worst case should match the documented arithmetic.
+        assert_eq!(worst, 18, "RFC 8478 max regular-frame header");
     }
 
     #[test]
