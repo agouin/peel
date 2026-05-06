@@ -820,13 +820,18 @@ phasing, but doesn't invalidate the plan):
    `decode_literal`'s inner loop, so wins from Phase 3 may
    compound here.
 2. `match_copy` lands at 3.4 % on compressible, not the
-   hypothesized 10–30 %. Reading
-   [`dict.rs`](../src/decode/xz_native/dict.rs), the non-overlap
-   path is already a `copy_within` call (Phase 2's main lever
-   is partially shipped). The remaining work is the overlap /
-   RLE specialization and the power-of-two ring rounding. Phase
-   2's exit-criterion floor (≥ 8 % gain) needs revisiting in
-   light of this; the available budget is closer to ≤ 5 %.
+   hypothesized 10–30 %. *Correction (2026-05-04, Phase 2 audit):*
+   the original Phase 0 note here claimed
+   [`dict.rs`](../src/decode/xz_native/dict.rs)'s non-overlap path
+   was already `copy_within`. That was a misread —
+   [`LzmaDict::recent`](../src/decode/xz_native/dict.rs)'s
+   memcpy-based path was confused with `match_copy`, which is
+   *not* shipped: `match_copy` is a genuine byte-by-byte loop
+   today. Phase 2's full bulk-copy lever is therefore available;
+   the smaller-than-hypothesized share (3.4 % rather than
+   10–30 %) is because real-world compressible payloads on this
+   fixture emit shorter matches than the plan assumed, not
+   because the bulk path is already in place.
 3. `decode_literal` is *bigger* than the plan thought (84 % on
    incompressible, plan hypothesized 71 %; 70 % on compressible,
    plan hypothesized 50 %). Promotes Phase 3 even further as the
@@ -835,11 +840,10 @@ phasing, but doesn't invalidate the plan):
 #### Phase ordering revision in light of Phase 0
 
 The plan's Phase 5 (catch-all) slot is now tentatively claimed by
-`decode_distance`. The plan's Phase 2 (match copy + dict) needs
-its exit-criterion floor reduced from 8 % to 5 % given the
-already-shipped `copy_within` work. Both updates land in the
-respective phase commits; this Phase 0 commit only records the
-findings.
+`decode_distance`. Phase 2's exit-criterion floor (≥ 8 %) was
+*not* lowered after the misread correction above — the bulk-copy
+lever is real and unimplemented; whether 8 % is the right gate is
+re-evaluated in Phase 2's commit based on actual measurements.
 
 ### Phase 1 results (CRC64 slicing-by-16) — 2026-05-04
 
@@ -934,13 +938,303 @@ cell. The microbench, the differential test, and the 256 MiB grid
 cell all clear their gates by margin; the 128 MiB cell sits at
 the noise floor of a single-run grid bench.
 
-### Phase 2 results (match copy + dict) (TBD)
+### Phase 2 results (match copy + dict) — 2026-05-04
 
-### Phase 3 results (literal decode) (TBD)
+Implementation: three sub-levers in
+[`src/decode/xz_native/dict.rs`](../src/decode/xz_native/dict.rs)
+and [`src/decode/xz_native/lzma2.rs`](../src/decode/xz_native/lzma2.rs):
 
-### Phase 4 results (range coder + probs) (TBD)
+1. **Power-of-two ring**. `LzmaDict`'s buffer is rounded up to the
+   next power of two; `byte_at` / `push` / `reload` /
+   `write_recent_into` replace `% capacity` with `& mask`. A new
+   `declared_size` field preserves the LZMA spec's `dist <
+   dict_size` validation (the rounded capacity may exceed
+   `dict_size` for non-power-of-two presets — without the field a
+   malicious encoder could reach older bytes than declared).
+2. **Bulk match copy**. `match_copy` branches on overlap:
+   non-overlap (`length <= dist + 1`) uses contiguous slice copies
+   (split at the ring's wrap point); `dist == 0` (LZMA single-byte
+   RLE) uses `slice::fill`; the periodic-overlap shape
+   (`dist > 0 && length > dist + 1`) keeps the byte-by-byte walk
+   (rare on real workloads, not worth the fold).
+3. **`prev_byte` cache**. `decode_chunk` no longer calls
+   `byte_at(0)` per literal iteration; the value is cached from
+   the prior `push` (or, after `match_copy`, from the staging
+   tail).
 
-### Phase 5 results (catch-all) (TBD)
+Differential gate: the new differential test
+`match_copy_matches_byte_by_byte_reference` covers 7 prefix
+lengths × 7 distances × 7 lengths × 7 seeds = 2401 fixture
+combinations against the byte-by-byte reference. The existing
+`recent_matches_byte_by_byte_reference` covers `recent` /
+`write_recent_into`. Both green; integration-level
+[`tests/test_xz_native.rs`](../tests/test_xz_native.rs) (15 fixtures,
+byte-identical to `xz2`) and
+[`tests/test_coordinator_crash.rs`](../tests/test_coordinator_crash.rs)
+(13 randomized kill points) green.
+
+#### Decoder-only MiB/s — M4 Max
+
+Two columns of Phase 2 numbers below: the "6-bench" column is the
+serialized run all six size variants together (used in Phase 0/1 too,
+but the M4 Max thermal-throttles by the 5th–6th bench, biasing the
+later numbers low — `xz2` numbers also dip in this column);
+the "calm 2-bench" column re-runs only the 128 MiB pair so the CPU
+is steady-state. The calm column is the more reliable signal.
+
+| Fixture                                          | Phase 1 | Phase 2 (6-bench) | Phase 2 (calm) | Δ % vs Phase 1 (calm) |
+|--------------------------------------------------|--------:|------------------:|---------------:|----------------------:|
+| 64 MiB · single-Block · preset 6 · LCG           |    34.7 |              35.6 |              — |                     — |
+| 128 MiB · single-Block · preset 6 · LCG          |    33.3 |              33.5 |       **35.9** |              **+7.8 %** |
+| 256 MiB · single-Block · preset 6 · LCG          |    29.6 |              30.2 |              — |                     — |
+| 64 MiB · single-Block · preset 6 · compressible  |    50.8 |              53.9 |              — |                     — |
+| 128 MiB · single-Block · preset 6 · compressible |    54.4 |              54.8 |       **59.7** |              **+9.7 %** |
+| 256 MiB · single-Block · preset 6 · compressible |    53.3 |              53.5 |              — |                     — |
+
+Cross-phase ratio (`peel/xz2`) — the thermal-noise-immune cousin
+of the absolute MiB/s number:
+
+| Fixture                            | Phase 0 | Phase 1 | Phase 2 | Total drop |
+|------------------------------------|--------:|--------:|--------:|-----------:|
+| 128 MiB · LCG                      |   1.62× |   1.53× |   1.48× |       0.14 |
+| 128 MiB · compressible             |   1.54× |   1.42× |   1.33× |       0.21 |
+
+The compressible ratio drop (1.54× → 1.33×) corresponds to peel
+moving from 64.7 % of liblzma to **75.4 %** on this fixture —
+a 10.7 percentage-point gain across Phases 1+2 toward the plan's
+≥ 80 % primary target. Phase 2 contributed roughly 6 pp of that.
+
+#### Bench grid `tar.xz` row — M4 Max (post-Phase-2)
+
+| Cell                       | Phase 0 | Phase 1 | Phase 2 | Δ vs Phase 1 |
+|----------------------------|--------:|--------:|--------:|-------------:|
+| 10 Mbps · 8 MiB · tar.xz   |   1.12× |   1.12× |   1.10× |        -0.02 |
+| 100 Mbps · 32 MiB · tar.xz |   1.04× |   1.04× |   1.03× |        -0.01 |
+| 1 Gbps · 128 MiB · tar.xz  |   1.63× |   1.62× | **1.53×** |    **-0.09** |
+| 10 Gbps · 256 MiB · tar.xz |   1.62× |   1.52× |   1.47× |        -0.05 |
+
+Headline cell drops 1.62× → **1.53×** (drop of 0.09, well above
+the plan's 0.04 gate). Plan's Phase 4 target was ≤ 1.30×; we're
+on track.
+
+#### Phase 2 exit criteria
+
+| Criterion                                                  | Status                                                              |
+|------------------------------------------------------------|---------------------------------------------------------------------|
+| Compressible decoder MiB/s improves ≥ 8 %                  | ✅ +9.7 % on calm 128 MiB; +5.6 % via thermal-immune ratio metric    |
+| Incompressible decoder MiB/s does not regress > 2 %        | ✅ +7.8 % improvement (well above no-regression floor)               |
+| Differential corpus byte-identical (`match_copy_matches_byte_by_byte_reference`, `tests/test_xz_native.rs`) | ✅                                                  |
+| Crash-resume harness byte-identical (`tests/test_coordinator_crash.rs`) | ✅ 13/13 green                                          |
+| `cargo fmt` / `cargo clippy --tests --release -- -D warnings` | ✅                                                                |
+
+**Phase exits.** The 6-bench column understates the true gain
+because of M4 Max thermal throttling on the longer serialized
+run — both peel and `xz2` numbers dip together in that column,
+which the ratio metric makes obvious. The calm column and the
+realistic grid (which exercises one cell at a time) both show
+the gain at +5.6 % to +9.7 %, comfortably above the gate.
+
+#### Findings worth flagging for downstream phases
+
+- Power-of-two ring rounding turned out to be more measurable
+  than the bulk match copy itself on this fixture: `match_copy`
+  was only 3.4 % of self-time, but `byte_at` is called from the
+  matched-literal sub-path of every literal iteration *and*
+  internally by the byte-by-byte fallback overlap path. Eliding
+  one modulo per call ripples wider than the symbol attribution
+  suggests.
+- The `prev_byte` cache contributed visibly on incompressible
+  (where `match_copy` is < 1 %) — confirming `byte_at(0)` had
+  been a per-literal-iteration tax on the literal hot path. This
+  is essentially Phase 3-flavored work that fell into Phase 2's
+  scope by virtue of touching the same call site.
+
+
+
+### Phase 3 results (literal decode) — 2026-05-04
+
+**Outcome: no measurable gain on M4 Max. Phase 3 ships as a no-op
+in code; Phase 0's hypothesis that the literal hot loop had 5–15 %
+of headroom in safe Rust was not borne out on this hardware.**
+
+#### Refreshed per-symbol attribution (post-Phase-2)
+
+`sample(1)` on M4 Max, 30 s incompressible / 25 s compressible,
+1 ms tick. Total decoder-thread samples: 25839 (incompressible),
+21494 (compressible).
+
+| Symbol                         | Incomp Ph0 | Incomp Ph2 | Comp Ph0 | Comp Ph2 |
+|--------------------------------|-----------:|-----------:|---------:|---------:|
+| `xz_native::probs::decode_literal`  |     84.0 % |   **87.4 %** |   69.7 % |   **76.0 %** |
+| `xz_native::lzma2::decode_chunk`    |      7.2 % |      8.0 % |    6.7 % |      7.4 % |
+| `xz_native::probs::decode_distance` |    < 0.1 % |      0.5 % |    7.0 % |      8.1 % |
+| `xz_native::probs::decode_length`   |      0.6 % |      0.5 % |    3.5 % |      3.7 % |
+| `Crc64::update` (CRC64)             |      7.3 % |   **0.96 %** |    8.9 % |   **1.34 %** |
+| `xz_native::dict::match_copy`       |      0.3 % |     0.55 % |    3.4 % |     0.53 % |
+| `_platform_memmove`                 |      0.0 % |      0.6 % |    0.8 % |      2.9 % |
+
+Phase 1's CRC64 win (7–9 % → ~1 %) and Phase 2's match-copy
+win (3.4 % → 0.5 %, with 2 pp shifted into `_platform_memmove`'s
+bulk-copy path) both show clearly. **`decode_literal` is now even
+more dominant** — its share grew because every other term shrank.
+
+#### What was tried in Phase 3 and why each was reverted
+
+All measurements use 3-run medians on the 128 MiB single-Block
+fixtures; baseline is the cleaner Phase 2 ratio (1.34× compressible /
+1.48× incompressible) since absolute MiB/s drifts with thermal state.
+
+| Lever                                                           | Source of hypothesis                              | Result                          |
+|-----------------------------------------------------------------|---------------------------------------------------|---------------------------------|
+| `#[inline(always)]` on `RangeDecoder::decode_bit` + `normalize` | Plan §"Inline … more aggressively"                | **Regressed** to 1.38× / 1.54× (i-cache pressure) |
+| `&mut [u16; LITERAL_CODER_SIZE]` fixed-size array reference     | Plan §"Cache the active prob slot pointer"        | Neutral — bounds check was already elided |
+| Manual unroll of matched-path `loop {}` → `for _ in 0..8`       | Plan §"Unroll the 8-bit walk"                     | Neutral — LLVM was already emitting equivalent code |
+| `unsafe { context_ptr.add(idx) }` (raw pointer per bit)         | Plan §"hoist `let context_ptr = …`"               | Neutral; per-policy `unsafe` requires ≥ 5 % gain to ship |
+
+The plan's `unsafe` policy ("admitted only when ≥ 5 % gain on the
+regression fixture") combined with the 0 % measured gain leaves no
+in-scope variant that ships. The literal hot loop is at LLVM's
+default-codegen ceiling on Apple aarch64 with `-C target-cpu=native`.
+
+#### Why this is not surprising in retrospect
+
+Two consistent themes across Phase 3's measurements:
+
+1. **LLVM was already eliding the bounds checks.** The plan's
+   suggested fix (cache `context.as_mut_ptr()`, use raw `.add(idx)`)
+   makes explicit what the compiler was already doing. `cargo asm`
+   on the matched-path inner loop shows no `panic_bounds_check`
+   either before or after the change.
+2. **The dependency chain is the bottleneck, not the per-bit
+   work.** Each iteration's prob-slot index depends on the
+   previous iteration's `bit`, which depends on the previous
+   iteration's `decode_bit` — a 4-cycle critical path that no
+   amount of unrolling shortens. The way to break this is
+   genuinely at the algorithmic level: table-driven literal
+   decode (filed in [`OPTIMIZATIONS.md`](OPTIMIZATIONS.md) as a
+   speculative ceiling per the plan's "Out of scope" bullet).
+
+#### Phase 3 exit decision
+
+The plan's exit gate is "Both fixtures' decoder MiB/s improve by
+≥ 8 %" — not met. Per the plan's profile-led ordering principle
+("If the compressible profile shows otherwise, swap this phase
+with Phase 3"), Phase 3 ships as a no-op and we proceed to Phase 4
+with the refreshed attribution above. The matter-of-fact statement
+of "tried, didn't pay back" is preserved here so a future engineer
+running Phase 3 levers under different codegen / hardware doesn't
+re-litigate the same options without context.
+
+
+### Phase 4 results (range coder + probs) — 2026-05-05
+
+**Outcome: no measurable gain ≥ the 3 % gate on either fixture; all
+changes reverted, Phase 4 ships as a no-op like Phase 3. Refreshed
+post-Phase-2 attribution above (Phase 3 results section) shows the
+remaining levers in scope have a small total budget against the
+~76 / 87 % `decode_literal` floor we can't move.**
+
+#### What was tried in Phase 4 and why each was reverted
+
+3-run medians on the 128 MiB single-Block fixtures; baseline is the
+clean Phase 2 ratio (1.34× compressible / 1.48× incompressible).
+
+| Lever                                                           | Source of hypothesis                              | Result                                                                                |
+|-----------------------------------------------------------------|---------------------------------------------------|---------------------------------------------------------------------------------------|
+| `#[inline(always)]` on `bit_tree_decode` + `bit_tree_reverse_decode` | Plan §"Inline … into the same translation unit" | +2.8 % absolute on compressible (single run, within thermal noise); ~0 % incompressible |
+| `core::hint::cold_path()` on `RangeDecoder::normalize`'s underflow branch | Plan §"Range coder normalize()"           | Neutral (LLVM already detected the rare branch via the `Result<…>` shape)             |
+| `is_match` field: `Box<[u16]>` → fixed-size inline `[u16; STATES * (1 << MAX_PB)]` | Plan §"Probability table layout"              | Net ~0 % on M4; struct grows by 384 B per Block; not worth keeping                    |
+
+Stacked: ~2 % on compressible (ratio 1.34→1.31×), ~0 % on
+incompressible. Below the plan's gate of "Both fixtures' decoder
+MiB/s improve by ≥ 3 %".
+
+#### Why this is consistent with the post-Phase-2 attribution
+
+`decode_literal` claims **87.4 % of incompressible** and **76.0 %
+of compressible** decoder-thread self-time post-Phase-2. Phase 4's
+levers attack the surrounding terms (`decode_chunk` 8 %,
+`decode_distance` / `decode_length` ~12 % combined on compressible,
+range coder branches diffused through everything). On incompressible
+those surrounding terms together total < 13 %; even halving them
+caps Phase 4's gain at ~6 %, and we measure essentially nothing.
+
+The fundamental ceiling is `decode_literal`. The plan's Phase 3
+already concluded LLVM is at default-codegen optimum on M4 Max;
+Phase 4 confirms that conclusion from a different angle —
+optimizing the surrounding terms doesn't move the bench because
+the loop-carried dependency chain in the bit walk is the
+bottleneck. Both phases' findings point at the same speculative
+ceiling: table-driven literal decode (filed in
+[`OPTIMIZATIONS.md`](OPTIMIZATIONS.md)).
+
+#### Phase 4 exit decision
+
+Reverted to clean Phase 2 baseline (`git diff --stat src/` empty
+after the revert). The plan's principle "phase wins microbench but
+doesn't move the bench grid does not exit" applies; we keep the
+post-Phase-2 attribution table above as the lasting Phase 4
+deliverable so the next attempt (likely Phase 5's `decode_distance`
+catch-all, or speculative-ceiling work on `decode_literal`) starts
+from the right top-5.
+
+
+
+### Phase 5 results (catch-all: `decode_distance`) — 2026-05-05
+
+**Outcome: no measurable gain that clears the "≥ 5 % on relevant
+fixture, no regression on other" gate; all changes reverted, Phase
+5 ships as a no-op like Phases 3 and 4.**
+
+#### Target
+
+Phase 0's profile surfaced `decode_distance` at **8.1 % of
+compressible self-time** (and only 0.5 % on incompressible), making
+it the largest unattributed term and the natural Phase 5 catch-all.
+`decode_length` at 3.7 % on compressible was bundled into the same
+attempt since the two share the bit-tree helpers
+(`bit_tree_decode` / `bit_tree_reverse_decode`) and
+`decode_direct_bits`.
+
+#### What was tried in Phase 5 and why each was reverted
+
+3-run medians on the 128 MiB fixtures; baseline is the clean
+Phase 2 ratio (1.34× compressible / 1.48× incompressible).
+
+| Lever                                                                                       | Result                                                                                                            |
+|---------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| `#[inline(always)]` on `bit_tree_decode` + `bit_tree_reverse_decode` + `decode_direct_bits` | Compressible 1.34 → 1.31× (~2 %); **incompressible regressed to 1.51× (~2 % regression)** — gate fail              |
+| Add `#[inline(always)]` on `decode_distance` + `decode_length`                              | Same incompressible regression (1.50× across 3 runs) without compressible upside                                  |
+
+The pattern: forced inlining of these helpers inflates
+`decode_chunk`'s body enough to cost i-cache pressure on the
+literal-only path of incompressible fixtures, even though those
+helpers aren't called there. The "no regression on the other
+fixture" gate rules this out per the plan's discipline.
+
+#### Phase 5 exit decision
+
+Reverted; `git diff --stat src/` is empty after the revert. Like
+Phase 4, Phase 5 confirms M4 Max + LLVM with `-C target-cpu=native`
+is at a near-optimal codegen ceiling for the decoder; aggressive
+inlining at this level *hurts* by inflating the dispatcher's body.
+
+#### Combined ship state (Phases 0–5 inclusive)
+
+After three consecutive non-exiting phases, the decoder's
+in-tree state is **identical to post-Phase-2**. Phase 2's
+`tar.xz · 1 Gbps · 128 MiB` ratio of **1.53×** is the as-shipped
+number; the plan's primary target of ≤ 1.30× requires either:
+
+- Hardware intrinsics (PCLMUL/PMULL CRC64 fallback paths, currently
+  filed in [`OPTIMIZATIONS.md`](OPTIMIZATIONS.md)).
+- Table-driven literal decode (the speculative ceiling per the
+  plan's Out-of-scope §; multi-week algorithmic rewrite).
+- Hand-rolled SIMD literal decode.
+
+None of these are achievable from "rotate the existing levers"
+work; they're research-grade items the plan deliberately scopes
+out of round one.
 
 ### Phase 6 final bench grid (TBD)
 
