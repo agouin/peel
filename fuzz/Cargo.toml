@@ -1,0 +1,70 @@
+# Fuzzing harness for the `peel` crate.
+#
+# Lives in its own self-contained package so the runtime crate stays
+# free of the libfuzzer / nightly toolchain plumbing. Run from this
+# directory with the cargo-fuzz subcommand on a nightly toolchain:
+#
+#     cargo install cargo-fuzz
+#     cargo +nightly fuzz run <target>
+#
+# Approved per `docs/ENGINEERING_STANDARDS.md` §5.2 ("Fuzz tests
+# (cargo fuzz)"), which calls out HTTP response parsing, checkpoint
+# file parsing, and frame boundary detection as the required
+# coverage areas — one fuzz target per area lives in `fuzz_targets/`.
+
+[package]
+name = "peel-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+peel-rs = { path = ".." }
+
+# Detach from any future workspace in the parent directory so the
+# fuzz crate keeps its own Cargo.lock and dependency graph.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "checkpoint_deserialize"
+path = "fuzz_targets/checkpoint_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response_parsing"
+path = "fuzz_targets/http_response_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_boundary"
+path = "fuzz_targets/frame_boundary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip_format"
+path = "fuzz_targets/zip_format.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_sink"
+path = "fuzz_targets/tar_sink.rs"
+test = false
+doc = false
+bench = false

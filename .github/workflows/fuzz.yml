@@ -1,0 +1,98 @@
+name: Fuzz
+
+on:
+  # Weekly cron: 03:17 UTC every Sunday. Off-peak so it doesn't compete
+  # with the regular CI minutes during the work week.
+  schedule:
+    - cron: "17 3 * * 0"
+  # Manual trigger for ad-hoc runs and corpus refreshes.
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz budget, in seconds"
+        required: false
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't let one target's crash hide the others — every target
+      # gets its full budget on every run.
+      fail-fast: false
+      matrix:
+        target:
+          - checkpoint_deserialize
+          - http_response_parsing
+          - frame_boundary
+          - zip_format
+          - tar_sink
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        # cargo-fuzz needs nightly for libFuzzer's sanitizer / coverage
+        # flags. Pinned via rustup-toolchain so the runner is
+        # deterministic; no rust-toolchain.toml in `fuzz/` because
+        # local users may want to track upstream nightly.
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup default nightly
+
+      - name: Cache cargo + fuzz target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: fuzz-${{ runner.os }}-
+
+      - name: Install cargo-fuzz
+        run: |
+          if ! command -v cargo-fuzz >/dev/null; then
+            cargo install cargo-fuzz --locked
+          fi
+
+      - name: Seed corpus from checked-in seeds
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          if [ -d fuzz/seeds/${{ matrix.target }} ]; then
+            cp -r fuzz/seeds/${{ matrix.target }}/. fuzz/corpus/${{ matrix.target }}/
+          fi
+
+      - name: Run fuzz target
+        working-directory: fuzz
+        env:
+          DURATION: ${{ github.event.inputs.duration_seconds || '300' }}
+        # `-max_total_time` halts libFuzzer cleanly; the wrapping
+        # `timeout` is a belt-and-suspenders ceiling so a misbehaving
+        # target can't burn the runner.
+        run: |
+          timeout $((DURATION + 60)) \
+            cargo +nightly fuzz run ${{ matrix.target }} \
+              -- -max_total_time=$DURATION
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload corpus snapshot
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 14
