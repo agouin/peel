@@ -225,11 +225,13 @@ pub enum CheckpointError {
         found: [u8; 8],
     },
 
-    /// The file declares a `format_version` newer than this build can
-    /// parse. Per §9.4 the older binary refuses to guess at the new
-    /// layout and surfaces this so the caller can surface a clean
-    /// upgrade-required message.
-    #[error("checkpoint format version {found} is newer than supported max {supported_max}")]
+    /// The file declares a `format_version` outside the supported
+    /// range `1..=FORMAT_VERSION`. Version 0 has never existed and
+    /// versions above [`FORMAT_VERSION`] are produced by newer
+    /// binaries; per §9.4 the older binary refuses to guess at either
+    /// shape and surfaces this so the caller can produce a clean
+    /// "checkpoint not readable / upgrade required" message.
+    #[error("checkpoint format version {found} is not in supported range 1..={supported_max}")]
     UnsupportedVersion {
         /// The version recorded in the file header.
         found: u32,
@@ -783,7 +785,11 @@ impl Checkpoint {
         }
 
         let format_version = read_u32(&bytes[8..12]);
-        if format_version > FORMAT_VERSION {
+        // Version 0 has never existed; reject it explicitly so the
+        // body-layout dispatch below (which assumes 1..=FORMAT_VERSION)
+        // is unreachable on adversarial input. Found by `cargo fuzz`
+        // target `checkpoint_deserialize`.
+        if format_version == 0 || format_version > FORMAT_VERSION {
             return Err(CheckpointError::UnsupportedVersion {
                 found: format_version,
                 supported_max: FORMAT_VERSION,

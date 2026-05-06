@@ -201,6 +201,33 @@ fn forward_compat_rejects_newer_format_version() {
     }
 }
 
+/// Regression test for a fuzz-discovered crash: a checkpoint header
+/// that declares `format_version == 0` previously slipped past the
+/// "newer than supported" check and tripped a `debug_assert!` in
+/// `decode_body`. The deserializer's contract is "never panics on
+/// adversarial input"; v0 must be rejected with `UnsupportedVersion`.
+#[test]
+fn rejects_format_version_zero() {
+    let path = unique_temp("v0");
+    let _g = CleanupOnDrop(path.clone());
+
+    let ckpt = realistic_tar_checkpoint();
+    let mut bytes = ckpt.serialize();
+    bytes[8..12].copy_from_slice(&0u32.to_le_bytes());
+    fs::write(&path, &bytes).expect("write tampered");
+
+    match Checkpoint::read(&path).unwrap_err() {
+        CheckpointError::UnsupportedVersion {
+            found,
+            supported_max,
+        } => {
+            assert_eq!(found, 0);
+            assert_eq!(supported_max, FORMAT_VERSION);
+        }
+        other => panic!("expected UnsupportedVersion, got {other:?}"),
+    }
+}
+
 /// Plan §9: the format is *not* JSON — peeking at the first eight
 /// bytes of a written file should observe the magic the reader
 /// validates against. Keeps anyone tempted to add a JSON parser later
