@@ -465,6 +465,24 @@ impl StreamingDecoder for GzipDecoder {
         self.last_frame_boundary
     }
 
+    fn set_source_start_offset(&mut self, offset: u64) {
+        // Gzip wraps a `BitReader` that reports the source-byte floor;
+        // align it the same way the bare deflate decoder does. Only
+        // reseat when the BitReader is fresh — the `resume_factory`
+        // path hands the cursor to an inner deflate decoder
+        // (`self.bits = None`) that has already been seeded and may
+        // have consumed bits, and even when the wrapper retains
+        // ownership the BitReader can be mid-pull.
+        if let Some(bits) = self.bits.as_mut() {
+            if bits.is_untouched() {
+                bits.set_byte_offset(offset);
+            }
+        }
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_source_start_offset(offset);
+        }
+    }
+
     fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // Gzip blobs only round-trip mid-deflate-body, when the
         // inner decoder is at a deflate-block boundary. Between

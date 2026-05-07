@@ -41,9 +41,13 @@ pub struct IdentityDecoder {
     /// EOF; subsequent steps return [`DecodeStatus::Eof`] without
     /// touching the source again.
     source: Option<Box<dyn Read + Send>>,
-    /// Total bytes copied from the source so far. Equal to bytes
-    /// written into the sink — this decoder is byte-for-byte.
-    bytes_copied: u64,
+    /// Global high-water mark in the source: bytes that have already
+    /// been consumed by *some* run, plus bytes copied in this run.
+    /// Initialized to 0 (fresh runs) and bumped by
+    /// [`StreamingDecoder::set_source_start_offset`] on resume so the
+    /// extractor's `decoder_position` stays aligned with the sink's
+    /// `archive_offset` across kill/restart cycles.
+    bytes_consumed: u64,
     /// Pre-allocated scratch space for the next decode step.
     output_buf: Vec<u8>,
 }
@@ -63,7 +67,7 @@ impl IdentityDecoder {
     pub fn new(src: Box<dyn Read + Send>) -> Result<Self, DecodeError> {
         Ok(Self {
             source: Some(src),
-            bytes_copied: 0,
+            bytes_consumed: 0,
             output_buf: vec![0u8; OUTPUT_CHUNK],
         })
     }
@@ -87,11 +91,11 @@ impl StreamingDecoder for IdentityDecoder {
                     .map_err(DecodeError::Write)?;
                 // INVARIANT: `n <= OUTPUT_CHUNK <= isize::MAX`, so the
                 // `as u64` cast cannot truncate.
-                self.bytes_copied = self.bytes_copied.saturating_add(n as u64);
+                self.bytes_consumed = self.bytes_consumed.saturating_add(n as u64);
                 Ok(DecodeStatus::MoreData)
             }
             Err(err) => {
-                let consumed = self.bytes_copied;
+                let consumed = self.bytes_consumed;
                 // A read error is terminal; subsequent steps must not
                 // attempt to pull more bytes from a source the OS has
                 // already told us is unhappy.
@@ -105,17 +109,26 @@ impl StreamingDecoder for IdentityDecoder {
     }
 
     fn bytes_consumed(&self) -> ByteOffset {
-        ByteOffset::new(self.bytes_copied)
+        ByteOffset::new(self.bytes_consumed)
     }
 
     fn frame_boundary(&self) -> Option<ByteOffset> {
         // The whole stream is one big restart-aligned region — every
         // observed offset is a valid resume point. Reporting
-        // bytes_copied lets the extractor's quiescent-checkpoint
-        // cadence land at the natural sink-side member boundaries
-        // instead of stalling waiting for a frame transition that will
-        // never arrive.
-        Some(ByteOffset::new(self.bytes_copied))
+        // `bytes_consumed` (a global source offset) lets the
+        // extractor's quiescent-checkpoint cadence land at the natural
+        // sink-side member boundaries instead of stalling waiting for
+        // a frame transition that will never arrive.
+        Some(ByteOffset::new(self.bytes_consumed))
+    }
+
+    fn set_source_start_offset(&mut self, offset: u64) {
+        // Identity decode has no internal state to migrate — the
+        // counter doubles as the high-water mark, so seeding it makes
+        // every subsequent report align with the global source. Called
+        // once before the first `decode_step`; calling later would
+        // smear progress and is forbidden by the trait contract.
+        self.bytes_consumed = offset;
     }
 }
 

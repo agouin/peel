@@ -643,6 +643,20 @@ impl StreamingDecoder for Decoder {
         self.last_frame_boundary
     }
 
+    fn set_source_start_offset(&mut self, offset: u64) {
+        // Only seed when the BitReader is fresh from the regular
+        // factory (zero bits buffered, nothing pulled, byte counter
+        // still at 0). The resume-factory path constructs via
+        // `new_at(start_offset)` and may then have consumed bits to
+        // honor the captured bit-offset within the boundary byte —
+        // reseating after that smear would either underreport
+        // (current cursor > offset) or trigger the
+        // `set_byte_offset`-must-be-untouched guard.
+        if self.bits.is_untouched() {
+            self.bits.set_byte_offset(offset);
+        }
+    }
+
     fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // Snapshotable iff we're between blocks (just past EOB /
         // end-of-stored-payload) and we've decoded at least one

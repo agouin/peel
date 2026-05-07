@@ -117,6 +117,36 @@ impl BitReader {
         }
     }
 
+    /// Reseat the byte-counter baseline. Equivalent to having
+    /// constructed via [`Self::new_at`] with this `byte_offset`. Only
+    /// valid before any bits have been consumed — the runtime check
+    /// guards against the smear that'd otherwise occur if a reseat
+    /// landed mid-byte.
+    pub fn set_byte_offset(&mut self, byte_offset: u64) {
+        debug_assert!(
+            self.is_untouched(),
+            "BitReader::set_byte_offset called after the cursor advanced \
+             (nbits={}, pull_pos={}, pull_filled={}, bytes_into_acc={})",
+            self.nbits,
+            self.pull_pos,
+            self.pull_filled,
+            self.bytes_into_acc,
+        );
+        self.bytes_into_acc = byte_offset;
+    }
+
+    /// `true` when the cursor is at its post-construction zero state
+    /// — no bits buffered, no bytes pulled, no bytes shifted into the
+    /// accumulator. Used by the deflate / gzip decoders'
+    /// `set_source_start_offset` overrides to distinguish a fresh
+    /// regular-factory build (safe to reseat) from a
+    /// `resume_factory`-built reader that has already been positioned
+    /// and may have consumed bits during the bit-skip dance.
+    #[must_use]
+    pub fn is_untouched(&self) -> bool {
+        self.nbits == 0 && self.pull_pos == self.pull_filled && self.bytes_into_acc == 0
+    }
+
     /// Best-effort: top up the accumulator from the pull-buffer
     /// (and the source, if the pull-buffer is empty) until it
     /// holds at least `n` valid bits, **or the source is

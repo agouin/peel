@@ -690,6 +690,14 @@ impl StreamingDecoder for Lz4Decoder {
         self.last_frame_boundary
     }
 
+    fn set_source_start_offset(&mut self, offset: u64) {
+        // Idempotent for the resume-factory path: `resume_factory`
+        // already seeds `bytes_consumed = start_offset`. For the
+        // regular factory this aligns the counter with the global
+        // source on resume from a frame end (no decoder state blob).
+        self.bytes_consumed = offset;
+    }
+
     fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // The blob is only meaningful at a position where the
         // decoder is paused mid-frame, between blocks; resuming from

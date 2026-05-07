@@ -747,6 +747,16 @@ impl StreamingDecoder for Decoder {
         self.last_frame_boundary
     }
 
+    fn set_source_start_offset(&mut self, offset: u64) {
+        // Idempotent for the resume-factory path: `resume::resume`
+        // already seeds `bytes_consumed = start_offset`, so calling
+        // here with the same offset is a no-op. The regular factory
+        // leaves the counter at zero; this is what aligns it with the
+        // global source offset on resume from a frame end (no decoder
+        // state blob saved at frame boundaries).
+        self.bytes_consumed = offset;
+    }
+
     fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
         // The blob is meaningful only when paused at a block
         // boundary inside a regular frame. Between frames the
