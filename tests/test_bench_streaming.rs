@@ -163,6 +163,60 @@ fn encode_gzip(payload: &[u8]) -> Vec<u8> {
     encoder.finish().expect("finish gzip")
 }
 
+/// Multi-member gzip blob: `payload` split into `n_members`
+/// approximately-equal contiguous slices, each encoded as a
+/// stand-alone gzip member, then concatenated. Per RFC 1952 §2.2 this
+/// is a valid gzip stream (`gunzip -c`, `gzip -d`, `flate2`'s
+/// `MultiGzDecoder`, and peel's [`peel::decode::deflate_native::gzip`]
+/// all decode it back to `payload`).
+///
+/// This is the on-the-wire shape `pigz` / `gzip a b > c.gz` produces.
+/// Phase 0 of `docs/PLAN_gzip_throughput.md`: the round-one parallel-
+/// member decoder targets exactly this shape; baseline `gzip -d` does
+/// not parallelize across members but does decode them sequentially,
+/// so the same baseline pipe row applies.
+/// Pick a member count for a multi-member gzip fixture given the
+/// total payload size. Targets ~32 MiB per member (the size `pigz -B
+/// 32M` produces and the size at which member-discovery overhead
+/// amortizes well over the deflate work). Caps at 8 members so the
+/// bench grid's smaller cells don't fragment to triviality, and
+/// requires ≥ 2 MiB per member so a 4-member 8 MiB fixture still has
+/// non-trivial deflate bodies. Returns 1 (i.e. fall back to the
+/// single-member row) when the payload is too small to split.
+fn pick_gz_member_count(payload_bytes: usize) -> usize {
+    const TARGET_MEMBER_BYTES: usize = 32 * 1024 * 1024;
+    const MIN_MEMBER_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_MEMBERS: usize = 8;
+    if payload_bytes < 2 * MIN_MEMBER_BYTES {
+        return 1;
+    }
+    let by_target = payload_bytes.div_ceil(TARGET_MEMBER_BYTES).max(2);
+    let by_floor = payload_bytes / MIN_MEMBER_BYTES;
+    by_target.min(by_floor).clamp(2, MAX_MEMBERS)
+}
+
+fn encode_gzip_multi_member(payload: &[u8], n_members: usize) -> Vec<u8> {
+    assert!(n_members >= 1, "n_members must be ≥ 1");
+    if n_members == 1 || payload.is_empty() {
+        return encode_gzip(payload);
+    }
+    let chunk = payload.len() / n_members;
+    // Last member absorbs the remainder so the input length round-trips
+    // exactly; with `chunk = len / n` the first `n-1` members are
+    // `chunk` bytes and the last is `len - (n-1)*chunk`.
+    let mut out = Vec::with_capacity(payload.len() / 2 + 32 * n_members);
+    for i in 0..n_members {
+        let start = i * chunk;
+        let end = if i + 1 == n_members {
+            payload.len()
+        } else {
+            start + chunk
+        };
+        out.extend_from_slice(&encode_gzip(&payload[start..end]));
+    }
+    out
+}
+
 /// Single-frame, single-block, *uncompressed* LZ4 archive — the
 /// minimum-viable shape `peel::decode::lz4` accepts and which `lz4 -d`
 /// also decodes. Re-implemented here (rather than depending on a
@@ -1539,7 +1593,7 @@ fn bench_throttled_realistic_grid() {
             );
         }
 
-        // ---- tar.gz ----------------------------------------------------
+        // ---- tar.gz (single-member, default-`gzip` shape) -------------
         if tool_present("tar") && tool_present("gzip") {
             let body = encode_gzip(&archive);
             run_throttled_case(
@@ -1559,6 +1613,44 @@ fn bench_throttled_realistic_grid() {
                     )
                 },
             );
+        }
+
+        // ---- tar.gz (multi-member, `pigz`/concat shape) ---------------
+        // Phase 0 of `docs/PLAN_gzip_throughput.md`: this row exists so
+        // the README grid can show "tar.gz · multi" alongside the
+        // single-member row once parallel-member decode lands. The
+        // baseline pipe is the same `gzip -d` (handles concatenated
+        // members natively per RFC 1952 §2.2 — single-threaded), so the
+        // ratio is directly comparable to the row above. `peel` is
+        // currently single-threaded on this fixture too; the row
+        // becomes the regression-gate for Phase 3's parallel decode.
+        //
+        // Smaller cells: skip when `n_members > payload / 1 MiB`
+        // (members below 1 MiB stop being representative — `pigz`
+        // defaults to 128 KiB but real-world fixtures cluster at
+        // ~32 MiB members).
+        if tool_present("tar") && tool_present("gzip") {
+            let n_members = pick_gz_member_count(rate.payload_bytes);
+            if n_members >= 2 {
+                let body = encode_gzip_multi_member(&archive, n_members);
+                run_throttled_case(
+                    rate,
+                    mib,
+                    "tar.gz·m",
+                    "curl|gzip|tar",
+                    &body,
+                    &archive,
+                    &entries,
+                    "bundle.tar.gz",
+                    |dir| {
+                        format!(
+                            r#"curl -sS --limit-rate {limit} "$URL" | gzip -d -q | tar -xf - -C {dir}"#,
+                            limit = rate.bytes_per_sec,
+                            dir = shell_quote(dir),
+                        )
+                    },
+                );
+            }
         }
 
         // ---- tar.lz4 (uncompressed frame; framing-only test) ----------

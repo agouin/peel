@@ -653,6 +653,50 @@ mod tests {
         );
     }
 
+    /// Phase 0 of `docs/PLAN_gzip_throughput.md`: cross-validate the
+    /// hand-rolled streaming wrapper against `flate2`'s
+    /// `MultiGzDecoder` on an 8-member fixture (the `pigz`/concat
+    /// shape the parallel-member work in later phases targets). This
+    /// guards against drift between the streaming-path output and
+    /// the differential reference before the parallel path is layered
+    /// on; round-one parallel decode reuses this same single-member
+    /// inner loop, so any divergence here would corrupt the parallel
+    /// path's per-member output too.
+    #[test]
+    fn multi_member_eight_member_round_trip_matches_flate2() {
+        // Eight ~1 KiB members with distinct contents. Sized to keep
+        // the test fast on debug builds while still exercising the
+        // outer state-machine transitions across all members.
+        let mut combined = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0u8..8 {
+            let payload: Vec<u8> = (0..1024)
+                .map(|j| (j as u8).wrapping_add(i.wrapping_mul(31)))
+                .collect();
+            combined.extend_from_slice(&encode_gzip(&payload));
+            expected.extend_from_slice(&payload);
+        }
+
+        // peel's hand-rolled decoder.
+        let peel_out = decode_all(combined.clone());
+        assert_eq!(
+            peel_out, expected,
+            "peel multi-member output differs from concatenated payloads"
+        );
+
+        // flate2's MultiGzDecoder reference. Cross-validates the
+        // wire-format interpretation; differential corpus expansion
+        // (Phase 2 of the plan) will widen this to a 50-fixture sweep.
+        let mut flate_out = Vec::new();
+        flate2::read::MultiGzDecoder::new(Cursor::new(combined.clone()))
+            .read_to_end(&mut flate_out)
+            .expect("flate2 multi-member decode");
+        assert_eq!(
+            peel_out, flate_out,
+            "peel multi-member output differs from flate2's MultiGzDecoder"
+        );
+    }
+
     #[test]
     fn multi_member_round_trip_records_each_boundary() {
         let payload_a = b"member A payload".repeat(512);
