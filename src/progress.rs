@@ -992,8 +992,7 @@ const PART_ROW_MIN_BAR_COLUMNS: usize = 4;
 fn part_row_bar_columns(term_cols: usize, label_width: usize) -> usize {
     let reserved = PART_ROW_RESERVED_NON_BAR.saturating_add(label_width);
     let available = term_cols.saturating_sub(reserved);
-    available
-        .clamp(PART_ROW_MIN_BAR_COLUMNS, PART_ROW_BAR_COLUMNS)
+    available.clamp(PART_ROW_MIN_BAR_COLUMNS, PART_ROW_BAR_COLUMNS)
 }
 
 /// Format one per-part progress row
@@ -1029,7 +1028,12 @@ fn format_part_row(
     } else {
         format!("{:5.1}%", frac * 100.0)
     };
-    let downloaded = format_bytes(part.bytes_downloaded);
+    let displayed_downloaded = if part.total_size > 0 {
+        part.bytes_downloaded.min(part.total_size)
+    } else {
+        part.bytes_downloaded
+    };
+    let downloaded = format_bytes(displayed_downloaded);
     let total = format_bytes(part.total_size);
     let label = pad_label(&part.label, label_width);
     let status = if part.bytes_downloaded == 0 {
@@ -1195,7 +1199,11 @@ impl LogRenderer {
         let pct = percent
             .map(|p| format!("{p:.1}%"))
             .unwrap_or_else(|| "?".into());
-        let downloaded = format_bytes(snap.bytes_downloaded);
+        let displayed_downloaded = match snap.total_size {
+            Some(t) if t > 0 => snap.bytes_downloaded.min(t),
+            _ => snap.bytes_downloaded,
+        };
+        let downloaded = format_bytes(displayed_downloaded);
         let total = snap
             .total_size
             .map(format_bytes)
@@ -1273,15 +1281,19 @@ impl LogRenderer {
                     .rate_parts
                     .get(i)
                     .and_then(RateBuffer::rate_bytes_per_sec);
-                let downloaded = format_bytes(part.bytes_downloaded);
+                let displayed_downloaded = if part.total_size > 0 {
+                    part.bytes_downloaded.min(part.total_size)
+                } else {
+                    part.bytes_downloaded
+                };
+                let downloaded = format_bytes(displayed_downloaded);
                 let total = format_bytes(part.total_size);
                 let pct = if part.total_size == 0 {
                     "?".to_string()
                 } else {
-                    format!(
-                        "{:.1}%",
-                        100.0 * (part.bytes_downloaded as f64 / part.total_size as f64)
-                    )
+                    let frac = (part.bytes_downloaded as f64 / part.total_size as f64)
+                        .clamp(0.0, 1.0);
+                    format!("{:.1}%", 100.0 * frac)
                 };
                 let status = if part.bytes_downloaded == 0 {
                     "idle".to_string()
@@ -1964,7 +1976,11 @@ fn format_download_line(
     rate: Option<f64>,
     bottleneck: Option<Bottleneck>,
 ) -> String {
-    let downloaded = format_bytes(snap.bytes_downloaded);
+    let displayed_downloaded = match snap.total_size {
+        Some(t) if t > 0 => snap.bytes_downloaded.min(t),
+        _ => snap.bytes_downloaded,
+    };
+    let downloaded = format_bytes(displayed_downloaded);
     let total = snap
         .total_size
         .map(format_bytes)
@@ -2989,8 +3005,7 @@ mod tests {
     #[test]
     fn part_row_fits_inside_narrow_terminals_without_wrapping() {
         for term_cols in [80usize, 88, 100, 120] {
-            let mut r =
-                TtyRenderer::with_style_and_width(Vec::new(), BarStyle::Ascii, term_cols);
+            let mut r = TtyRenderer::with_style_and_width(Vec::new(), BarStyle::Ascii, term_cols);
             let lines = r.format_lines(&three_part_snapshot(), Instant::now());
             // Every per-part row (the first three lines for a
             // 3-part snapshot) must fit within the terminal — using

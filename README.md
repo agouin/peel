@@ -259,6 +259,20 @@ peel https://primary.example.com/dataset.tar.zst \
   --max-bandwidth 50MB/s \
   -C ./out
 
+# Multi-part split archive: concatenated parts form one logical
+# stream. Pass each part as a positional URL; --sha256 is repeatable
+# and pairs with the URLs by order. Workers fetch every part in
+# parallel via ranged GETs, the same way `aria2c -Z` would, but
+# stream into the decoder so the compressed bytes never fully land
+# on disk. Used in production against Arbitrum snapshot bundles
+# (see scripts/arb-snapshot.sh).
+peel \
+  https://snapshot.arbitrum.io/nova/2026-04-26-7efe0f23/pruned.tar.part0000 \
+  https://snapshot.arbitrum.io/nova/2026-04-26-7efe0f23/pruned.tar.part0001 \
+  --sha256 0a8de6e83fd8ba040fd052fd8d4fd0e009a9736ace5cb32bb2abd4ac6a61725d \
+  --sha256 1bcf4d2e9aa01ff5...                                              \
+  -C ./nova-out
+
 # URL has no useful suffix? Pin the decoder.
 peel "https://example.com/download?id=42" --format zstd -o ./out.bin
 
