@@ -1596,6 +1596,43 @@ fn build_resume_plan(
             ),
         });
     }
+    // Multi-URL parts comparison
+    // (`docs/PLAN_multi_url_source.md` §5 step 4): the part count
+    // and per-part `(url, size)` must agree. Per-part fingerprints
+    // can drift across runs (a CDN swap legitimately changes
+    // `ETag` per part) so we don't reject on those alone — the
+    // top-level `fingerprint_matches` check still covers the
+    // primary part, and `--sha256` (when set) is the byte-level
+    // guard.
+    if prior.parts.len() != info.source.len() {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint had {} parts, current run has {}",
+                prior.parts.len(),
+                info.source.len(),
+            ),
+        });
+    }
+    for (i, (prior_part, current_part)) in
+        prior.parts.iter().zip(info.source.parts().iter()).enumerate()
+    {
+        if prior_part.url != current_part.url.to_string() {
+            return Err(CoordinatorError::SourceChanged {
+                reason: format!(
+                    "part {i} URL was {:?}, current request is {:?}",
+                    prior_part.url, current_part.url
+                ),
+            });
+        }
+        if prior_part.size != current_part.size {
+            return Err(CoordinatorError::SourceChanged {
+                reason: format!(
+                    "part {i} size was {}, current source reports {}",
+                    prior_part.size, current_part.size,
+                ),
+            });
+        }
+    }
     if prior.chunk_size != config.chunk_size {
         return Err(CoordinatorError::SourceChanged {
             reason: format!(
@@ -1942,6 +1979,7 @@ fn run_one<S: Sink>(
                 url: requested_url.to_string(),
                 etag: info.fingerprint.etag.clone(),
                 last_modified: info.fingerprint.last_modified.clone(),
+                parts: Vec::new(),
                 total_size: info.total_size,
                 chunk_size,
                 decoder_position: ByteOffset::new(info_cb.source_position),
@@ -2230,6 +2268,7 @@ fn run_zip(
                     url: requested_url.to_string(),
                     etag: info.fingerprint.etag.clone(),
                     last_modified: info.fingerprint.last_modified.clone(),
+                    parts: Vec::new(),
                     total_size: info.total_size,
                     chunk_size,
                     decoder_position: ByteOffset::new(0),
@@ -2334,6 +2373,7 @@ fn run_zip(
                     url: requested_url.to_string(),
                     etag: info.fingerprint.etag.clone(),
                     last_modified: info.fingerprint.last_modified.clone(),
+                    parts: Vec::new(),
                     total_size: info.total_size,
                     chunk_size,
                     decoder_position: ByteOffset::new(0),
@@ -2766,38 +2806,54 @@ fn build_integrity_hasher(
                 skip_remaining: 0,
             }))
         }
-        (true, Some(state_bytes)) => {
-            // Multi-URL resume from a v7 checkpoint cannot tell us
-            // which part the saved hasher was midway through.
-            // Phase 5 of `docs/PLAN_multi_url_source.md` adds the
-            // v8 field; until then this combination is a clean
-            // hard error.
-            if source.len() > 1 {
+        (true, Some(saved)) => {
+            let restored =
+                crate::hash::sha256::Sha256::deserialize(&saved.bytes).map_err(|source| {
+                    CoordinatorError::Integrity(
+                        crate::hash::IntegrityError::CheckpointHashStateDecode { source },
+                    )
+                })?;
+            let active_part_idx = saved.active_part_idx as usize;
+            // Reject a checkpoint whose saved active_part_idx
+            // doesn't fit this run's part list. The most common
+            // cause is a v7 checkpoint (active_part_idx implied
+            // 0) being resumed against a multi-URL re-run with
+            // matching parts.len() > 1 — that combination is
+            // safe iff the prior run finished part 0 (idx > 0)
+            // or hadn't started part 0 yet (idx == 0). v7 always
+            // implies idx == 0 so it's compatible only if
+            // single-URL OR no parts crossed yet.
+            if active_part_idx >= source.len() {
                 return Err(CoordinatorError::Integrity(
                     crate::hash::IntegrityError::MultiPartResumeNotYetWired {
                         ckpt_path: ckpt_path.to_path_buf(),
                     },
                 ));
             }
-            let restored =
-                crate::hash::sha256::Sha256::deserialize(state_bytes).map_err(|source| {
-                    CoordinatorError::Integrity(
-                        crate::hash::IntegrityError::CheckpointHashStateDecode { source },
-                    )
-                })?;
-            // The saved hash covers source bytes
-            // `[0, restored.bytes_processed())`, but the new
-            // BlockingSparseReader will start handing out bytes from
-            // `reader_start` (the resume's `decoder_position`).
-            // Anything in `[reader_start, restored.bytes_processed())`
-            // was already hashed last run; skip those.
-            let already = restored.bytes_processed();
-            let skip_remaining = already.saturating_sub(reader_start);
-            let hasher_inner = crate::hash::IntegrityHasher::from_single_snapshot(
-                restored,
-                source.total_size(),
-                expected[0],
-            );
+            let part_sizes: Vec<u64> = source.parts().iter().map(|p| p.size).collect();
+            // The saved active hasher's bytes_processed counts
+            // only the active part's bytes, so the *global*
+            // bytes_processed = sum(part_sizes[0..idx]) +
+            // active.bytes_processed(). Anything in
+            // `[reader_start, global_bytes_processed)` was
+            // already hashed by the previous run; skip those.
+            let prefix: u64 = part_sizes.iter().take(active_part_idx).sum();
+            let global_bytes_processed = prefix.saturating_add(restored.bytes_processed());
+            let skip_remaining = global_bytes_processed.saturating_sub(reader_start);
+            let hasher_inner = if source.len() == 1 {
+                crate::hash::IntegrityHasher::from_single_snapshot(
+                    restored,
+                    source.total_size(),
+                    expected[0],
+                )
+            } else {
+                crate::hash::IntegrityHasher::from_multi_part_snapshot(
+                    restored,
+                    &part_sizes,
+                    expected.to_vec(),
+                    active_part_idx,
+                )
+            };
             Ok(Some(IntegrityHasherSetup {
                 hasher: crate::hash::shared_hasher(hasher_inner),
                 skip_remaining,
@@ -2810,17 +2866,15 @@ fn build_integrity_hasher(
 /// inclusion in the next checkpoint.
 ///
 /// Locks the shared hasher, asks the [`crate::hash::IntegrityHasher`]
-/// for its active part's serialized form (small, fixed-size), drops
-/// the lock, and returns the bytes. Returns `None` when integrity
-/// tracking is off or when a prior boundary mismatch already
-/// poisoned the hasher (no point checkpointing a doomed state).
-///
-/// Single-URL only for now. Multi-URL needs the active part index
-/// alongside, which lands in the v8 checkpoint format
-/// (`docs/PLAN_multi_url_source.md` §5).
+/// for its active part's serialized form (small, fixed-size), and
+/// pairs it with the active part index so resume can rebuild the
+/// per-part state machine. Returns `None` when integrity tracking is
+/// off or when a prior boundary mismatch already poisoned the hasher
+/// (no point checkpointing a doomed state). Single-URL runs always
+/// emit `active_part_idx = 0`.
 fn snapshot_hash_state(
     hasher: Option<&crate::hash::SharedHasher>,
-) -> Option<[u8; crate::hash::sha256::SERIALIZED_LEN]> {
+) -> Option<crate::checkpoint::HashState> {
     let h = hasher?;
     // INVARIANT: the mutex is touched from the extractor's thread
     // only — the checkpoint observer pauses the decoder before
@@ -2830,15 +2884,12 @@ fn snapshot_hash_state(
     // to "no integrity state captured this round") is the safe
     // option — a subsequent successful snapshot supersedes it.
     let guard = h.lock().ok()?;
-    // Multi-URL hash_state checkpointing requires the v8 format
-    // (`docs/PLAN_multi_url_source.md` §5). Until that lands, we
-    // skip the snapshot for multi-part hashers — `build_integrity_hasher`
-    // refuses to resume from such a checkpoint, so the absence is
-    // explicit rather than silent.
-    if guard.part_count() > 1 {
-        return None;
-    }
-    guard.snapshot_active_serialized()
+    let bytes = guard.snapshot_active_serialized()?;
+    let active_part_idx = u32::try_from(guard.active_part_idx()).unwrap_or(u32::MAX);
+    Some(crate::checkpoint::HashState {
+        active_part_idx,
+        bytes,
+    })
 }
 
 /// Construct the [`SparseFile`] for this run, picking between the
@@ -3546,10 +3597,18 @@ mod tests {
     }
 
     fn sample_checkpoint(url: &str, total_size: u64, chunk_size: u64) -> Checkpoint {
+        let etag = Some("\"abc\"".to_string());
         Checkpoint {
             url: url.into(),
-            etag: Some("\"abc\"".into()),
+            etag: etag.clone(),
             last_modified: None,
+            parts: vec![crate::checkpoint::PartRecord {
+                url: url.into(),
+                size: total_size,
+                etag,
+                last_modified: None,
+                expected_sha256: None,
+            }],
             total_size,
             chunk_size,
             decoder_position: ByteOffset::new(0),

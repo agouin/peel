@@ -40,11 +40,22 @@ impl Drop for CleanupOnDrop {
 }
 
 fn realistic_tar_checkpoint() -> Checkpoint {
+    let url = "https://releases.example.com/v2/dataset-2026-04.tar.zst".to_string();
+    let etag = Some("\"4abf2c9-e8b1\"".to_string());
+    let last_modified = Some("Tue, 28 Apr 2026 10:00:00 GMT".to_string());
+    let total_size = 12 * 1024 * 1024 * 1024u64;
     Checkpoint {
-        url: "https://releases.example.com/v2/dataset-2026-04.tar.zst".into(),
-        etag: Some("\"4abf2c9-e8b1\"".into()),
-        last_modified: Some("Tue, 28 Apr 2026 10:00:00 GMT".into()),
-        total_size: 12 * 1024 * 1024 * 1024,
+        url: url.clone(),
+        etag: etag.clone(),
+        last_modified: last_modified.clone(),
+        parts: vec![peel::checkpoint::PartRecord {
+            url,
+            size: total_size,
+            etag,
+            last_modified,
+            expected_sha256: None,
+        }],
+        total_size,
         chunk_size: 4 * 1024 * 1024,
         decoder_position: ByteOffset::new(2 * 1024 * 1024 * 1024 + 42),
         bitmap_completed: (0u8..=200).cycle().take(8192).collect(),
@@ -280,11 +291,20 @@ fn round_trip_raw_sink_state() {
     let path = unique_temp("raw");
     let _g = CleanupOnDrop(path.clone());
 
+    let url = "https://example.com/blob.zst".to_string();
+    let total_size = 1_500_000u64;
     let ckpt = Checkpoint {
-        url: "https://example.com/blob.zst".into(),
+        url: url.clone(),
         etag: None,
         last_modified: None,
-        total_size: 1_500_000,
+        parts: vec![peel::checkpoint::PartRecord {
+            url,
+            size: total_size,
+            etag: None,
+            last_modified: None,
+            expected_sha256: None,
+        }],
+        total_size,
         chunk_size: 65_536,
         decoder_position: ByteOffset::new(196_608),
         bitmap_completed: vec![0xFFu8; (1_500_000u64.div_ceil(65_536) as usize).div_ceil(8)],

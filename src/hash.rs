@@ -326,9 +326,7 @@ impl IntegrityHasher {
     }
 
     /// Reconstruct a single-part hasher from its checkpointed
-    /// `Sha256` snapshot. Used by the single-URL resume path. Multi-
-    /// URL resume needs additional state (`active_part_idx`) and
-    /// lands in `docs/PLAN_multi_url_source.md` §5.
+    /// `Sha256` snapshot. Used by the single-URL resume path.
     #[must_use]
     pub fn from_single_snapshot(
         active: Sha256,
@@ -341,6 +339,73 @@ impl IntegrityHasher {
             active_part_idx: 0,
             boundaries: vec![total_size],
             expected: vec![expected],
+            bytes_processed,
+            error: None,
+        }
+    }
+
+    /// Reconstruct a multi-part hasher from its checkpointed
+    /// snapshot (`docs/PLAN_multi_url_source.md` §5). Parts before
+    /// `active_part_idx` are treated as already verified; the
+    /// active hasher continues from `active`'s mid-stream state.
+    /// `bytes_processed` is `prefix_sum(part_sizes[0..idx]) +
+    /// active.bytes_processed()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`crate::hash::sha256::Sha256DeserializeError`] when the
+    /// caller passes a malformed `active`; otherwise returns the
+    /// reconstructed hasher.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `part_sizes.is_empty()`, `expected.len() !=
+    /// part_sizes.len()`, `active_part_idx >= part_sizes.len()`,
+    /// or if `active.bytes_processed() > part_sizes[active_part_idx]`
+    /// (the saved hasher overshot its own part).
+    #[must_use]
+    pub fn from_multi_part_snapshot(
+        active: Sha256,
+        part_sizes: &[u64],
+        expected: Vec<Option<[u8; DIGEST_LEN]>>,
+        active_part_idx: usize,
+    ) -> Self {
+        assert!(
+            !part_sizes.is_empty(),
+            "from_multi_part_snapshot requires at least one part"
+        );
+        assert_eq!(
+            part_sizes.len(),
+            expected.len(),
+            "from_multi_part_snapshot: expected length must match part count"
+        );
+        assert!(
+            active_part_idx < part_sizes.len(),
+            "from_multi_part_snapshot: active_part_idx out of range"
+        );
+        assert!(
+            active.bytes_processed() <= part_sizes[active_part_idx],
+            "from_multi_part_snapshot: active.bytes_processed() exceeds active part size"
+        );
+        let mut boundaries = Vec::with_capacity(part_sizes.len());
+        let mut acc: u64 = 0;
+        for &sz in part_sizes {
+            acc = acc
+                .checked_add(sz)
+                .expect("from_multi_part_snapshot: total source size overflows u64");
+            boundaries.push(acc);
+        }
+        let bytes_processed = if active_part_idx == 0 {
+            active.bytes_processed()
+        } else {
+            boundaries[active_part_idx - 1] + active.bytes_processed()
+        };
+        Self {
+            active,
+            active_part_idx,
+            boundaries,
+            expected,
             bytes_processed,
             error: None,
         }
