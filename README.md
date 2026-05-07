@@ -114,9 +114,10 @@ sparse part-file, frame-aligned checkpoints, hole-punching — make
 `peel` slower than just `curl | zstd -d | tar -xf -`?" At realistic
 network speeds, no. The decoder side is faster than the wire side, so
 the structural overhead disappears into the network wait, and `peel`
-actually wins by a small margin from ranged-GET parallelism. The one
-exception is pipes faster than ~3 Gbps, where `peel`'s decoder pipeline
-becomes the bottleneck.
+actually wins by a small margin from ranged-GET parallelism. The
+single exception is `tar.xz` above ~1 Gbps, where `peel`'s clean-room
+single-threaded LZMA decoder is genuinely slower than liblzma's
+20+-year-old hand-tuned C path.
 
 Both sides share the same rate cap (`peel --max-bandwidth`,
 `curl --limit-rate`). Payload size scales per row so wire-time stays
@@ -137,16 +138,22 @@ Lower is better; **bold** = `peel` is faster than the shell pipe.
 
 | Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
 | --- | --- | --- | --- | --- |
-| `tar` | 1.02× | **0.94×** | **0.78×** | **0.91×** |
-| `tar.zst` | 1.05× | **0.94×** | **0.78×** | **0.89×** |
-| `tar.gz` | 1.09× | **0.95×** | **0.80×** | 2.86× |
-| `tar.lz4` | 1.08× | **0.94×** | **0.78×** | **0.97×** |
-| `tar.xz` | 1.09× | 1.04× | 1.53× | 1.49× |
+| `tar` | 1.07× | **0.94×** | **0.79×** | **0.90×** |
+| `tar.zst` | 1.08× | **0.94×** | **0.79×** | **0.93×** |
+| `tar.gz`¹ | 1.14× | **0.94×** | **0.79×** | 1.05× |
+| `tar.gz·m`² | 1.08× | **0.95×** | **0.79×** | **0.97×** |
+| `tar.lz4` | 1.09× | **0.94×** | **0.78×** | **0.91×** |
+| `tar.xz` | 1.10× | 1.03× | 1.51× | 1.47× |
+
+¹ Single-member gzip — the default-`gzip` / `tar -z` shape.
+² Multi-member gzip (~32 MiB members) — the `pigz` / `gzip a b > c.gz`
+shape. Same baseline pipe (`gzip -d` handles concatenated members per
+RFC 1952 §2.2).
 
 Absolute wall-clock for the 10 Gbps · 256 MiB column, for scale:
-`tar` 0.22 s vs 0.24 s · `tar.zst` 0.21 s vs 0.24 s · `tar.lz4`
-0.24 s vs 0.24 s · `tar.gz` 0.68 s vs 0.24 s · `tar.xz` 9.08 s vs
-6.12 s.
+`tar` 0.21 s vs 0.24 s · `tar.zst` 0.22 s vs 0.23 s · `tar.lz4`
+0.22 s vs 0.24 s · `tar.gz` 0.25 s vs 0.24 s · `tar.gz·m` 0.23 s vs
+0.24 s · `tar.xz` 8.58 s vs 5.84 s.
 
 ### Reading the grid
 
@@ -202,20 +209,11 @@ scales with realized download throughput so the bench's 32 checkpoints
 collapse to 2–3. Combined with parallel ranged GETs, `peel` finishes
 ahead of the shell pipe across the whole streaming-codec range.
 
-**xz at 10 Gbps** still trails `curl | xz | tar` by ~1.49× — the
+**xz at 10 Gbps** still trails `curl | xz | tar` by ~1.47× — the
 network is no longer in the budget; the gap is the LZMA decoder
 itself. (Down from ~1.60× pre-Phase-1+2, but the plan's 80 %
 target requires the speculative-ceiling work above.)
 
-**gzip at 10 Gbps** is the one remaining trailing row at 2.86×.
-The deflate decoder is `peel`'s clean-room
-[`flate2`-free `inflate`](src/decode/deflate_native.rs) and runs at
-~380 MiB/s on Apple M4 Max — fast enough for everyday WAN
-(matches the fast-codec rows through 1 Gbps) but bottlenecked when
-the wire stops being the limit. The fix shape mirrors the xz row's
-multi-Block plan: parallel-frame decode for streams that have
-restart points, plus the same CRC-acceleration work the xz CRC64
-plan files. Filed as a follow-on; not blocking.
 
 ### When to reach for `peel`
 
@@ -233,8 +231,9 @@ Use `peel` when **any** of these hold (which is most of the time):
 
 Use `curl | tool | tar` when **all** of these hold:
 
-- The archive is `tar.xz` (or `tar.gz` over a > 1 Gbps link) and
-  decode time dominates.
+- The archive is `tar.xz` and decode time dominates (~1.5× ratio
+  above 1 Gbps; everything else is at-or-below
+  parity now).
 - You don't need resume / integrity / multi-mirror.
 
 ## Usage
