@@ -1038,6 +1038,15 @@ impl StreamingDecoder for Decoder {
         self.last_frame_boundary
     }
 
+    fn set_source_start_offset(&mut self, offset: u64) {
+        // Idempotent for the resume-factory path: `resume::resume`
+        // already seeds `bytes_consumed = start_offset`. For the
+        // regular factory this aligns the counter with the global
+        // source on resume from a stream end / block boundary that
+        // didn't capture a decoder-state blob.
+        self.bytes_consumed = offset;
+    }
+
     fn decoder_state_size_hint(&self) -> usize {
         // xz_native's blob is dominated by the LZMA dict
         // (`recent_len(capacity)`) plus a fixed-size header

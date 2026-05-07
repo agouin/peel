@@ -1057,3 +1057,192 @@ fn single_member_gzip_punches_per_block_bounded_peak() {
          threshold={PUNCH_THRESHOLD}",
     );
 }
+
+// ---- Raw-tar resume: decoder_position must equal sink.archive_offset ----
+//
+// Regression for the multi-URL raw-tar resume corruption (the "malformed
+// tar header at archive offset 30749245440" bug). The IdentityDecoder
+// used to report `bytes_consumed` / `frame_boundary` as its run-local
+// `bytes_copied`. After the saved checkpoint loaded the sink's
+// `archive_offset` from the prior run but the freshly-constructed
+// decoder restarted at zero, every subsequent quiescent checkpoint
+// pinned a small `source_position` against a large `archive_offset`.
+// The next resume served bytes from `source_position` (small) while the
+// sink expected the file body to continue at `archive_offset` (large) —
+// the two cursors talked past each other and the next 512-byte block
+// failed the `ustar` magic check at the resume seam.
+//
+// The fix routes through
+// [`peel::decode::StreamingDecoder::set_source_start_offset`]: the
+// coordinator calls it once after construction, the IdentityDecoder
+// override seeds its `bytes_consumed` counter, and the trait contract on
+// `bytes_consumed` / `frame_boundary` (a global source-byte offset, not
+// a run-local count) is restored.
+
+/// Extract `archive` with the identity decoder + the supplied tar sink,
+/// capturing `(source_position, archive_offset)` from every quiescent
+/// checkpoint. Returns the captured pairs along with the final
+/// `ExtractionStats`.
+fn run_identity_tar_with_checkpoints(
+    archive: &[u8],
+    start_offset: u64,
+    sink: TarSink,
+) -> (Vec<(u64, u64)>, ExtractionStats) {
+    let captured: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+    let src_path = fresh_path("identity_resume.tar");
+    fs::write(&src_path, archive).expect("write src");
+    let _g = CleanupOnDrop(src_path.clone());
+    let read_handle = fs::File::open(&src_path).expect("open src");
+    let rw_handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&src_path)
+        .expect("open rw");
+
+    let mut decoder: Box<dyn StreamingDecoder> = Box::new(
+        peel::decode::identity::IdentityDecoder::new(Box::new(read_handle)).expect("decoder"),
+    );
+    decoder.set_source_start_offset(start_offset);
+
+    let stats = Extractor::with_defaults()
+        .extract_with_callback(
+            rw_handle.as_fd(),
+            &mut *decoder,
+            sink,
+            &NoopPuncher::new(),
+            |info| {
+                let archive_offset = match &info.sink_state {
+                    peel::checkpoint::SinkState::Tar {
+                        in_flight: Some(s), ..
+                    } => s.archive_offset,
+                    peel::checkpoint::SinkState::Tar {
+                        in_flight: None, ..
+                    } => 0,
+                    other => panic!("expected Tar sink state, got {other:?}"),
+                };
+                captured
+                    .lock()
+                    .expect("captured lock")
+                    .push((info.source_position, archive_offset));
+                Ok(())
+            },
+        )
+        .expect("extract");
+
+    (captured.into_inner().expect("captured"), stats)
+}
+
+/// The load-bearing assertion: for raw tar (identity decode) every
+/// quiescent checkpoint must have `source_position == archive_offset`.
+/// Each input byte advances both counters by one, so any drift is the
+/// resume bug. Verifies on a fresh run (start_offset = 0), then on a
+/// mid-file resumed run (start_offset > 0) — the failure surface that
+/// motivated the fix.
+#[test]
+fn identity_decoder_resume_keeps_decoder_position_equal_to_archive_offset() {
+    use peel::sink::Sink;
+
+    // Single member large enough to span multiple `decode_step` calls
+    // (the identity decoder's per-step ceiling is 1 MiB) so several
+    // quiescent checkpoints fire mid-file. The default
+    // `checkpoint_min_bytes` is 0 so each step boundary is a candidate.
+    let payload = random_bytes(0xA1B2_C3D4, 4 * 1024 * 1024 + 17);
+    let files: &[(&str, &[u8])] = &[("big.bin", &payload)];
+    let archive = build_simple_archive(files);
+
+    // Phase 1: fresh run.
+    let dst1 = fresh_path("identity_resume_phase1");
+    let _g1 = CleanupOnDrop(dst1.clone());
+    fs::create_dir_all(&dst1).expect("create dst1");
+    let sink1 = TarSink::new(&dst1).expect("sink1");
+    let (checkpoints1, stats1) = run_identity_tar_with_checkpoints(&archive, 0, sink1);
+
+    assert!(
+        !checkpoints1.is_empty(),
+        "fresh run must observe at least one quiescent checkpoint",
+    );
+    for (i, (pos, archive_off)) in checkpoints1.iter().enumerate() {
+        assert_eq!(
+            *pos, *archive_off,
+            "fresh-run checkpoint #{i}: source_position ({pos}) must equal \
+             archive_offset ({archive_off}); identity decoder is 1:1 with \
+             the source stream",
+        );
+    }
+    assert_eq!(stats1.bytes_in, archive.len() as u64);
+    assert_eq!(
+        fs::read(dst1.join("big.bin")).expect("phase1 extracted"),
+        payload,
+    );
+
+    // Phase 2: pick a mid-file interrupt point and capture a fresh
+    // sink_state at that position. The previous extract consumed
+    // `sink1`, so we feed a separate sink only the prefix.
+    let interrupt_pos = checkpoints1
+        .iter()
+        .map(|(pos, _)| *pos)
+        .find(|pos| *pos > 512 + 1024 && *pos < (archive.len() as u64).saturating_sub(1024))
+        .expect("at least one mid-file checkpoint");
+
+    let dst_resume = fresh_path("identity_resume_phase2_resume");
+    let _g_resume = CleanupOnDrop(dst_resume.clone());
+    fs::create_dir_all(&dst_resume).expect("create dst_resume");
+    let mut prefix_sink = TarSink::new(&dst_resume).expect("prefix_sink");
+    prefix_sink
+        .write(&archive[..interrupt_pos as usize])
+        .expect("write prefix");
+    let captured_state = prefix_sink.sink_state();
+    drop(prefix_sink);
+
+    // Phase 3: build a fresh decoder over the SUFFIX of the archive,
+    // seed it with the global start offset, and restore the sink from
+    // the captured state. This is what the coordinator does on resume.
+    let resumed_in_flight = match &captured_state {
+        peel::checkpoint::SinkState::Tar {
+            in_flight: Some(s), ..
+        } => s.clone(),
+        other => panic!("expected mid-flight tar state, got {other:?}"),
+    };
+    let resumed_sink = TarSink::resume(&dst_resume, &resumed_in_flight).expect("resume sink");
+
+    let suffix = archive[interrupt_pos as usize..].to_vec();
+    let (checkpoints3, stats3) =
+        run_identity_tar_with_checkpoints(&suffix, interrupt_pos, resumed_sink);
+
+    assert!(
+        !checkpoints3.is_empty(),
+        "resumed run must observe at least one quiescent checkpoint",
+    );
+    for (i, (pos, archive_off)) in checkpoints3.iter().enumerate() {
+        assert_eq!(
+            *pos, *archive_off,
+            "resumed-run checkpoint #{i}: source_position ({pos}) must equal \
+             archive_offset ({archive_off}); the resumed decoder must \
+             report global offsets, not run-local bytes_copied",
+        );
+        assert!(
+            *pos >= interrupt_pos,
+            "resumed-run checkpoint #{i}: source_position ({pos}) must be at \
+             or past the interrupt point ({interrupt_pos}); a smaller value \
+             is the run-local-counter bug",
+        );
+    }
+    // `bytes_in` is the decoder's high-water mark in the global
+    // source — start_offset + bytes pulled this run — so a clean
+    // resumed extraction lands at `archive.len()`, not `suffix.len()`.
+    assert_eq!(stats3.bytes_in, archive.len() as u64);
+    let final_offset = checkpoints3.last().expect("at least one").0;
+    assert!(
+        final_offset >= archive.len() as u64 - 1024,
+        "resumed run did not reach near end-of-archive: final \
+         source_position={final_offset}, archive_len={}",
+        archive.len(),
+    );
+
+    // The output file must be byte-identical to the original payload.
+    assert_eq!(
+        fs::read(dst_resume.join("big.bin")).expect("resumed extracted"),
+        payload,
+    );
+}

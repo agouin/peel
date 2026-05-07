@@ -260,6 +260,35 @@ pub trait StreamingDecoder: Send {
     fn decoder_state_size_hint(&self) -> usize {
         0
     }
+
+    /// Inform the decoder of the source-byte offset at which `src`
+    /// will deliver its first byte. Called once by the coordinator
+    /// immediately after construction.
+    ///
+    /// The contract on [`Self::bytes_consumed`] / [`Self::frame_boundary`]
+    /// is that they return *global* source-stream offsets — the
+    /// high-water mark in the underlying source, not the count of
+    /// bytes pulled by this decoder instance. For fresh runs the
+    /// source starts at 0 and the two coincide; for runs resumed from
+    /// a saved [`crate::checkpoint::Checkpoint::decoder_position`], the
+    /// source is positioned at that offset and the decoder's internal
+    /// run-local counter must be seeded with it so the global property
+    /// is preserved.
+    ///
+    /// Resume factories ([`DecoderResumeFactory`]) already seed
+    /// `bytes_consumed` to `start_offset` at construction; the
+    /// override on those decoders is idempotent (calling with the same
+    /// offset is a no-op). Decoders constructed via the regular
+    /// [`DecoderFactory`] start with `bytes_consumed = 0` and rely on
+    /// this hook to align with the source.
+    ///
+    /// The default no-op is safe only for decoders whose
+    /// `bytes_consumed` is naturally zero-relative (i.e. no resume
+    /// support and the source is always fresh). All in-tree decoders
+    /// override.
+    fn set_source_start_offset(&mut self, offset: u64) {
+        let _ = offset;
+    }
 }
 
 /// Type-erased function that constructs a decoder from a source.

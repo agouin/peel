@@ -1293,6 +1293,18 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     ),
                     _ => (factory(source).map_err(CoordinatorError::Decode)?, false),
                 };
+                // Align the decoder's source-byte counter with the
+                // global stream offset the source reader is positioned
+                // at. Without this, decoders constructed via the
+                // regular `factory` (every fresh run, plus resumes from
+                // a coarse boundary that didn't capture a decoder-state
+                // blob) report run-local `bytes_consumed` /
+                // `frame_boundary`, and the saved `decoder_position`
+                // drifts apart from the sink's `archive_offset` across
+                // kill/restart cycles. Idempotent for the
+                // resume-factory branch above (which pre-seeds at the
+                // same `start_offset`).
+                decoder.set_source_start_offset(reader_start);
                 used_decoder_state_flag.store(used_decoder_state, Ordering::Relaxed);
 
                 // Run the extractor with a checkpoint observer that

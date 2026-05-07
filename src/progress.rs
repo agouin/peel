@@ -926,12 +926,19 @@ impl<W: Write + Send> TtyRenderer<W> {
                 .map(|p| p.label.chars().count())
                 .max()
                 .unwrap_or(0);
+            let part_bar_cols = part_row_bar_columns(term_cols, label_width);
             for (i, part) in snap.parts.iter().take(MAX_PART_ROWS).enumerate() {
                 let part_rate = self
                     .rate_parts
                     .get(i)
                     .and_then(RateBuffer::rate_bytes_per_sec);
-                lines.push(format_part_row(part, part_rate, label_width, self.style));
+                lines.push(format_part_row(
+                    part,
+                    part_rate,
+                    label_width,
+                    part_bar_cols,
+                    self.style,
+                ));
             }
             if snap.parts.len() > MAX_PART_ROWS {
                 let remaining = snap.parts.len() - MAX_PART_ROWS;
@@ -950,21 +957,62 @@ impl<W: Write + Send> TtyRenderer<W> {
     }
 }
 
+/// Display columns occupied by everything in a per-part row *other
+/// than* the bar, conservatively sized so the row never wraps:
+/// ```text
+///   {bar}  {pct:5}  {label}  {dl} / {total}{status}
+///   ↑   ↑     ↑   ↑   ↑     ↑     ↑     ↑
+///   2   2     6   2  Lw     2 +width(dl/total) +width(status)
+/// ```
+/// Reserves ~10 cols for `dl` (e.g. `1023.4 GiB`), ~10 cols for
+/// `total`, and 14 cols for the worst-case status (`  @ 999.9 MiB/s`).
+/// Tighter byte counts and shorter rates leave a little extra
+/// breathing room.
+const PART_ROW_RESERVED_NON_BAR: usize = 2 + 2 + 6 + 2 + 2 + 10 + 3 + 10 + 14;
+
+/// Minimum bar width before falling back to the leanest possible bar
+/// — at 4 cols a unicode bar is just two emoji cells (4 display cols)
+/// and an ASCII bar is `[##]`-shaped, both still legible.
+const PART_ROW_MIN_BAR_COLUMNS: usize = 4;
+
+/// Pick a per-part bar width that lets the row fit inside `term_cols`
+/// without wrapping at typical terminal widths (80, 88, 100, 120 …).
+/// `label_width` is the longest part label in the snapshot — it
+/// expands the row in proportion to inventory naming, so we subtract
+/// it from the available budget.
+///
+/// Returns at least [`PART_ROW_MIN_BAR_COLUMNS`] (a wrapped row is
+/// worse than a tiny bar — the renderer's `\x1b[NA` cursor-up math
+/// counts logical lines, but the terminal counts visual rows, so any
+/// wrap silently misaligns the redraw and stacks ghosts of prior
+/// frames in the scrollback) and at most [`PART_ROW_BAR_COLUMNS`].
+fn part_row_bar_columns(term_cols: usize, label_width: usize) -> usize {
+    let reserved = PART_ROW_RESERVED_NON_BAR.saturating_add(label_width);
+    let available = term_cols.saturating_sub(reserved);
+    available
+        .clamp(PART_ROW_MIN_BAR_COLUMNS, PART_ROW_BAR_COLUMNS)
+}
+
 /// Format one per-part progress row
 /// (`docs/PLAN_multi_url_source.md` progress UI). Layout:
 ///
 /// ```text
-/// [================  ]  pruned.tar.part0001  165.0 GiB / 256.0 GiB  @ 12.0 MiB/s
+/// [================  ]   64.5%  pruned.tar.part0001  165.0 GiB / 256.0 GiB  @ 12.0 MiB/s
 /// ```
 ///
-/// `label_width` pads the label so a vertical inventory aligns. A
-/// completed part shows `done` instead of a rate; an idle part with
-/// zero bytes downloaded shows `idle`. The bar matches whichever
-/// row's downloaded/total ratio it represents.
+/// `label_width` pads the label so a vertical inventory aligns;
+/// `bar_cols` is the per-row bar width [`part_row_bar_columns`]
+/// computed for this terminal. A completed part shows `done` instead
+/// of a rate; an idle part with zero bytes downloaded shows `idle`.
+/// The bar matches whichever row's downloaded/total ratio it
+/// represents; the percent column mirrors the aggregate row's
+/// placement (`peel  [bar]  XX.X%`) so the per-part rows and the
+/// footer line up visually.
 fn format_part_row(
     part: &PartProgressSnapshot,
     rate: Option<f64>,
     label_width: usize,
+    bar_cols: usize,
     style: BarStyle,
 ) -> String {
     let frac = if part.total_size == 0 {
@@ -972,7 +1020,12 @@ fn format_part_row(
     } else {
         (part.bytes_downloaded as f64 / part.total_size as f64).clamp(0.0, 1.0)
     };
-    let bar = render_bar_for(frac, PART_ROW_BAR_COLUMNS, style);
+    let bar = render_bar_for(frac, bar_cols, style);
+    let pct = if part.total_size == 0 {
+        "  --.-%".to_string()
+    } else {
+        format!("{:5.1}%", frac * 100.0)
+    };
     let downloaded = format_bytes(part.bytes_downloaded);
     let total = format_bytes(part.total_size);
     let label = pad_label(&part.label, label_width);
@@ -986,7 +1039,7 @@ fn format_part_row(
             None => "  …".to_string(),
         }
     };
-    format!("  {bar}  {label}  {downloaded} / {total}{status}")
+    format!("  {bar}  {pct}  {label}  {downloaded} / {total}{status}")
 }
 
 /// Pad `label` on the right with spaces to `width` *display columns*.
@@ -2921,6 +2974,62 @@ mod tests {
         // Aggregate footer's first line carries the `peel  [...]`
         // overall bar — sanity that the footer landed in place.
         assert!(lines[3].starts_with("peel"), "agg start: {:?}", lines[3]);
+    }
+
+    /// Regression: the per-part bar must shrink to fit narrow
+    /// terminals so the row never wraps. A wrapped row breaks the
+    /// renderer's `\x1b[NA` cursor-up math (which counts logical
+    /// lines, while the terminal counts visual rows) and stacks
+    /// ghosts of prior frames in the scrollback. The Arbitrum-shaped
+    /// reproduction landed at ~88 cols; pin both that and the
+    /// 80-col default.
+    #[test]
+    fn part_row_fits_inside_narrow_terminals_without_wrapping() {
+        for term_cols in [80usize, 88, 100, 120] {
+            let mut r =
+                TtyRenderer::with_style_and_width(Vec::new(), BarStyle::Ascii, term_cols);
+            let lines = r.format_lines(&three_part_snapshot(), Instant::now());
+            // Every per-part row (the first three lines for a
+            // 3-part snapshot) must fit within the terminal — using
+            // ASCII so display width == byte length.
+            for row in lines.iter().take(3) {
+                assert!(
+                    row.chars().count() <= term_cols,
+                    "term_cols={term_cols}: part row \
+                     ({len} chars) overflows: {row:?}",
+                    len = row.chars().count(),
+                );
+            }
+        }
+    }
+
+    /// Direct check on the bar-sizing helper: at 80 / 88 cols (where
+    /// the user's `pruned.tar.part0000` reproduction sat) the bar
+    /// must shrink below the historical 24-col cap, but at 120 cols
+    /// it should still hit the cap.
+    #[test]
+    fn part_row_bar_columns_shrinks_for_narrow_terminals() {
+        // Largest label in the user's reproduction.
+        let label_width = "pruned.tar.part0000".len();
+        let narrow = part_row_bar_columns(80, label_width);
+        let just_short = part_row_bar_columns(88, label_width);
+        let wide = part_row_bar_columns(120, label_width);
+        assert!(
+            narrow < PART_ROW_BAR_COLUMNS,
+            "80-col terminal must shrink the bar (got {narrow})",
+        );
+        assert!(
+            just_short < PART_ROW_BAR_COLUMNS,
+            "88-col terminal must shrink the bar (got {just_short})",
+        );
+        assert_eq!(
+            wide, PART_ROW_BAR_COLUMNS,
+            "120-col terminal must reach the historical cap",
+        );
+        assert!(
+            narrow >= PART_ROW_MIN_BAR_COLUMNS,
+            "narrow bar must not collapse below the floor: {narrow}",
+        );
     }
 
     #[test]
