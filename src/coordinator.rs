@@ -703,19 +703,6 @@ pub enum CoordinatorError {
     #[error("ZIP extraction failed")]
     Zip(#[source] ZipPipelineError),
 
-    /// The caller passed per-part SHA-256 digests
-    /// (`CoordinatorConfig::expected_sha256s`) on a multi-URL run,
-    /// but the per-part verification path is not yet wired
-    /// (`docs/PLAN_multi_url_source.md` §4 — phase 4). Phase 3
-    /// landed the CLI surface so this combination parses; surfacing
-    /// the gap here is the contract until §4 lands.
-    #[error(
-        "per-part --sha256 verification is not yet implemented; \
-         re-run without --sha256 (multi-URL hashing will land in \
-         docs/PLAN_multi_url_source.md §4)"
-    )]
-    PerPartHashesNotYetWired,
-
     /// The caller's [`RunArgs::kill_switch`] flipped to `true`
     /// between checkpoint writes. The .peel.part / .peel.ckpt
     /// sidecars are intentionally left on disk so the next call
@@ -805,10 +792,12 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     // step 1): when extra positional URLs were provided, route
     // through [`discover_multi`] over `[primary, ...additional]`
     // instead of the mirror-aware discovery. The CLI already
-    // rejects `--mirror` + multi-URL at parse time (§3 step 3),
-    // and per-part SHA-256 verification (`expected_sha256s`) is
-    // wired in §4 — until then we surface a clear error if a
-    // multi-URL caller already passed digests.
+    // rejects `--mirror` + multi-URL at parse time (§3 step 3).
+    // Per-part SHA-256 verification (§4) is wired through the
+    // [`crate::hash::IntegrityHasher`] state machine constructed
+    // below — multi-URL fresh runs with `--sha256` succeed; resume
+    // of an in-flight multi-URL run with `--sha256` errors cleanly
+    // until the v8 checkpoint format lands in §5.
     let (info, mirror_set, dropped_mirrors) = if additional_urls.is_empty() {
         let (info, ms, dropped) = discover_with_mirrors(
             &client,
@@ -819,12 +808,6 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         .map_err(CoordinatorError::Scheduler)?;
         (info, ms, dropped)
     } else {
-        if !config.expected_sha256s.is_empty() {
-            // Phase 4 will wire per-part hash verification; until
-            // then surface the gap clearly rather than silently
-            // ignoring the digests the user passed.
-            return Err(CoordinatorError::PerPartHashesNotYetWired);
-        }
         let mut all = Vec::with_capacity(1 + additional_urls.len());
         all.push(parsed_url.clone());
         for u in &additional_urls {
@@ -1212,8 +1195,29 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 // snapshot by the checkpoint observer (`PLAN_v2.md`
                 // §10 step 4).
                 let reader_start = cursor.load(Ordering::Acquire);
+                // Build the per-part `expected` vec parallel to
+                // `info.source.parts()`. Single-URL with `--sha256`
+                // populates a 1-element vec; multi-URL with N
+                // `--sha256` flags populates an N-element vec; an
+                // empty Vec from the CLI translates to all-`None`,
+                // which `build_integrity_hasher` treats as "no
+                // integrity tracking."
+                let part_expected: Vec<Option<[u8; crate::hash::sha256::DIGEST_LEN]>> =
+                    if info.source.len() == 1 {
+                        vec![config.expected_sha256]
+                    } else if config.expected_sha256s.is_empty() {
+                        vec![None; info.source.len()]
+                    } else {
+                        debug_assert_eq!(
+                            config.expected_sha256s.len(),
+                            info.source.len(),
+                            "CLI validates per-part hash count"
+                        );
+                        config.expected_sha256s.iter().copied().map(Some).collect()
+                    };
                 let hasher_setup = build_integrity_hasher(
-                    config.expected_sha256.as_ref(),
+                    &info.source,
+                    &part_expected,
                     prior.as_ref(),
                     &ckpt_path,
                     reader_start,
@@ -1342,7 +1346,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 };
 
                 let hasher_handle = hasher_setup.as_ref().map(|s| Arc::clone(&s.hasher));
-                let mut stats = match &output {
+                let run_result: Result<ExtractionStats, CoordinatorError> = match &output {
                     OutputTarget::File(path) => {
                         let sink = build_raw_sink(path, &resume_plan)?;
                         run_one(
@@ -1361,7 +1365,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
-                        )?
+                        )
                     }
                     OutputTarget::Dir(path) => {
                         let sink = build_tar_sink(path, &resume_plan)?;
@@ -1381,7 +1385,30 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
-                        )?
+                        )
+                    }
+                };
+                // The HashingReader surfaces a mismatch as a generic
+                // io::Error to the decoder (which then emerges from
+                // `run_one` as an Extractor/Decode error). When that
+                // happens we prefer the typed `IntegrityError`
+                // recorded inside the shared hasher — it carries the
+                // part index and the friendly "the file you got is
+                // not the file you expected" message. Drop the
+                // decoder first to release the HashingReader's Arc
+                // clone of the hasher.
+                drop(decoder);
+                let mut stats = match run_result {
+                    Ok(s) => s,
+                    Err(extractor_err) => {
+                        if let Some(setup) = hasher_handle.as_ref() {
+                            if let Ok(guard) = setup.lock() {
+                                if let Some(integrity) = guard.error() {
+                                    return Err(CoordinatorError::Integrity(integrity));
+                                }
+                            }
+                        }
+                        return Err(extractor_err);
                     }
                 };
                 let source_snapshot = source_metrics.snapshot();
@@ -1391,41 +1418,23 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 stats.source_wait_count = source_snapshot.wait_count;
                 stats.source_poll_sleeps = source_snapshot.poll_sleeps;
 
-                // Drop the decoder before finalizing the hasher: the
-                // decoder owns the HashingReader, which holds a
-                // clone of the SharedHasher. Dropping it releases
-                // any buffered bytes still in the BufReader through
-                // to the hasher (they were already counted) and
-                // releases that Arc reference.
-                drop(decoder);
-
-                if let (Some(setup), Some(expected)) =
-                    (hasher_setup, config.expected_sha256.as_ref())
-                {
-                    let inner = match Arc::try_unwrap(setup.hasher) {
-                        Ok(mutex) => mutex.into_inner().map_err(|_| {
-                            CoordinatorError::IoBackend(io::Error::other(
-                                "hasher mutex poisoned at finalize",
-                            ))
-                        })?,
-                        Err(arc) => {
-                            // Defensive: someone else still holds
-                            // the Arc. Clone the state, drop the
-                            // outer reference, and finalize the
-                            // clone. Functionally equivalent.
-                            let snapshot = arc
-                                .lock()
-                                .map_err(|_| {
-                                    CoordinatorError::IoBackend(io::Error::other(
-                                        "hasher mutex poisoned at finalize",
-                                    ))
-                                })?
-                                .clone();
-                            snapshot
-                        }
-                    };
-                    let computed = inner.finalize();
-                    crate::hash::verify_digest(expected, &computed)
+                // Verification path: the [`crate::hash::IntegrityHasher`]
+                // already verified each part as the stream crossed
+                // its boundary inside `update`, so this block usually
+                // just drains a clean state. We still call
+                // `finalize_remaining` so an early-stopping decoder
+                // (`bytes_processed < total_size`) gets the
+                // partial-digest mismatch surfaced rather than
+                // silently passing — matching the pre-state-machine
+                // behaviour for single-URL.
+                if let Some(setup) = hasher_setup {
+                    let mut guard = setup.hasher.lock().map_err(|_| {
+                        CoordinatorError::IoBackend(io::Error::other(
+                            "hasher mutex poisoned at finalize",
+                        ))
+                    })?;
+                    guard
+                        .finalize_remaining()
                         .map_err(CoordinatorError::Integrity)?;
                 }
 
@@ -2682,32 +2691,53 @@ struct IntegrityHasherSetup {
     skip_remaining: u64,
 }
 
-/// Build the integrity hasher for this run, or `None` if `--sha256`
-/// is not set.
+/// Build the integrity hasher for this run, or `None` when no
+/// hashes were configured.
 ///
-/// Resume semantics (`docs/PLAN_v2.md` §10 step 4):
+/// `info.source` carries the per-part layout (length 1 for
+/// single-URL); `expected` is parallel to it, with each entry
+/// `Some` when the user supplied a hash for that part and `None`
+/// otherwise. When every entry is `None` (or `expected` is empty)
+/// no hasher is built and the coordinator skips the integrity
+/// pipeline entirely.
 ///
-/// - **Fresh run + `--sha256`** → fresh hasher, skip = 0.
-/// - **Resume + `--sha256` + saved hash_state** → restore hasher
-///   from the saved state. The hasher's `bytes_processed` may be
-///   larger than `decoder_position` because the previous run's
-///   BufReader had prefetched past the boundary; subtract to get
-///   the per-byte skip count for the new HashingReader.
-/// - **Resume + `--sha256` + no saved hash_state** → hard error
-///   (`IntegrityError::CheckpointMissingHashState`); we cannot
-///   rebuild a faithful end-of-run digest from a half-tracked run.
-/// - **Resume + no `--sha256` + saved hash_state** → hard error
-///   (`IntegrityError::CheckpointHadHashState`); refusing keeps
-///   the user's prior intent intact rather than silently losing it.
+/// Resume semantics:
+///
+/// - **Fresh run + any expected hash** → fresh single- or
+///   multi-part [`IntegrityHasher`], skip = 0.
+/// - **Resume + single-URL + saved hash_state** → restore the
+///   active `Sha256` from the saved state and rebuild a 1-part
+///   `IntegrityHasher` around it. Today's `--sha256` resume path
+///   (`PLAN_v2.md` §10 step 4) is unchanged.
+/// - **Resume + single-URL + no saved hash_state** → hard error
+///   ([`crate::hash::IntegrityError::CheckpointMissingHashState`]);
+///   we cannot rebuild a faithful end-of-run digest from a
+///   half-tracked run.
+/// - **Resume + no expected hashes + saved hash_state** → hard
+///   error ([`crate::hash::IntegrityError::CheckpointHadHashState`]);
+///   refusing keeps the user's prior intent intact rather than
+///   silently losing it.
+/// - **Resume + multi-URL + any expected hashes** → hard error
+///   ([`crate::hash::IntegrityError::MultiPartResumeNotYetWired`])
+///   because the v7 checkpoint format has no slot for the active
+///   part index. Phase 5 of `docs/PLAN_multi_url_source.md` adds
+///   the v8 field and lifts this restriction.
 fn build_integrity_hasher(
-    expected: Option<&[u8; crate::hash::sha256::DIGEST_LEN]>,
+    source: &crate::download::MultiPartSource,
+    expected: &[Option<[u8; crate::hash::sha256::DIGEST_LEN]>],
     prior: Option<&Checkpoint>,
     ckpt_path: &Path,
     reader_start: u64,
 ) -> Result<Option<IntegrityHasherSetup>, CoordinatorError> {
+    debug_assert_eq!(
+        expected.len(),
+        source.len(),
+        "expected length must match part count"
+    );
+    let any_expected = expected.iter().any(Option::is_some);
     let prior_hash_state = prior.and_then(|p| p.hash_state.as_ref());
 
-    match (expected.is_some(), prior_hash_state) {
+    match (any_expected, prior_hash_state) {
         (false, Some(_)) => Err(CoordinatorError::Integrity(
             crate::hash::IntegrityError::CheckpointHadHashState {
                 ckpt_path: ckpt_path.to_path_buf(),
@@ -2725,12 +2755,30 @@ fn build_integrity_hasher(
                     },
                 ));
             }
+            let hasher_inner = if source.len() == 1 {
+                crate::hash::IntegrityHasher::single(source.total_size(), expected[0])
+            } else {
+                let sizes: Vec<u64> = source.parts().iter().map(|p| p.size).collect();
+                crate::hash::IntegrityHasher::multi_part(&sizes, expected.to_vec())
+            };
             Ok(Some(IntegrityHasherSetup {
-                hasher: crate::hash::shared_hasher(crate::hash::sha256::Sha256::new()),
+                hasher: crate::hash::shared_hasher(hasher_inner),
                 skip_remaining: 0,
             }))
         }
         (true, Some(state_bytes)) => {
+            // Multi-URL resume from a v7 checkpoint cannot tell us
+            // which part the saved hasher was midway through.
+            // Phase 5 of `docs/PLAN_multi_url_source.md` adds the
+            // v8 field; until then this combination is a clean
+            // hard error.
+            if source.len() > 1 {
+                return Err(CoordinatorError::Integrity(
+                    crate::hash::IntegrityError::MultiPartResumeNotYetWired {
+                        ckpt_path: ckpt_path.to_path_buf(),
+                    },
+                ));
+            }
             let restored =
                 crate::hash::sha256::Sha256::deserialize(state_bytes).map_err(|source| {
                     CoordinatorError::Integrity(
@@ -2745,21 +2793,31 @@ fn build_integrity_hasher(
             // was already hashed last run; skip those.
             let already = restored.bytes_processed();
             let skip_remaining = already.saturating_sub(reader_start);
+            let hasher_inner = crate::hash::IntegrityHasher::from_single_snapshot(
+                restored,
+                source.total_size(),
+                expected[0],
+            );
             Ok(Some(IntegrityHasherSetup {
-                hasher: crate::hash::shared_hasher(restored),
+                hasher: crate::hash::shared_hasher(hasher_inner),
                 skip_remaining,
             }))
         }
     }
 }
 
-/// Snapshot the running SHA-256 hasher's state for inclusion in the
-/// next checkpoint, when integrity tracking is on.
+/// Snapshot the running integrity hasher's active part state for
+/// inclusion in the next checkpoint.
 ///
-/// Locks the shared hasher, clones the (small, fixed-size) state,
-/// drops the lock, and serializes outside the critical section. The
-/// hasher remains usable for further `update`s — `Sha256` is `Clone`
-/// and the clone is independent of the original.
+/// Locks the shared hasher, asks the [`crate::hash::IntegrityHasher`]
+/// for its active part's serialized form (small, fixed-size), drops
+/// the lock, and returns the bytes. Returns `None` when integrity
+/// tracking is off or when a prior boundary mismatch already
+/// poisoned the hasher (no point checkpointing a doomed state).
+///
+/// Single-URL only for now. Multi-URL needs the active part index
+/// alongside, which lands in the v8 checkpoint format
+/// (`docs/PLAN_multi_url_source.md` §5).
 fn snapshot_hash_state(
     hasher: Option<&crate::hash::SharedHasher>,
 ) -> Option<[u8; crate::hash::sha256::SERIALIZED_LEN]> {
@@ -2771,8 +2829,16 @@ fn snapshot_hash_state(
     // coordinator into the panic path. Returning `None` (degrades
     // to "no integrity state captured this round") is the safe
     // option — a subsequent successful snapshot supersedes it.
-    let snapshot = h.lock().ok()?.clone();
-    Some(snapshot.serialize())
+    let guard = h.lock().ok()?;
+    // Multi-URL hash_state checkpointing requires the v8 format
+    // (`docs/PLAN_multi_url_source.md` §5). Until that lands, we
+    // skip the snapshot for multi-part hashers — `build_integrity_hasher`
+    // refuses to resume from such a checkpoint, so the absence is
+    // explicit rather than silent.
+    if guard.part_count() > 1 {
+        return None;
+    }
+    guard.snapshot_active_serialized()
 }
 
 /// Construct the [`SparseFile`] for this run, picking between the

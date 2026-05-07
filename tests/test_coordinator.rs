@@ -1509,6 +1509,147 @@ fn sha256_mismatch_aborts_with_integrity_error() {
 }
 
 #[test]
+fn multi_url_per_part_sha256_mismatch_fails_at_part_one_boundary() {
+    // Phase 4 demo (`docs/PLAN_multi_url_source.md` §4):
+    // a 3-part run where the user passes a bad hash for part 1
+    // must abort *the moment part 1 finishes streaming* — before
+    // the decoder spends time on parts 2..N. The bytes themselves
+    // are correct (uncorrupted on the wire); the user's expected
+    // hash for part 1 is the only thing wrong.
+    //
+    // Build a tar archive padded to exactly 768 KiB (3 × 256 KiB
+    // so each part aligns with the multi-URL chunk-size floor,
+    // `MIN_ALIGNED_CHUNK_SIZE`). The trailing zeros after the
+    // tar end-of-archive markers are ignored by the parser.
+    let big_payload = vec![0xABu8; 200 * 1024];
+    let mut archive = build_simple_archive(&[
+        ("part0.bin", &big_payload),
+        ("part1.bin", &big_payload),
+        ("part2.bin", &big_payload),
+    ]);
+    let total: usize = 768 * 1024;
+    assert!(archive.len() <= total);
+    archive.resize(total, 0u8);
+
+    let part_size: usize = 256 * 1024;
+    let p0 = archive[..part_size].to_vec();
+    let p1 = archive[part_size..2 * part_size].to_vec();
+    let p2 = archive[2 * part_size..].to_vec();
+
+    let h0 = sha256_hex(&p0);
+    let h1_correct = sha256_hex(&p1);
+    let h2 = sha256_hex(&p2);
+    // Bit-flip the first byte of part 1's expected digest. The
+    // bytes the server returns will hash to `h1_correct`, which
+    // does not equal `h1_wrong`, so the boundary check fires.
+    let mut h1_wrong = h1_correct;
+    h1_wrong[0] ^= 0xFF;
+    assert_ne!(h1_wrong, h1_correct);
+
+    let server0 = MockServer::start(ok_handler(p0, Some("\"p0\"")));
+    let server1 = MockServer::start(ok_handler(p1.clone(), Some("\"p1\"")));
+    let server2 = MockServer::start(ok_handler(p2, Some("\"p2\"")));
+
+    let work = unique_dir("multipart_sha256_mismatch");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let args = RunArgs {
+        url: format!("{}/x.tar.part0000", server0.base_url()),
+        additional_urls: vec![
+            format!("{}/x.tar.part0001", server1.base_url()),
+            format!("{}/x.tar.part0002", server2.base_url()),
+        ],
+        output: OutputTarget::Dir(out_dir),
+        config: CoordinatorConfig {
+            forced_format: Some("tar".into()),
+            expected_sha256s: vec![h0, h1_wrong, h2],
+            ..coord_config_for_test(256 * 1024)
+        },
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+        io_backend: None,
+    };
+
+    let err = run(args).expect_err("part 1 hash mismatch must abort");
+    match err {
+        CoordinatorError::Integrity(peel::hash::IntegrityError::PartMismatch {
+            part_index,
+            expected,
+            got,
+        }) => {
+            assert_eq!(part_index, 1, "must fail at part 1, not 0 or 2");
+            assert_eq!(expected.len(), 64);
+            assert_eq!(got.len(), 64);
+            assert_ne!(expected, got);
+        }
+        other => panic!("expected PartMismatch part 1, got {other:?}"),
+    }
+}
+
+#[test]
+fn multi_url_all_per_part_sha256_match_completes_cleanly() {
+    // Companion to the mismatch test above: when every part's
+    // hash matches, the run completes and extracts the archive.
+    let big_payload = vec![0xCDu8; 200 * 1024];
+    let mut archive = build_simple_archive(&[
+        ("a.bin", &big_payload),
+        ("b.bin", &big_payload),
+        ("c.bin", &big_payload),
+    ]);
+    let total: usize = 768 * 1024;
+    archive.resize(total, 0u8);
+
+    let part_size: usize = 256 * 1024;
+    let p0 = archive[..part_size].to_vec();
+    let p1 = archive[part_size..2 * part_size].to_vec();
+    let p2 = archive[2 * part_size..].to_vec();
+    let h0 = sha256_hex(&p0);
+    let h1 = sha256_hex(&p1);
+    let h2 = sha256_hex(&p2);
+
+    let server0 = MockServer::start(ok_handler(p0, Some("\"p0\"")));
+    let server1 = MockServer::start(ok_handler(p1, Some("\"p1\"")));
+    let server2 = MockServer::start(ok_handler(p2, Some("\"p2\"")));
+
+    let work = unique_dir("multipart_sha256_match");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let args = RunArgs {
+        url: format!("{}/x.tar.part0000", server0.base_url()),
+        additional_urls: vec![
+            format!("{}/x.tar.part0001", server1.base_url()),
+            format!("{}/x.tar.part0002", server2.base_url()),
+        ],
+        output: OutputTarget::Dir(out_dir.clone()),
+        config: CoordinatorConfig {
+            forced_format: Some("tar".into()),
+            expected_sha256s: vec![h0, h1, h2],
+            ..coord_config_for_test(256 * 1024)
+        },
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+        io_backend: None,
+    };
+    let stats = run(args).expect("clean multi-URL run with matching hashes");
+    assert!(!stats.resumed);
+    let entries = read_dir_recursive(&out_dir);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"a.bin"));
+    assert!(names.contains(&"b.bin"));
+    assert!(names.contains(&"c.bin"));
+}
+
+#[test]
 fn sha256_resume_with_saved_state_completes_cleanly() {
     // Two-phase test: phase 1 runs with a kill switch that fires
     // after the first checkpoint, leaving a `.peel.part` /
