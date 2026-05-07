@@ -46,6 +46,7 @@ use thiserror::Error;
 use super::chunk_fingerprints::ChunkFingerprints;
 use super::chunk_policy::{ChunkSizePolicy, Sample};
 use super::mirrors::{Mirror, MirrorSet};
+use super::multi_url::{MultiPartSource, MultiPartSourceError};
 use super::rate_limit::{RateLimitedReader, RateLimiter};
 use super::sparse_file::{SparseFile, SparseFileError};
 use super::worker::{
@@ -239,6 +240,16 @@ pub enum SchedulerError {
         actual: u64,
     },
 
+    /// Constructing a [`MultiPartSource`] from the discovered parts
+    /// failed (empty list, zero-sized part, or total-size overflow).
+    /// The single-URL discovery path can only hit
+    /// [`MultiPartSourceError::ZeroSizedPart`] in practice — the
+    /// `Content-Length: 0` rejection upstream is what protects this
+    /// arm — but we surface every variant cleanly so [`discover_multi`]
+    /// can share the same error path.
+    #[error("invalid multi-part source")]
+    MultiPart(#[source] MultiPartSourceError),
+
     /// IO into the sparse file failed.
     #[error("sparse-file io")]
     SparseFile(#[source] SparseFileError),
@@ -258,17 +269,35 @@ pub enum SchedulerError {
     },
 }
 
-/// Discovery summary returned by [`discover`].
+/// Discovery summary returned by [`discover`] and [`discover_multi`].
+///
+/// The legacy fields (`url`, `total_size`, `fingerprint`) reflect the
+/// **primary** part — for single-URL discovery they are identical to
+/// the source's only part; for multi-URL discovery they describe
+/// `source.parts()[0]` while `total_size` carries the sum across all
+/// parts. The full per-part data lives in [`Self::source`]; downstream
+/// code that needs to route ranged GETs per part reads from there
+/// (`docs/PLAN_multi_url_source.md` §1).
 #[derive(Debug, Clone)]
 pub struct DownloadInfo {
-    /// Final URL after redirects.
+    /// Final URL after redirects (primary part for multi-URL runs).
     pub url: Url,
-    /// Total source size in bytes.
+    /// Total virtual source size in bytes — the sum of every part's
+    /// `Content-Length` for multi-URL runs.
     pub total_size: u64,
-    /// Source identity captured from `ETag` / `Last-Modified`.
+    /// Source identity captured from `ETag` / `Last-Modified` of the
+    /// primary part. Per-part fingerprints live on
+    /// `source.parts()[i].fingerprint`.
     pub fingerprint: SourceFingerprint,
-    /// True iff the server advertised `Accept-Ranges: bytes`.
+    /// True iff every part advertised `Accept-Ranges: bytes`. Without
+    /// it, parallel ranged GETs are not safe; the run falls back to
+    /// the single-stream path (which only supports a single URL).
     pub accept_ranges: bool,
+    /// The full per-part view. For single-URL runs this is a
+    /// one-element source whose fields agree with the legacy fields
+    /// above; for multi-URL runs it carries every part with its own
+    /// URL, size, and fingerprint.
+    pub source: MultiPartSource,
 }
 
 /// Tunables for [`run`].
@@ -478,11 +507,19 @@ pub fn discover(client: &Client, url: &Url) -> Result<DownloadInfo, SchedulerErr
                     .map(|v| v.eq_ignore_ascii_case("bytes"))
                     .unwrap_or(false);
                 let fingerprint = SourceFingerprint::from_headers(&head.headers);
+                let source = MultiPartSource::from_single(
+                    head.final_url.clone(),
+                    total_size,
+                    fingerprint.clone(),
+                    None,
+                )
+                .map_err(SchedulerError::MultiPart)?;
                 return Ok(DownloadInfo {
                     url: head.final_url,
                     total_size,
                     fingerprint,
                     accept_ranges,
+                    source,
                 });
             }
         }
@@ -524,11 +561,112 @@ fn discover_via_range_probe(client: &Client, url: &Url) -> Result<DownloadInfo, 
         })?;
     let fingerprint = SourceFingerprint::from_headers(&resp.headers);
     drop(resp.body);
+    let source = MultiPartSource::from_single(url.clone(), total_size, fingerprint.clone(), None)
+        .map_err(SchedulerError::MultiPart)?;
     Ok(DownloadInfo {
         url: url.clone(),
         total_size,
         fingerprint,
         accept_ranges: true,
+        source,
+    })
+}
+
+/// Discover N parts in parallel and bundle them into a multi-part
+/// [`DownloadInfo`] (`docs/PLAN_multi_url_source.md` §1 step 3).
+///
+/// Each part is HEAD'd independently; the returned info's
+/// `total_size` is the sum of every part's `Content-Length`,
+/// `accept_ranges` is true iff *every* part advertised
+/// `Accept-Ranges: bytes`, and the legacy `url` / `fingerprint`
+/// fields reflect the first part.
+///
+/// Cross-part fingerprint agreement is **not** required: parts are
+/// distinct objects whose ETags need not match. The agreement
+/// machinery in [`discover_with_mirrors`] is for `--mirror`
+/// alternates of the *same* file and is unrelated.
+///
+/// # Errors
+///
+/// Propagates the first per-part [`SchedulerError`] observed.
+/// `parts.is_empty()` returns [`SchedulerError::MultiPart`] wrapping
+/// [`MultiPartSourceError::Empty`] without issuing any HEAD requests.
+pub fn discover_multi(client: &Client, urls: &[Url]) -> Result<DownloadInfo, SchedulerError> {
+    if urls.is_empty() {
+        return Err(SchedulerError::MultiPart(MultiPartSourceError::Empty));
+    }
+    if urls.len() == 1 {
+        return discover(client, &urls[0]);
+    }
+
+    // Parallel HEADs: each part's discovery is independent of the
+    // others, and serializing them would visibly delay startup
+    // (especially against high-latency origins). Mirrors the pattern
+    // in `discover_with_mirrors`.
+    let results: Vec<Result<DownloadInfo, SchedulerError>> = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(urls.len());
+        for url in urls {
+            let client_ref = client;
+            let url_clone = url.clone();
+            let h = thread::Builder::new()
+                .name("peel-multipart-discover".into())
+                .spawn_scoped(scope, move || discover(client_ref, &url_clone))
+                .ok();
+            handles.push(h);
+        }
+        handles
+            .into_iter()
+            .map(|h| match h {
+                Some(handle) => handle.join().unwrap_or_else(|_| {
+                    Err(SchedulerError::Head {
+                        url: "<panicked>".into(),
+                        source: ClientError::DnsEmpty {
+                            host: String::new(),
+                            port: 0,
+                        },
+                    })
+                }),
+                None => Err(SchedulerError::Head {
+                    url: "<spawn-failed>".into(),
+                    source: ClientError::DnsEmpty {
+                        host: String::new(),
+                        port: 0,
+                    },
+                }),
+            })
+            .collect()
+    });
+
+    // Surface the first error; otherwise build a multi-part source.
+    let mut parts: Vec<super::multi_url::PartDescriptor> = Vec::with_capacity(urls.len());
+    let mut all_accept_ranges = true;
+    let mut total_size: u64 = 0;
+    for r in results {
+        let info = r?;
+        all_accept_ranges &= info.accept_ranges;
+        total_size = total_size
+            .checked_add(info.total_size)
+            .ok_or(SchedulerError::MultiPart(
+                MultiPartSourceError::TotalOverflow { index: parts.len() },
+            ))?;
+        parts.push(super::multi_url::PartDescriptor {
+            url: info.url,
+            size: info.total_size,
+            fingerprint: info.fingerprint,
+            expected_sha256: None,
+        });
+    }
+    let source = MultiPartSource::new(parts).map_err(SchedulerError::MultiPart)?;
+    let primary = source
+        .parts()
+        .first()
+        .expect("MultiPartSource::new rejects empty input");
+    Ok(DownloadInfo {
+        url: primary.url.clone(),
+        total_size,
+        fingerprint: primary.fingerprint.clone(),
+        accept_ranges: all_accept_ranges,
+        source,
     })
 }
 
@@ -816,10 +954,25 @@ fn run_parallel(
     // this on every dispatch tick and respawns workers when it dips
     // below `workers`.
     let alive_workers = AtomicU32::new(0);
+    // Multi-URL routing (`docs/PLAN_multi_url_source.md` §1 step 4):
+    // when the discovered source has more than one part, the worker
+    // ignores the mirror set and fetches each chunk from the part
+    // containing its global offset. The single-URL case (`len() == 1`)
+    // keeps the mirror set as the source of truth so existing
+    // `--mirror` runs are unchanged. `--mirror` plus multi-URL is
+    // rejected by the CLI (§3 step 3) so neither field needs to handle
+    // the combined case.
+    let multi_part_source: Option<&MultiPartSource> = if info.source.len() > 1 {
+        Some(&info.source)
+    } else {
+        None
+    };
+
     let scheduler_outcome: Result<DownloadStats, SchedulerError> = thread::scope(|scope| {
         let ctx = ChunkContext {
             client,
             mirrors,
+            source: multi_part_source,
             chunk_size: config.chunk_size,
             sparse,
             progress: config.progress.as_deref(),

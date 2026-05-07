@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use peel::bitmap::ChunkBitmap;
 use peel::download::{
-    chunk_count, discover, discover_with_mirrors, run, ChunkSizePolicy, DownloadMode, MirrorSet,
-    RetryConfig, SchedulerConfig, SchedulerError, SparseFile, WorkerError,
+    chunk_count, discover, discover_multi, discover_with_mirrors, run, ChunkSizePolicy,
+    DownloadMode, MirrorSet, RetryConfig, SchedulerConfig, SchedulerError, SparseFile, WorkerError,
 };
 use peel::http::{Client, ClientConfig, Url};
 use peel::types::ChunkIndex;
@@ -1735,4 +1735,154 @@ fn run_parallel_with_rate_limiter_paces_below_uncapped_rate() {
         limited > unlimited * 5,
         "limiter did not slow the run noticeably: limited={limited:?}, unlimited={unlimited:?}"
     );
+}
+
+// ---- multi-URL: split-archive parts (PLAN_multi_url_source.md §1) -----
+
+/// Build a 3-part split source served by three independent mock
+/// servers and verify the byte-concatenated stream lands intact in
+/// the sparse file. Exercises:
+///
+/// - [`discover_multi`] doing parallel HEADs across distinct origins.
+/// - The scheduler's per-part dispatch routing in
+///   `worker::try_once`: each chunk's ranged GET targets the part
+///   that contains its global byte offset, with a *part-relative*
+///   `Range` header (every chunk's `Range: bytes=0-…` against its
+///   per-part URL, not a global offset).
+/// - End-to-end byte parity with the source — the sparse file's
+///   contents equal `bytes(part0) ++ bytes(part1) ++ bytes(part2)`.
+#[test]
+fn run_parallel_assembles_three_part_split_archive() {
+    // Sizes chosen so chunk_size (1024) divides every part size,
+    // keeping every dispatch single-segment per
+    // `PLAN_multi_url_source.md` §2 alignment. Total = 8 KiB.
+    let part_lens = [2048usize, 3072, 3072];
+    let total: usize = part_lens.iter().sum();
+    let full_body = make_body(total);
+    let mut offset = 0usize;
+    let mut part_bodies: Vec<Vec<u8>> = Vec::with_capacity(part_lens.len());
+    for &len in &part_lens {
+        part_bodies.push(full_body[offset..offset + len].to_vec());
+        offset += len;
+    }
+    assert_eq!(offset, total);
+
+    // Each part lives on its own MockServer (distinct origin) so the
+    // worker has to consult `MultiPartSource::locate` per chunk to
+    // pick the right URL — a single shared-server fixture would let
+    // a buggy router accidentally hit any URL and still succeed.
+    let server0 = MockServer::start(ok_handler(part_bodies[0].clone(), Some("\"p0\"")));
+    let server1 = MockServer::start(ok_handler(part_bodies[1].clone(), Some("\"p1\"")));
+    let server2 = MockServer::start(ok_handler(part_bodies[2].clone(), Some("\"p2\"")));
+    let client = build_client();
+
+    let urls = vec![
+        url(&server0, "/pruned.tar.part0000"),
+        url(&server1, "/pruned.tar.part0001"),
+        url(&server2, "/pruned.tar.part0002"),
+    ];
+    let info = discover_multi(&client, &urls).expect("discover_multi ok");
+
+    assert_eq!(info.total_size, total as u64);
+    assert!(info.accept_ranges, "every part advertised Accept-Ranges");
+    assert_eq!(info.source.len(), 3);
+    assert_eq!(info.source.parts()[0].size, part_lens[0] as u64);
+    assert_eq!(info.source.parts()[1].size, part_lens[1] as u64);
+    assert_eq!(info.source.parts()[2].size, part_lens[2] as u64);
+    assert_eq!(
+        info.source.parts()[1].fingerprint.etag.as_deref(),
+        Some("\"p1\"")
+    );
+
+    let chunk_size = 1024;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    assert_eq!(total_chunks as u64 * chunk_size, total as u64);
+
+    let path = temp_path("multipart_three");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    let stats = run(
+        &client,
+        &info,
+        &sparse,
+        &bitmap,
+        &cursor,
+        &cfg(chunk_size, 4),
+    )
+    .expect("run ok");
+
+    assert_eq!(stats.bytes_downloaded as usize, total);
+    assert_eq!(stats.chunks_completed, total_chunks);
+    assert_eq!(stats.chunks_resumed, 0);
+    assert!(matches!(
+        stats.mode,
+        DownloadMode::Parallel { workers: 4, .. }
+    ));
+    for i in 0..total_chunks {
+        assert!(bitmap.is_complete(ChunkIndex::new(i)));
+    }
+    assert_eq!(read_full(&path), full_body, "concatenated parts byte-match");
+
+    // Routing sanity: each server must have served exactly the
+    // chunks that fall within its part — none of the per-part GETs
+    // can have leaked across origins.
+    let p0_chunks = part_lens[0] as u64 / chunk_size;
+    let p1_chunks = part_lens[1] as u64 / chunk_size;
+    let p2_chunks = part_lens[2] as u64 / chunk_size;
+    // Each server saw 1 HEAD + N range-GETs.
+    assert_eq!(server0.request_count(), 1 + p0_chunks);
+    assert_eq!(server1.request_count(), 1 + p1_chunks);
+    assert_eq!(server2.request_count(), 1 + p2_chunks);
+
+    // Every range request server N saw must have started at a
+    // part-relative offset within `[0, part_lens[N])`. A buggy
+    // router that handed the global offset to a per-part URL would
+    // overshoot the part's `Content-Length` and trip a 416.
+    for (idx, server) in [&server0, &server1, &server2].iter().enumerate() {
+        for req in server.snapshot_requests() {
+            if req.method != "GET" {
+                continue;
+            }
+            let hdr = req.header("range").expect("ranged GET");
+            let (a, b) = parse_range(hdr).expect("range parses");
+            assert!(
+                a < part_lens[idx] as u64,
+                "part {idx} got range start {a} past its size {}",
+                part_lens[idx]
+            );
+            assert!(
+                b < part_lens[idx] as u64,
+                "part {idx} got range end {b} past its size {}",
+                part_lens[idx]
+            );
+        }
+    }
+}
+
+/// `discover_multi` rejects an empty URL list before issuing any
+/// requests.
+#[test]
+fn discover_multi_rejects_empty_url_list() {
+    let client = build_client();
+    let err = discover_multi(&client, &[]).expect_err("must reject empty");
+    assert!(matches!(err, SchedulerError::MultiPart(_)));
+}
+
+/// `discover_multi` with a single URL behaves identically to
+/// `discover` (collapses to the existing single-URL discovery path).
+#[test]
+fn discover_multi_single_url_matches_discover() {
+    let body = make_body(2048);
+    let server = MockServer::start(ok_handler(body, Some("\"v1\"")));
+    let client = build_client();
+    let url = url(&server, "/file");
+
+    let info = discover_multi(&client, std::slice::from_ref(&url)).expect("discover_multi ok");
+    assert_eq!(info.total_size, 2048);
+    assert_eq!(info.source.len(), 1);
+    assert_eq!(info.source.parts()[0].size, 2048);
+    assert_eq!(info.fingerprint.etag.as_deref(), Some("\"v1\""));
 }

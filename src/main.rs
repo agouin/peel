@@ -680,7 +680,8 @@ fn scheduler_err_is_retryable(s: &SchedulerError) -> bool {
         | SchedulerError::BitmapLengthMismatch { .. }
         | SchedulerError::InvalidChunkSize
         | SchedulerError::InvalidWorkerCount
-        | SchedulerError::TooManyChunks { .. } => false,
+        | SchedulerError::TooManyChunks { .. }
+        | SchedulerError::MultiPart(_) => false,
     }
 }
 

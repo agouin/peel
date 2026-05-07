@@ -2445,6 +2445,7 @@ fn run_resume_probe(
     let ctx = crate::download::worker::ChunkContext {
         client,
         mirrors: &probe_mirrors,
+        source: None,
         chunk_size,
         sparse,
         progress: None,
@@ -3356,14 +3357,24 @@ mod tests {
     }
 
     fn sample_info(total_size: u64) -> DownloadInfo {
-        DownloadInfo {
-            url: Url::parse("https://example.com/x.tar.zst").expect("parse"),
+        let url = Url::parse("https://example.com/x.tar.zst").expect("parse");
+        let fingerprint = SourceFingerprint {
+            etag: Some("\"abc\"".into()),
+            last_modified: None,
+        };
+        let source = crate::download::MultiPartSource::from_single(
+            url.clone(),
             total_size,
-            fingerprint: SourceFingerprint {
-                etag: Some("\"abc\"".into()),
-                last_modified: None,
-            },
+            fingerprint.clone(),
+            None,
+        )
+        .expect("non-zero size");
+        DownloadInfo {
+            url,
+            total_size,
+            fingerprint,
             accept_ranges: true,
+            source,
         }
     }
 

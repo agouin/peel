@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::mirrors::{MirrorSet, DEFAULT_MIRROR_PICK_DEADLINE};
+use super::multi_url::MultiPartSource;
 use super::rate_limit::{RateLimitedReader, RateLimiter};
 use super::sparse_file::{SparseFile, SparseFileError};
 use crate::hash::crc32c::Crc32c;
@@ -198,6 +199,38 @@ pub enum WorkerError {
         /// How long the worker waited for a live mirror to recover.
         wait_secs: f64,
     },
+
+    /// Multi-URL (`docs/PLAN_multi_url_source.md`) routing tried to
+    /// dispatch a chunk whose global byte range crosses a part
+    /// boundary. The runtime invariant is that the bitmap chunk size
+    /// divides every part size; violation is enforced upstream by the
+    /// alignment check planned in §2 of that doc. Until that lands,
+    /// surface the case clearly rather than corrupting the per-part
+    /// `Range` request.
+    #[error(
+        "multi-part dispatch for chunk {chunk} crosses part {part_index}'s boundary; \
+         chunk size must divide every part size"
+    )]
+    MultiPartCrossesBoundary {
+        /// Chunk being fetched.
+        chunk: ChunkIndex,
+        /// Part the dispatch started in but extended past.
+        part_index: usize,
+    },
+
+    /// Multi-URL routing was asked for a global offset past the end
+    /// of the assembled source. Indicates a scheduler bug: the
+    /// dispatch range escaped the `[0, total_size)` clamp.
+    #[error(
+        "multi-part dispatch for chunk {chunk} starts at global offset {offset} \
+         which is past the end of the assembled source"
+    )]
+    MultiPartOutOfRange {
+        /// Chunk being fetched.
+        chunk: ChunkIndex,
+        /// Global byte offset that fell off the source.
+        offset: u64,
+    },
 }
 
 impl WorkerError {
@@ -222,6 +255,8 @@ impl WorkerError {
             Self::ChunkVerifyMismatch { .. } => false,
             Self::Cancelled { .. } => false,
             Self::NoLiveMirror { .. } => false,
+            Self::MultiPartCrossesBoundary { .. } => false,
+            Self::MultiPartOutOfRange { .. } => false,
         }
     }
 }
@@ -398,7 +433,23 @@ pub struct ChunkContext<'a> {
     /// (`PLAN_v2.md` §13). Single-URL runs construct a one-element
     /// set via [`MirrorSet::single`]; multi-mirror runs build the
     /// full set in [`crate::download::discover_with_mirrors`].
+    ///
+    /// Inert for multi-part runs (`source.is_some() &&
+    /// source.unwrap().len() > 1`): the URL routing is decided by
+    /// [`Self::source`] instead. The field stays in the context so
+    /// the single-URL and single-URL-plus-mirrors code paths remain
+    /// unchanged. The plan (`docs/PLAN_multi_url_source.md` §1
+    /// step 5) keeps `--mirror` and multi-URL mutually exclusive at
+    /// config time, so no run ever needs both at once.
     pub mirrors: &'a MirrorSet,
+    /// When set with `len() > 1`, the worker routes each ranged GET
+    /// to the part containing the dispatch's start offset, using a
+    /// part-relative `Range` header against `parts[i].url`. When
+    /// `None` or `len() == 1`, the worker falls through to the
+    /// existing [`Self::mirrors`] path. The single-URL case builds a
+    /// one-element source whose `parts[0].url` matches the lone
+    /// mirror, so either field would yield the same URL.
+    pub source: Option<&'a MultiPartSource>,
     /// Bitmap chunk size — used to slice the dispatch body into
     /// per-chunk CRC-32Cs (`PLAN_v2.md` §11).
     pub chunk_size: u64,
@@ -615,11 +666,54 @@ fn try_once(
     cancel: &AtomicBool,
 ) -> Result<(u64, Vec<u32>, Duration), WorkerError> {
     let chunk = dispatch.first;
-    let range = dispatch.range;
-    let mirror = ctx.mirrors.mirror(mirror_idx);
+    let global_range = dispatch.range;
+
+    // Multi-URL routing (`docs/PLAN_multi_url_source.md` §1 step 4):
+    // when the source has more than one part, the URL, the `Range`
+    // header value, and the fingerprint to verify all come from the
+    // part the dispatch lives in. The single-URL / `--mirror` case
+    // (`source` is `None` or `len() == 1`) falls through to the
+    // existing mirror-set lookup, preserving today's behaviour
+    // byte-for-byte.
+    let multipart = ctx.source.filter(|s| s.len() > 1);
+    let (target_url, wire_range, target_fingerprint) = if let Some(source) = multipart {
+        let start = global_range.start().get();
+        let (part_idx, in_part_start) =
+            source
+                .locate(start)
+                .ok_or(WorkerError::MultiPartOutOfRange {
+                    chunk,
+                    offset: start,
+                })?;
+        let part = &source.parts()[part_idx];
+        let in_part_end = in_part_start.checked_add(global_range.len()).ok_or(
+            WorkerError::MultiPartCrossesBoundary {
+                chunk,
+                part_index: part_idx,
+            },
+        )?;
+        if in_part_end > part.size {
+            return Err(WorkerError::MultiPartCrossesBoundary {
+                chunk,
+                part_index: part_idx,
+            });
+        }
+        let wire_range =
+            ByteRange::from_start_len(ByteOffset::new(in_part_start), global_range.len()).ok_or(
+                WorkerError::MultiPartCrossesBoundary {
+                    chunk,
+                    part_index: part_idx,
+                },
+            )?;
+        (&part.url, wire_range, &part.fingerprint)
+    } else {
+        let mirror = ctx.mirrors.mirror(mirror_idx);
+        (&mirror.url, global_range, &mirror.fingerprint)
+    };
+
     let resp = ctx
         .client
-        .get_range(&mirror.url, range)
+        .get_range(target_url, wire_range)
         .map_err(|source| match source {
             ClientError::UnexpectedStatus { status, .. } => {
                 WorkerError::UnexpectedStatus { chunk, status }
@@ -630,15 +724,16 @@ fn try_once(
             },
         })?;
 
-    verify_content_range(&resp.headers, chunk, range)?;
-    verify_content_length(&resp, chunk, range.len())?;
-    verify_fingerprint(&resp.headers, &mirror.fingerprint, chunk)?;
+    verify_content_range(&resp.headers, chunk, wire_range)?;
+    verify_content_length(&resp, chunk, wire_range.len())?;
+    verify_fingerprint(&resp.headers, target_fingerprint, chunk)?;
 
-    let len_usize = usize::try_from(range.len()).map_err(|_| WorkerError::BodyLengthMismatch {
-        chunk,
-        expected: range.len(),
-        actual: None,
-    })?;
+    let len_usize =
+        usize::try_from(global_range.len()).map_err(|_| WorkerError::BodyLengthMismatch {
+            chunk,
+            expected: global_range.len(),
+            actual: None,
+        })?;
     let mut buf = vec![0u8; len_usize];
     let mut body = resp.body;
     // Aggregate bandwidth cap (`PLAN_v2.md` §14): when configured,
@@ -684,8 +779,10 @@ fn try_once(
     }
 
     let pwrite_started = Instant::now();
+    // pwrite always uses the GLOBAL offset; the part-relative range
+    // is only the wire-side coordinate space.
     ctx.sparse
-        .pwrite_at(range.start(), &buf)
+        .pwrite_at(global_range.start(), &buf)
         .map_err(|source| WorkerError::SparseFile { chunk, source })?;
     let pwrite_time = pwrite_started.elapsed();
 
@@ -708,7 +805,7 @@ fn try_once(
     }
 
     refund.disarm();
-    Ok((range.len(), crcs, pwrite_time))
+    Ok((global_range.len(), crcs, pwrite_time))
 }
 
 /// RAII guard that refunds partial download-counter increments on any

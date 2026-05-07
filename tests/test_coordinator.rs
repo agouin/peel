@@ -2097,6 +2097,7 @@ fn worker_probe_detects_source_drift() {
     let ctx = peel::download::worker::ChunkContext {
         client: &client,
         mirrors: &mirrors,
+        source: None,
         chunk_size,
         sparse: &sparse,
         progress: None,
