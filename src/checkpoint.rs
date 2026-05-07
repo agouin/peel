@@ -982,8 +982,13 @@ impl Checkpoint {
         // trio at the top; we lift that into a synthetic
         // single-element `parts[0]` after `total_size` is read.
         let parts: Vec<PartRecord> = if format_version >= 8 {
-            let count = cursor.read_u32("parts.len")?;
-            let mut acc = Vec::with_capacity(count as usize);
+            // Each part begins with a u32 url-length read; that's the
+            // smallest commit per element. Don't preallocate against
+            // the untrusted count — even a count bounded by the cursor
+            // can multiply by `sizeof(PartRecord)` into a multi-GB
+            // allocation.
+            let count = cursor.read_count_capped("parts.len", 4)?;
+            let mut acc: Vec<PartRecord> = Vec::new();
             for i in 0..count {
                 let url_label = format!("parts[{i}].url");
                 let url = cursor.read_string_dyn(&url_label)?;
@@ -1062,8 +1067,10 @@ impl Checkpoint {
                 bytes_written: cursor.read_u64("sink.raw.bytes_written")?,
             },
             SINK_TAG_TAR => {
-                let count = cursor.read_u32("sink.tar.members_completed.len")?;
-                let mut members = Vec::with_capacity(count as usize);
+                // Each member is a length-prefixed string; minimum on
+                // the wire is the u32 length prefix.
+                let count = cursor.read_count_capped("sink.tar.members_completed.len", 4)?;
+                let mut members: Vec<String> = Vec::new();
                 for i in 0..count {
                     // Use the index in the field tag so a malformed
                     // entry's position is in the error message.
@@ -1092,8 +1099,9 @@ impl Checkpoint {
                 }
             }
             SINK_TAG_ZIP => {
-                let count = cursor.read_u32("sink.zip.entries_completed.len")?;
-                let mut entries = Vec::with_capacity(count as usize);
+                // Each entry is a u32 index — 4 bytes on the wire.
+                let count = cursor.read_count_capped("sink.zip.entries_completed.len", 4)?;
+                let mut entries: Vec<u32> = Vec::new();
                 for _ in 0..count {
                     entries.push(cursor.read_u32("sink.zip.entries_completed[i]")?);
                 }
@@ -1207,8 +1215,9 @@ impl Checkpoint {
             match presence {
                 0 => None,
                 1 => {
-                    let count = cursor.read_u32("chunk_crc32c.len")?;
-                    let mut crcs = Vec::with_capacity(count as usize);
+                    // Each CRC is a u32 — 4 bytes on the wire.
+                    let count = cursor.read_count_capped("chunk_crc32c.len", 4)?;
+                    let mut crcs: Vec<u32> = Vec::new();
                     for _ in 0..count {
                         crcs.push(cursor.read_u32("chunk_crc32c[i]")?);
                     }
@@ -1698,6 +1707,44 @@ impl<'a> Cursor<'a> {
         let len = self.read_u32(field)? as usize;
         let bytes = self.require(len, field)?;
         Ok(bytes.to_vec())
+    }
+
+    /// Read a u32 element count and reject it up front if the cursor
+    /// could not possibly contain that many elements: each element
+    /// must consume at least `min_bytes_per_element` bytes before the
+    /// inner-element loop can detect a malformed element, so any
+    /// declared count whose minimum byte budget overruns the remaining
+    /// body is provably malformed.
+    ///
+    /// This guards against adversarial counts (found by `cargo fuzz`
+    /// target `checkpoint_deserialize`) that would otherwise drive the
+    /// inner loop billions of iterations or — when paired with a
+    /// `Vec::with_capacity(count)` — request a multi-hundred-GB
+    /// allocation. Callers MUST still avoid `with_capacity(count)`
+    /// because even within this bound the count can be large enough
+    /// that `count * sizeof(T)` exceeds available memory; use
+    /// `Vec::new()` and let the loop grow the vec as elements parse.
+    fn read_count_capped(
+        &mut self,
+        field: &'static str,
+        min_bytes_per_element: usize,
+    ) -> Result<usize, CheckpointError> {
+        let count = self.read_u32(field)? as usize;
+        // INVARIANT: callers always pass min_bytes_per_element >= 1.
+        // Saturating multiply avoids overflow; on 64-bit `usize` the
+        // saturation point is far above MAX_BODY_LEN so saturation
+        // cannot mask a real overrun.
+        let need = count.saturating_mul(min_bytes_per_element.max(1));
+        if need > self.remaining() {
+            return Err(CheckpointError::Truncated {
+                reason: format!(
+                    "field {field} declares {count} elements (>= {need} bytes) \
+                     but only {} bytes remain",
+                    self.remaining(),
+                ),
+            });
+        }
+        Ok(count)
     }
 
     fn read_string(&mut self, field: &'static str) -> Result<String, CheckpointError> {
@@ -2533,6 +2580,32 @@ mod tests {
                 assert_eq!(field, "chunk_crc32c");
             }
             other => panic!("expected InvalidPresence(chunk_crc32c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_parts_count() {
+        // Regression for cargo-fuzz target `checkpoint_deserialize`
+        // OOM (artifact oom-0b10b89f...): a v8 body that declares
+        // `parts.len = 0xFFFFFF24` previously reached
+        // `Vec::with_capacity(~4.29e9)` and tried to allocate ~515 GB
+        // before failing inside the read loop. The bounded-count
+        // helper must reject the count up front.
+        let mut body = Vec::new();
+        write_u32(&mut body, 0xFFFF_FF24); // parts.len — far beyond what could fit
+                                           // Append a few trailing bytes; their content does not matter
+                                           // because the count check fires first.
+        body.extend_from_slice(&[0u8; 16]);
+        let bytes = frame_legacy_body(&body, 8);
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::Truncated { reason } => {
+                assert!(
+                    reason.contains("parts.len"),
+                    "reason should name the offending field, got {reason:?}",
+                );
+            }
+            other => panic!("expected Truncated(parts.len), got {other:?}"),
         }
     }
 
