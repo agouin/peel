@@ -100,6 +100,7 @@ pub mod dynamic;
 pub mod error;
 pub mod gzip;
 pub mod huffman;
+pub mod members;
 pub mod resume;
 pub mod window;
 

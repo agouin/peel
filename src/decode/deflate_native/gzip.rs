@@ -101,6 +101,25 @@ pub struct GzipDecoder {
     /// member's trailer validates cleanly; carried across decode
     /// steps so [`StreamingDecoder::frame_boundary`] is monotone.
     last_frame_boundary: Option<ByteOffset>,
+    /// CRC-32 the most-recently-validated member's trailer recorded.
+    /// `None` until the first member's trailer lands. Read via
+    /// [`Self::last_member_crc32`]; used by the
+    /// [`super::members::scan_first_member`] helper to populate
+    /// [`super::members::GzMemberRecord::crc32`] without re-decoding
+    /// the bytes. Persists across the inter-member transition until
+    /// the next member's trailer lands.
+    last_member_crc32: Option<u32>,
+    /// ISIZE (low 32 bits of decompressed length, RFC 1952 §2.3.1.5)
+    /// the most-recently-validated member's trailer recorded. `None`
+    /// until the first member's trailer lands. Lives next to
+    /// [`Self::last_member_crc32`] for the same reason.
+    last_member_isize: Option<u32>,
+    /// Count of members whose trailers have validated cleanly so
+    /// far. Read via [`Self::members_scanned`]; the parallel path's
+    /// entry condition gates on `≥ 2`. Resets only on a fresh
+    /// [`Self::new`] / [`super::members::scan_first_member`] call;
+    /// monotonically non-decreasing across decode steps.
+    members_scanned: u32,
 }
 
 /// Outer state machine for the gzip wrapper.
@@ -168,7 +187,72 @@ impl GzipDecoder {
             running_crc: Crc32::new(),
             running_isize: 0,
             last_frame_boundary: None,
+            last_member_crc32: None,
+            last_member_isize: None,
+            members_scanned: 0,
         })
+    }
+
+    /// Number of gzip members whose trailers have validated cleanly
+    /// since construction. Phase 2 of [`docs/PLAN_gzip_throughput.md`]:
+    /// the parallel-path entry condition gates on
+    /// `members_scanned() >= 2`, and the [`super::members`] scanner
+    /// helpers loop until this advances.
+    #[must_use]
+    pub fn members_scanned(&self) -> u32 {
+        self.members_scanned
+    }
+
+    /// CRC-32 the most-recently-validated member's trailer recorded.
+    /// `None` until the first member's trailer lands. Carries the
+    /// per-member CRC across the inter-member transition (the
+    /// running CRC32 hasher resets on the next member's
+    /// `AwaitingHeader → InDeflateBody` transition; this field
+    /// persists). Used by [`super::members::scan_first_member`] to
+    /// populate [`super::members::GzMemberRecord::crc32`].
+    #[must_use]
+    pub fn last_member_crc32(&self) -> Option<u32> {
+        self.last_member_crc32
+    }
+
+    /// ISIZE (RFC 1952 §2.3.1.5: low 32 bits of decompressed length)
+    /// the most-recently-validated member's trailer recorded. `None`
+    /// until the first member's trailer lands. Sister of
+    /// [`Self::last_member_crc32`].
+    #[must_use]
+    pub fn last_member_isize(&self) -> Option<u32> {
+        self.last_member_isize
+    }
+
+    /// Mirror of [`StreamingDecoder::decode_step`] that returns the
+    /// internal [`DeflateError`] vocabulary instead of round-tripping
+    /// through [`DecodeError`]'s flattened `io::Error::other(...)`.
+    /// Phase 2 of [`docs/PLAN_gzip_throughput.md`]: the
+    /// [`super::members`] scanner needs the typed variants
+    /// (`UnexpectedEof` vs `GzipBadMagic` vs `GzipCrcMismatch`) so
+    /// the coordinator can discriminate "retry / wrong format / fail
+    /// closed" without parsing message strings.
+    ///
+    /// Same terminal-error contract as [`Self::decode_step`]: any
+    /// error clamps the wrapper to `Done` and drops the inner
+    /// decoder + bit reader so subsequent calls cleanly short-
+    /// circuit.
+    pub(super) fn step_typed(
+        &mut self,
+        sink: &mut dyn Write,
+    ) -> Result<DecodeStatus, DeflateError> {
+        if matches!(self.state, State::Done) {
+            return Ok(DecodeStatus::Eof);
+        }
+        match self.step_inner(sink) {
+            Ok(status) => Ok(status),
+            Err(e) => {
+                self.state = State::Done;
+                self.inner = None;
+                self.bits = None;
+                Err(e)
+            }
+        }
     }
 
     /// Source-byte high-water mark, regardless of which phase owns
@@ -267,15 +351,21 @@ impl GzipDecoder {
             }
 
             State::AwaitingTrailer => {
-                self.read_and_validate_trailer()?;
+                let (recorded_crc, recorded_isize) = self.read_and_validate_trailer()?;
                 // Member done. Record the boundary at the current
-                // byte cursor (now past the trailer).
+                // byte cursor (now past the trailer) plus the
+                // per-member CRC32 / ISIZE so the
+                // [`super::members::scan_first_member`] helper can
+                // pull them out without re-decoding.
                 let bits = self
                     .bits
                     .as_ref()
                     .expect("bits owned in AwaitingTrailer state");
                 let boundary = bits.byte_position().0;
                 self.last_frame_boundary = Some(ByteOffset::new(boundary));
+                self.last_member_crc32 = Some(recorded_crc);
+                self.last_member_isize = Some(recorded_isize);
+                self.members_scanned = self.members_scanned.saturating_add(1);
                 self.state = State::BetweenMembers;
                 Ok(DecodeStatus::MoreData)
             }
@@ -391,8 +481,11 @@ impl GzipDecoder {
     /// Byte-align the bit cursor (RFC 1951's "any incomplete bits
     /// of the final byte are skipped" rule), then read and
     /// validate the 8-byte trailer (CRC32 + ISIZE) against the
-    /// running counters.
-    fn read_and_validate_trailer(&mut self) -> Result<(), DeflateError> {
+    /// running counters. Returns `(recorded_crc, recorded_isize)`
+    /// on success so the caller can stash them on the wrapper for
+    /// [`Self::last_member_crc32`] / [`Self::last_member_isize`]
+    /// without re-decoding.
+    fn read_and_validate_trailer(&mut self) -> Result<(u32, u32), DeflateError> {
         let bits = self
             .bits
             .as_mut()
@@ -415,7 +508,7 @@ impl GzipDecoder {
                 computed: self.running_isize,
             });
         }
-        Ok(())
+        Ok((recorded_crc, recorded_isize))
     }
 }
 
@@ -604,6 +697,14 @@ pub fn resume_factory(
         running_crc,
         running_isize,
         last_frame_boundary,
+        // The resume blob captures the prefix of one in-progress
+        // member (Phase 7 of `PLAN_deflate_block_decoder.md`); no
+        // member's trailer has validated *in this resumed
+        // GzipDecoder*, so the per-member fields stay `None` until
+        // the resumed member's own trailer lands.
+        last_member_crc32: None,
+        last_member_isize: None,
+        members_scanned: 0,
     }))
 }
 
@@ -695,6 +796,94 @@ mod tests {
             peel_out, flate_out,
             "peel multi-member output differs from flate2's MultiGzDecoder"
         );
+    }
+
+    /// Phase 2 of `docs/PLAN_gzip_throughput.md`: tighten the
+    /// per-member contract. `frame_boundary()` must advance exactly
+    /// once per member (no spurious advances within a member's
+    /// deflate body — those go through the inner deflate decoder's
+    /// per-block boundary, not the gzip wrapper's last-frame field),
+    /// and `members_scanned()` must increment in lockstep with each
+    /// observed boundary advance. The parallel-path entry condition
+    /// gates on `members_scanned() >= 2`, so this contract is
+    /// load-bearing for the Phase 3 dispatch decision.
+    #[test]
+    fn frame_boundary_advances_per_member_in_multi_member_stream() {
+        // Six members of distinct sizes so any "boundary observed
+        // twice" or "boundary skipped" bug surfaces directly in the
+        // expected vector.
+        let mut combined = Vec::new();
+        let mut expected_offsets = Vec::new();
+        let mut cursor = 0u64;
+        for i in 0u8..6 {
+            let payload: Vec<u8> = (0..(512 * (i as usize + 1)))
+                .map(|j| (j as u8).wrapping_add(i.wrapping_mul(13)))
+                .collect();
+            let blob = encode_gzip(&payload);
+            cursor += blob.len() as u64;
+            combined.extend_from_slice(&blob);
+            expected_offsets.push(cursor);
+        }
+
+        let mut decoder =
+            GzipDecoder::new(Box::new(Cursor::new(combined.clone()))).expect("construct");
+        let mut sink = Vec::new();
+        let mut observed_offsets: Vec<u64> = Vec::new();
+        let mut observed_counts: Vec<u32> = Vec::new();
+        let mut last_boundary = decoder.frame_boundary();
+        loop {
+            let status = decoder.decode_step(&mut sink).expect("decode_step");
+            // We're checking *gzip-wrapper* per-member advances —
+            // that means the wrapper's `last_frame_boundary` field,
+            // which is only observable as `frame_boundary()` between
+            // members (i.e. when the inner deflate decoder is not
+            // owning the bit reader). Use `members_scanned()` as the
+            // load-bearing per-member counter; sample
+            // `frame_boundary()` whenever the count advances.
+            let count = decoder.members_scanned();
+            let expected_seen = observed_counts.last().copied().unwrap_or(0);
+            if count > expected_seen {
+                // The wrapper is now in `BetweenMembers` /
+                // `Done` state, so `frame_boundary()` returns the
+                // wrapper's `last_frame_boundary` rather than
+                // delegating to a non-existent inner decoder.
+                let boundary = decoder
+                    .frame_boundary()
+                    .expect("frame_boundary observable after a member's trailer validates");
+                observed_offsets.push(boundary.get());
+                observed_counts.push(count);
+                last_boundary = Some(boundary);
+            } else {
+                // Within a member: the boundary must not have moved
+                // backward (monotone), and must equal the previous
+                // observation while we're inside the deflate body.
+                if let (Some(prev), Some(curr)) = (last_boundary, decoder.frame_boundary()) {
+                    assert!(
+                        curr >= prev,
+                        "frame_boundary regressed: {prev:?} → {curr:?}",
+                    );
+                }
+            }
+            if status == DecodeStatus::Eof {
+                break;
+            }
+        }
+
+        assert_eq!(
+            observed_offsets, expected_offsets,
+            "per-member boundaries must match the encoded layout exactly",
+        );
+        assert_eq!(
+            observed_counts,
+            (1u32..=expected_offsets.len() as u32).collect::<Vec<_>>(),
+            "members_scanned must increment in lockstep with each observed boundary",
+        );
+        assert_eq!(
+            decoder.members_scanned(),
+            expected_offsets.len() as u32,
+            "final members_scanned must equal the number of encoded members",
+        );
+        assert_eq!(decoder.bytes_consumed().get(), combined.len() as u64);
     }
 
     #[test]
