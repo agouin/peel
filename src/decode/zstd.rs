@@ -602,7 +602,16 @@ impl Decoder {
 
                             // 3. Execute: walk sequences, materialize
                             //    bytes into `block_out`, update window
-                            //    and repeat slots.
+                            //    and repeat slots. The Block_Maximum_
+                            //    Decompressed_Size cap (RFC §3.1.1.2:
+                            //    min(Window_Size, 128 KiB)) is enforced
+                            //    inside `execute` *up front* — checking
+                            //    after the fact would be too late, the
+                            //    underlying `out.reserve` could already
+                            //    have OOMed on a malformed sequences
+                            //    section.
+                            let decompressed_cap =
+                                u64::from(BLOCK_MAX_SIZE).min(frame_header.window_size);
                             self.block_out.clear();
                             sequences::execute(
                                 &seqs,
@@ -610,18 +619,8 @@ impl Decoder {
                                 &mut frame_state.window,
                                 &mut frame_state.repeats,
                                 &mut self.block_out,
+                                decompressed_cap,
                             )?;
-
-                            // Block_Maximum_Decompressed_Size cap
-                            // (RFC §3.1.1.2): per-block decoded size
-                            // ≤ min(Window_Size, 128 KiB).
-                            let decompressed_cap =
-                                u64::from(BLOCK_MAX_SIZE).min(frame_header.window_size);
-                            if self.block_out.len() as u64 > decompressed_cap {
-                                return Err(ZstdError::MalformedFrameHeader(
-                                    "Compressed_Block decompressed size exceeds Block_Maximum_Size",
-                                ));
-                            }
 
                             sink.write_all(&self.block_out).map_err(ZstdError::SinkIo)?;
                             // The sequence executor already appended

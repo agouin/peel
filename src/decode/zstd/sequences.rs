@@ -519,19 +519,43 @@ impl RepeatOffsets {
 /// `literals.len() + sum(match_length)`, which is the block's
 /// declared decompressed size.
 ///
+/// `decompressed_cap` is the per-block decompressed-size ceiling
+/// per RFC 8478 §3.1.1.2 (`min(Window_Size, 128 KiB)`). The
+/// executor verifies up front that
+/// `literals.len() + sum(match_length) ≤ decompressed_cap` and
+/// rejects out-of-spec inputs before any allocation. Without this
+/// guard a malformed sequences section can drive
+/// [`SlidingWindow::match_copy`]'s `out.reserve(length)` into a
+/// multi-GB allocation; surfaced by `cargo fuzz` target
+/// `frame_boundary` (artifact `oom-9aa68fbb…`).
+///
 /// # Errors
 ///
-/// - [`ZstdError::MalformedFrameHeader`] when a sequence's
-///   `literals_length` exceeds the remaining `literals` buffer,
-///   when the offset is invalid, or when the repeat-slot state
-///   triggers the `Repeated_Offset1 - 1 == 0` corruption case.
+/// - [`ZstdError::MalformedFrameHeader`] when the cumulative
+///   decompressed size would exceed `decompressed_cap`, when a
+///   sequence's `literals_length` exceeds the remaining `literals`
+///   buffer, when the offset is invalid, or when the repeat-slot
+///   state triggers the `Repeated_Offset1 - 1 == 0` corruption case.
 pub fn execute(
     sequences: &[Sequence],
     literals: &[u8],
     window: &mut SlidingWindow,
     repeats: &mut RepeatOffsets,
     out: &mut Vec<u8>,
+    decompressed_cap: u64,
 ) -> Result<(), ZstdError> {
+    let mut total = literals.len() as u64;
+    for seq in sequences {
+        total = total.checked_add(u64::from(seq.match_length)).ok_or(
+            ZstdError::MalformedFrameHeader("sequence match_length sum overflows u64"),
+        )?;
+    }
+    if total > decompressed_cap {
+        return Err(ZstdError::MalformedFrameHeader(
+            "Compressed_Block decompressed size exceeds Block_Maximum_Size",
+        ));
+    }
+
     let mut lit_cursor = 0usize;
     for seq in sequences {
         // 1. Literal run: copy `literals_length` bytes from the
@@ -920,7 +944,15 @@ mod tests {
         let mut window = SlidingWindow::new(64).expect("window");
         let mut repeats = RepeatOffsets::default();
         let mut out = Vec::new();
-        execute(&[], b"hello, world", &mut window, &mut repeats, &mut out).expect("execute");
+        execute(
+            &[],
+            b"hello, world",
+            &mut window,
+            &mut repeats,
+            &mut out,
+            u64::MAX,
+        )
+        .expect("execute");
         assert_eq!(out, b"hello, world");
         assert_eq!(window.total_written(), 12);
         // No sequences -> repeat slots unchanged.
@@ -941,7 +973,15 @@ mod tests {
             match_length: 2,
             offset_value: 4,
         }];
-        execute(&seqs, b"abcX", &mut window, &mut repeats, &mut out).expect("execute");
+        execute(
+            &seqs,
+            b"abcX",
+            &mut window,
+            &mut repeats,
+            &mut out,
+            u64::MAX,
+        )
+        .expect("execute");
         assert_eq!(out, b"abcccX");
         // Slots updated: non-repeat, slot[0] = 1.
         assert_eq!(repeats.slots(), [1, 1, 4]);
@@ -961,7 +1001,7 @@ mod tests {
             match_length: 4,
             offset_value: 4,
         }];
-        execute(&seqs, b"a", &mut window, &mut repeats, &mut out).expect("execute");
+        execute(&seqs, b"a", &mut window, &mut repeats, &mut out, u64::MAX).expect("execute");
         assert_eq!(out, b"aaaaa");
     }
 
@@ -999,7 +1039,15 @@ mod tests {
                 offset_value: 2225,
             },
         ];
-        execute(&seqs, &literals, &mut window, &mut repeats, &mut out).expect("execute");
+        execute(
+            &seqs,
+            &literals,
+            &mut window,
+            &mut repeats,
+            &mut out,
+            u64::MAX,
+        )
+        .expect("execute");
         assert_eq!(repeats.slots(), [2222, 1111, 1]);
         // Block decompressed size = literals.len() + sum(ml).
         assert_eq!(out.len(), literals.len() + 3);
@@ -1016,7 +1064,14 @@ mod tests {
             match_length: 3,
             offset_value: 4,
         }];
-        match execute(&seqs, b"hello", &mut window, &mut repeats, &mut out) {
+        match execute(
+            &seqs,
+            b"hello",
+            &mut window,
+            &mut repeats,
+            &mut out,
+            u64::MAX,
+        ) {
             Err(ZstdError::MalformedFrameHeader(_)) => {}
             other => panic!("expected malformed, got {other:?}"),
         }
@@ -1032,9 +1087,44 @@ mod tests {
             match_length: 1,
             offset_value: 0,
         }];
-        match execute(&seqs, b"", &mut window, &mut repeats, &mut out) {
+        match execute(&seqs, b"", &mut window, &mut repeats, &mut out, u64::MAX) {
             Err(ZstdError::MalformedFrameHeader(_)) => {}
             other => panic!("expected malformed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn execute_rejects_block_decompressed_size_over_cap() {
+        // Regression for cargo-fuzz target `frame_boundary` OOM
+        // (artifact oom-9aa68fbb...): a malformed sequences section
+        // can decode to a sequence whose `match_length` plus the
+        // literals run far exceeds the per-block decompressed cap.
+        // Without the up-front check, `SlidingWindow::match_copy`'s
+        // `out.reserve(length)` allocates multi-GB before the
+        // post-execute cap could fire.
+        let mut window = SlidingWindow::new(64).expect("window");
+        let mut repeats = RepeatOffsets::default();
+        let mut out = Vec::new();
+        // Use offset_value=4 (non-repeat → actual offset = 1) so the
+        // sequence is otherwise legal; `match_length` of 200_000
+        // alone exceeds the conservative 128 KiB block cap.
+        let seqs = [Sequence {
+            literals_length: 1,
+            match_length: 200_000,
+            offset_value: 4,
+        }];
+        match execute(&seqs, b"a", &mut window, &mut repeats, &mut out, 128 * 1024) {
+            Err(ZstdError::MalformedFrameHeader(msg)) => {
+                assert!(
+                    msg.contains("Block_Maximum_Size"),
+                    "expected size-cap error, got {msg:?}",
+                );
+            }
+            other => panic!("expected malformed, got {other:?}"),
+        }
+        // The window must remain untouched: no allocation happened
+        // because the size check fires before any append.
+        assert_eq!(out.len(), 0);
+        assert_eq!(window.total_written(), 0);
     }
 }
