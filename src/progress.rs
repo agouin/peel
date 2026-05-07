@@ -31,7 +31,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -115,6 +115,33 @@ pub struct ProgressState {
     /// [`crate::extractor`] §2.2 cannot fire while the call is still
     /// running, so this is the reachable signal during a true wedge).
     decode_step_started_ns: AtomicU64,
+    /// Per-part counters for multi-URL split-source runs
+    /// (`docs/PLAN_multi_url_source.md`). Initialized once by the
+    /// coordinator after discovery via [`Self::set_parts`]; left
+    /// unset for runs that never hit that path. When set, workers
+    /// credit per-part bytes via [`Self::add_downloaded_to_part`]
+    /// in addition to the aggregate `bytes_downloaded`. Snapshots
+    /// expose the per-part view through [`ProgressSnapshot::parts`].
+    parts: OnceLock<Vec<PartCounter>>,
+}
+
+/// Per-part download counters published in [`ProgressSnapshot::parts`].
+///
+/// Initialized once by [`ProgressState::set_parts`] from the
+/// post-discovery [`crate::download::MultiPartSource`]; afterward the
+/// label and total size are read-only and only `bytes_downloaded`
+/// changes. The renderer reads a coherent view via
+/// [`ProgressState::snapshot`].
+#[derive(Debug)]
+pub struct PartCounter {
+    /// Short label for the part — typically the URL's basename
+    /// (e.g. `pruned.tar.part0000`). Used by the renderers to
+    /// label per-part rows.
+    pub label: String,
+    /// `Content-Length` reported for this part at HEAD time.
+    pub total_size: u64,
+    /// Compressed bytes downloaded for this part so far.
+    pub bytes_downloaded: AtomicU64,
 }
 
 impl ProgressState {
@@ -135,7 +162,66 @@ impl ProgressState {
             disk_bound: AtomicBool::new(false),
             state_anchor: Instant::now(),
             decode_step_started_ns: AtomicU64::new(0),
+            parts: OnceLock::new(),
         })
+    }
+
+    /// Initialize the per-part counters
+    /// (`docs/PLAN_multi_url_source.md`). Call once after discovery.
+    /// Subsequent calls are silently ignored — `OnceLock` semantics —
+    /// so the same coordinator can [`Self::reset_for_retry`] and
+    /// re-init only on a brand-new state instance. `parts` carries
+    /// `(label, total_size)` per part; the worker labels its rows
+    /// from the URL's basename.
+    pub fn set_parts(&self, parts: Vec<(String, u64)>) {
+        let _ = self.parts.set(
+            parts
+                .into_iter()
+                .map(|(label, total_size)| PartCounter {
+                    label,
+                    total_size,
+                    bytes_downloaded: AtomicU64::new(0),
+                })
+                .collect(),
+        );
+    }
+
+    /// Borrow the per-part counters. Returns `None` until
+    /// [`Self::set_parts`] has been called.
+    #[must_use]
+    pub fn parts(&self) -> Option<&[PartCounter]> {
+        self.parts.get().map(Vec::as_slice)
+    }
+
+    /// Add `n` to the per-part counter for `part_idx`. Silently
+    /// no-ops when [`Self::set_parts`] hasn't been called or the
+    /// index is out of range — pre-multi-URL writers can keep
+    /// calling [`Self::add_downloaded`] alone without surprise.
+    pub fn add_downloaded_to_part(&self, part_idx: usize, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(parts) = self.parts.get() {
+            if let Some(part) = parts.get(part_idx) {
+                part.bytes_downloaded.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Roll back a partial in-flight per-part increment. Mirrors
+    /// [`Self::sub_downloaded`]'s contract but for per-part
+    /// counters; pair every [`Self::add_downloaded_to_part`] that
+    /// might be rolled back with a corresponding rollback so the
+    /// per-part view stays consistent with the aggregate.
+    pub fn sub_downloaded_from_part(&self, part_idx: usize, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(parts) = self.parts.get() {
+            if let Some(part) = parts.get(part_idx) {
+                part.bytes_downloaded.fetch_sub(n, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Set the total source size. `0` is the sentinel for "unknown".
@@ -306,6 +392,20 @@ impl ProgressState {
         let total = self.total_size.load(Ordering::Acquire);
         let est = self.extracted_estimate.load(Ordering::Acquire);
         let max_buf = self.max_disk_buffer.load(Ordering::Acquire);
+        let parts: Vec<PartProgressSnapshot> = self
+            .parts
+            .get()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .map(|p| PartProgressSnapshot {
+                        label: p.label.clone(),
+                        total_size: p.total_size,
+                        bytes_downloaded: p.bytes_downloaded.load(Ordering::Relaxed),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         ProgressSnapshot {
             total_size: if total == 0 { None } else { Some(total) },
             bytes_downloaded: self.bytes_downloaded.load(Ordering::Relaxed),
@@ -319,6 +419,7 @@ impl ProgressState {
             max_disk_buffer: if max_buf == 0 { None } else { Some(max_buf) },
             disk_bound: self.disk_bound.load(Ordering::Acquire),
             decode_step_elapsed: self.decode_step_elapsed(),
+            parts,
         }
     }
 }
@@ -328,7 +429,7 @@ impl ProgressState {
 /// The fields whose underlying atomic uses `0` as a sentinel for
 /// "unknown" are surfaced here as `Option`, so renderers don't need
 /// to re-encode the convention.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProgressSnapshot {
     /// Total source size, if known.
     pub total_size: Option<u64>,
@@ -365,6 +466,25 @@ pub struct ProgressSnapshot {
     /// blocking syscall on its own thread (where the §2.2 post-hoc
     /// watchdog cannot reach).
     pub decode_step_elapsed: Option<Duration>,
+    /// Per-part view of the download counters
+    /// (`docs/PLAN_multi_url_source.md`). Empty for runs that did
+    /// not call [`ProgressState::set_parts`] — single-URL runs
+    /// historically take this path. Length matches the discovered
+    /// part count when populated; index N is the same part as
+    /// `info.source.parts()[N]`.
+    pub parts: Vec<PartProgressSnapshot>,
+}
+
+/// Per-part snapshot row in [`ProgressSnapshot::parts`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PartProgressSnapshot {
+    /// Short label — typically the URL's basename
+    /// (e.g. `pruned.tar.part0000`).
+    pub label: String,
+    /// `Content-Length` reported for this part at HEAD time.
+    pub total_size: u64,
+    /// Compressed bytes downloaded for this part so far.
+    pub bytes_downloaded: u64,
 }
 
 /// Rolling-window rate tracker.
@@ -636,7 +756,26 @@ pub struct TtyRenderer<W: Write + Send> {
     bar_max_columns: usize,
     started_render: bool,
     last_lines_emitted: usize,
+    /// Per-part rate buffers, one per discovered part. Allocated
+    /// lazily on the first non-empty snapshot
+    /// (`docs/PLAN_multi_url_source.md` progress UI). `Vec::is_empty()`
+    /// means "not yet seen multi-URL data" — single-URL runs leave it
+    /// empty for the entire run.
+    rate_parts: Vec<RateBuffer>,
 }
+
+/// Maximum number of per-part rows the TTY renderer prints before
+/// collapsing the tail into a `... + N more` summary
+/// (`docs/PLAN_multi_url_source.md` progress UI). Sized so a 24-row
+/// xterm shows every row plus the 5-line aggregate footer for
+/// realistic Arbitrum-shaped inventories (≤ 5 parts) and most
+/// long-tail manifests, while still bounding output for pathological
+/// 100-part lists.
+const MAX_PART_ROWS: usize = 16;
+/// Bar width for per-part rows. Narrower than the main aggregate bar
+/// so the URL label has room on the right of the bar at typical
+/// 80–120 column terminals.
+const PART_ROW_BAR_COLUMNS: usize = 24;
 
 impl<W: Write + Send> TtyRenderer<W> {
     /// Construct with the default rate buffers, locale-detected bar
@@ -652,6 +791,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             bar_max_columns: MAX_BAR_COLUMNS,
             started_render: false,
             last_lines_emitted: 0,
+            rate_parts: Vec::new(),
         }
     }
 
@@ -670,6 +810,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             bar_max_columns: bar,
             started_render: false,
             last_lines_emitted: 0,
+            rate_parts: Vec::new(),
         }
     }
 
@@ -686,6 +827,7 @@ impl<W: Write + Send> TtyRenderer<W> {
             bar_max_columns: MAX_BAR_COLUMNS,
             started_render: false,
             last_lines_emitted: 0,
+            rate_parts: Vec::new(),
         }
     }
 
@@ -707,14 +849,57 @@ impl<W: Write + Send> TtyRenderer<W> {
     /// download cursor and the decoder cursor against the configured
     /// throttle cap, so an operator can tell at a glance whether the
     /// decoder is reading source bytes when extract progress is flat.
+    ///
+    /// Single-URL (or pre-discovery) snapshots emit exactly the
+    /// historical 5 lines. Multi-URL snapshots
+    /// (`docs/PLAN_multi_url_source.md` progress UI) emit one row per
+    /// part *above* the 5-line aggregate footer; rows past
+    /// [`MAX_PART_ROWS`] are collapsed into a `... + N more` line.
     pub fn format_block(
         &mut self,
         snap: &ProgressSnapshot,
         now: Instant,
     ) -> (String, String, String, String, String) {
+        // Backwards-compatible accessor used by the existing tests:
+        // returns just the 5-line aggregate. Multi-URL callers should
+        // use [`Self::format_lines`] instead.
+        let lines = self.format_lines(snap, now);
+        let agg_start = lines.len().saturating_sub(5);
+        let agg = &lines[agg_start..];
+        (
+            agg[0].clone(),
+            agg[1].clone(),
+            agg[2].clone(),
+            agg[3].clone(),
+            agg[4].clone(),
+        )
+    }
+
+    /// Format the full block as a vec of lines: per-part rows first
+    /// (multi-URL only), then the 5-line aggregate footer. Pure
+    /// w.r.t. `self.out`. The returned Vec always has at least 5
+    /// entries; multi-URL adds one entry per displayed part.
+    pub fn format_lines(&mut self, snap: &ProgressSnapshot, now: Instant) -> Vec<String> {
+        // Aggregate rate samples first — those drive the footer.
         self.rate_dl.push(now, snap.bytes_downloaded);
         self.rate_ex.push(now, snap.bytes_extracted);
         self.rate_decoded_in.push(now, snap.bytes_decoded_input);
+
+        // Lazily allocate per-part rate buffers when we first see a
+        // populated parts vec. Re-running the coordinator (retry path)
+        // resets the counters but the part list shape stays the same;
+        // we re-allocate on a length change so a topology shift would
+        // surface as fresh rate windows.
+        if !snap.parts.is_empty() && self.rate_parts.len() != snap.parts.len() {
+            self.rate_parts = (0..snap.parts.len())
+                .map(|_| RateBuffer::for_renderer())
+                .collect();
+        }
+        for (i, part) in snap.parts.iter().enumerate() {
+            if let Some(buf) = self.rate_parts.get_mut(i) {
+                buf.push(now, part.bytes_downloaded);
+            }
+        }
 
         let dl_rate = self.rate_dl.rate_bytes_per_sec();
         let ex_rate = self.rate_ex.rate_bytes_per_sec();
@@ -727,21 +912,107 @@ impl<W: Write + Send> TtyRenderer<W> {
         let bar_cap = self.bar_max_columns.min(MAX_BAR_COLUMNS);
         let bottleneck = classify_bottleneck(snap, dl_rate, decoded_in_rate);
 
-        let line1 = format_overall_line(snap, percent, term_cols, bar_cap, self.style);
-        let line2 = format_download_line(snap, dl_rate, bottleneck);
-        let line3 = format_extract_line(snap, ex_rate, bottleneck);
-        let line4 = format_lookahead_line(snap, bottleneck);
-        let line5 = format_eta_line(eta, self.style, bottleneck);
-        (line1, line2, line3, line4, line5)
+        let mut lines: Vec<String> = Vec::with_capacity(snap.parts.len() + 5);
+
+        // Per-part section: only when the discovered source is
+        // multi-URL. Single-URL runs (parts.len() == 1) keep the
+        // historical 5-line block so existing tooling and tests stay
+        // unchanged.
+        if snap.parts.len() > 1 {
+            let label_width = snap
+                .parts
+                .iter()
+                .take(MAX_PART_ROWS)
+                .map(|p| p.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            for (i, part) in snap.parts.iter().take(MAX_PART_ROWS).enumerate() {
+                let part_rate = self
+                    .rate_parts
+                    .get(i)
+                    .and_then(RateBuffer::rate_bytes_per_sec);
+                lines.push(format_part_row(part, part_rate, label_width, self.style));
+            }
+            if snap.parts.len() > MAX_PART_ROWS {
+                let remaining = snap.parts.len() - MAX_PART_ROWS;
+                lines.push(format!("  …+ {remaining} more parts"));
+            }
+        }
+
+        lines.push(format_overall_line(
+            snap, percent, term_cols, bar_cap, self.style,
+        ));
+        lines.push(format_download_line(snap, dl_rate, bottleneck));
+        lines.push(format_extract_line(snap, ex_rate, bottleneck));
+        lines.push(format_lookahead_line(snap, bottleneck));
+        lines.push(format_eta_line(eta, self.style, bottleneck));
+        lines
+    }
+}
+
+/// Format one per-part progress row
+/// (`docs/PLAN_multi_url_source.md` progress UI). Layout:
+///
+/// ```text
+/// [================  ]  pruned.tar.part0001  165.0 GiB / 256.0 GiB  @ 12.0 MiB/s
+/// ```
+///
+/// `label_width` pads the label so a vertical inventory aligns. A
+/// completed part shows `done` instead of a rate; an idle part with
+/// zero bytes downloaded shows `idle`. The bar matches whichever
+/// row's downloaded/total ratio it represents.
+fn format_part_row(
+    part: &PartProgressSnapshot,
+    rate: Option<f64>,
+    label_width: usize,
+    style: BarStyle,
+) -> String {
+    let frac = if part.total_size == 0 {
+        0.0
+    } else {
+        (part.bytes_downloaded as f64 / part.total_size as f64).clamp(0.0, 1.0)
+    };
+    let bar = render_bar_for(frac, PART_ROW_BAR_COLUMNS, style);
+    let downloaded = format_bytes(part.bytes_downloaded);
+    let total = format_bytes(part.total_size);
+    let label = pad_label(&part.label, label_width);
+    let status = if part.bytes_downloaded == 0 {
+        "  idle".to_string()
+    } else if part.bytes_downloaded >= part.total_size && part.total_size > 0 {
+        "  done".to_string()
+    } else {
+        match rate {
+            Some(r) => format!("  @ {}", format_rate(r)),
+            None => "  …".to_string(),
+        }
+    };
+    format!("  {bar}  {label}  {downloaded} / {total}{status}")
+}
+
+/// Pad `label` on the right with spaces to `width` *display columns*.
+/// Counts characters (not bytes) to handle multibyte labels uniformly
+/// — labels usually come from URL basenames which are ASCII in
+/// practice but the helper is safe regardless.
+fn pad_label(label: &str, width: usize) -> String {
+    let chars = label.chars().count();
+    if chars >= width {
+        label.to_string()
+    } else {
+        let mut out = String::with_capacity(label.len() + (width - chars));
+        out.push_str(label);
+        for _ in 0..(width - chars) {
+            out.push(' ');
+        }
+        out
     }
 }
 
 impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
     fn render(&mut self, snapshot: &ProgressSnapshot) {
         let now = Instant::now();
-        let (l1, l2, l3, l4, l5) = self.format_block(snapshot, now);
-        // Each render rewrites five lines. Strategy:
-        //   First tick: write all five lines, each terminated with
+        let lines = self.format_lines(snapshot, now);
+        // Each render rewrites the previous block. Strategy:
+        //   First tick: write every line, each terminated with
         //               \x1b[K (clear-to-EOL) and \n.
         //   Subsequent: \x1b[<N>A move cursor up N lines (start of
         //               line, since we ended each line with \n which
@@ -754,26 +1025,44 @@ impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
         // cursor-up approach is robust to that: if scroll-back has
         // pushed our block off-screen, the cursor-up just moves to
         // the top of whatever is currently visible and we redraw
-        // there. Five lines always lose nothing; if the user wants
-        // to see the original block they're already redrawing it.
+        // there. Per-part runs make the block taller but the same
+        // logic still applies — we just pass the new line count.
+        //
+        // The block height can change between ticks: the first tick
+        // before discovery has zero parts, the second tick has N
+        // parts (`docs/PLAN_multi_url_source.md` progress UI). When
+        // the new block is *shorter* than the previous one we'd
+        // leave stale rows visible below; emit a clear-to-EOL on
+        // each leftover row (then move back up) so the dropped tail
+        // disappears cleanly.
         if self.started_render {
-            // Move cursor to the start of the first line we previously
-            // wrote. Lines emitted: at most 5.
             let n = self.last_lines_emitted.min(99);
             if n > 0 {
                 let _ = write!(self.out, "\x1b[{n}A");
+            }
+            if lines.len() < self.last_lines_emitted {
+                // Erase the trailing rows the new block doesn't
+                // cover. Move down to where they sit, clear, then
+                // move back up to the top of the new block.
+                let down = lines.len();
+                if down > 0 {
+                    let _ = write!(self.out, "\x1b[{down}B");
+                }
+                let extra = self.last_lines_emitted - lines.len();
+                for _ in 0..extra {
+                    let _ = writeln!(self.out, "\x1b[K");
+                }
+                let _ = write!(self.out, "\x1b[{}A", down + extra);
             }
         } else {
             self.started_render = true;
         }
 
-        let _ = writeln!(self.out, "{l1}\x1b[K");
-        let _ = writeln!(self.out, "{l2}\x1b[K");
-        let _ = writeln!(self.out, "{l3}\x1b[K");
-        let _ = writeln!(self.out, "{l4}\x1b[K");
-        let _ = writeln!(self.out, "{l5}\x1b[K");
+        for line in &lines {
+            let _ = writeln!(self.out, "{line}\x1b[K");
+        }
         let _ = self.out.flush();
-        self.last_lines_emitted = 5;
+        self.last_lines_emitted = lines.len();
     }
 
     fn finish(&mut self) {
@@ -797,6 +1086,10 @@ pub struct LogRenderer {
     rate_dl: RateBuffer,
     rate_ex: RateBuffer,
     rate_decoded_in: RateBuffer,
+    /// Per-part rate buffers, allocated lazily on first non-empty
+    /// snapshot (`docs/PLAN_multi_url_source.md` progress UI). Empty
+    /// for single-URL runs.
+    rate_parts: Vec<RateBuffer>,
 }
 
 impl Default for LogRenderer {
@@ -813,19 +1106,25 @@ impl LogRenderer {
             rate_dl: RateBuffer::for_renderer(),
             rate_ex: RateBuffer::for_renderer(),
             rate_decoded_in: RateBuffer::for_renderer(),
+            rate_parts: Vec::new(),
         }
     }
 
-    /// Format the line [`Self::render`] will emit. Pure: tests call
-    /// it without a tracing subscriber.
+    /// Format the aggregate line [`Self::render`] emits. Pure: tests
+    /// call it without a tracing subscriber.
     ///
-    /// Mirrors the TTY renderer's three-line block in shape — sizes
-    /// via [`format_bytes`], rates via [`format_rate`], ETA via
-    /// [`format_eta`] — flattened onto one log line so each tick is a
-    /// single record. A bottleneck label (`bottleneck=disk` or
-    /// `=net`) is appended when the classifier has a verdict, with
-    /// no ANSI color escapes (the log subscriber is responsible for
-    /// any styling it wants to apply).
+    /// Mirrors the TTY renderer's footer in shape — sizes via
+    /// [`format_bytes`], rates via [`format_rate`], ETA via
+    /// [`format_eta`] — flattened onto one log line so each tick's
+    /// aggregate is a single record. A bottleneck label
+    /// (`bottleneck=disk` or `=net`) is appended when the classifier
+    /// has a verdict, with no ANSI color escapes (the log subscriber
+    /// is responsible for any styling it wants to apply).
+    ///
+    /// For multi-URL runs ([`Self::format_part_lines`] returns a
+    /// non-empty Vec) this is the *aggregate* row only; per-part
+    /// rows are formatted separately so log scrapers can grep for
+    /// `[partN]` independently.
     pub fn format_line(&mut self, snap: &ProgressSnapshot, now: Instant) -> String {
         self.rate_dl.push(now, snap.bytes_downloaded);
         self.rate_ex.push(now, snap.bytes_extracted);
@@ -862,8 +1161,19 @@ impl LogRenderer {
             None => "uncapped".into(),
         };
         let decoded_in = format_bytes(snap.bytes_decoded_input);
+        // For single-URL runs we keep today's `progress: ...` prefix
+        // so log scrapers built against the historical line shape
+        // continue to parse. Multi-URL runs change the prefix to
+        // `[overall] progress: ...` to pair cleanly with the
+        // sibling `[partN] ...` lines, and so a grep for `[overall]`
+        // returns one record per tick.
+        let prefix = if snap.parts.len() > 1 {
+            "[overall] progress"
+        } else {
+            "progress"
+        };
         let mut line = format!(
-            "progress: {pct}  download {downloaded} / {total} @ {dl}  \
+            "{prefix}: {pct}  download {downloaded} / {total} @ {dl}  \
              extract {extracted} / {est} @ {ex}  \
              lookahead {lookahead} / {cap}  decoded_in {decoded_in}  \
              workers {}/{}  ETA {eta_s}",
@@ -879,11 +1189,70 @@ impl LogRenderer {
         }
         line
     }
+
+    /// Format the per-part log lines for `snap`. Returns an empty
+    /// Vec for single-URL runs (`parts.len() <= 1`); otherwise one
+    /// line per part with a `[partN]` prefix that grep-isolates each
+    /// one. Pushes per-part rate samples so the rate column
+    /// stabilizes after a few ticks.
+    pub fn format_part_lines(&mut self, snap: &ProgressSnapshot, now: Instant) -> Vec<String> {
+        if snap.parts.len() <= 1 {
+            return Vec::new();
+        }
+        if self.rate_parts.len() != snap.parts.len() {
+            self.rate_parts = (0..snap.parts.len())
+                .map(|_| RateBuffer::for_renderer())
+                .collect();
+        }
+        for (i, part) in snap.parts.iter().enumerate() {
+            if let Some(buf) = self.rate_parts.get_mut(i) {
+                buf.push(now, part.bytes_downloaded);
+            }
+        }
+        snap.parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let rate = self
+                    .rate_parts
+                    .get(i)
+                    .and_then(RateBuffer::rate_bytes_per_sec);
+                let downloaded = format_bytes(part.bytes_downloaded);
+                let total = format_bytes(part.total_size);
+                let pct = if part.total_size == 0 {
+                    "?".to_string()
+                } else {
+                    format!(
+                        "{:.1}%",
+                        100.0 * (part.bytes_downloaded as f64 / part.total_size as f64)
+                    )
+                };
+                let status = if part.bytes_downloaded == 0 {
+                    "idle".to_string()
+                } else if part.bytes_downloaded >= part.total_size && part.total_size > 0 {
+                    "done".to_string()
+                } else {
+                    rate.map(format_rate).unwrap_or_else(|| "—".into())
+                };
+                format!(
+                    "[part{i}] progress: {pct}  download {downloaded} / {total} @ {status}  label {}",
+                    part.label
+                )
+            })
+            .collect()
+    }
 }
 
 impl ProgressRenderer for LogRenderer {
     fn render(&mut self, snapshot: &ProgressSnapshot) {
         let now = Instant::now();
+        // Per-part lines first (multi-URL only), then the aggregate
+        // — `progress` for single-URL keeps the existing log shape;
+        // `[overall] progress` pairs with `[partN]` siblings on
+        // multi-URL.
+        for line in self.format_part_lines(snapshot, now) {
+            tracing::info!(target: "peel::progress", "{line}");
+        }
         let line = self.format_line(snapshot, now);
         tracing::info!(target: "peel::progress", "{line}");
     }
@@ -1804,6 +2173,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let p = overall_percent(&snap).expect("percent");
         // 250/1000 = 25%, even though download is 50%.
@@ -1825,6 +2195,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let p = overall_percent(&snap).expect("percent");
         assert!((p - 50.0).abs() < 0.01);
@@ -1845,6 +2216,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         assert!(overall_percent(&snap).is_none());
     }
@@ -1864,6 +2236,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         // dl: 500k remaining @ 100kB/s = 5 s; ex: 1.9M remaining @
         // 100kB/s = 19 s. Bottleneck = extract = 19 s.
@@ -1886,6 +2259,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         assert!(compute_eta(&snap, None, None).is_none());
     }
@@ -1965,6 +2339,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         }
     }
 
@@ -1993,6 +2368,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let bar = render_bar(&snap, 8, BarStyle::Ascii);
         assert_eq!(bar.matches('#').count(), 0);
@@ -2041,6 +2417,7 @@ mod tests {
             max_disk_buffer: Some(1024),
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -2081,6 +2458,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -2117,6 +2495,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
@@ -2144,6 +2523,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
@@ -2172,6 +2552,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         r.render(&snap);
         r.render(&snap);
@@ -2197,6 +2578,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let line = r.format_line(&snap, Instant::now());
         // Sizes are KiB/MiB-formatted, not raw bytes.
@@ -2238,6 +2620,7 @@ mod tests {
             max_disk_buffer: Some(100),
             disk_bound: true,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let line = r.format_line(&snap, Instant::now());
         assert!(line.contains("bottleneck=disk"), "got {line:?}");
@@ -2320,6 +2703,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         // dl = 50 MiB/s, decoded_in = 100 MiB/s. dl < 0.9 * decoded_in.
         let b = classify_bottleneck(&snap, Some(50.0e6), Some(100.0e6));
@@ -2344,6 +2728,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         // dl = 60 MiB/s, decoded_in = 50 MiB/s. decoded_in < 0.9 * dl
         // is false (50 vs 54 — too tight), so widen to make the test
@@ -2367,6 +2752,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         // Within the 10% deadband: dl = 100, decoded_in = 95.
         let b = classify_bottleneck(&snap, Some(100.0e6), Some(95.0e6));
@@ -2401,6 +2787,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         let a = classify_bottleneck(&snap, Some(60.0e6), Some(40.0e6));
         snap.extracted_estimate = Some(10_000_000);
@@ -2426,6 +2813,7 @@ mod tests {
             max_disk_buffer: Some(1_000_000),
             disk_bound: true,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -2456,13 +2844,14 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         };
         // Drive `format_block` with two samples spanning > min_span
         // (1 s) at the same wall-clock anchor so we don't introduce
         // flake from `Instant::now()` jitter inside `render`. We
         // assert against `format_block` directly.
         let t0 = Instant::now();
-        let mut snap1 = snap;
+        let mut snap1 = snap.clone();
         snap1.bytes_downloaded = 0;
         snap1.bytes_extracted = 0;
         snap1.bytes_decoded_input = 0;
@@ -2475,6 +2864,160 @@ mod tests {
         assert!(l5.contains("\x1b[36m"), "expected cyan ANSI escape");
         // The download line's rate is also painted cyan.
         assert!(l2.contains("\x1b[36m"));
+    }
+
+    // ---- per-part display (`docs/PLAN_multi_url_source.md`) -------
+
+    fn three_part_snapshot() -> ProgressSnapshot {
+        ProgressSnapshot {
+            total_size: Some(3 * 256 * 1024),
+            bytes_downloaded: 256 * 1024 + 128 * 1024,
+            bytes_extracted: 0,
+            extracted_estimate: None,
+            active_workers: 2,
+            total_workers: 4,
+            started: true,
+            done: false,
+            bytes_decoded_input: 0,
+            max_disk_buffer: None,
+            disk_bound: false,
+            decode_step_elapsed: None,
+            parts: vec![
+                PartProgressSnapshot {
+                    label: "x.tar.part0000".into(),
+                    total_size: 256 * 1024,
+                    bytes_downloaded: 256 * 1024,
+                },
+                PartProgressSnapshot {
+                    label: "x.tar.part0001".into(),
+                    total_size: 256 * 1024,
+                    bytes_downloaded: 128 * 1024,
+                },
+                PartProgressSnapshot {
+                    label: "x.tar.part0002".into(),
+                    total_size: 256 * 1024,
+                    bytes_downloaded: 0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn tty_emits_per_part_rows_above_aggregate_footer_for_multi_url() {
+        let mut r = TtyRenderer::with_style_and_width(Vec::new(), BarStyle::Ascii, 100);
+        let snap = three_part_snapshot();
+        let lines = r.format_lines(&snap, Instant::now());
+        // 3 part rows + 5-line aggregate footer.
+        assert_eq!(lines.len(), 3 + 5);
+        // First three lines are per-part; their order matches
+        // the snapshot's parts order.
+        assert!(lines[0].contains("x.tar.part0000"), "row 0: {:?}", lines[0]);
+        assert!(lines[1].contains("x.tar.part0001"), "row 1: {:?}", lines[1]);
+        assert!(lines[2].contains("x.tar.part0002"), "row 2: {:?}", lines[2]);
+        // Per-part status: completed → done, idle → idle, mid →
+        // numeric progress.
+        assert!(lines[0].contains("done"), "completed: {:?}", lines[0]);
+        assert!(lines[2].contains("idle"), "idle: {:?}", lines[2]);
+        // Aggregate footer's first line carries the `peel  [...]`
+        // overall bar — sanity that the footer landed in place.
+        assert!(lines[3].starts_with("peel"), "agg start: {:?}", lines[3]);
+    }
+
+    #[test]
+    fn tty_single_url_keeps_historical_5_line_layout() {
+        let mut r = TtyRenderer::with_style_and_width(Vec::new(), BarStyle::Ascii, 100);
+        let mut snap = three_part_snapshot();
+        snap.parts.truncate(1);
+        let lines = r.format_lines(&snap, Instant::now());
+        // Single-URL: no per-part section, just the 5-line aggregate.
+        assert_eq!(lines.len(), 5, "single-URL must keep 5 lines: {lines:?}");
+        assert!(lines[0].starts_with("peel"));
+    }
+
+    #[test]
+    fn tty_collapses_part_rows_past_max_part_rows() {
+        let mut r = TtyRenderer::with_style_and_width(Vec::new(), BarStyle::Ascii, 120);
+        let mut parts = Vec::new();
+        for i in 0..(MAX_PART_ROWS + 5) {
+            parts.push(PartProgressSnapshot {
+                label: format!("x.tar.part{i:04}"),
+                total_size: 256 * 1024,
+                bytes_downloaded: 0,
+            });
+        }
+        let snap = ProgressSnapshot {
+            parts,
+            ..three_part_snapshot()
+        };
+        let lines = r.format_lines(&snap, Instant::now());
+        // First MAX_PART_ROWS rows show, plus a summary line, plus
+        // 5-line footer.
+        assert_eq!(lines.len(), MAX_PART_ROWS + 1 + 5);
+        // The summary line names the leftover count.
+        assert!(
+            lines[MAX_PART_ROWS].contains("…+ 5 more"),
+            "summary line: {:?}",
+            lines[MAX_PART_ROWS]
+        );
+        // The last per-part row is still part0015 (zero-indexed),
+        // not part0020 — the tail collapses cleanly.
+        assert!(
+            lines[MAX_PART_ROWS - 1].contains(&format!("x.tar.part{:04}", MAX_PART_ROWS - 1)),
+            "last shown: {:?}",
+            lines[MAX_PART_ROWS - 1],
+        );
+    }
+
+    #[test]
+    fn tty_handles_block_height_change_between_ticks() {
+        // First tick before discovery (zero parts) is a 5-line block;
+        // second tick post-discovery (3 parts) grows to 8 lines. The
+        // renderer must update `last_lines_emitted` so the next tick
+        // moves the cursor up the right amount.
+        let mut r = TtyRenderer::with_style_and_width(Vec::new(), BarStyle::Ascii, 100);
+        let mut snap = three_part_snapshot();
+        snap.parts.clear();
+        let lines_a = r.format_lines(&snap, Instant::now());
+        assert_eq!(lines_a.len(), 5);
+        let snap_with_parts = three_part_snapshot();
+        let lines_b = r.format_lines(&snap_with_parts, Instant::now());
+        assert_eq!(lines_b.len(), 8);
+    }
+
+    // ---- LogRenderer per-part lines -------------------------------
+
+    #[test]
+    fn log_renderer_emits_one_line_per_part_plus_overall_for_multi_url() {
+        let mut r = LogRenderer::new();
+        let snap = three_part_snapshot();
+        let part_lines = r.format_part_lines(&snap, Instant::now());
+        assert_eq!(part_lines.len(), 3);
+        assert!(part_lines[0].starts_with("[part0]"), "{:?}", part_lines[0]);
+        assert!(part_lines[0].contains("x.tar.part0000"));
+        assert!(part_lines[0].contains("done"));
+        assert!(part_lines[2].contains("idle"));
+        let agg = r.format_line(&snap, Instant::now());
+        assert!(
+            agg.starts_with("[overall] progress"),
+            "multi-URL aggregate: {agg:?}"
+        );
+    }
+
+    #[test]
+    fn log_renderer_single_url_keeps_historical_progress_prefix() {
+        let mut r = LogRenderer::new();
+        let mut snap = three_part_snapshot();
+        snap.parts.truncate(1);
+        let part_lines = r.format_part_lines(&snap, Instant::now());
+        assert!(
+            part_lines.is_empty(),
+            "single-URL must emit no per-part lines: {part_lines:?}"
+        );
+        let agg = r.format_line(&snap, Instant::now());
+        assert!(
+            agg.starts_with("progress:"),
+            "single-URL aggregate keeps the historical prefix: {agg:?}"
+        );
     }
 
     fn base_snapshot() -> ProgressSnapshot {
@@ -2491,6 +3034,7 @@ mod tests {
             max_disk_buffer: None,
             disk_bound: false,
             decode_step_elapsed: None,
+            parts: Vec::new(),
         }
     }
 

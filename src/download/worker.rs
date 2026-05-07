@@ -757,13 +757,26 @@ fn try_once(
     // tripping mid-read, or a panic caught by the scheduler's
     // `catch_unwind`. The guard is disarmed only after every step
     // that could leave bytes credited has succeeded.
-    let mut refund = ProgressRefundGuard::new(ctx.progress);
+    // Multi-URL routing also tells the progress sink which part to
+    // credit (`docs/PLAN_multi_url_source.md`). Single-URL runs
+    // populate a one-element parts vec at startup so part_idx 0
+    // is always a valid attribution target; the `progress.parts()`
+    // OnceLock guards against an un-initialized vec on its own.
+    let part_attribution_idx = match multipart {
+        Some(source) => source
+            .locate(global_range.start().get())
+            .map(|(idx, _)| idx)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let mut refund = ProgressRefundGuard::new(ctx.progress, part_attribution_idx);
     let read_result = if let Some(limiter) = ctx.rate_limiter {
         let mut limited = RateLimitedReader::new(&mut body, Arc::clone(limiter), cancel);
         read_with_progress(
             &mut limited,
             &mut buf,
             ctx.progress,
+            part_attribution_idx,
             &mut refund.attempt_progress,
         )
     } else {
@@ -771,6 +784,7 @@ fn try_once(
             &mut body,
             &mut buf,
             ctx.progress,
+            part_attribution_idx,
             &mut refund.attempt_progress,
         )
     };
@@ -829,14 +843,23 @@ fn try_once(
 /// about the guard type.
 struct ProgressRefundGuard<'a> {
     progress: Option<&'a ProgressState>,
+    /// Index into [`ProgressState::parts`] this attempt's bytes are
+    /// credited against. The aggregate counter is always
+    /// incremented; the per-part counter is incremented only when
+    /// `parts` is set (`docs/PLAN_multi_url_source.md`). On rollback
+    /// the same part_idx is used to refund the per-part view, so the
+    /// aggregate and per-part totals stay in sync after a failed
+    /// attempt.
+    part_idx: usize,
     attempt_progress: u64,
     armed: bool,
 }
 
 impl<'a> ProgressRefundGuard<'a> {
-    fn new(progress: Option<&'a ProgressState>) -> Self {
+    fn new(progress: Option<&'a ProgressState>, part_idx: usize) -> Self {
         Self {
             progress,
+            part_idx,
             attempt_progress: 0,
             armed: true,
         }
@@ -852,6 +875,7 @@ impl Drop for ProgressRefundGuard<'_> {
         if self.armed && self.attempt_progress > 0 {
             if let Some(p) = self.progress {
                 p.sub_downloaded(self.attempt_progress);
+                p.sub_downloaded_from_part(self.part_idx, self.attempt_progress);
             }
         }
     }
@@ -932,6 +956,7 @@ fn read_with_progress<R: Read>(
     reader: &mut R,
     buf: &mut [u8],
     progress: Option<&ProgressState>,
+    part_idx: usize,
     attempt_progress: &mut u64,
 ) -> io::Result<()> {
     let mut filled = 0usize;
@@ -949,6 +974,7 @@ fn read_with_progress<R: Read>(
                 *attempt_progress = attempt_progress.saturating_add(n_u64);
                 if let Some(p) = progress {
                     p.add_downloaded(n_u64);
+                    p.add_downloaded_to_part(part_idx, n_u64);
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1479,7 +1505,7 @@ mod tests {
         let state = ProgressState::new();
         state.add_downloaded(1_000_000);
         {
-            let mut guard = ProgressRefundGuard::new(Some(&state));
+            let mut guard = ProgressRefundGuard::new(Some(&state), 0);
             // Mirror the read loop: every `read` call adds to both the
             // shared counter and the guard's local tally.
             for _ in 0..3 {
@@ -1502,7 +1528,7 @@ mod tests {
     fn progress_refund_guard_disarmed_leaves_bytes_credited() {
         let state = ProgressState::new();
         {
-            let mut guard = ProgressRefundGuard::new(Some(&state));
+            let mut guard = ProgressRefundGuard::new(Some(&state), 0);
             state.add_downloaded(128 * 1024);
             guard.attempt_progress = guard.attempt_progress.saturating_add(128 * 1024);
             guard.disarm();
@@ -1518,7 +1544,7 @@ mod tests {
         let state = Arc::new(ProgressState::new());
         let state_for_panic = Arc::clone(&state);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut guard = ProgressRefundGuard::new(Some(&state_for_panic));
+            let mut guard = ProgressRefundGuard::new(Some(&state_for_panic), 0);
             state_for_panic.add_downloaded(256 * 1024);
             guard.attempt_progress = guard.attempt_progress.saturating_add(256 * 1024);
             // Simulate a panic site after partial credit (e.g. a
@@ -1534,7 +1560,7 @@ mod tests {
     /// attached) must be a silent no-op on drop.
     #[test]
     fn progress_refund_guard_with_no_progress_is_noop() {
-        let mut guard = ProgressRefundGuard::new(None);
+        let mut guard = ProgressRefundGuard::new(None, 0);
         guard.attempt_progress = 4096;
         drop(guard);
         // Nothing to assert beyond "did not panic"; the test exists to

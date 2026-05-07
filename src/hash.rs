@@ -125,21 +125,22 @@ pub enum IntegrityError {
         source: sha256::Sha256DeserializeError,
     },
 
-    /// Multi-URL with `--sha256` was resumed from a checkpoint that
-    /// was written before the multi-URL hash-state format landed
-    /// (`docs/PLAN_multi_url_source.md` §5 will add the
-    /// `active_part_idx` field). Surface the gap clearly: re-run
-    /// from scratch (delete the checkpoint) or wait for §5 to land.
+    /// The checkpoint's `active_part_idx` is out of range for the
+    /// current run's part list — typically because the user changed
+    /// the URL list (or count) between runs while keeping the same
+    /// checkpoint sidecar. Delete the `.peel.ckpt` to start fresh.
     #[error(
-        "resuming a multi-URL run with --sha256 is not yet supported; \
-         delete the checkpoint at {ckpt_path:?} to start fresh, \
-         or drop --sha256 to resume without per-part verification \
-         (multi-URL hash-state checkpointing lands in \
-         docs/PLAN_multi_url_source.md §5)"
+        "checkpoint at {ckpt_path:?} records active_part_idx={active_part_idx} but \
+         this run has only {part_count} parts; the source layout changed between \
+         runs — delete the checkpoint to start fresh"
     )]
-    MultiPartResumeNotYetWired {
+    CheckpointPartIndexOutOfRange {
         /// Path to the checkpoint that cannot be safely resumed.
         ckpt_path: std::path::PathBuf,
+        /// `active_part_idx` recorded in the checkpoint.
+        active_part_idx: usize,
+        /// Part count the current run discovered.
+        part_count: usize,
     },
 }
 

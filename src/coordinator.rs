@@ -986,11 +986,35 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
 
     if let Some(state) = progress_state.as_ref() {
         state.set_total_size(info.total_size);
+        // Per-part labels for the progress UI
+        // (`docs/PLAN_multi_url_source.md`): pull each part's URL
+        // basename and pair it with the discovered size. Single-URL
+        // runs populate a one-element vec; the renderer special-
+        // cases len==1 to skip the per-part section.
+        let parts_for_progress: Vec<(String, u64)> = info
+            .source
+            .parts()
+            .iter()
+            .map(|p| (label_from_url(&p.url), p.size))
+            .collect();
+        state.set_parts(parts_for_progress);
         // Pre-credit the resumed bytes so the renderer's progress bar
         // doesn't snap from 0% on the first tick of a resume.
         let resumed_bytes = u64::from(chunks_resumed).saturating_mul(config.chunk_size);
         let resumed_bytes = resumed_bytes.min(info.total_size);
         state.add_downloaded(resumed_bytes);
+        // Distribute the pre-credited resumed bytes across the
+        // per-part counters in source order so a resumed run's
+        // per-part rows match the global counter from tick zero.
+        let mut remaining = resumed_bytes;
+        for (idx, part) in info.source.parts().iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let credit = remaining.min(part.size);
+            state.add_downloaded_to_part(idx, credit);
+            remaining -= credit;
+        }
         // Pre-credit the resumed *extracted* count too: the sink's
         // checkpointed state already records what was written through
         // it, so the renderer should not rewind to 0 just because the
@@ -1613,8 +1637,11 @@ fn build_resume_plan(
             ),
         });
     }
-    for (i, (prior_part, current_part)) in
-        prior.parts.iter().zip(info.source.parts().iter()).enumerate()
+    for (i, (prior_part, current_part)) in prior
+        .parts
+        .iter()
+        .zip(info.source.parts().iter())
+        .enumerate()
     {
         if prior_part.url != current_part.url.to_string() {
             return Err(CoordinatorError::SourceChanged {
@@ -1979,7 +2006,7 @@ fn run_one<S: Sink>(
                 url: requested_url.to_string(),
                 etag: info.fingerprint.etag.clone(),
                 last_modified: info.fingerprint.last_modified.clone(),
-                parts: Vec::new(),
+                parts: parts_from_source(&info.source),
                 total_size: info.total_size,
                 chunk_size,
                 decoder_position: ByteOffset::new(info_cb.source_position),
@@ -2592,10 +2619,21 @@ fn run_resume_probe(
     // probing happens later via §11's mid-flight verifier.
     let probe_mirrors =
         crate::download::MirrorSet::single(info.url.clone(), info.fingerprint.clone());
+    // Multi-URL routing for the probe (`docs/PLAN_multi_url_source.md`
+    // §1 step 4): when the source has more than one part, hand the
+    // worker the part list so the probe's ranged GET goes to the
+    // *correct* per-part URL with a part-relative `Range` header.
+    // Without this, every probe would hit the primary URL with a
+    // global offset and trip a 416 on out-of-bound parts.
+    let multi_part: Option<&crate::download::MultiPartSource> = if info.source.len() > 1 {
+        Some(&info.source)
+    } else {
+        None
+    };
     let ctx = crate::download::worker::ChunkContext {
         client,
         mirrors: &probe_mirrors,
-        source: None,
+        source: multi_part,
         chunk_size,
         sparse,
         progress: None,
@@ -2757,11 +2795,11 @@ struct IntegrityHasherSetup {
 ///   error ([`crate::hash::IntegrityError::CheckpointHadHashState`]);
 ///   refusing keeps the user's prior intent intact rather than
 ///   silently losing it.
-/// - **Resume + multi-URL + any expected hashes** → hard error
-///   ([`crate::hash::IntegrityError::MultiPartResumeNotYetWired`])
-///   because the v7 checkpoint format has no slot for the active
-///   part index. Phase 5 of `docs/PLAN_multi_url_source.md` adds
-///   the v8 field and lifts this restriction.
+/// - **Resume + active_part_idx out of range** → hard error
+///   ([`crate::hash::IntegrityError::CheckpointPartIndexOutOfRange`])
+///   when the saved index points past the current run's part
+///   count, which happens if the user changed the URL list
+///   between runs while keeping the same `.peel.ckpt` sidecar.
 fn build_integrity_hasher(
     source: &crate::download::MultiPartSource,
     expected: &[Option<[u8; crate::hash::sha256::DIGEST_LEN]>],
@@ -2825,8 +2863,10 @@ fn build_integrity_hasher(
             // single-URL OR no parts crossed yet.
             if active_part_idx >= source.len() {
                 return Err(CoordinatorError::Integrity(
-                    crate::hash::IntegrityError::MultiPartResumeNotYetWired {
+                    crate::hash::IntegrityError::CheckpointPartIndexOutOfRange {
                         ckpt_path: ckpt_path.to_path_buf(),
+                        active_part_idx,
+                        part_count: source.len(),
                     },
                 ));
             }
@@ -2860,6 +2900,30 @@ fn build_integrity_hasher(
             }))
         }
     }
+}
+
+/// Build the v8 [`crate::checkpoint::PartRecord`] vec for a
+/// checkpoint write from the live [`crate::download::MultiPartSource`]
+/// (`docs/PLAN_multi_url_source.md` §5). Single-URL runs produce a
+/// one-element vec; multi-URL runs record one entry per part. Per-
+/// part expected SHA-256 digests are *not* recorded — the CLI
+/// re-supplies them on resume and the
+/// [`crate::hash::IntegrityHasher`] state is rebuilt from
+/// [`crate::checkpoint::HashState::active_part_idx`] alone.
+fn parts_from_source(
+    source: &crate::download::MultiPartSource,
+) -> Vec<crate::checkpoint::PartRecord> {
+    source
+        .parts()
+        .iter()
+        .map(|p| crate::checkpoint::PartRecord {
+            url: p.url.to_string(),
+            size: p.size,
+            etag: p.fingerprint.etag.clone(),
+            last_modified: p.fingerprint.last_modified.clone(),
+            expected_sha256: None,
+        })
+        .collect()
 }
 
 /// Snapshot the running integrity hasher's active part state for
@@ -3031,6 +3095,34 @@ pub(crate) fn filename_from_url(url: &Url) -> Option<String> {
     } else {
         Some(last.to_string())
     }
+}
+
+/// Short progress-row label derived from a part URL
+/// (`docs/PLAN_multi_url_source.md`). Falls back to the host when the
+/// URL has no usable basename so the renderer always has something to
+/// print, and caps at 48 columns to keep multi-row TTY blocks tidy on
+/// 80-column terminals.
+fn label_from_url(url: &Url) -> String {
+    const LABEL_MAX_COLUMNS: usize = 48;
+    let raw = filename_from_url(url).unwrap_or_else(|| url.host().to_string());
+    if raw.chars().count() <= LABEL_MAX_COLUMNS {
+        return raw;
+    }
+    // Drop characters from the middle so both ends survive (the
+    // progress eye usually wants the trailing part0000-style suffix
+    // and the leading file name).
+    let head_take = LABEL_MAX_COLUMNS / 2 - 1;
+    let tail_take = LABEL_MAX_COLUMNS - head_take - 1;
+    let mut head = String::with_capacity(LABEL_MAX_COLUMNS + 1);
+    for c in raw.chars().take(head_take) {
+        head.push(c);
+    }
+    head.push('…');
+    let total = raw.chars().count();
+    for c in raw.chars().skip(total - tail_take) {
+        head.push(c);
+    }
+    head
 }
 
 #[derive(Debug, Default)]

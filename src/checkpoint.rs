@@ -1039,16 +1039,12 @@ impl Checkpoint {
             cursor.read_string("url")?
         };
         let etag = if format_version >= 8 {
-            parts
-                .first()
-                .and_then(|p| p.etag.clone())
+            parts.first().and_then(|p| p.etag.clone())
         } else {
             cursor.read_optional_string("etag")?
         };
         let last_modified = if format_version >= 8 {
-            parts
-                .first()
-                .and_then(|p| p.last_modified.clone())
+            parts.first().and_then(|p| p.last_modified.clone())
         } else {
             cursor.read_optional_string("last_modified")?
         };
@@ -2034,6 +2030,56 @@ mod tests {
         }
     }
 
+    /// Multi-part fixture exercising v8's `parts` vec with three
+    /// distinct part records and an active-part-aware `hash_state`.
+    fn sample_multi_part() -> Checkpoint {
+        let part0 = PartRecord {
+            url: "https://h/a.tar.part0000".into(),
+            size: 256 * 1024,
+            etag: Some("\"p0\"".into()),
+            last_modified: None,
+            expected_sha256: Some([0x11; crate::hash::sha256::DIGEST_LEN]),
+        };
+        let part1 = PartRecord {
+            url: "https://h/a.tar.part0001".into(),
+            size: 384 * 1024,
+            etag: Some("\"p1\"".into()),
+            last_modified: Some("Sun, 01 Jan 2026 00:00:00 GMT".into()),
+            expected_sha256: Some([0x22; crate::hash::sha256::DIGEST_LEN]),
+        };
+        let part2 = PartRecord {
+            url: "https://h/a.tar.part0002".into(),
+            size: 128 * 1024,
+            etag: None,
+            last_modified: None,
+            expected_sha256: None,
+        };
+        let total_size = part0.size + part1.size + part2.size;
+        let mut active = crate::hash::sha256::Sha256::new();
+        active.update(b"mid-stream bytes for part 1");
+        Checkpoint {
+            url: part0.url.clone(),
+            etag: part0.etag.clone(),
+            last_modified: part0.last_modified.clone(),
+            parts: vec![part0, part1, part2],
+            total_size,
+            chunk_size: 256 * 1024,
+            decoder_position: ByteOffset::new(256 * 1024 + 1024),
+            bitmap_completed: vec![0xFFu8; 4],
+            created_at: UNIX_EPOCH + Duration::new(1_900_000_000, 0),
+            sink_state: SinkState::Tar {
+                members_completed: vec!["root/a".into()],
+                in_flight: None,
+            },
+            hash_state: Some(HashState {
+                active_part_idx: 1,
+                bytes: active.serialize(),
+            }),
+            chunk_crc32c: None,
+            decoder_state: None,
+        }
+    }
+
     // ---- magic / framing ---------------------------------------------
 
     #[test]
@@ -2555,6 +2601,122 @@ mod tests {
         ckpt.chunk_crc32c = Some(vec![0xDEAD_BEEF, 0xCAFE_F00D, 0x1234_5678]);
         let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
         assert_eq!(parsed, ckpt);
+    }
+
+    // ---- v8 multi-URL round-trip (PLAN_multi_url_source.md §5) ----
+
+    #[test]
+    fn round_trip_multi_part_with_active_part_idx() {
+        let original = sample_multi_part();
+        let bytes = original.serialize();
+        // The header must record v8.
+        let version = read_u32(&bytes[8..12]);
+        assert_eq!(version, FORMAT_VERSION);
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+        // Sanity on the recovered parts vec.
+        assert_eq!(parsed.parts.len(), 3);
+        assert_eq!(parsed.parts[0].url, "https://h/a.tar.part0000");
+        assert_eq!(
+            parsed.parts[0].expected_sha256,
+            Some([0x11; crate::hash::sha256::DIGEST_LEN])
+        );
+        assert_eq!(parsed.parts[2].expected_sha256, None);
+        let saved = parsed.hash_state.expect("hash state present");
+        assert_eq!(saved.active_part_idx, 1);
+    }
+
+    #[test]
+    fn v7_checkpoint_lifts_legacy_url_into_synthesized_parts() {
+        // Hand-build a valid v7 body: legacy `(url, etag,
+        // last_modified)` trio at the top, with a `hash_state`
+        // present (no active_part_idx field — that's v8). The v8
+        // reader must lift those into a one-element `parts[0]` and
+        // treat the saved hash as `active_part_idx = 0`.
+        let url = "https://example.com/legacy.tar.zst";
+        let etag = "\"v7-etag\"";
+        let total_size = 4096u64;
+        let mut active = crate::hash::sha256::Sha256::new();
+        active.update(b"hello v7");
+        let active_bytes = active.serialize();
+
+        let mut body = Vec::new();
+        write_string(&mut body, url);
+        write_optional_string(&mut body, Some(etag));
+        write_optional_string(&mut body, None);
+        write_u64(&mut body, total_size);
+        write_u64(&mut body, 256);
+        write_u64(&mut body, 0);
+        write_byte_array(&mut body, &[]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 0);
+        // hash_state: present (v7 has no active_part_idx; just bytes).
+        body.push(1);
+        body.extend_from_slice(&active_bytes);
+        // chunk_crc32c absent, decoder_state absent.
+        body.push(0);
+        body.push(0);
+
+        let body_len = body.len() as u64;
+        let checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, 7); // legacy v7 header
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, checksum);
+        buf.extend_from_slice(&body);
+
+        let parsed = Checkpoint::deserialize(&buf).expect("decode v7");
+        assert_eq!(parsed.url, url);
+        assert_eq!(parsed.etag.as_deref(), Some(etag));
+        assert_eq!(parsed.parts.len(), 1, "v7 lifts into one synthesized part");
+        assert_eq!(parsed.parts[0].url, url);
+        assert_eq!(parsed.parts[0].size, total_size);
+        assert_eq!(parsed.parts[0].etag.as_deref(), Some(etag));
+        let saved = parsed.hash_state.expect("hash state present");
+        assert_eq!(
+            saved.active_part_idx, 0,
+            "v7 hash_state implies active_part_idx = 0"
+        );
+        assert_eq!(saved.bytes, active_bytes);
+    }
+
+    #[test]
+    fn v8_with_zero_parts_is_rejected() {
+        // A v8 checkpoint that declares `parts.len() == 0` is
+        // malformed; the reader rejects it via a Truncated error
+        // path rather than silently producing an empty parts vec.
+        let mut body = Vec::new();
+        write_u32(&mut body, 0); // parts.len() = 0
+        write_u64(&mut body, 0); // total_size
+        write_u64(&mut body, 0); // chunk_size
+        write_u64(&mut body, 0); // decoder_position
+        write_byte_array(&mut body, &[]); // bitmap
+        write_i64(&mut body, 0);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 0);
+        body.push(0); // hash_state absent
+        body.push(0); // chunk_crc32c absent
+        body.push(0); // decoder_state absent
+
+        let body_len = body.len() as u64;
+        let checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::Truncated { reason } => {
+                assert!(reason.contains("zero parts"), "reason was {reason:?}");
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
     }
 
     #[test]

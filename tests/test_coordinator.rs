@@ -729,7 +729,7 @@ struct RecordingRenderer {
 
 impl ProgressRenderer for RecordingRenderer {
     fn render(&mut self, snap: &ProgressSnapshot) {
-        self.snaps.lock().unwrap().push(*snap);
+        self.snaps.lock().unwrap().push(snap.clone());
     }
     fn finish(&mut self) {
         self.finish_called
@@ -1650,6 +1650,121 @@ fn multi_url_all_per_part_sha256_match_completes_cleanly() {
     assert!(names.contains(&"a.bin"));
     assert!(names.contains(&"b.bin"));
     assert!(names.contains(&"c.bin"));
+}
+
+#[test]
+fn multi_url_per_part_sha256_kill_then_resume_completes_cleanly() {
+    // Phase 5 demo (`docs/PLAN_multi_url_source.md` §5): kill a
+    // multi-URL run with `--sha256` mid-flight, re-run, and the
+    // coordinator must rebuild the per-part
+    // [`peel::hash::IntegrityHasher`] state machine from the
+    // saved `active_part_idx` and continue verifying without
+    // re-hashing parts already finalized.
+    let big_payload = vec![0xEDu8; 200 * 1024];
+    let mut archive = build_simple_archive(&[
+        ("a.bin", &big_payload),
+        ("b.bin", &big_payload),
+        ("c.bin", &big_payload),
+    ]);
+    let total: usize = 768 * 1024;
+    archive.resize(total, 0u8);
+
+    let part_size: usize = 256 * 1024;
+    let p0 = archive[..part_size].to_vec();
+    let p1 = archive[part_size..2 * part_size].to_vec();
+    let p2 = archive[2 * part_size..].to_vec();
+    let h0 = sha256_hex(&p0);
+    let h1 = sha256_hex(&p1);
+    let h2 = sha256_hex(&p2);
+
+    let server0 = MockServer::start(ok_handler(p0, Some("\"p0\"")));
+    let server1 = MockServer::start(ok_handler(p1, Some("\"p1\"")));
+    let server2 = MockServer::start(ok_handler(p2, Some("\"p2\"")));
+
+    let work = unique_dir("multipart_kill_resume");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let primary_url = format!("{}/x.tar.part0000", server0.base_url());
+    let additional_urls = vec![
+        format!("{}/x.tar.part0001", server1.base_url()),
+        format!("{}/x.tar.part0002", server2.base_url()),
+    ];
+    let hashes = vec![h0, h1, h2];
+
+    // Phase 1: kill switch trips on the first checkpoint write so
+    // the coordinator emits an Aborted error and leaves sidecars
+    // for phase 2 to resume.
+    let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let kill_for_progress = Arc::clone(&kill);
+        let progress: ProgressFn = Box::new(move |event| {
+            if let ProgressEvent::CheckpointWritten { .. } = event {
+                kill_for_progress.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        let args = RunArgs {
+            url: primary_url.clone(),
+            additional_urls: additional_urls.clone(),
+            output: OutputTarget::Dir(out_dir.clone()),
+            config: CoordinatorConfig {
+                forced_format: Some("tar".into()),
+                expected_sha256s: hashes.clone(),
+                ..coord_config_for_test(256 * 1024)
+            },
+            client: build_client(),
+            registry: DecoderRegistry::with_defaults(),
+            progress: Some(progress),
+            progress_state: None,
+            kill_switch: Some(kill),
+            io_backend: None,
+        };
+        let err = run(args).expect_err("kill switch must trip");
+        match err {
+            CoordinatorError::Aborted {
+                checkpoints_written,
+            } => {
+                assert!(checkpoints_written >= 1);
+            }
+            other => panic!("expected Aborted, got {other:?}"),
+        }
+    }
+
+    // Sidecars left on disk so the second run picks them up.
+    assert!(work.join("out.peel.part").exists());
+    assert!(work.join("out.peel.ckpt").exists());
+
+    // Phase 2: re-run with the same multi-URL + per-part hashes.
+    // The coordinator must restore the IntegrityHasher state at
+    // the saved `active_part_idx` and finish cleanly.
+    let args = RunArgs {
+        url: primary_url,
+        additional_urls,
+        output: OutputTarget::Dir(out_dir.clone()),
+        config: CoordinatorConfig {
+            forced_format: Some("tar".into()),
+            expected_sha256s: hashes,
+            ..coord_config_for_test(256 * 1024)
+        },
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+        io_backend: None,
+    };
+    let stats = run(args).expect("resume with same --sha256s succeeds");
+    assert!(stats.resumed, "phase 2 must be a resume");
+
+    let entries = read_dir_recursive(&out_dir);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"a.bin"));
+    assert!(names.contains(&"b.bin"));
+    assert!(names.contains(&"c.bin"));
+    // Sidecars cleaned up after the clean second run.
+    assert!(!work.join("out.peel.part").exists());
+    assert!(!work.join("out.peel.ckpt").exists());
 }
 
 #[test]
