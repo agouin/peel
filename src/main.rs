@@ -370,6 +370,7 @@ fn main() -> Result<()> {
     // are not trivially cloneable as a unit), but every field we need
     // is independently cloneable; we just have to assemble them.
     let url = args.url.clone();
+    let additional_urls = args.additional_urls.clone();
     let output = args.output.clone();
     let coord_config = args.config.clone();
     let client = args.client.clone();
@@ -378,6 +379,7 @@ fn main() -> Result<()> {
 
     let make_args = || RunArgs {
         url: url.clone(),
+        additional_urls: additional_urls.clone(),
         output: output.clone(),
         config: coord_config.clone(),
         client: client.clone(),

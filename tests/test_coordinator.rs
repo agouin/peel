@@ -114,6 +114,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
+        expected_sha256s: Vec::new(),
         mirror_urls: Vec::new(),
         max_bandwidth_bps: None,
         max_disk_buffer: None,
@@ -322,6 +323,7 @@ fn make_args(
 ) -> RunArgs {
     RunArgs {
         url: format!("{}/{suffix}", server.base_url()),
+        additional_urls: Vec::new(),
         output,
         config,
         client: build_client(),
@@ -1376,6 +1378,7 @@ fn zip_resume_skips_already_extracted_entries() {
     let mut after_first_ckpt = false;
     let args1 = RunArgs {
         url: format!("{}/release.zip", server.base_url()),
+        additional_urls: Vec::new(),
         output: OutputTarget::Dir(out_dir.clone()),
         config: cfg1,
         client: build_client(),
@@ -1456,6 +1459,7 @@ fn sha256_match_completes_clean_extraction() {
         OutputTarget::File(out_path.clone()),
         CoordinatorConfig {
             expected_sha256: Some(expected),
+            expected_sha256s: Vec::new(),
             ..coord_config_for_test(4096)
         },
     );
@@ -1489,6 +1493,7 @@ fn sha256_mismatch_aborts_with_integrity_error() {
         OutputTarget::File(out_path),
         CoordinatorConfig {
             expected_sha256: Some(wrong),
+            expected_sha256s: Vec::new(),
             ..coord_config_for_test(4096)
         },
     );
@@ -1533,9 +1538,11 @@ fn sha256_resume_with_saved_state_completes_cleanly() {
         });
         let args = RunArgs {
             url: format!("{}/x.zst", server.base_url()),
+            additional_urls: Vec::new(),
             output: OutputTarget::File(out_path.clone()),
             config: CoordinatorConfig {
                 expected_sha256: Some(expected),
+                expected_sha256s: Vec::new(),
                 ..coord_config_for_test(4096)
             },
             client: build_client(),
@@ -1567,6 +1574,7 @@ fn sha256_resume_with_saved_state_completes_cleanly() {
         OutputTarget::File(out_path.clone()),
         CoordinatorConfig {
             expected_sha256: Some(expected),
+            expected_sha256s: Vec::new(),
             ..coord_config_for_test(4096)
         },
     );
@@ -1624,6 +1632,7 @@ fn sha256_added_on_resume_without_saved_state_errors() {
         CoordinatorConfig {
             chunk_size,
             expected_sha256: Some(expected),
+            expected_sha256s: Vec::new(),
             ..coord_config_for_test(chunk_size)
         },
     );
@@ -1681,6 +1690,7 @@ fn sha256_dropped_on_resume_with_saved_state_errors() {
         CoordinatorConfig {
             chunk_size,
             expected_sha256: None,
+            expected_sha256s: Vec::new(),
             ..coord_config_for_test(chunk_size)
         },
     );
@@ -2248,6 +2258,7 @@ fn small_disk_buffer_completes_under_throttle() {
     let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let args = RunArgs {
         url: format!("{}/x.tar.zst", server.base_url()),
+        additional_urls: Vec::new(),
         output: OutputTarget::Dir(out_dir.clone()),
         config,
         client: build_client(),
@@ -2294,6 +2305,7 @@ fn one_chunk_cap_run_completes_under_heavy_throttling() {
     let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let args = RunArgs {
         url: format!("{}/x.tar.zst", server.base_url()),
+        additional_urls: Vec::new(),
         output: OutputTarget::Dir(out_dir.clone()),
         config,
         client: build_client(),
@@ -2334,6 +2346,7 @@ fn small_cap_with_many_workers_completes() {
     let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let args = RunArgs {
         url: format!("{}/x.tar.zst", server.base_url()),
+        additional_urls: Vec::new(),
         output: OutputTarget::Dir(out_dir.clone()),
         config,
         client: build_client(),
@@ -2416,6 +2429,7 @@ fn small_cap_with_drip_server_completes() {
     let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let args = RunArgs {
         url: format!("{}/x.tar.zst", server.base_url()),
+        additional_urls: Vec::new(),
         output: OutputTarget::Dir(out_dir.clone()),
         config,
         client: build_client(),

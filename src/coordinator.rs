@@ -162,9 +162,9 @@ use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
 use crate::download::{
     chunk_count, discover_with_mirrors, run as run_scheduler, ChunkFingerprints, DownloadInfo,
-    DownloadStats, ProbeConfig, RetryConfig, SchedulerConfig, SchedulerError, SourceFingerprint,
-    SparseFile, SparseFileError, ZipPipeline, ZipPipelineConfig, ZipPipelineError,
-    ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
+    DownloadStats, MirrorSet, ProbeConfig, RetryConfig, SchedulerConfig, SchedulerError,
+    SourceFingerprint, SparseFile, SparseFileError, ZipPipeline, ZipPipelineConfig,
+    ZipPipelineError, ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 use crate::extractor::{
     CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
@@ -298,6 +298,16 @@ pub struct CoordinatorConfig {
     /// the integrity check does not extend to that path in round-one
     /// of `PLAN_v2.md`.
     pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
+    /// Per-part SHA-256 digests for multi-URL runs
+    /// (`docs/PLAN_multi_url_source.md` §3 step 2). Empty for
+    /// single-URL runs (which use [`Self::expected_sha256`]) or
+    /// when no `--sha256` flags were supplied. Otherwise carries
+    /// exactly `1 + additional_urls.len()` digests, paired by URL
+    /// order — verified per-part as the decoder advances past each
+    /// boundary. Phase 3 of that plan accepts and validates the CLI
+    /// shape; phase 4 wires the runtime verification, until then
+    /// the coordinator errors at startup when this vec is non-empty.
+    pub expected_sha256s: Vec<[u8; crate::hash::sha256::DIGEST_LEN]>,
     /// Additional mirror URLs (`PLAN_v2.md` §13). Each mirror is
     /// expected to serve byte-identical copies of the source. The
     /// coordinator runs `HEAD` against the primary plus every mirror
@@ -341,6 +351,7 @@ impl Default for CoordinatorConfig {
             force_format_from_magic: false,
             io_backend: crate::io_backend::IoBackendChoice::default(),
             expected_sha256: None,
+            expected_sha256s: Vec::new(),
             mirror_urls: Vec::new(),
             max_bandwidth_bps: None,
             max_disk_buffer: Some(DEFAULT_MAX_DISK_BUFFER),
@@ -398,8 +409,19 @@ pub enum ProgressEvent<'a> {
 
 /// Knobs the [`run`] entry point asks the caller to supply.
 pub struct RunArgs {
-    /// Source URL (the `peel` CLI's positional argument).
+    /// Primary source URL (the first positional argument). Holds
+    /// the entire archive in single-URL mode and part 0 in multi-URL
+    /// mode — see [`Self::additional_urls`].
     pub url: String,
+    /// Additional source URLs for multi-part split archives
+    /// (`docs/PLAN_multi_url_source.md`). When empty, this is a
+    /// single-URL run and behaves exactly as before. When non-empty,
+    /// the coordinator runs N parallel HEADs across `[url] ++
+    /// additional_urls` via [`crate::download::discover_multi`] and
+    /// treats the byte-concatenation as one logical archive stream.
+    /// `--mirror` is mutually exclusive with this list (rejected at
+    /// CLI parse time).
+    pub additional_urls: Vec<String>,
     /// Where extracted output goes.
     pub output: OutputTarget,
     /// Tunables. Pass [`CoordinatorConfig::default`] for production.
@@ -681,6 +703,19 @@ pub enum CoordinatorError {
     #[error("ZIP extraction failed")]
     Zip(#[source] ZipPipelineError),
 
+    /// The caller passed per-part SHA-256 digests
+    /// (`CoordinatorConfig::expected_sha256s`) on a multi-URL run,
+    /// but the per-part verification path is not yet wired
+    /// (`docs/PLAN_multi_url_source.md` §4 — phase 4). Phase 3
+    /// landed the CLI surface so this combination parses; surfacing
+    /// the gap here is the contract until §4 lands.
+    #[error(
+        "per-part --sha256 verification is not yet implemented; \
+         re-run without --sha256 (multi-URL hashing will land in \
+         docs/PLAN_multi_url_source.md §4)"
+    )]
+    PerPartHashesNotYetWired,
+
     /// The caller's [`RunArgs::kill_switch`] flipped to `true`
     /// between checkpoint writes. The .peel.part / .peel.ckpt
     /// sidecars are intentionally left on disk so the next call
@@ -719,6 +754,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     let started = Instant::now();
     let RunArgs {
         url,
+        additional_urls,
         output,
         config,
         client,
@@ -765,13 +801,51 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         })
         .collect::<Result<_, _>>()?;
 
-    let (info, mirror_set, dropped_mirrors) = discover_with_mirrors(
-        &client,
-        &parsed_url,
-        &mirror_urls,
-        config.expected_sha256.is_some(),
-    )
-    .map_err(CoordinatorError::Scheduler)?;
+    // Multi-URL split-archive (`docs/PLAN_multi_url_source.md` §3
+    // step 1): when extra positional URLs were provided, route
+    // through [`discover_multi`] over `[primary, ...additional]`
+    // instead of the mirror-aware discovery. The CLI already
+    // rejects `--mirror` + multi-URL at parse time (§3 step 3),
+    // and per-part SHA-256 verification (`expected_sha256s`) is
+    // wired in §4 — until then we surface a clear error if a
+    // multi-URL caller already passed digests.
+    let (info, mirror_set, dropped_mirrors) = if additional_urls.is_empty() {
+        let (info, ms, dropped) = discover_with_mirrors(
+            &client,
+            &parsed_url,
+            &mirror_urls,
+            config.expected_sha256.is_some(),
+        )
+        .map_err(CoordinatorError::Scheduler)?;
+        (info, ms, dropped)
+    } else {
+        if !config.expected_sha256s.is_empty() {
+            // Phase 4 will wire per-part hash verification; until
+            // then surface the gap clearly rather than silently
+            // ignoring the digests the user passed.
+            return Err(CoordinatorError::PerPartHashesNotYetWired);
+        }
+        let mut all = Vec::with_capacity(1 + additional_urls.len());
+        all.push(parsed_url.clone());
+        for u in &additional_urls {
+            all.push(
+                Url::parse(u).map_err(|source| CoordinatorError::InvalidUrl {
+                    url: u.clone(),
+                    source,
+                })?,
+            );
+        }
+        let info =
+            crate::download::discover_multi(&client, &all).map_err(CoordinatorError::Scheduler)?;
+        // Multi-URL is mutually exclusive with `--mirror` (CLI
+        // rejects the combination), so the mirror set we build
+        // here exists only to keep the scheduler's existing single-
+        // URL fallback wiring happy. The worker bypasses it
+        // whenever `info.source.len() > 1` (`docs/PLAN_multi_url_source.md`
+        // §1 step 4); see `try_once`.
+        let ms = MirrorSet::single(info.url.clone(), info.fingerprint.clone());
+        (info, ms, Vec::new())
+    };
     let mirror_set = Arc::new(mirror_set);
     let _ = dropped_mirrors; // surfaced via tracing::warn! inside discover_with_mirrors
 

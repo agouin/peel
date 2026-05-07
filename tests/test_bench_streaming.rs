@@ -349,6 +349,7 @@ fn coord_config() -> CoordinatorConfig {
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
+        expected_sha256s: Vec::new(),
         mirror_urls: Vec::new(),
         max_bandwidth_bps: None,
         max_disk_buffer: None,
@@ -358,6 +359,7 @@ fn coord_config() -> CoordinatorConfig {
 fn run_peel(server: &MockServer, suffix: &str, output: OutputTarget) -> RunStats {
     let args = RunArgs {
         url: format!("{}/{suffix}", server.base_url()),
+        additional_urls: Vec::new(),
         output,
         config: coord_config(),
         client: build_client(),
@@ -867,6 +869,7 @@ fn diag_plain_tar_breakdown() {
         let _g = CleanupDir(work.clone());
         let args = RunArgs {
             url: format!("{}/{suffix}", server.base_url()),
+            additional_urls: Vec::new(),
             output: OutputTarget::Dir(work.clone()),
             config: build(body_len),
             client: build_client(),
@@ -986,6 +989,7 @@ fn diag_tar_xz_breakdown() {
         let _g = CleanupDir(work.clone());
         let args = RunArgs {
             url: format!("{}/{suffix}", server.base_url()),
+            additional_urls: Vec::new(),
             output: OutputTarget::Dir(work.clone()),
             config: build(body_len),
             client: build_client(),
@@ -1226,6 +1230,7 @@ fn diag_streaming_source_pipeline_10gbps() {
             let progress_state = std::sync::Arc::new(peel::progress::ProgressState::new());
             let args = RunArgs {
                 url: format!("{}/{}", server.base_url(), format.suffix),
+                additional_urls: Vec::new(),
                 output: OutputTarget::Dir(work.clone()),
                 config: (variant.build)(coord_config()),
                 client: build_client(),
@@ -1380,6 +1385,7 @@ fn diag_plain_tar_io_backends() {
         config.io_backend = *choice;
         let args = RunArgs {
             url: format!("{}/{suffix}", server.base_url()),
+            additional_urls: Vec::new(),
             output: OutputTarget::Dir(work.clone()),
             config,
             client: build_client(),
@@ -1619,6 +1625,7 @@ fn run_throttled_case(
     let progress_state = std::sync::Arc::new(peel::progress::ProgressState::new());
     let args = RunArgs {
         url: url.clone(),
+        additional_urls: Vec::new(),
         output: OutputTarget::Dir(work_p.clone()),
         config,
         client: build_client(),

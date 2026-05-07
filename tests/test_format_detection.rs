@@ -98,6 +98,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
+        expected_sha256s: Vec::new(),
         mirror_urls: Vec::new(),
         max_bandwidth_bps: None,
         max_disk_buffer: None,
@@ -229,6 +230,7 @@ fn make_args(
 ) -> RunArgs {
     RunArgs {
         url: format!("{}/{suffix}", server.base_url()),
+        additional_urls: Vec::new(),
         output,
         config,
         client: build_client(),

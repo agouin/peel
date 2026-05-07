@@ -112,6 +112,7 @@ fn coord_config(chunk_size: u64) -> CoordinatorConfig {
         force_format_from_magic: false,
         io_backend: peel::io_backend::IoBackendChoice::Blocking,
         expected_sha256: None,
+        expected_sha256s: Vec::new(),
         mirror_urls: Vec::new(),
         max_bandwidth_bps: None,
         max_disk_buffer: None,
@@ -191,6 +192,7 @@ fn make_args(
 ) -> RunArgs {
     RunArgs {
         url: format!("{}/{suffix}", server.base_url()),
+        additional_urls: Vec::new(),
         output,
         config,
         client: build_client(),
@@ -2105,6 +2107,7 @@ fn sha256_match_after_random_kill_points_resume() {
     });
     let cfg = CoordinatorConfig {
         expected_sha256: Some(expected),
+        expected_sha256s: Vec::new(),
         ..coord_config(4096)
     };
     let args = make_args(
@@ -2138,6 +2141,7 @@ fn sha256_match_after_random_kill_points_resume() {
         let progress = kill_after(Arc::clone(&kill), abort_after, Arc::clone(&counter));
         let cfg = CoordinatorConfig {
             expected_sha256: Some(expected),
+            expected_sha256s: Vec::new(),
             ..coord_config(4096)
         };
         let args = make_args(

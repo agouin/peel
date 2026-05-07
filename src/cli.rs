@@ -48,8 +48,15 @@ use crate::io_backend::IoBackendChoice;
         .args(["forced_format", "force_format_from_magic"]),
 ))]
 pub struct Cli {
-    /// Source URL (e.g. https://example.com/dataset.tar.zst).
-    pub url: String,
+    /// Source URL(s). One URL is the historical single-source case.
+    /// Two or more URLs activate the multi-part split-archive path
+    /// (`docs/PLAN_multi_url_source.md`): the byte-concatenation of
+    /// every URL's body is treated as one logical archive stream,
+    /// and the workers fetch all parts in parallel via ranged GETs.
+    /// Examples: `peel https://host/x.tar.zst -C out/` or
+    /// `peel https://host/x.tar.part0000 https://host/x.tar.part0001 -C out/`.
+    #[arg(num_args = 1..)]
+    pub urls: Vec<String>,
 
     /// Extract a tar archive into this directory.
     #[arg(short = 'C', long = "output-dir", value_name = "DIR")]
@@ -150,20 +157,28 @@ pub struct Cli {
     #[arg(long = "http-version", value_enum, default_value_t = HttpVersionArg::Auto)]
     pub http_version: HttpVersionArg,
 
-    /// Verify the assembled compressed source against this SHA-256
-    /// digest (`PLAN_v2.md` §10).
+    /// SHA-256 digest(s) the source must match. Repeatable.
     ///
-    /// The 64-character hex string is the SHA-256 of the original
-    /// compressed file (matching what `sha256sum` prints, not the
-    /// digest of the decoded contents). On clean completion the
-    /// run aborts with a distinct error if the bytes received did
-    /// not match. The hash state is checkpointed across resumes,
-    /// so a `kill -9` and follow-up resume produce a digest
-    /// byte-identical to a clean run. Streaming pipeline only;
-    /// `.zip` archives extract per-entry and integrity checking
-    /// does not extend to that path in round-one of `PLAN_v2.md`.
+    /// Single-URL runs (`PLAN_v2.md` §10): pass `--sha256 <hex>`
+    /// once; the coordinator hashes the assembled compressed source
+    /// as it streams and aborts at clean completion if the digest
+    /// disagrees. The hash state is checkpointed across resumes, so
+    /// a `kill -9` and follow-up resume produce a digest
+    /// byte-identical to a clean run.
+    ///
+    /// Multi-URL runs (`docs/PLAN_multi_url_source.md`): pass
+    /// `--sha256` either zero times (no verification) or exactly
+    /// once per URL, paired by order. The hashes are per-part
+    /// digests of each part's bytes — the coordinator verifies each
+    /// one at its part-boundary as the decoder advances (planned in
+    /// §4 of that doc; phase 3 lands the CLI surface, phase 4 wires
+    /// the runtime).
+    ///
+    /// Streaming pipeline only; `.zip` archives extract per-entry
+    /// and integrity checking does not extend to that path in
+    /// round-one of `PLAN_v2.md`.
     #[arg(long = "sha256", value_name = "HEX")]
-    pub expected_sha256: Option<String>,
+    pub expected_sha256s: Vec<String>,
 
     /// Additional mirror URL serving the same file
     /// (`PLAN_v2.md` §13). The flag is repeatable; the positional
@@ -326,6 +341,43 @@ pub enum CliError {
     /// no default output directory could be derived.
     #[error("URL has no filename to derive a default output directory from; pass -C <DIR> or -o <FILE> explicitly")]
     NoDefaultOutput,
+
+    /// `--sha256` was given a number of times that does not match
+    /// the URL count (`docs/PLAN_multi_url_source.md` §3 step 2).
+    /// For a single-URL run, 0 or 1 hash is accepted; for a
+    /// multi-URL run, 0 or exactly `urls` hashes is accepted.
+    #[error(
+        "--sha256 count {hashes} does not match URL count {urls}: \
+         pass either no `--sha256` (skip verification) or one per URL"
+    )]
+    ShaCountMismatch {
+        /// How many positional URLs were given.
+        urls: usize,
+        /// How many `--sha256` flags were given.
+        hashes: usize,
+    },
+
+    /// The CLI was constructed with zero positional URLs. Cannot be
+    /// produced by `clap` parsing (the `#[arg(num_args = 1..)]`
+    /// constraint guarantees at least one), but a library caller
+    /// that builds a [`Cli`] by hand can hit this — and getting an
+    /// explicit error is friendlier than a panic.
+    #[error("at least one source URL is required")]
+    NoUrls,
+
+    /// `--mirror` was combined with multiple positional URLs. The
+    /// `--mirror` flag means "alternate source for the same file"
+    /// (a peer of the primary URL); multi-URL means "this archive
+    /// is split across N URLs" (a sequence of distinct parts). The
+    /// two semantics are mutually exclusive — combining them is
+    /// rejected at parse time per `docs/PLAN_multi_url_source.md`
+    /// §3 step 3. A future plan may add per-part mirroring.
+    #[error(
+        "--mirror is incompatible with multi-URL runs: \
+         multi-URL treats each positional URL as a distinct part, \
+         while --mirror treats the alternates as copies of the same source"
+    )]
+    MirrorMultipleUrls,
 }
 
 /// Compression and archive suffixes stripped when deriving a default
@@ -359,17 +411,37 @@ fn strip_archive_extensions(name: &str) -> &str {
 }
 
 /// Derive the default output directory when neither `-C` nor `-o` is
-/// given: parse the URL, take its basename, strip known compression /
-/// archive extensions, and place the result in the current working
-/// directory (as a relative path).
+/// given: parse the URL, take its basename, strip the multi-part
+/// `.partNNNN` suffix (`docs/PLAN_multi_url_source.md` §3 step 4) if
+/// present, then strip known compression / archive extensions, and
+/// place the result in the current working directory (as a relative
+/// path).
 fn default_output_dir(url: &str) -> Result<PathBuf, CliError> {
     let parsed = Url::parse(url).map_err(CliError::InvalidUrl)?;
     let name = filename_from_url(&parsed).ok_or(CliError::NoDefaultOutput)?;
-    let stripped = strip_archive_extensions(&name);
+    let depart = strip_part_suffix(&name);
+    let stripped = strip_archive_extensions(depart);
     if stripped.is_empty() {
         return Err(CliError::NoDefaultOutput);
     }
     Ok(PathBuf::from(stripped))
+}
+
+/// If `name` ends in `.partNNNN…` (one or more decimal digits, any
+/// length), strip that suffix. Used to turn `pruned.tar.part0000`
+/// into `pruned.tar` before the regular extension-strip loop runs.
+/// Conservative: requires a leading `.part` and at least one digit;
+/// otherwise returns `name` unchanged.
+fn strip_part_suffix(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    let Some(idx) = lower.rfind(".part") else {
+        return name;
+    };
+    let tail = &name[idx + ".part".len()..];
+    if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return name;
+    }
+    &name[..idx]
 }
 
 /// Parse a `--max-disk-buffer` value into `Option<u64>` (bytes).
@@ -399,18 +471,59 @@ impl Cli {
     /// constructed, or [`CliError::InvalidSha256`] if the
     /// `--sha256 <HEX>` argument failed to parse.
     pub fn into_run_args(self) -> Result<RunArgs, CliError> {
+        // The `num_args = 1..` constraint guarantees at least one
+        // URL at parse time; `urls[0]` is the primary part. The
+        // explicit fallback below keeps the function defensive
+        // against an `into_run_args` caller that constructed `Cli`
+        // by hand and skipped clap (the assert path).
+        let mut urls_iter = self.urls.into_iter();
+        let primary_url = urls_iter.next().ok_or(CliError::NoUrls)?;
+        let additional_urls: Vec<String> = urls_iter.collect();
+        let multi_part = !additional_urls.is_empty();
+
+        // §3 step 3: --mirror is for alternates of the same file;
+        // multi-URL is for distinct parts of the same archive. The
+        // two flags carry different semantics — combining them is a
+        // user error, not a runtime warning.
+        if multi_part && !self.mirrors.is_empty() {
+            return Err(CliError::MirrorMultipleUrls);
+        }
+
+        // §3 step 2: validate the --sha256 count against the URL
+        // count, then split the parsed digests into the (single,
+        // many) shape the `CoordinatorConfig` exposes.
+        let parsed_hashes: Vec<[u8; crate::hash::sha256::DIGEST_LEN]> = self
+            .expected_sha256s
+            .iter()
+            .map(|hex| parse_hex_digest(hex).map_err(CliError::InvalidSha256))
+            .collect::<Result<_, _>>()?;
+        let n_urls = 1 + additional_urls.len();
+        let n_hashes = parsed_hashes.len();
+        let (expected_sha256, expected_sha256s) = match (multi_part, n_hashes) {
+            (false, 0) => (None, Vec::new()),
+            (false, 1) => (Some(parsed_hashes[0]), Vec::new()),
+            (true, 0) => (None, Vec::new()),
+            (true, n) if n == n_urls => (None, parsed_hashes),
+            (_, _) => {
+                return Err(CliError::ShaCountMismatch {
+                    urls: n_urls,
+                    hashes: n_hashes,
+                })
+            }
+        };
+
         let output = match (self.output_dir, self.output_file) {
             (Some(d), None) => OutputTarget::Dir(d),
             (None, Some(f)) => OutputTarget::File(f),
-            (None, None) => OutputTarget::Dir(default_output_dir(&self.url)?),
+            // §3 step 4: derive the default output dir from the
+            // *first* URL's basename, with the multi-part suffix
+            // stripped first so `pruned.tar.part0000` becomes
+            // `pruned`.
+            (None, None) => OutputTarget::Dir(default_output_dir(&primary_url)?),
             // The clap ArgGroup rejects setting both at once at parse
             // time, so this arm cannot fire in practice; the catch-all
             // keeps the match exhaustive without `unreachable!`.
             (Some(d), Some(_)) => OutputTarget::Dir(d),
-        };
-        let expected_sha256 = match self.expected_sha256 {
-            Some(hex) => Some(parse_hex_digest(&hex).map_err(CliError::InvalidSha256)?),
-            None => None,
         };
         let max_bandwidth_bps = match self.max_bandwidth {
             Some(s) => Some(parse_bandwidth(&s).map_err(CliError::InvalidBandwidth)?),
@@ -433,7 +546,8 @@ impl Cli {
             ..ClientConfig::default()
         })?;
         Ok(RunArgs {
-            url: self.url,
+            url: primary_url,
+            additional_urls,
             output,
             config: CoordinatorConfig {
                 chunk_size: self.chunk_size,
@@ -452,6 +566,7 @@ impl Cli {
                 force_format_from_magic: self.force_format_from_magic,
                 io_backend: self.io_backend.into(),
                 expected_sha256,
+                expected_sha256s,
                 mirror_urls: self.mirrors,
                 max_bandwidth_bps,
                 max_disk_buffer,
@@ -986,5 +1101,208 @@ mod tests {
         ])
         .expect_err("must conflict");
         let _ = err;
+    }
+
+    // ---- multi-URL (PLAN_multi_url_source.md §3) --------------------
+
+    #[test]
+    fn parses_multiple_positional_urls() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/p0",
+            "https://h/p1",
+            "https://h/p2",
+            "-C",
+            "/tmp/out",
+        ])
+        .expect("parse");
+        assert_eq!(cli.urls.len(), 3);
+        assert_eq!(cli.urls[0], "https://h/p0");
+        assert_eq!(cli.urls[2], "https://h/p2");
+    }
+
+    #[test]
+    fn into_run_args_splits_primary_and_additional_urls() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/p0",
+            "https://h/p1",
+            "https://h/p2",
+            "-C",
+            "/tmp/out",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(args.url, "https://h/p0");
+        assert_eq!(
+            args.additional_urls,
+            vec!["https://h/p1".to_string(), "https://h/p2".into()]
+        );
+    }
+
+    #[test]
+    fn single_url_keeps_additional_urls_empty() {
+        let cli =
+            Cli::try_parse_from(["peel", "https://h/x.tar.zst", "-C", "/tmp/out"]).expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(args.url, "https://h/x.tar.zst");
+        assert!(args.additional_urls.is_empty());
+    }
+
+    #[test]
+    fn multi_url_pairs_sha256_per_part() {
+        // Three URLs and three --sha256 hashes — populates
+        // expected_sha256s in URL order, leaves expected_sha256 None.
+        let h0 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let h1 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let h2 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/p0",
+            "https://h/p1",
+            "https://h/p2",
+            "--sha256",
+            h0,
+            "--sha256",
+            h1,
+            "--sha256",
+            h2,
+            "-C",
+            "/tmp/out",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(args.config.expected_sha256.is_none());
+        assert_eq!(args.config.expected_sha256s.len(), 3);
+        assert_eq!(args.config.expected_sha256s[0][0], 0xBA);
+        assert_eq!(args.config.expected_sha256s[1][0], 0xB9);
+        assert_eq!(args.config.expected_sha256s[2][0], 0x9F);
+    }
+
+    #[test]
+    fn multi_url_with_no_sha256_is_accepted() {
+        let cli = Cli::try_parse_from(["peel", "https://h/p0", "https://h/p1", "-C", "/tmp/out"])
+            .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(args.config.expected_sha256.is_none());
+        assert!(args.config.expected_sha256s.is_empty());
+    }
+
+    #[test]
+    fn rejects_partial_sha256_count_for_multi_url() {
+        // 3 URLs + only 2 hashes → ShaCountMismatch.
+        let h = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/p0",
+            "https://h/p1",
+            "https://h/p2",
+            "--sha256",
+            h,
+            "--sha256",
+            h,
+            "-C",
+            "/tmp/out",
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        match err {
+            CliError::ShaCountMismatch { urls, hashes } => {
+                assert_eq!(urls, 3);
+                assert_eq!(hashes, 2);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_two_sha256_for_single_url() {
+        // Single URL with 2 --sha256 → ShaCountMismatch (not the
+        // historical Some(_)/None binary; with multiple hashes the
+        // single-URL slot can't represent the user's intent).
+        let h = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/x",
+            "--sha256",
+            h,
+            "--sha256",
+            h,
+            "-C",
+            "/tmp/out",
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        match err {
+            CliError::ShaCountMismatch { urls, hashes } => {
+                assert_eq!(urls, 1);
+                assert_eq!(hashes, 2);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_mirror_combined_with_multi_url() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/p0",
+            "https://h/p1",
+            "--mirror",
+            "https://m/x",
+            "-C",
+            "/tmp/out",
+        ])
+        .expect("parse");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::MirrorMultipleUrls));
+    }
+
+    #[test]
+    fn mirror_works_with_single_url() {
+        // --mirror is unchanged for the single-URL path.
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/x.tar.zst",
+            "--mirror",
+            "https://m/x.tar.zst",
+            "-C",
+            "/tmp/out",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert_eq!(
+            args.config.mirror_urls,
+            vec!["https://m/x.tar.zst".to_string()]
+        );
+        assert!(args.additional_urls.is_empty());
+    }
+
+    #[test]
+    fn default_output_dir_strips_part_suffix() {
+        // `pruned.tar.part0000` → strip `.part0000` → `pruned.tar` →
+        // strip `.tar` → `pruned`.
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/snap/pruned.tar.part0000",
+            "https://h/snap/pruned.tar.part0001",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        match args.output {
+            OutputTarget::Dir(p) => assert_eq!(p, PathBuf::from("pruned")),
+            OutputTarget::File(_) => panic!("expected Dir target"),
+        }
+    }
+
+    #[test]
+    fn strip_part_suffix_recognizes_part_nnnn() {
+        assert_eq!(strip_part_suffix("pruned.tar.part0000"), "pruned.tar");
+        assert_eq!(strip_part_suffix("pruned.tar.part12345"), "pruned.tar");
+        assert_eq!(strip_part_suffix("PRUNED.TAR.PART0000"), "PRUNED.TAR");
+        // Non-part suffixes are left alone.
+        assert_eq!(strip_part_suffix("pruned.tar"), "pruned.tar");
+        assert_eq!(strip_part_suffix("pruned.partAA"), "pruned.partAA");
+        assert_eq!(strip_part_suffix("pruned.part"), "pruned.part");
     }
 }
