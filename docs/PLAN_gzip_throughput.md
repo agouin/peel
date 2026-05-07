@@ -1,11 +1,68 @@
 # PLAN — gzip 10 Gbps throughput (parallel-member decode + CRC32 acceleration)
 
-**Status**: proposed (2026-05-06).
+**Status**: Phases 0–2 shipped (2026-05-07); Phase 3 deprioritized
+(see "Phase 3 deprioritization" below); Phase 4 shipped in narrowed
+form — multi-member crash-resume coverage only, no parallel-decode
+checkpoint integration (which would have required Phase 3).
 **Owner**: TBD.
 **Promotes**: the README's "Reading the grid" follow-on for the
-`tar.gz` 10 Gbps · 256 MiB row, currently filed as
+`tar.gz` 10 Gbps · 256 MiB row, originally filed as
 "Filed as a follow-on; not blocking" in
 [`README.md`](../README.md#benchmarks-peel-vs-curl---decompressor---tar).
+The README's bench grid now reflects the Phase 1 win: the single-
+member `tar.gz` row is **1.05×** (was 2.86×), the multi-member
+`tar.gz·m` row is **0.97×** (sub-1× without parallelism), and the
+gz prose has been updated to match.
+
+## Phase 3 deprioritization (2026-05-07)
+
+Phase 3's premise — that the deflate decoder is the binding
+constraint at 10 Gbps — held when the row was **2.86×** with the
+decoder running at ~530 MiB/s. **Phase 1's CRC32 slicing-by-16 took
+the decoder to ~3.0 GiB/s** (a 5.8× shift, far larger than the
+plan's modeled "≥ 5 % bench-grid improvement" target — the running
+CRC was actually ~80 % of decoder self-time on the LCG-random
+fixture, not the ~7 % the plan estimated from the xz CRC64 share).
+The bench grid `tar.gz` row went **2.86× → 1.05×** in one phase.
+
+At the new floor, the wire is the binding constraint:
+
+| Quantity | Time | Source |
+|---|---|---|
+| Pure wire time (256 MiB @ 10 Gbps cap) | 200 ms | `--limit-rate` |
+| `curl \| gzip \| tar` end-to-end       | 237 ms | bench grid |
+| `peel` end-to-end                       | 251 ms | bench grid |
+| `peel` decoder-only (no pipeline)       |  84 ms | `bench_deflate_native_..._single_member_w1` |
+
+The decoder is now ~3× faster than the wire delivers. With perfect
+pipelining, the wall-clock contribution of the decoder is
+`max(0, 84 − 200) = 0 ms`. Phase 3's parallel-member work cannot
+recover wall-clock that does not exist.
+
+**The 14 ms peel/curl gap on the single-member row is non-decoder**:
+pipeline ramp-up, sink writes, checkpoint serialization, and the
+final post-wire flush. Profiling that gap is filed as a follow-on
+(see "Future work" below). Until that profile names a decoder-bound
+fraction worth ≥ 25 ms, Phase 3's 1.5–2-week investment is not
+justified.
+
+**What stays shipped**: Phases 0–2 — the multi-member fixture, the
+member-boundary scanner ([`src/decode/deflate_native/members.rs`](../src/decode/deflate_native/members.rs)),
+the `GzipDecoder::members_scanned` / `last_member_crc32` /
+`last_member_isize` / `step_typed` introspection surface, and the
+50-fixture differential corpus against `flate2::MultiGzDecoder`.
+This infrastructure is the precondition for Phase 3 if it ever
+gets re-promoted (resume-from-disk benchmark, > 10 Gbps fixture, or
+high-compression-ratio fixture where the decoder becomes the
+binding constraint at the configured wire rate).
+
+**Sub-plans demoted to follow-ons** (filed in
+[`docs/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) when the gating
+conditions surface):
+- Parallel-member decode (Phase 3 of this plan).
+- DEFLATE inner-loop SIMD / table-driven literal decode.
+- Tail-search member discovery (was a Phase 7 follow-on of this
+  plan; trimmed alongside the rest).
 **Sister plans**:
 - [`docs/PLAN_xz_parallel_block_decode.md`](PLAN_xz_parallel_block_decode.md)
   — same architectural shape (worker pool + ordered output ring +
@@ -541,7 +598,49 @@ corpus; worker-count=4 shows ≥ 3× speedup vs worker-count=1
 on a multi-member 256 MiB fixture; decoder-only multi-member
 W=4 ≥ 1.4 GiB/s.
 
-### Phase 4 — Resume + integrity + checkpoints (1 week)
+### Phase 4 — Resume + integrity + checkpoints (narrowed: 2 hours)
+
+**Status: shipped 2026-05-07 in narrowed form.** Phase 3 was
+deprioritized, which removed the precondition (parallel-decode
+drain) for the original Phase 4 scope (checkpoint format extension
+`gz_members_complete`, completed-member skip-on-resume, SHA-256
+streaming over the parallel drain). What remained was a real
+testing gap: the multi-member tar.gz shape Phase 0 added to the
+bench grid had **zero crash-resume coverage** (the existing
+single-member harness in
+[`tests/test_coordinator_crash.rs`](../tests/test_coordinator_crash.rs)
+covered only the default `gzip` shape).
+
+Multi-member crosses a code path the single-member tests never
+see: at member boundaries the wrapper sits in
+`State::BetweenMembers` with `self.inner == None`, so
+[`GzipDecoder::decoder_state_into`](../src/decode/deflate_native/gzip.rs)
+returns `false` and the checkpoint at that boundary captures *no*
+`decoder_state` blob. Resume from such a checkpoint takes the
+regular `factory()` path, not `resume_factory()`. That
+discrimination was untested.
+
+What shipped: one new test
+[`random_kill_points_resume_multi_member_tar_gz_byte_identical`](../tests/test_coordinator_crash.rs)
+(12 trials × 4-gz-member fixture × 8 inner tar members) plus a
+local `encode_gzip_multi_member` helper. Uses
+[`ExpectedResumeMode::SomeDecoderState`](../tests/test_coordinator_crash.rs)
+so kills landing at gz member boundaries (no-blob path) and kills
+landing mid-deflate-body (decoder_state path) both have to produce
+byte-identical resumes, with ≥ 1 of each kind across the trial set.
+
+What did **not** ship (and is not pending): checkpoint format
+extension, completed-member skip-on-resume, SHA-256 streaming over
+the parallel drain. None of those have anything to integrate with
+without Phase 3.
+
+Total project crash-resume coverage post-Phase-4: 36 single-member
+tar.gz + 12 multi-member tar.gz + ~211 across other formats =
+~259 randomized kill-and-resume runs. Original plan target was
+"100 randomized crash-resume runs"; we are 2.5× past that.
+
+**Original Phase 4 scope** (preserved here for the historical
+record; superseded by the narrowed scope above):
 
 Parallels Phase 3 of `PLAN_xz_parallel_block_decode.md`.
 
