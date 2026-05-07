@@ -775,6 +775,33 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     let mirror_set = Arc::new(mirror_set);
     let _ = dropped_mirrors; // surfaced via tracing::warn! inside discover_with_mirrors
 
+    // Per `docs/PLAN_multi_url_source.md` §2: for multi-URL runs the
+    // bitmap chunk size must divide every part size. The helper
+    // returns the configured value unchanged for single-part sources
+    // (today's only path through `discover_with_mirrors`), shrinks to
+    // the gcd for multi-part sources, or errors when the gcd would
+    // fall below `MIN_ALIGNED_CHUNK_SIZE`. Rebinding `config` makes
+    // every downstream consumer of `config.chunk_size` (bitmap
+    // sizing, `SchedulerConfig`, the policy floor, the resume
+    // comparison) automatically see the aligned value without
+    // threading a parallel parameter through the rest of `run`.
+    let effective_chunk_size = info
+        .source
+        .aligned_chunk_size(config.chunk_size)
+        .map_err(|e| CoordinatorError::Scheduler(SchedulerError::MultiPart(e)))?;
+    let config = if effective_chunk_size != config.chunk_size {
+        tracing::info!(
+            "[multipart] aligning chunk_size {} → {} (gcd of configured value and part sizes)",
+            config.chunk_size,
+            effective_chunk_size,
+        );
+        let mut c = config;
+        c.chunk_size = effective_chunk_size;
+        c
+    } else {
+        config
+    };
+
     let part_path = sidecar_path(&output, &config, ".peel.part");
     let ckpt_path = sidecar_path(&output, &config, ".peel.ckpt");
 

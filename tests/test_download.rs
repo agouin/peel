@@ -1886,3 +1886,106 @@ fn discover_multi_single_url_matches_discover() {
     assert_eq!(info.source.parts()[0].size, 2048);
     assert_eq!(info.fingerprint.etag.as_deref(), Some("\"v1\""));
 }
+
+/// Phase 2 (`docs/PLAN_multi_url_source.md` §2) demo: with the adaptive
+/// chunk-size policy pinned at "coalesce every chunk," a multi-part run
+/// must still emit one ranged GET per part — never a single GET that
+/// would have to cross a part boundary. Without the boundary clamp the
+/// scheduler would build a 12 KiB dispatch covering all three parts; the
+/// worker would then either trip
+/// [`peel::download::WorkerError::MultiPartCrossesBoundary`] or
+/// (in some other architecture) silently corrupt the assembly.
+#[test]
+fn run_clamps_adaptive_coalesce_at_part_boundaries() {
+    // 3 parts × 4 KiB. chunk_size = 1 KiB → 12 bitmap chunks total.
+    let part_lens = [4096usize, 4096, 4096];
+    let total: usize = part_lens.iter().sum();
+    let full_body = make_body(total);
+
+    let mut offset = 0usize;
+    let part0 = full_body[offset..offset + part_lens[0]].to_vec();
+    offset += part_lens[0];
+    let part1 = full_body[offset..offset + part_lens[1]].to_vec();
+    offset += part_lens[1];
+    let part2 = full_body[offset..offset + part_lens[2]].to_vec();
+
+    let counters: Vec<Arc<AtomicU64>> = (0..3).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let server0 = MockServer::start(ok_handler_with_range_counter(part0, counters[0].clone()));
+    let server1 = MockServer::start(ok_handler_with_range_counter(part1, counters[1].clone()));
+    let server2 = MockServer::start(ok_handler_with_range_counter(part2, counters[2].clone()));
+
+    let client = build_client();
+    let urls = vec![
+        url(&server0, "/p0"),
+        url(&server1, "/p1"),
+        url(&server2, "/p2"),
+    ];
+    let info = discover_multi(&client, &urls).expect("discover_multi ok");
+    assert_eq!(info.total_size, total as u64);
+
+    let chunk_size = 1024u64;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    assert_eq!(total_chunks, 12);
+
+    let path = temp_path("multipart_coalesce_clamp");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    // Pin the policy at "coalesce all 12 chunks." Without the
+    // boundary clamp this would emit one ranged GET; with the clamp
+    // it must emit at least one per part.
+    let policy = Arc::new(ChunkSizePolicy::with_bounds(
+        chunk_size,
+        12 * chunk_size,
+        12 * chunk_size,
+        12 * chunk_size,
+        Duration::from_millis(0),
+    ));
+
+    let cfg = SchedulerConfig {
+        chunk_size,
+        workers: 4,
+        retry: fast_retry(),
+        progress: None,
+        policy: Some(Arc::clone(&policy)),
+        fingerprints: None,
+        probe: peel::download::ProbeConfig::default(),
+        mirrors: None,
+        rate_limiter: None,
+        max_disk_buffer: None,
+        abort: None,
+    };
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("run ok");
+
+    assert_eq!(stats.chunks_completed, total_chunks);
+    assert_eq!(read_full(&path), full_body, "byte parity");
+
+    // Each server must have seen exactly one ranged GET (the
+    // coalesced 4-chunk dispatch for its part). If the boundary
+    // clamp were missing, the scheduler would have asked one
+    // server for a 12 KiB range and the other two would see 0
+    // — or, more likely, the worker would have errored.
+    for (i, c) in counters.iter().enumerate() {
+        let observed = c.load(Ordering::Relaxed);
+        assert_eq!(
+            observed, 1,
+            "server {i} expected exactly 1 ranged GET (the coalesced part), got {observed}",
+        );
+    }
+
+    // Sanity: every range request was part-relative — start and end
+    // both within the part's own size bound. Catches a regression
+    // where the dispatch range escaped the part.
+    for (i, server) in [&server0, &server1, &server2].iter().enumerate() {
+        for req in server.snapshot_requests() {
+            if req.method != "GET" {
+                continue;
+            }
+            let hdr = req.header("range").expect("ranged GET");
+            let (a, b) = parse_range(hdr).expect("range parses");
+            assert!(b < part_lens[i] as u64, "part {i} range {a}-{b} overshot");
+        }
+    }
+}

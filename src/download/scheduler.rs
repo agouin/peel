@@ -1155,6 +1155,7 @@ fn run_parallel(
                     target_chunks,
                     config.chunk_size,
                     info.total_size,
+                    multi_part_source,
                 ) else {
                     break;
                 };
@@ -1691,15 +1692,28 @@ fn pick_next_dispatch(
     target_chunks: u32,
     chunk_size: u64,
     total_size: u64,
+    multi_part: Option<&MultiPartSource>,
 ) -> Option<Dispatch> {
     let first = pick_next_chunk(dispatched, cursor_chunk, total_chunks)?;
     let target = target_chunks.max(1);
     // Walk forward to see how many consecutive chunks we can
-    // coalesce. Cap at `target_chunks` and at `total_chunks`.
+    // coalesce. Cap at `target_chunks`, at `total_chunks`, and — for
+    // multi-URL runs (`docs/PLAN_multi_url_source.md` §2 step 2) —
+    // at the next part boundary so the resulting dispatch lives in
+    // exactly one part.
+    let first_start = u64::from(first.get()).checked_mul(chunk_size)?;
+    let coalesce_cap = match multi_part {
+        Some(s) => s.next_part_boundary_at_or_after(first_start),
+        None => total_size,
+    };
     let mut count: u32 = 1;
     while count < target {
         let next = first.get().checked_add(count)?;
         if next >= total_chunks {
+            break;
+        }
+        let next_byte = u64::from(next).checked_mul(chunk_size)?;
+        if next_byte >= coalesce_cap {
             break;
         }
         let next_idx = ChunkIndex::new(next);
@@ -1709,10 +1723,11 @@ fn pick_next_dispatch(
         count += 1;
     }
 
-    let start_byte = u64::from(first.get()).checked_mul(chunk_size)?;
+    let start_byte = first_start;
     let end_byte = start_byte
         .checked_add(u64::from(count).checked_mul(chunk_size)?)?
-        .min(total_size);
+        .min(total_size)
+        .min(coalesce_cap);
     let range = ByteRange::new(ByteOffset::new(start_byte), ByteOffset::new(end_byte))?;
     Some(Dispatch {
         first,
@@ -2047,7 +2062,8 @@ mod tests {
     #[test]
     fn pick_next_dispatch_single_chunk_when_target_one() {
         let dispatched = ChunkBitmap::new(8);
-        let task = pick_next_dispatch(&dispatched, 0, 8, 1, 1024, 8 * 1024).expect("dispatch");
+        let task =
+            pick_next_dispatch(&dispatched, 0, 8, 1, 1024, 8 * 1024, None).expect("dispatch");
         assert_eq!(task.first.get(), 0);
         assert_eq!(task.count, 1);
         assert_eq!(task.range.len(), 1024);
@@ -2056,7 +2072,8 @@ mod tests {
     #[test]
     fn pick_next_dispatch_coalesces_consecutive_incomplete() {
         let dispatched = ChunkBitmap::new(8);
-        let task = pick_next_dispatch(&dispatched, 0, 8, 4, 1024, 8 * 1024).expect("dispatch");
+        let task =
+            pick_next_dispatch(&dispatched, 0, 8, 4, 1024, 8 * 1024, None).expect("dispatch");
         assert_eq!(task.first.get(), 0);
         assert_eq!(task.count, 4);
         assert_eq!(task.range.len(), 4 * 1024);
@@ -2068,7 +2085,8 @@ mod tests {
         // Mark chunk 2 as already dispatched; the run starting at 0
         // can only cover 0,1.
         dispatched.mark_complete(ChunkIndex::new(2));
-        let task = pick_next_dispatch(&dispatched, 0, 8, 8, 1024, 8 * 1024).expect("dispatch");
+        let task =
+            pick_next_dispatch(&dispatched, 0, 8, 8, 1024, 8 * 1024, None).expect("dispatch");
         assert_eq!(task.first.get(), 0);
         assert_eq!(task.count, 2);
         assert_eq!(task.range.len(), 2 * 1024);
@@ -2078,7 +2096,7 @@ mod tests {
     fn pick_next_dispatch_truncates_last_partial_chunk() {
         // 3 chunks total but the last is half-sized.
         let dispatched = ChunkBitmap::new(3);
-        let task = pick_next_dispatch(&dispatched, 0, 3, 8, 1_000, 2_500).expect("dispatch");
+        let task = pick_next_dispatch(&dispatched, 0, 3, 8, 1_000, 2_500, None).expect("dispatch");
         assert_eq!(task.first.get(), 0);
         assert_eq!(task.count, 3);
         // 2*1000 (full) + 500 (truncated last)
@@ -2091,7 +2109,88 @@ mod tests {
         for i in 0..4 {
             dispatched.mark_complete(ChunkIndex::new(i));
         }
-        assert!(pick_next_dispatch(&dispatched, 0, 4, 8, 1024, 4 * 1024).is_none());
+        assert!(pick_next_dispatch(&dispatched, 0, 4, 8, 1024, 4 * 1024, None).is_none());
+    }
+
+    // ---- pick_next_dispatch: multi-part boundary clamp --------------
+
+    /// Build a multi-part source with the given part sizes for use in
+    /// the coalesce-clamp tests below.
+    fn multipart_for(sizes: &[u64]) -> MultiPartSource {
+        let parts: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &sz)| super::super::multi_url::PartDescriptor {
+                url: Url::parse(&format!("https://h/p{i}")).expect("url"),
+                size: sz,
+                fingerprint: SourceFingerprint::default(),
+                expected_sha256: None,
+            })
+            .collect();
+        MultiPartSource::new(parts).expect("valid")
+    }
+
+    #[test]
+    fn pick_next_dispatch_clamps_coalesce_at_part_boundary() {
+        // 3 parts × 4 chunks each (chunk_size=1024, parts=4096 each).
+        // From cursor=0, target=12 (the whole stream), the dispatch
+        // would normally coalesce all 12 chunks into one GET. With the
+        // multi-part clamp the coalesce stops at part 0's end (chunk 4).
+        let dispatched = ChunkBitmap::new(12);
+        let source = multipart_for(&[4096, 4096, 4096]);
+        let task = pick_next_dispatch(&dispatched, 0, 12, 12, 1024, 12 * 1024, Some(&source))
+            .expect("dispatch");
+        assert_eq!(task.first.get(), 0);
+        assert_eq!(task.count, 4, "coalesce must stop at part 0/1 boundary");
+        assert_eq!(task.range.len(), 4 * 1024);
+        assert_eq!(task.range.start().get(), 0);
+        assert_eq!(task.range.end_exclusive().get(), 4096);
+    }
+
+    #[test]
+    fn pick_next_dispatch_starts_a_new_dispatch_inside_each_part() {
+        // After part 0 is done, the next dispatch starts at chunk 4
+        // (= start of part 1) and again clamps at part 1's end.
+        let dispatched = ChunkBitmap::new(12);
+        for i in 0..4 {
+            dispatched.mark_complete(ChunkIndex::new(i));
+        }
+        let source = multipart_for(&[4096, 4096, 4096]);
+        let task = pick_next_dispatch(&dispatched, 4, 12, 12, 1024, 12 * 1024, Some(&source))
+            .expect("dispatch");
+        assert_eq!(task.first.get(), 4);
+        assert_eq!(task.count, 4, "coalesce clamps at part 1/2 boundary");
+        assert_eq!(task.range.start().get(), 4096);
+        assert_eq!(task.range.end_exclusive().get(), 8192);
+    }
+
+    #[test]
+    fn pick_next_dispatch_within_one_part_coalesces_normally() {
+        // Cursor inside part 1 with target=2: coalesces 2 chunks
+        // without ever hitting a boundary.
+        let dispatched = ChunkBitmap::new(12);
+        let source = multipart_for(&[4096, 4096, 4096]);
+        let task = pick_next_dispatch(&dispatched, 5, 12, 2, 1024, 12 * 1024, Some(&source))
+            .expect("dispatch");
+        assert_eq!(task.first.get(), 5);
+        assert_eq!(task.count, 2);
+        assert_eq!(task.range.start().get(), 5 * 1024);
+        assert_eq!(task.range.end_exclusive().get(), 7 * 1024);
+    }
+
+    #[test]
+    fn pick_next_dispatch_single_part_unaffected_by_clamp() {
+        // For a 1-part source the boundary equals the total size, so
+        // the clamp matches the unconstrained behaviour exactly.
+        let dispatched = ChunkBitmap::new(8);
+        let source = multipart_for(&[8 * 1024]);
+        let with_source = pick_next_dispatch(&dispatched, 0, 8, 4, 1024, 8 * 1024, Some(&source))
+            .expect("dispatch");
+        let without_source =
+            pick_next_dispatch(&dispatched, 0, 8, 4, 1024, 8 * 1024, None).expect("dispatch");
+        assert_eq!(with_source.first, without_source.first);
+        assert_eq!(with_source.count, without_source.count);
+        assert_eq!(with_source.range.len(), without_source.range.len());
     }
 
     #[test]
