@@ -2352,6 +2352,34 @@ fn encode_gzip_single_member(payload: &[u8], level: u32) -> Vec<u8> {
     encoder.finish().expect("gzip finish")
 }
 
+/// Encode `payload` as a multi-member gzip blob: split into
+/// `n_members` approximately-equal contiguous slices, each
+/// independently gzip-encoded, then concatenated. Mirrors
+/// [`tests/test_bench_streaming.rs::encode_gzip_multi_member`] —
+/// the on-the-wire shape `pigz` / `gzip a b > c.gz` produces, valid
+/// per RFC 1952 §2.2 and decoded byte-identically by `gzip -d`,
+/// `flate2::MultiGzDecoder`, and peel's
+/// `crate::decode::deflate_native::gzip::GzipDecoder`. Used by the
+/// multi-member crash-resume harness below.
+fn encode_gzip_multi_member(payload: &[u8], n_members: usize, level: u32) -> Vec<u8> {
+    assert!(n_members >= 1, "n_members must be ≥ 1");
+    if n_members == 1 || payload.is_empty() {
+        return encode_gzip_single_member(payload, level);
+    }
+    let chunk = payload.len() / n_members;
+    let mut out = Vec::with_capacity(payload.len() / 2 + 32 * n_members);
+    for i in 0..n_members {
+        let start = i * chunk;
+        let end = if i + 1 == n_members {
+            payload.len()
+        } else {
+            start + chunk
+        };
+        out.extend_from_slice(&encode_gzip_single_member(&payload[start..end], level));
+    }
+    out
+}
+
 #[test]
 fn random_kill_points_resume_single_member_tar_gz_byte_identical() {
     // Phase 11 of `docs/PLAN_deflate_block_decoder.md`: a
@@ -2490,4 +2518,93 @@ fn random_kill_points_resume_single_member_tar_gz_property() {
             ExpectedResumeMode::AllDecoderState,
         );
     }
+}
+
+#[test]
+fn random_kill_points_resume_multi_member_tar_gz_byte_identical() {
+    // Phase 4 of `docs/PLAN_gzip_throughput.md` (narrowed scope):
+    // pin crash-resume on a multi-member tar.gz fixture (the
+    // `pigz` / `gzip a b > c.gz` shape, valid per RFC 1952 §2.2).
+    //
+    // Multi-member crosses a code path the single-member tests
+    // never see: at member boundaries the wrapper sits in
+    // `State::BetweenMembers` with `self.inner == None`, so
+    // [`peel::decode::deflate_native::gzip::GzipDecoder::decoder_state_into`]
+    // returns `false` and the checkpoint at that boundary captures
+    // *no* `decoder_state` blob. Resume from such a checkpoint
+    // takes the regular `factory()` path (fresh decoder at the
+    // post-trailer source offset), not the `resume_factory()` path
+    // — exactly the discrimination the harness's
+    // [`ExpectedResumeMode::SomeDecoderState`] gates: ≥ 1 mid-deflate-
+    // body kill produces a byte-identical resume *via*
+    // `resume_factory`, while member-boundary kills produce a
+    // byte-identical resume via the regular factory.
+    //
+    // The streaming-path Phase 0 / Phase 2 differential corpus
+    // proved peel decodes multi-member byte-identically to
+    // `flate2::MultiGzDecoder`; this test pins the *resume*
+    // contract on the same shape.
+    //
+    // Fixture: 4 gzip members, each carrying 2 tar members of
+    // awkward (prime) sizes so deflate-block boundaries and
+    // tar-member boundaries don't collude into a single coincident
+    // checkpoint cadence. Total tar archive ~ a few MiB so the
+    // golden run produces ≥ 2 mid-deflate-body checkpoints across
+    // the 4-member span (the harness's load-bearing gate via
+    // `run_dir_kill_resume_trials`).
+    const GZ_MEMBERS: usize = 4;
+    const TAR_MEMBERS_PER_GZ: usize = 2;
+    let primes = [
+        217_001usize,
+        319_393,
+        405_011,
+        531_581,
+        687_517,
+        823_751,
+        941_069,
+        1_103_747,
+    ];
+    let total_tar_members = GZ_MEMBERS * TAR_MEMBERS_PER_GZ;
+    let mut tar_members: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for i in 0..total_tar_members {
+        let name = Box::leak(format!("dir/multi_member_gz_{i:02}.bin").into_boxed_str());
+        let payload = build_lzma_friendly_input(primes[i % primes.len()], 0xC0DE_F00D ^ i as u32);
+        tar_members.push((name, payload));
+    }
+
+    // Build the full tar archive bytes once. Then split it across
+    // GZ_MEMBERS gzip members at TAR_MEMBERS_PER_GZ-aligned tar
+    // member boundaries — this isn't necessary for correctness (per
+    // RFC 1952 the gz members can split anywhere), but it produces
+    // a fixture where each gz member's decompressed bytes are valid
+    // tar input on their own. That makes the test's failure mode
+    // easier to diagnose if the resume contract regresses: a
+    // kill-and-resume that mis-attributes bytes to the wrong gz
+    // member would surface as a tar-parser error in the resumed
+    // output rather than a silent byte-mismatch.
+    let mut archive = Vec::new();
+    for (name, payload) in &tar_members {
+        archive.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    archive.extend_from_slice(&end_of_archive_block());
+
+    let body = encode_gzip_multi_member(&archive, GZ_MEMBERS, 6);
+    let trial_count = 12u64;
+    run_dir_kill_resume_trials(
+        "multi_member_tar_gz",
+        "x.tar.gz",
+        body,
+        "\"v-multi-member-tar-gz\"",
+        0xBEEF_F00D_C0DE_BABEu64,
+        trial_count,
+        // Multi-member tar.gz: most kills land mid-deflate-body
+        // (decoder_state path), but at least some across N=12
+        // trials should land at gz member boundaries (no-blob
+        // path via the regular factory). Both must produce
+        // byte-identical resumes; `SomeDecoderState` asserts that
+        // ≥ 1 trial took the decoder_state path so the gzip
+        // wrapper's mid-member resume contract stays exercised
+        // across the 4-member fixture.
+        ExpectedResumeMode::SomeDecoderState,
+    );
 }
