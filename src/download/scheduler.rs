@@ -1697,13 +1697,25 @@ fn pick_next_dispatch(
     let first = pick_next_chunk(dispatched, cursor_chunk, total_chunks)?;
     let target = target_chunks.max(1);
     // Walk forward to see how many consecutive chunks we can
-    // coalesce. Cap at `target_chunks`, at `total_chunks`, and — for
-    // multi-URL runs (`docs/PLAN_multi_url_source.md` §2 step 2) —
-    // at the next part boundary so the resulting dispatch lives in
-    // exactly one part.
+    // coalesce. Cap at `target_chunks`, `total_chunks`, and — for
+    // multi-URL runs (`docs/PLAN_multi_url_source.md`) — keep the
+    // dispatch within one part *for adaptive coalescing*. The first
+    // chunk is always included even when its nominal range straddles
+    // a part boundary; the worker iterates
+    // [`MultiPartSource::dispatch_range`] and issues one ranged GET
+    // per part-segment. The clamp here only prevents *additional*
+    // chunks from extending into a second part, so the dispatch
+    // crosses at most one boundary.
     let first_start = u64::from(first.get()).checked_mul(chunk_size)?;
+    let first_chunk_end = first_start.checked_add(chunk_size)?.min(total_size);
     let coalesce_cap = match multi_part {
-        Some(s) => s.next_part_boundary_at_or_after(first_start),
+        Some(s) => {
+            // After a chunk that straddles a boundary, further
+            // coalescing must stay within the part the chunk's
+            // *end* lives in, so the boundary the first chunk
+            // crossed is the only one this dispatch hits.
+            s.next_part_boundary_at_or_after(first_chunk_end.saturating_sub(1))
+        }
         None => total_size,
     };
     let mut count: u32 = 1;
@@ -1712,6 +1724,14 @@ fn pick_next_dispatch(
         if next >= total_chunks {
             break;
         }
+        // Add the next chunk only if its START is inside
+        // `coalesce_cap`. Single-URL: cap is total_size, so the
+        // legitimate truncated-last-chunk-of-source case still
+        // gets included. Multi-URL: cap is the post-first-cross
+        // boundary, so subsequent chunks must stay in one part.
+        // The chunk's nominal range may extend past its part's
+        // boundary; the worker iterates `dispatch_range` and
+        // routes per-segment.
         let next_byte = u64::from(next).checked_mul(chunk_size)?;
         if next_byte >= coalesce_cap {
             break;
@@ -1724,10 +1744,14 @@ fn pick_next_dispatch(
     }
 
     let start_byte = first_start;
+    // The dispatch covers exactly `count` whole chunks (clamped at
+    // total_size for the source's last chunk, which is the only
+    // legitimate "partial" case). Never clamped at a part boundary —
+    // the worker handles the at-most-one cross via multi-segment
+    // routing.
     let end_byte = start_byte
         .checked_add(u64::from(count).checked_mul(chunk_size)?)?
-        .min(total_size)
-        .min(coalesce_cap);
+        .min(total_size);
     let range = ByteRange::new(ByteOffset::new(start_byte), ByteOffset::new(end_byte))?;
     Some(Dispatch {
         first,
@@ -2176,6 +2200,54 @@ mod tests {
         assert_eq!(task.count, 2);
         assert_eq!(task.range.start().get(), 5 * 1024);
         assert_eq!(task.range.end_exclusive().get(), 7 * 1024);
+    }
+
+    #[test]
+    fn pick_next_dispatch_emits_cross_boundary_chunk_for_misaligned_parts() {
+        // Real-world Arb shape: chunk_size doesn't divide every
+        // part_size, so a single bitmap chunk straddles a boundary.
+        // Total = 5 KiB across 2 parts of 2.5 KiB each (gcd 512 B).
+        // chunk_size = 1024 → 5 chunks total. Chunk 2 covers global
+        // [2048, 3072) which spans the part 0 / part 1 boundary at
+        // 2560.
+        let dispatched = ChunkBitmap::new(5);
+        let source = multipart_for(&[2560, 2560]);
+        // From the source's start, target = 5 (request all). The
+        // first dispatch must INCLUDE chunk 2 even though it
+        // crosses, so the dispatch covers part 0 + the cross
+        // chunk. Subsequent chunks (3, 4) are entirely in part 1
+        // and should not be coalesced into this dispatch.
+        let task =
+            pick_next_dispatch(&dispatched, 0, 5, 5, 1024, 5120, Some(&source)).expect("dispatch");
+        assert_eq!(task.first.get(), 0);
+        // Chunks 0 (part 0), 1 (part 0), 2 (CROSSES). After chunk 2
+        // the next chunk (3) starts at 3072 which is past the
+        // post-boundary cap, so it stops here.
+        assert_eq!(task.count, 3, "include the cross-boundary chunk only");
+        assert_eq!(task.range.start().get(), 0);
+        // The dispatch's nominal end is 3 * 1024 = 3072. NOT
+        // truncated at the boundary (2560) — the worker handles
+        // the cross via multi-segment routing.
+        assert_eq!(task.range.end_exclusive().get(), 3072);
+    }
+
+    #[test]
+    fn pick_next_dispatch_starts_at_cross_boundary_chunk_after_part_1_complete() {
+        // After completing chunks 0..3 (which spans the boundary),
+        // the next dispatch begins at chunk 3 in part 1.
+        let dispatched = ChunkBitmap::new(5);
+        for i in 0..3 {
+            dispatched.mark_complete(ChunkIndex::new(i));
+        }
+        let source = multipart_for(&[2560, 2560]);
+        let task =
+            pick_next_dispatch(&dispatched, 3, 5, 5, 1024, 5120, Some(&source)).expect("dispatch");
+        assert_eq!(task.first.get(), 3);
+        // Chunks 3 and 4 cover [3072, 5120) which fits in part 1.
+        // Both included, no further parts to cross.
+        assert_eq!(task.count, 2);
+        assert_eq!(task.range.start().get(), 3072);
+        assert_eq!(task.range.end_exclusive().get(), 5120);
     }
 
     #[test]

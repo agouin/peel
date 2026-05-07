@@ -228,6 +228,48 @@ fn tar_sink_rejects_dotdot_path() {
     );
 }
 
+/// Self-referential directory entries (`./` and `.`) are accepted
+/// as no-op `mkdir -p` of the existing root. `bsdtar` and GNU `tar`
+/// both emit such entries when run as `tar cf out.tar ./`, and
+/// rejecting them refuses every Arbitrum snapshot bundle. The
+/// extraction must continue past the entry without error.
+#[test]
+fn tar_sink_accepts_self_referential_root_entry() {
+    let dir = fresh_dir("tar_root_entry");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let mut archive = Vec::new();
+    // `./` directory entry (typeflag 5, size 0).
+    archive.extend_from_slice(&build_header("./", 0, b'5'));
+    // Followed by a real file so the sink still extracts the rest.
+    archive.extend_from_slice(&build_header("./hello.txt", 5, b'0'));
+    archive.extend_from_slice(&pad_block(b"hello"));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive)
+        .expect("self-referential root entry must be accepted");
+    sink.close().expect("close");
+
+    let got = fs::read(dir.join("hello.txt")).expect("hello.txt extracted");
+    assert_eq!(got, b"hello");
+}
+
+/// Bare `.` (no trailing slash) likewise resolves to the root.
+#[test]
+fn tar_sink_accepts_bare_dot_entry() {
+    let dir = fresh_dir("tar_bare_dot");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_header(".", 0, b'5'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive).expect("`.` entry must be accepted");
+    sink.close().expect("close");
+}
+
 /// Path-escape: absolute paths (Unix-style) are rejected.
 #[test]
 fn tar_sink_rejects_absolute_path() {

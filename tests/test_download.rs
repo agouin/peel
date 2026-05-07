@@ -1989,3 +1989,84 @@ fn run_clamps_adaptive_coalesce_at_part_boundaries() {
         }
     }
 }
+
+/// Real-world Arbitrum shape: chunk_size doesn't divide every part_size,
+/// so a single bitmap chunk spans the part 0 / part 1 boundary. The
+/// worker must split that chunk into per-part GETs and pwrite each
+/// piece at its global offset; the assembled stream must be byte-
+/// identical to `cat part0 part1`.
+///
+/// Sizes here are the ones an aligned-only design would have rejected:
+/// part0 = 5 KiB, part1 = 6 KiB, total 11 KiB, chunk_size = 4 KiB. The
+/// gcd is 1 KiB which is far below the old 256 KiB floor — the entire
+/// point of the multi-segment refactor is making this case work.
+/// Chunk 1 (global [4096, 8192)) crosses the part 0 / part 1 boundary
+/// at 5120, so it must produce two ranged GETs: bytes 4096-5119 from
+/// part 0's URL (offset 4096-) and bytes 0-3071 from part 1's URL.
+#[test]
+fn run_parallel_handles_chunks_that_cross_part_boundaries() {
+    let part_lens = [5 * 1024usize, 6 * 1024];
+    let total: usize = part_lens.iter().sum();
+    let full_body = make_body(total);
+    let p0 = full_body[..part_lens[0]].to_vec();
+    let p1 = full_body[part_lens[0]..].to_vec();
+
+    let server0 = MockServer::start(ok_handler(p0, Some("\"p0\"")));
+    let server1 = MockServer::start(ok_handler(p1, Some("\"p1\"")));
+    let client = build_client();
+    let urls = vec![url(&server0, "/p0"), url(&server1, "/p1")];
+    let info = discover_multi(&client, &urls).expect("discover_multi ok");
+    assert_eq!(info.total_size, total as u64);
+
+    let chunk_size = 4 * 1024u64;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    // 11 KiB / 4 KiB = 3 chunks (chunk 2 is partial — 3 KiB).
+
+    let path = temp_path("multipart_misaligned");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+    let stats = run(
+        &client,
+        &info,
+        &sparse,
+        &bitmap,
+        &cursor,
+        &cfg(chunk_size, 4),
+    )
+    .expect("run ok");
+
+    assert_eq!(stats.bytes_downloaded as usize, total);
+    assert_eq!(stats.chunks_completed, total_chunks);
+    for i in 0..total_chunks {
+        assert!(bitmap.is_complete(ChunkIndex::new(i)));
+    }
+    assert_eq!(read_full(&path), full_body, "byte-parity across boundary");
+
+    // Sanity: server 0 must have served part of chunk 1 (the
+    // straddler) — i.e. its request log should include a range
+    // ending exactly at part 0's last byte (5119). Server 1 must
+    // have served the leading bytes of chunk 1 — a range starting
+    // at 0.
+    let s0_ranges: Vec<(u64, u64)> = server0
+        .snapshot_requests()
+        .iter()
+        .filter(|r| r.method == "GET")
+        .filter_map(|r| r.header("range").and_then(parse_range))
+        .collect();
+    let s1_ranges: Vec<(u64, u64)> = server1
+        .snapshot_requests()
+        .iter()
+        .filter(|r| r.method == "GET")
+        .filter_map(|r| r.header("range").and_then(parse_range))
+        .collect();
+    assert!(
+        s0_ranges.iter().any(|(_, b)| *b == part_lens[0] as u64 - 1),
+        "server 0 should have served the cross-boundary segment to part 0's end; ranges={s0_ranges:?}"
+    );
+    assert!(
+        s1_ranges.iter().any(|(a, _)| *a == 0),
+        "server 1 should have served the cross-boundary segment from part 1's start; ranges={s1_ranges:?}"
+    );
+}

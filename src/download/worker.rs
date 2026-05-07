@@ -200,24 +200,6 @@ pub enum WorkerError {
         wait_secs: f64,
     },
 
-    /// Multi-URL (`docs/PLAN_multi_url_source.md`) routing tried to
-    /// dispatch a chunk whose global byte range crosses a part
-    /// boundary. The runtime invariant is that the bitmap chunk size
-    /// divides every part size; violation is enforced upstream by the
-    /// alignment check planned in §2 of that doc. Until that lands,
-    /// surface the case clearly rather than corrupting the per-part
-    /// `Range` request.
-    #[error(
-        "multi-part dispatch for chunk {chunk} crosses part {part_index}'s boundary; \
-         chunk size must divide every part size"
-    )]
-    MultiPartCrossesBoundary {
-        /// Chunk being fetched.
-        chunk: ChunkIndex,
-        /// Part the dispatch started in but extended past.
-        part_index: usize,
-    },
-
     /// Multi-URL routing was asked for a global offset past the end
     /// of the assembled source. Indicates a scheduler bug: the
     /// dispatch range escaped the `[0, total_size)` clamp.
@@ -255,7 +237,6 @@ impl WorkerError {
             Self::ChunkVerifyMismatch { .. } => false,
             Self::Cancelled { .. } => false,
             Self::NoLiveMirror { .. } => false,
-            Self::MultiPartCrossesBoundary { .. } => false,
             Self::MultiPartOutOfRange { .. } => false,
         }
     }
@@ -667,67 +648,6 @@ fn try_once(
 ) -> Result<(u64, Vec<u32>, Duration), WorkerError> {
     let chunk = dispatch.first;
     let global_range = dispatch.range;
-
-    // Multi-URL routing (`docs/PLAN_multi_url_source.md` §1 step 4):
-    // when the source has more than one part, the URL, the `Range`
-    // header value, and the fingerprint to verify all come from the
-    // part the dispatch lives in. The single-URL / `--mirror` case
-    // (`source` is `None` or `len() == 1`) falls through to the
-    // existing mirror-set lookup, preserving today's behaviour
-    // byte-for-byte.
-    let multipart = ctx.source.filter(|s| s.len() > 1);
-    let (target_url, wire_range, target_fingerprint) = if let Some(source) = multipart {
-        let start = global_range.start().get();
-        let (part_idx, in_part_start) =
-            source
-                .locate(start)
-                .ok_or(WorkerError::MultiPartOutOfRange {
-                    chunk,
-                    offset: start,
-                })?;
-        let part = &source.parts()[part_idx];
-        let in_part_end = in_part_start.checked_add(global_range.len()).ok_or(
-            WorkerError::MultiPartCrossesBoundary {
-                chunk,
-                part_index: part_idx,
-            },
-        )?;
-        if in_part_end > part.size {
-            return Err(WorkerError::MultiPartCrossesBoundary {
-                chunk,
-                part_index: part_idx,
-            });
-        }
-        let wire_range =
-            ByteRange::from_start_len(ByteOffset::new(in_part_start), global_range.len()).ok_or(
-                WorkerError::MultiPartCrossesBoundary {
-                    chunk,
-                    part_index: part_idx,
-                },
-            )?;
-        (&part.url, wire_range, &part.fingerprint)
-    } else {
-        let mirror = ctx.mirrors.mirror(mirror_idx);
-        (&mirror.url, global_range, &mirror.fingerprint)
-    };
-
-    let resp = ctx
-        .client
-        .get_range(target_url, wire_range)
-        .map_err(|source| match source {
-            ClientError::UnexpectedStatus { status, .. } => {
-                WorkerError::UnexpectedStatus { chunk, status }
-            }
-            other => WorkerError::Transport {
-                chunk,
-                source: other,
-            },
-        })?;
-
-    verify_content_range(&resp.headers, chunk, wire_range)?;
-    verify_content_length(&resp, chunk, wire_range.len())?;
-    verify_fingerprint(&resp.headers, target_fingerprint, chunk)?;
-
     let len_usize =
         usize::try_from(global_range.len()).map_err(|_| WorkerError::BodyLengthMismatch {
             chunk,
@@ -735,70 +655,47 @@ fn try_once(
             actual: None,
         })?;
     let mut buf = vec![0u8; len_usize];
-    let mut body = resp.body;
-    // Aggregate bandwidth cap (`PLAN_v2.md` §14): when configured,
-    // wrap the body so each underlying socket read is gated by the
-    // shared token bucket. Cancellation is the same `cancel` flag the
-    // dispatch loop polls, so a stalled limiter still tears down on
-    // shutdown. Refunding tokens on a short read keeps the bucket
-    // accurate even when the server hands us a chunked frame.
-    //
-    // We hand-roll the read loop (instead of `read_exact`) so the
-    // shared progress counter is updated *per socket read* rather than
-    // once per whole dispatch. With adaptive chunk sizing growing
-    // dispatches up to 64 MiB, a slow link would otherwise leave the
-    // counter flat for tens of seconds and the renderer's rate window
-    // would read 0 b/s until a chunk landed.
-    //
-    // [`ProgressRefundGuard`] (PLAN_decoder_freeze.md §1.2) wraps the
-    // attempt-progress counter so a partial increment is automatically
-    // rolled back on any non-success exit — the original retry path,
-    // a `pwrite_at` failure, a verify failure, the `cancel` flag
-    // tripping mid-read, or a panic caught by the scheduler's
-    // `catch_unwind`. The guard is disarmed only after every step
-    // that could leave bytes credited has succeeded.
-    // Multi-URL routing also tells the progress sink which part to
-    // credit (`docs/PLAN_multi_url_source.md`). Single-URL runs
-    // populate a one-element parts vec at startup so part_idx 0
-    // is always a valid attribution target; the `progress.parts()`
-    // OnceLock guards against an un-initialized vec on its own.
-    let part_attribution_idx = match multipart {
-        Some(source) => source
-            .locate(global_range.start().get())
-            .map(|(idx, _)| idx)
-            .unwrap_or(0),
-        None => 0,
-    };
-    let mut refund = ProgressRefundGuard::new(ctx.progress, part_attribution_idx);
-    let read_result = if let Some(limiter) = ctx.rate_limiter {
-        let mut limited = RateLimitedReader::new(&mut body, Arc::clone(limiter), cancel);
-        read_with_progress(
-            &mut limited,
-            &mut buf,
-            ctx.progress,
-            part_attribution_idx,
-            &mut refund.attempt_progress,
-        )
-    } else {
-        read_with_progress(
-            &mut body,
-            &mut buf,
-            ctx.progress,
-            part_attribution_idx,
-            &mut refund.attempt_progress,
-        )
-    };
-    if let Err(source) = read_result {
-        return Err(WorkerError::BodyIo { chunk, source });
-    }
 
-    let pwrite_started = Instant::now();
-    // pwrite always uses the GLOBAL offset; the part-relative range
-    // is only the wire-side coordinate space.
-    ctx.sparse
-        .pwrite_at(global_range.start(), &buf)
-        .map_err(|source| WorkerError::SparseFile { chunk, source })?;
-    let pwrite_time = pwrite_started.elapsed();
+    // Multi-URL routing (`docs/PLAN_multi_url_source.md`): when the
+    // source has more than one part, iterate
+    // [`MultiPartSource::dispatch_range`] — typically yields one
+    // segment, but a chunk that straddles a part boundary (the
+    // user's chunk_size doesn't divide every part_size) yields one
+    // segment per crossed part. Each segment runs its own GET +
+    // pwrite into the right slice of `buf`. The single-URL /
+    // `--mirror` case (`source` is `None` or `len() == 1`) keeps
+    // the existing single-GET/single-pwrite path so historical
+    // behaviour is byte-identical.
+    let multipart = ctx.source.filter(|s| s.len() > 1);
+    let mut refund = ProgressRefundGuard::new(ctx.progress);
+    let pwrite_time = if let Some(source) = multipart {
+        download_multi_segment(
+            ctx,
+            chunk,
+            source,
+            global_range,
+            &mut buf,
+            &mut refund,
+            cancel,
+        )?
+    } else {
+        let mirror = ctx.mirrors.mirror(mirror_idx);
+        // Single-URL credits the full dispatch to part_idx 0
+        // (single-element parts vec by convention; see
+        // `ProgressState::set_parts` in `coordinator::run`).
+        download_single_segment(
+            ctx,
+            chunk,
+            &mirror.url,
+            &mirror.fingerprint,
+            global_range,
+            global_range,
+            0,
+            &mut buf,
+            &mut refund,
+            cancel,
+        )?
+    };
 
     // hyper-util's connection pool reclaims the connection when the
     // body is dropped at end of scope; no explicit release step.
@@ -838,30 +735,68 @@ fn try_once(
 /// construction, disarmed only when every byte has been written and
 /// verified, and refunds on `Drop` otherwise.
 ///
-/// `attempt_progress` is exposed as a `&mut u64` so the existing
-/// `read_with_progress` loop can keep adding into it without learning
-/// about the guard type.
+/// Multi-URL dispatches (`docs/PLAN_multi_url_source.md`) credit
+/// per-part counters separately. The guard tracks each segment's
+/// `(part_idx, bytes)` so a later-segment failure (or a panic
+/// across the dispatch) refunds *every* prior segment as well as
+/// the failing one. Single-URL runs push one entry with
+/// `part_idx == 0`, matching the conventional one-element parts vec
+/// the coordinator initialises at startup.
 struct ProgressRefundGuard<'a> {
     progress: Option<&'a ProgressState>,
-    /// Index into [`ProgressState::parts`] this attempt's bytes are
-    /// credited against. The aggregate counter is always
-    /// incremented; the per-part counter is incremented only when
-    /// `parts` is set (`docs/PLAN_multi_url_source.md`). On rollback
-    /// the same part_idx is used to refund the per-part view, so the
-    /// aggregate and per-part totals stay in sync after a failed
-    /// attempt.
-    part_idx: usize,
-    attempt_progress: u64,
+    /// Pending refund log: `(part_idx, bytes_credited_this_segment)`
+    /// in segment order. On drop without disarm we walk this and
+    /// reverse every credit. Bytes credited inside `read_with_progress`
+    /// (which fires once per socket-level read) accumulate into the
+    /// active segment's `pending` field; segments transition that
+    /// `pending` onto the rollback log via [`Self::record_segment`].
+    increments: Vec<(usize, u64)>,
+    /// Bytes credited inside the *current* segment but not yet
+    /// pushed onto `increments`. `read_with_progress` adds into
+    /// this; the segment helper either pushes the total to
+    /// `increments` (success) or drops the dispatch via the same
+    /// drop-time refund below (failure).
+    pending: u64,
+    /// Part index the active segment is crediting into. Only
+    /// meaningful while `pending > 0`.
+    pending_part_idx: usize,
     armed: bool,
 }
 
 impl<'a> ProgressRefundGuard<'a> {
-    fn new(progress: Option<&'a ProgressState>, part_idx: usize) -> Self {
+    fn new(progress: Option<&'a ProgressState>) -> Self {
         Self {
             progress,
-            part_idx,
-            attempt_progress: 0,
+            increments: Vec::new(),
+            pending: 0,
+            pending_part_idx: 0,
             armed: true,
+        }
+    }
+
+    /// Begin tracking a new segment's progress credit. Pairs with
+    /// [`Self::commit_segment`] on success; on failure the pending
+    /// total flows through `Drop`.
+    fn begin_segment(&mut self, part_idx: usize) {
+        // Defensive: previous segment's pending should already be
+        // committed to `increments`. If not (a bug or panic between
+        // segments), absorb it here so we don't lose track.
+        if self.pending > 0 {
+            self.increments.push((self.pending_part_idx, self.pending));
+            self.pending = 0;
+        }
+        self.pending_part_idx = part_idx;
+    }
+
+    /// Commit the active segment's pending credit as a permanent
+    /// rollback entry. Called when a segment's GET + pwrite both
+    /// succeed; the bytes stay in the aggregate counter (and the
+    /// per-part counter) and are only refunded if the whole
+    /// dispatch later fails.
+    fn commit_segment(&mut self) {
+        if self.pending > 0 {
+            self.increments.push((self.pending_part_idx, self.pending));
+            self.pending = 0;
         }
     }
 
@@ -872,13 +807,152 @@ impl<'a> ProgressRefundGuard<'a> {
 
 impl Drop for ProgressRefundGuard<'_> {
     fn drop(&mut self) {
-        if self.armed && self.attempt_progress > 0 {
-            if let Some(p) = self.progress {
-                p.sub_downloaded(self.attempt_progress);
-                p.sub_downloaded_from_part(self.part_idx, self.attempt_progress);
-            }
+        if !self.armed {
+            return;
+        }
+        let Some(p) = self.progress else {
+            return;
+        };
+        // Refund the pending segment first (it's the one the failure
+        // happened inside), then unwind committed segments in reverse
+        // order. Reverse order is just nice for diagnostics in
+        // tracing — the counters are atomics so any order works.
+        if self.pending > 0 {
+            p.sub_downloaded(self.pending);
+            p.sub_downloaded_from_part(self.pending_part_idx, self.pending);
+        }
+        for (idx, n) in self.increments.iter().rev() {
+            p.sub_downloaded(*n);
+            p.sub_downloaded_from_part(*idx, *n);
         }
     }
+}
+
+/// Fetch one part-segment of a dispatch's range:
+/// - issues `GET <url>` with `Range: bytes=<wire_range>`;
+/// - validates `Content-Range`, `Content-Length`, and the part's
+///   `ETag` / `Last-Modified` fingerprint;
+/// - reads the body into the supplied `dest` slice (which is a
+///   sub-slice of the dispatch's combined buffer);
+/// - `pwrite_at`s the segment at its global offset.
+///
+/// `part_idx` attributes the read bytes to the right per-part
+/// counter (`docs/PLAN_multi_url_source.md`). Single-URL runs pass
+/// `0` here — the coordinator initialises a one-element parts vec
+/// so the attribution is always valid.
+///
+/// Used by the multi-segment loop in `try_once` and (with
+/// `part_idx == 0` for single-URL) the legacy single-GET path.
+#[allow(clippy::too_many_arguments)]
+fn download_single_segment(
+    ctx: &ChunkContext<'_>,
+    chunk: ChunkIndex,
+    url: &crate::http::Url,
+    fingerprint: &SourceFingerprint,
+    wire_range: ByteRange,
+    global_range: ByteRange,
+    part_idx: usize,
+    dest: &mut [u8],
+    refund: &mut ProgressRefundGuard<'_>,
+    cancel: &AtomicBool,
+) -> Result<Duration, WorkerError> {
+    let resp = ctx
+        .client
+        .get_range(url, wire_range)
+        .map_err(|source| match source {
+            ClientError::UnexpectedStatus { status, .. } => {
+                WorkerError::UnexpectedStatus { chunk, status }
+            }
+            other => WorkerError::Transport {
+                chunk,
+                source: other,
+            },
+        })?;
+    verify_content_range(&resp.headers, chunk, wire_range)?;
+    verify_content_length(&resp, chunk, wire_range.len())?;
+    verify_fingerprint(&resp.headers, fingerprint, chunk)?;
+
+    refund.begin_segment(part_idx);
+    let mut body = resp.body;
+    let read_result = if let Some(limiter) = ctx.rate_limiter {
+        let mut limited = RateLimitedReader::new(&mut body, Arc::clone(limiter), cancel);
+        read_with_progress(
+            &mut limited,
+            dest,
+            ctx.progress,
+            part_idx,
+            &mut refund.pending,
+        )
+    } else {
+        read_with_progress(&mut body, dest, ctx.progress, part_idx, &mut refund.pending)
+    };
+    if let Err(source) = read_result {
+        return Err(WorkerError::BodyIo { chunk, source });
+    }
+
+    let pwrite_started = Instant::now();
+    // pwrite always uses the GLOBAL offset; the part-relative range
+    // is only the wire-side coordinate space.
+    ctx.sparse
+        .pwrite_at(global_range.start(), dest)
+        .map_err(|source| WorkerError::SparseFile { chunk, source })?;
+    let pwrite_time = pwrite_started.elapsed();
+
+    refund.commit_segment();
+    Ok(pwrite_time)
+}
+
+/// Multi-segment fetch for a dispatch whose global range crosses
+/// one or more part boundaries (`docs/PLAN_multi_url_source.md`).
+/// Walks [`MultiPartSource::dispatch_range`] and runs
+/// [`download_single_segment`] against each, into the right slice
+/// of the combined buffer. Returns the summed `pwrite_at` wall-clock
+/// time (used by the run's diagnostics).
+fn download_multi_segment(
+    ctx: &ChunkContext<'_>,
+    chunk: ChunkIndex,
+    source: &super::multi_url::MultiPartSource,
+    global_range: ByteRange,
+    buf: &mut [u8],
+    refund: &mut ProgressRefundGuard<'_>,
+    cancel: &AtomicBool,
+) -> Result<Duration, WorkerError> {
+    let dispatch_start = global_range.start().get();
+    let mut total_pwrite_time = Duration::ZERO;
+    let mut had_segment = false;
+    for seg in source.dispatch_range(global_range) {
+        had_segment = true;
+        let part = source
+            .parts()
+            .get(seg.part_index)
+            .ok_or(WorkerError::MultiPartOutOfRange {
+                chunk,
+                offset: seg.global.start().get(),
+            })?;
+        let buf_offset = (seg.global.start().get() - dispatch_start) as usize;
+        let buf_end = buf_offset + (seg.global.len() as usize);
+        let dest = &mut buf[buf_offset..buf_end];
+        let pwrite = download_single_segment(
+            ctx,
+            chunk,
+            &part.url,
+            &part.fingerprint,
+            seg.part_relative,
+            seg.global,
+            seg.part_index,
+            dest,
+            refund,
+            cancel,
+        )?;
+        total_pwrite_time += pwrite;
+    }
+    if !had_segment {
+        return Err(WorkerError::MultiPartOutOfRange {
+            chunk,
+            offset: dispatch_start,
+        });
+    }
+    Ok(total_pwrite_time)
 }
 
 /// Read the env once per process (the value is set before any
@@ -1505,12 +1579,13 @@ mod tests {
         let state = ProgressState::new();
         state.add_downloaded(1_000_000);
         {
-            let mut guard = ProgressRefundGuard::new(Some(&state), 0);
+            let mut guard = ProgressRefundGuard::new(Some(&state));
+            guard.begin_segment(0);
             // Mirror the read loop: every `read` call adds to both the
             // shared counter and the guard's local tally.
             for _ in 0..3 {
                 state.add_downloaded(64 * 1024);
-                guard.attempt_progress = guard.attempt_progress.saturating_add(64 * 1024);
+                guard.pending = guard.pending.saturating_add(64 * 1024);
             }
             // Guard never disarmed — a real worker would have hit an
             // error or panicked on the way to `disarm()`.
@@ -1528,9 +1603,11 @@ mod tests {
     fn progress_refund_guard_disarmed_leaves_bytes_credited() {
         let state = ProgressState::new();
         {
-            let mut guard = ProgressRefundGuard::new(Some(&state), 0);
+            let mut guard = ProgressRefundGuard::new(Some(&state));
+            guard.begin_segment(0);
             state.add_downloaded(128 * 1024);
-            guard.attempt_progress = guard.attempt_progress.saturating_add(128 * 1024);
+            guard.pending = guard.pending.saturating_add(128 * 1024);
+            guard.commit_segment();
             guard.disarm();
         }
         assert_eq!(snapshot_downloaded(&state), 128 * 1024);
@@ -1544,9 +1621,10 @@ mod tests {
         let state = Arc::new(ProgressState::new());
         let state_for_panic = Arc::clone(&state);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut guard = ProgressRefundGuard::new(Some(&state_for_panic), 0);
+            let mut guard = ProgressRefundGuard::new(Some(&state_for_panic));
+            guard.begin_segment(0);
             state_for_panic.add_downloaded(256 * 1024);
-            guard.attempt_progress = guard.attempt_progress.saturating_add(256 * 1024);
+            guard.pending = guard.pending.saturating_add(256 * 1024);
             // Simulate a panic site after partial credit (e.g. a
             // pwrite_at that triple-faulted, or a verify path that
             // assertion-failed). We never reach `disarm()`.
@@ -1560,11 +1638,40 @@ mod tests {
     /// attached) must be a silent no-op on drop.
     #[test]
     fn progress_refund_guard_with_no_progress_is_noop() {
-        let mut guard = ProgressRefundGuard::new(None, 0);
-        guard.attempt_progress = 4096;
+        let mut guard = ProgressRefundGuard::new(None);
+        guard.begin_segment(0);
+        guard.pending = 4096;
         drop(guard);
         // Nothing to assert beyond "did not panic"; the test exists to
         // pin the None-branch behavior so a future refactor can't
         // accidentally make it write through a None.
+    }
+
+    /// Multi-segment dispatch: a later-segment failure must roll
+    /// back the earlier segments' credits too.
+    #[test]
+    fn progress_refund_guard_refunds_committed_segments_on_drop() {
+        let state = ProgressState::new();
+        state.set_parts(vec![("p0".into(), 1024 * 1024), ("p1".into(), 1024 * 1024)]);
+        {
+            let mut guard = ProgressRefundGuard::new(Some(&state));
+            // Segment 0 succeeds: 100 KiB credited and committed.
+            guard.begin_segment(0);
+            state.add_downloaded(100 * 1024);
+            state.add_downloaded_to_part(0, 100 * 1024);
+            guard.pending = 100 * 1024;
+            guard.commit_segment();
+            // Segment 1 partially credits then "fails": pending
+            // sits in the guard. On drop, both the committed
+            // segment 0 and the pending segment 1 must be refunded.
+            guard.begin_segment(1);
+            state.add_downloaded(40 * 1024);
+            state.add_downloaded_to_part(1, 40 * 1024);
+            guard.pending = 40 * 1024;
+        }
+        let snap = state.snapshot();
+        assert_eq!(snap.bytes_downloaded, 0, "aggregate fully refunded");
+        assert_eq!(snap.parts[0].bytes_downloaded, 0, "p0 fully refunded");
+        assert_eq!(snap.parts[1].bytes_downloaded, 0, "p1 fully refunded");
     }
 }

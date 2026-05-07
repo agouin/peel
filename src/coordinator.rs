@@ -832,32 +832,19 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     let mirror_set = Arc::new(mirror_set);
     let _ = dropped_mirrors; // surfaced via tracing::warn! inside discover_with_mirrors
 
-    // Per `docs/PLAN_multi_url_source.md` §2: for multi-URL runs the
-    // bitmap chunk size must divide every part size. The helper
-    // returns the configured value unchanged for single-part sources
-    // (today's only path through `discover_with_mirrors`), shrinks to
-    // the gcd for multi-part sources, or errors when the gcd would
-    // fall below `MIN_ALIGNED_CHUNK_SIZE`. Rebinding `config` makes
-    // every downstream consumer of `config.chunk_size` (bitmap
-    // sizing, `SchedulerConfig`, the policy floor, the resume
-    // comparison) automatically see the aligned value without
-    // threading a parallel parameter through the rest of `run`.
-    let effective_chunk_size = info
-        .source
-        .aligned_chunk_size(config.chunk_size)
-        .map_err(|e| CoordinatorError::Scheduler(SchedulerError::MultiPart(e)))?;
-    let config = if effective_chunk_size != config.chunk_size {
-        tracing::info!(
-            "[multipart] aligning chunk_size {} → {} (gcd of configured value and part sizes)",
-            config.chunk_size,
-            effective_chunk_size,
-        );
-        let mut c = config;
-        c.chunk_size = effective_chunk_size;
-        c
-    } else {
-        config
-    };
+    // Multi-URL runs (`docs/PLAN_multi_url_source.md`) keep the
+    // user's `--chunk-size` even when individual parts are not a
+    // multiple of it. The worker's
+    // [`crate::download::worker::download_multi_segment`] handles
+    // chunks whose nominal range straddles a part boundary by
+    // issuing one ranged GET per part-segment and pwriting each
+    // piece at its global offset. Earlier rounds of this plan
+    // shrank `chunk_size` to the gcd of the part sizes; that
+    // produced bitmaps and per-chunk fingerprint vecs orders of
+    // magnitude larger than the source warranted (a 622 GiB Arb
+    // snapshot whose parts have a 2 KiB gcd would have built a
+    // 1.3 GiB CRC vec). The cross-boundary worker is the right
+    // alternative.
 
     let part_path = sidecar_path(&output, &config, ".peel.part");
     let ckpt_path = sidecar_path(&output, &config, ".peel.ckpt");

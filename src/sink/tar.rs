@@ -791,6 +791,15 @@ impl TarSink {
 
     /// Resolve an entry name to an absolute path under `self.root`,
     /// rejecting anything that escapes.
+    ///
+    /// Tar archives in the wild commonly include a self-referential
+    /// directory entry like `./` (or just `.`) representing the
+    /// archive root itself — `bsdtar` and GNU `tar` both emit it on
+    /// `tar cf out.tar ./`. Those entries resolve to `self.root` and
+    /// are extracted as a no-op `mkdir -p` of the (already-existing)
+    /// output directory. Treating that as a path-escape would refuse
+    /// every Arbitrum snapshot and many real-world tarballs; accept
+    /// it instead.
     fn resolve_entry_path(&self, entry: &str) -> Result<PathBuf, SinkError> {
         if entry.is_empty() || entry.contains('\0') {
             return Err(SinkError::PathEscape {
@@ -805,7 +814,6 @@ impl TarSink {
             });
         }
         let mut out = self.root.clone();
-        let mut pushed = 0usize;
         for component in entry.split('/') {
             if component.is_empty() || component == "." {
                 continue;
@@ -831,14 +839,15 @@ impl TarSink {
                 });
             }
             out.push(component);
-            pushed += 1;
         }
-        if pushed == 0 {
-            return Err(SinkError::PathEscape {
-                entry: entry.to_string(),
-                root: self.root.clone(),
-            });
-        }
+        // Empty resolved path means the entry was `.`, `./`, or
+        // similar — that's the archive root itself. Return
+        // `self.root`; the caller's `create_dir_all` is a no-op
+        // because the root already exists. A file entry whose name
+        // resolves to the root (vanishingly rare; would have to be
+        // `./` with type-flag `0`) would fail at `OpenOptions::write`
+        // with a clean "Is a directory" IO error — matched behaviour
+        // is fine.
         Ok(out)
     }
 }

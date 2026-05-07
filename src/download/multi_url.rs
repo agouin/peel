@@ -49,7 +49,7 @@ pub struct PartDescriptor {
     pub expected_sha256: Option<[u8; 32]>,
 }
 
-/// Construction and configuration errors for [`MultiPartSource`].
+/// Construction errors for [`MultiPartSource`].
 #[derive(Debug, Clone, Error)]
 pub enum MultiPartSourceError {
     /// `parts` was empty.
@@ -71,35 +71,7 @@ pub enum MultiPartSourceError {
         /// Index at which the running total overflowed.
         index: usize,
     },
-    /// Aligning the configured chunk size against the discovered part
-    /// sizes (`docs/PLAN_multi_url_source.md` §2) produced a value
-    /// below [`MIN_ALIGNED_CHUNK_SIZE`]. Surfaces the problem with
-    /// enough context for the user to retry against a chunk size that
-    /// divides every part.
-    #[error(
-        "configured chunk size {configured} bytes does not align with the part sizes; \
-         their GCD is {gcd} bytes which is below the {min_aligned}-byte floor — \
-         retry with `--chunk-size {gcd}` (or any divisor of every part size at or above the floor)"
-    )]
-    ChunkSizeBelowFloor {
-        /// Chunk size the caller asked for.
-        configured: u64,
-        /// `gcd(configured, part0_size, part1_size, …)`.
-        gcd: u64,
-        /// The configured floor (currently [`MIN_ALIGNED_CHUNK_SIZE`]).
-        min_aligned: u64,
-    },
 }
-
-/// Minimum effective chunk size for multi-URL runs
-/// (`docs/PLAN_multi_url_source.md` §2). Below this, the bitmap grows
-/// large enough that per-chunk overhead — bookkeeping, fingerprint
-/// recording, the dispatch channel — starts to dominate the
-/// throughput we'd otherwise gain from parallel ranged GETs. When the
-/// gcd of the configured chunk size and every part size falls below
-/// this floor we reject with [`MultiPartSourceError::ChunkSizeBelowFloor`]
-/// rather than silently shrinking into a bad operating regime.
-pub const MIN_ALIGNED_CHUNK_SIZE: u64 = 256 * 1024;
 
 /// N URLs flattened into one virtual byte range.
 ///
@@ -244,47 +216,6 @@ impl MultiPartSource {
         Some((part_idx, in_part))
     }
 
-    /// Compute the effective chunk size for this source given the
-    /// caller's configured value (`docs/PLAN_multi_url_source.md` §2).
-    ///
-    /// The bitmap unit must divide every part size — otherwise a
-    /// chunk would straddle a part boundary and a single dispatch
-    /// would need two ranged GETs against two URLs to satisfy it.
-    /// For single-part sources alignment is automatic and `configured`
-    /// is returned unchanged. For multi-part sources we shrink to
-    /// `gcd(configured, part0_size, part1_size, …)` so every chunk
-    /// fits inside one part.
-    ///
-    /// In practice the gcd equals the configured value (Arbitrum
-    /// snapshot parts are 512 GiB-aligned and the default
-    /// `--chunk-size` is 4 MiB, so `gcd = 4 MiB`); the shrink path
-    /// only fires when the user passes an unusual value or the source
-    /// uses a non-power-of-two part size.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MultiPartSourceError::ChunkSizeBelowFloor`] when the
-    /// gcd is below [`MIN_ALIGNED_CHUNK_SIZE`] — the per-chunk
-    /// overhead would dominate the run, so we surface the
-    /// misalignment instead of degrading silently.
-    pub fn aligned_chunk_size(&self, configured: u64) -> Result<u64, MultiPartSourceError> {
-        if self.parts.len() == 1 {
-            return Ok(configured);
-        }
-        let mut g = configured;
-        for p in &self.parts {
-            g = gcd(g, p.size);
-        }
-        if g < MIN_ALIGNED_CHUNK_SIZE {
-            return Err(MultiPartSourceError::ChunkSizeBelowFloor {
-                configured,
-                gcd: g,
-                min_aligned: MIN_ALIGNED_CHUNK_SIZE,
-            });
-        }
-        Ok(g)
-    }
-
     /// The global byte offset of the next part-boundary at or after
     /// `global_offset`, capped at `total_size` for the last part.
     /// Used by the scheduler to clamp adaptive-coalescing dispatches
@@ -371,20 +302,6 @@ impl Iterator for DispatchSegments<'_> {
             global,
         })
     }
-}
-
-/// Greatest common divisor of two `u64`s using Euclid's algorithm.
-///
-/// Hand-rolled to avoid pulling in a numerics crate
-/// (`docs/ENGINEERING_STANDARDS.md` §2). `gcd(0, n) == n` and
-/// `gcd(n, 0) == n`, matching the standard mathematical definition.
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let r = a % b;
-        a = b;
-        b = r;
-    }
-    a
 }
 
 #[cfg(test)]
@@ -654,95 +571,6 @@ mod tests {
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].part_index, 0);
         assert_eq!(segs[0].global, segs[0].part_relative);
-    }
-
-    // ---- gcd ---------------------------------------------------------
-
-    #[test]
-    fn gcd_matches_mathematical_definition() {
-        assert_eq!(gcd(0, 0), 0);
-        assert_eq!(gcd(5, 0), 5);
-        assert_eq!(gcd(0, 5), 5);
-        assert_eq!(gcd(12, 18), 6);
-        assert_eq!(gcd(18, 12), 6);
-        assert_eq!(gcd(7, 13), 1); // coprime
-        assert_eq!(gcd(1024, 4096), 1024);
-        assert_eq!(gcd(4 << 20, 512u64 << 30), 4 << 20); // Arb-shaped
-    }
-
-    // ---- aligned_chunk_size -----------------------------------------
-
-    fn parts_of(sizes: &[u64]) -> MultiPartSource {
-        MultiPartSource::new(
-            sizes
-                .iter()
-                .enumerate()
-                .map(|(i, &sz)| PartDescriptor {
-                    url: url(&format!("https://h/p{i}")),
-                    size: sz,
-                    fingerprint: SourceFingerprint::default(),
-                    expected_sha256: None,
-                })
-                .collect(),
-        )
-        .expect("valid")
-    }
-
-    #[test]
-    fn aligned_chunk_size_passes_through_for_single_part() {
-        let s = parts_of(&[1024]);
-        // Single-part has no alignment constraint; the configured
-        // value flows through, even values that wouldn't divide the
-        // single part size cleanly.
-        assert_eq!(s.aligned_chunk_size(4096).expect("ok"), 4096);
-        assert_eq!(s.aligned_chunk_size(7).expect("ok"), 7);
-    }
-
-    #[test]
-    fn aligned_chunk_size_returns_configured_when_already_aligned() {
-        // 4 MiB chunk, parts at 512 GiB each — Arb shape.
-        let s = parts_of(&[512u64 << 30, 512u64 << 30, 512u64 << 30]);
-        let aligned = s.aligned_chunk_size(4 << 20).expect("ok");
-        assert_eq!(aligned, 4 << 20);
-    }
-
-    #[test]
-    fn aligned_chunk_size_shrinks_to_gcd_when_misaligned_above_floor() {
-        // chunk_size 4 MiB; one part is 3 MiB. gcd(4MiB, 3MiB) = 1 MiB,
-        // which is above the 256 KiB floor → return 1 MiB.
-        let s = parts_of(&[4 << 20, 3 << 20, 4 << 20]);
-        let aligned = s.aligned_chunk_size(4 << 20).expect("ok");
-        assert_eq!(aligned, 1 << 20);
-    }
-
-    #[test]
-    fn aligned_chunk_size_rejects_when_gcd_below_floor() {
-        // Force gcd below 256 KiB by introducing a coprime-ish small
-        // part. chunk_size 4 MiB, parts at 4 MiB and 4 MiB + 1 byte.
-        // gcd reduces to 1 byte → below floor → reject.
-        let s = parts_of(&[4 << 20, (4 << 20) + 1]);
-        let err = s.aligned_chunk_size(4 << 20).expect_err("must reject");
-        match err {
-            MultiPartSourceError::ChunkSizeBelowFloor {
-                configured,
-                gcd,
-                min_aligned,
-            } => {
-                assert_eq!(configured, 4 << 20);
-                assert_eq!(gcd, 1);
-                assert_eq!(min_aligned, MIN_ALIGNED_CHUNK_SIZE);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn aligned_chunk_size_accepts_exactly_at_floor() {
-        // gcd == MIN_ALIGNED_CHUNK_SIZE exactly should be accepted —
-        // the predicate is strictly `< floor`, not `<= floor`.
-        let s = parts_of(&[MIN_ALIGNED_CHUNK_SIZE * 2, MIN_ALIGNED_CHUNK_SIZE * 3]);
-        let aligned = s.aligned_chunk_size(MIN_ALIGNED_CHUNK_SIZE).expect("ok");
-        assert_eq!(aligned, MIN_ALIGNED_CHUNK_SIZE);
     }
 
     // ---- next_part_boundary_at_or_after -----------------------------
