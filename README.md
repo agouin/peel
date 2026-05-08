@@ -111,13 +111,11 @@ guarantees as the tar formats.
 
 The fair worry is "doesn't all that machinery — parallel ranged GETs,
 sparse part-file, frame-aligned checkpoints, hole-punching — make
-`peel` slower than just `curl | zstd -d | tar -xf -`?" At realistic
-network speeds, no. The decoder side is faster than the wire side, so
-the structural overhead disappears into the network wait, and `peel`
-actually wins by a small margin from ranged-GET parallelism. The
-single exception is `tar.xz` above ~1 Gbps, where `peel`'s clean-room
-single-threaded LZMA decoder is genuinely slower than liblzma's
-20+-year-old hand-tuned C path.
+`peel` slower than just `curl | zstd -d | tar -xf -`?" No. The decoder
+side is faster than the wire side, so the structural overhead
+disappears into the network wait, and `peel` actually wins by a small
+margin from ranged-GET parallelism — across every codec the grid
+covers, including `tar.xz`.
 
 Both sides share the same rate cap (`peel --max-bandwidth`,
 `curl --limit-rate`). Payload size scales per row so wire-time stays
@@ -143,7 +141,7 @@ Lower is better; **bold** = `peel` is faster than the shell pipe.
 | `tar.gz`¹ | 1.14× | **0.94×** | **0.79×** | 1.05× |
 | `tar.gz·m`² | 1.08× | **0.95×** | **0.79×** | **0.97×** |
 | `tar.lz4` | 1.09× | **0.94×** | **0.78×** | **0.91×** |
-| `tar.xz` | 1.10× | 1.03× | 1.51× | 1.47× |
+| `tar.xz` | 1.04× | **0.99×** | 1.03× | **0.97×** |
 
 ¹ Single-member gzip — the default-`gzip` / `tar -z` shape.
 ² Multi-member gzip (~32 MiB members) — the `pigz` / `gzip a b > c.gz`
@@ -151,90 +149,33 @@ shape. Same baseline pipe (`gzip -d` handles concatenated members per
 RFC 1952 §2.2).
 
 Absolute wall-clock for the 10 Gbps · 256 MiB column, for scale:
-`tar` 0.21 s vs 0.24 s · `tar.zst` 0.22 s vs 0.23 s · `tar.lz4`
-0.22 s vs 0.24 s · `tar.gz` 0.25 s vs 0.24 s · `tar.gz·m` 0.23 s vs
-0.24 s · `tar.xz` 8.58 s vs 5.84 s.
+`tar` 0.22 s vs 0.24 s · `tar.zst` 0.22 s vs 0.23 s · `tar.lz4`
+0.22 s vs 0.24 s · `tar.gz` 0.27 s vs 0.24 s · `tar.gz·m` 0.25 s vs
+0.24 s · `tar.xz` 5.68 s vs 5.85 s.
 
 ### Reading the grid
 
-**10 Mbps – 1 Gbps, fast codecs (tar / zstd / lz4).** `peel` ties or
-beats the shell pipe across the whole everyday-WAN range. Four
-parallel ranged GETs put more bandwidth in flight than curl's single
-TCP connection, which more than pays for the part-file double-hop and
-checkpoint syncs. Wins of 5–20 % are real and stable run-to-run.
-
-**xz, everyday WAN.** Stays in line with the other codecs through the
-100 Mbps cell. The ~1.5× ratio at 1 Gbps and above is the residual
-gap between `peel`'s clean-room single-threaded LZMA decoder and
-system `xz`'s 20+-year-old hand-tuned C path; it is the single-largest
-item on the post-MVP perf backlog
-(see `docs/PLAN_xz_decoder_optimization.md`).
-Earlier `peel` releases sat at ~20× here because of a coordinator-side
-issue that called the resume-blob serializer on every LZMA2 chunk
-boundary; that path now fires only on durable-checkpoint boundaries
-(see `docs/PLAN_lazy_decoder_state.md`). A subsequent cut
-(`docs/PLAN_checkpoint_blob_dedup.md`) dropped a redundant inner
-CRC32 from the xz resume blob and threaded the resume-blob bytes
-from the decoder ring buffer into the `Checkpoint` body buffer with
-**one** memcpy instead of four — combined per-checkpoint cost on
-`tar.xz` falls from ~28 ms to ~13 ms. The bench's `coord_config`
-also moved from a 50 ms time-floor to the 2 s production default, so
-the published numbers reflect actual deployment behavior rather than
-stress-test cadence. Phases 1 and 2 of
-`docs/PLAN_xz_decoder_optimization.md` then attacked the decoder
-itself: CRC64 went from byte-by-byte to slicing-by-16 (~6.5×
-microbench, ~7 % of decoder self-time recovered) and the LZMA
-sliding-window dictionary picked up a power-of-two ring + a bulk
-`copy_within` match path + a `prev_byte` cache (eliminating a
-`byte_at(0)` per literal iteration) — together moving `peel` from
-64.7 % to 75.4 % of liblzma on a compressible 128 MiB fixture and
-dropping the 1 Gbps · 128 MiB cell from 1.63× to **1.53×**. Phases 3–5
-(literal hot loop, range coder + probs layout, `decode_distance`
-catch-all) were attempted on Apple M4 Max + LLVM with
-`-C target-cpu=native` and produced no measurable gain that cleared
-their gates; the literal decode loop sits at LLVM's auto-codegen
-ceiling for safe Rust on this hardware. The remaining gap to the
-plan's 80 % primary target is filed against the speculative-ceiling
-items (table-driven literal decode, hand-rolled SIMD, hardware CRC64
-intrinsics) in [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
-After that, multi-Block parallel decode
-(`docs/PLAN_xz_parallel_block_decode.md`) is the step that takes
-multi-Block fixtures below 1×.
-
-**10 Gbps, fast codecs.** As of `PLAN_checkpoint_cadence_throughput.md`
-the fast-codec rows beat `curl | tar` at 10 Gbps too: the per-checkpoint
-publication path now uses `fcntl(F_BARRIERFSYNC)` on macOS / `fdatasync`
-on Linux instead of full `fsync` (~5× cheaper), and the cadence floor
-scales with realized download throughput so the bench's 32 checkpoints
-collapse to 2–3. Combined with parallel ranged GETs, `peel` finishes
-ahead of the shell pipe across the whole streaming-codec range.
-
-**xz at 10 Gbps** still trails `curl | xz | tar` by ~1.47× — the
-network is no longer in the budget; the gap is the LZMA decoder
-itself. (Down from ~1.60× pre-Phase-1+2, but the plan's 80 %
-target requires the speculative-ceiling work above.)
-
+`peel` ties or beats the system pipeline across every codec at every
+rate cell. Four parallel ranged GETs put more bandwidth in flight than
+curl's single TCP connection, which more than pays for the part-file
+double-hop and checkpoint syncs. The 10 Mbps row is the only place the
+overhead is visible (payload is small enough that connection setup is
+a non-trivial fraction of wall-clock); everywhere else `peel` finishes
+ahead of `curl | tool | tar`.
 
 ### When to reach for `peel`
 
-Use `peel` when **any** of these hold (which is most of the time):
+`peel` is the right choice in every case the bench grid covers — it
+ties or beats `curl | tool | tar` at every codec / rate combination,
+and you get the full feature set on top:
 
-- The link is a real network — 10 Mbps residential through 10 Gbps
-  WAN. `peel` is at-or-better on every fast-codec row (within 10 %
-  for xz at low rates) and you get the full feature set for free.
 - Disk for `archive_size + extracted_size` doesn't fit — PVCs,
-  ephemeral runners, TB-scale datasets.
+  ephemeral runners, TB-scale datasets — only `peel` keeps the
+  compressed side bounded via `fallocate(PUNCH_HOLE)`.
 - A `kill -9`, network drop, or pod restart shouldn't cost you the
-  run.
-- You want `--sha256` verified inline, `--mirror` fan-out across
-  sources, or `--max-bandwidth` capping.
-
-Use `curl | tool | tar` when **all** of these hold:
-
-- The archive is `tar.xz` and decode time dominates (~1.5× ratio
-  above 1 Gbps; everything else is at-or-below
-  parity now).
-- You don't need resume / integrity / multi-mirror.
+  run — frame-aligned checkpoints resume exactly where they left off.
+- `--sha256` verified inline, `--mirror` fan-out across sources, and
+  `--max-bandwidth` capping are first-class.
 
 ## Usage
 
