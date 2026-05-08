@@ -794,6 +794,26 @@ pub fn lzma_decode_port(
             coder.sequence = Sequence::IsMatch;
         }
 
+        // Cache the most-recently-emitted byte across the
+        // outer loop. The literal-context-index formula
+        // reads `prev_byte` per literal symbol; without the
+        // cache that's `dict.dict_get(0)` per literal (5+
+        // instructions) — a per-output-byte cost on LCG-shape
+        // payloads, half-density on compressible. The cache:
+        // - Initialized from `dict.dict_get(0)` once (or 0 if
+        //   the dict is empty).
+        // - Updated to the just-decoded byte after every
+        //   literal / short-rep emission (free — the value is
+        //   already in scope).
+        // - Re-loaded via `dict.dict_get(0)` once per match
+        //   copy (so multi-byte matches amortize to one
+        //   dict_get per match, not per byte).
+        //
+        // Liblzma doesn't do this caching; we move ahead of
+        // it on this lever. Predecessor `xz_native` Phase 2
+        // shipped the same optimization with measurable gains.
+        let mut prev_byte: u8 = if dict.is_empty() { 0 } else { dict.dict_get(0) };
+
         // Outer loop: produce one LZMA symbol per iteration
         // (literal byte, single-byte short-rep, or match
         // copy). Terminates when `dict.pos == dict.limit`.
@@ -820,7 +840,8 @@ pub fn lzma_decode_port(
 
             if !is_match {
                 // ===== Literal =====
-                let prev_byte: u8 = if dict.is_empty() { 0 } else { dict.dict_get(0) };
+                // `prev_byte` cached across iterations; see
+                // the cache comment above the outer loop.
                 let lit_state = literal_context_index(dict.pos as u64, prev_byte, lc, lp_mask);
                 let mut symbol: u32 = 1;
 
@@ -867,6 +888,7 @@ pub fn lzma_decode_port(
                 coder.state = update_literal(coder.state);
 
                 let byte = (symbol & 0xFF) as u8;
+                prev_byte = byte;
                 if dict.dict_put(byte) {
                     // dict full mid-literal. Phase F resume
                     // path; Phase 3 fixtures don't hit this
@@ -1069,6 +1091,7 @@ pub fn lzma_decode_port(
                         // Short rep0: emit one byte at rep0.
                         coder.state = update_short_rep(coder.state);
                         let b = dict.dict_get(coder.rep0);
+                        prev_byte = b;
                         if dict.dict_put(b) {
                             coder.rc.range = range;
                             coder.rc.code = code;
@@ -1158,6 +1181,11 @@ pub fn lzma_decode_port(
                 coder.sequence = Sequence::Copy;
                 return Ok(DecodeStatus::NeedInput);
             }
+            // Refresh prev_byte once per match copy. The
+            // amortized cost is one dict_get per match (not
+            // per byte of the match), so multi-byte matches
+            // benefit most.
+            prev_byte = dict.dict_get(0);
         }
 
         // dict.pos reached limit. Final normalize per liblzma's
@@ -1192,6 +1220,12 @@ pub fn lzma_decode_port(
 /// labeling (Phase F will use distinct sequence variants for
 /// match-len vs rep-len resume); the decode itself is
 /// identical.
+///
+/// **Inlining note**: `#[inline(always)]` was tried (Phase
+/// 4.5) and **regressed LCG by 6 pp** (i-cache pressure on the
+/// literal hot loop). Compressible was unchanged. Default
+/// `#[inline]` shipped — LLVM's heuristic appears to inline
+/// this body anyway when called from a single hot site.
 #[allow(clippy::too_many_arguments)]
 fn decode_length_inline(
     range: &mut u32,

@@ -499,3 +499,45 @@ fn bench_xz_liblzma_correctness_4mib_compressible() {
     assert_eq!(peel_out.len(), archive.len(), "length mismatch");
     assert_eq!(peel_out, archive, "byte mismatch vs xz2-encoded archive");
 }
+
+/// Profiling helper: encode 64 MiB compressible once, decode in
+/// a loop. Used for `samply record`-style profilers to find
+/// compressible-fixture hot spots.
+///
+/// **NB**: xz2's preset-6 encoder of 64 MiB compressible takes
+/// ~18 s on M4 Max (the encoder is genuinely slow). Profilers
+/// must be told to skip the early seconds of the run before
+/// sampling, OR set `PEEL_LIBLZMA_ITERS` high enough that the
+/// decode loop dominates the timeline.
+///
+/// ```text
+/// RUSTFLAGS="-C target-cpu=native -C debuginfo=2" \
+///     cargo test --release --test test_bench_xz_liblzma \
+///     bench_xz_liblzma_profile_loop_compressible --no-run
+/// samply record target/release/deps/test_bench_xz_liblzma-* \
+///     bench_xz_liblzma_profile_loop_compressible --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "profiling helper; opt-in via --ignored"]
+fn bench_xz_liblzma_profile_loop_compressible() {
+    let archive = build_compressible_tar_payload(64 * 1024 * 1024);
+    let compressed = encode_xz(&archive);
+    let iters: u32 = std::env::var("PEEL_LIBLZMA_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let started = Instant::now();
+    let mut total_bytes: u64 = 0;
+    for _ in 0..iters {
+        let (out, _) = run_peel_port(&compressed);
+        total_bytes = total_bytes.saturating_add(out.len() as u64);
+        assert_eq!(out.len(), archive.len());
+    }
+    let elapsed = started.elapsed();
+    let mibps = (total_bytes as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    println!(
+        "[profile-compressible] iters={iters} total={tot:.1} MiB elapsed={el:.3}s avg={mibps:.1} MiB/s",
+        tot = (total_bytes as f64) / (1024.0 * 1024.0),
+        el = elapsed.as_secs_f64(),
+    );
+}
