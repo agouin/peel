@@ -49,4 +49,5 @@
 pub mod decoder;
 pub mod dict;
 pub mod error;
+pub mod lzma2;
 pub mod range_coder;

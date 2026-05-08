@@ -91,4 +91,68 @@ pub enum XzPortError {
         /// the caller's saved state pointed at.
         sequence: super::decoder::Sequence,
     },
+
+    /// LZMA2 chunk framing produced an error. Round-one
+    /// borrows
+    /// [`crate::decode::xz_native::block::parse_lzma2_chunk_header`]
+    /// for chunk parsing; its [`crate::decode::xz_native::error::XzError`]
+    /// values are surfaced here as a string. Phase 6 ports the
+    /// framing parsers into `xz_liblzma` directly and gives
+    /// these structured variants.
+    #[error("xz_liblzma: LZMA2 framing error: {0}")]
+    Framing(String),
+
+    /// The first LZMA2 chunk in a Block didn't request a
+    /// dict reset. liblzma rejects this; the spec requires
+    /// the first chunk to be one of the dict-resetting modes
+    /// (`0x01` uncompressed-with-reset or `0xE0..=0xFF` LZMA-
+    /// with-full-reset).
+    #[error("xz_liblzma: first LZMA2 chunk did not reset the dictionary (control byte 0x{0:02X})")]
+    FirstChunkMustResetDict(u8),
+
+    /// An LZMA chunk demands an `lc/lp/pb` properties byte
+    /// (because the prior chunk reset state, or this is the
+    /// first chunk) but the chunk header didn't carry one.
+    /// Mirror of liblzma's `LZMA_DATA_ERROR` in the same
+    /// conditional.
+    #[error("xz_liblzma: LZMA2 chunk needs properties byte but didn't reset_props")]
+    ChunkNeedsProperties,
+
+    /// The range coder didn't end in the spec's "well-finished"
+    /// state at chunk end (`code != 0` or unconsumed input
+    /// bytes). Mirror of liblzma's
+    /// `LZMA_DATA_ERROR` from the same check.
+    #[error(
+        "xz_liblzma: LZMA2 chunk range coder unfinished \
+         (code=0x{code:08X}, leftover={leftover})"
+    )]
+    ChunkRangeCoderUnfinished {
+        /// The non-zero `code` value at chunk end (or `0` if
+        /// the leftover-bytes check is what fired).
+        code: u32,
+        /// Bytes left unconsumed in the chunk's compressed
+        /// payload after decode.
+        leftover: usize,
+    },
+
+    /// LZMA2 chunk payload was shorter than the chunk
+    /// header's declared `compressed_size`.
+    #[error(
+        "xz_liblzma: LZMA2 chunk truncated (declared {compressed_size} bytes, \
+         {available} available)"
+    )]
+    ChunkTruncated {
+        /// `compressed_size` from the chunk header.
+        compressed_size: u32,
+        /// Bytes actually available in the input slice.
+        available: usize,
+    },
+}
+
+// --- conversion from xz_native errors used by the borrowed parser ---
+
+impl From<crate::decode::xz_native::error::XzError> for XzPortError {
+    fn from(e: crate::decode::xz_native::error::XzError) -> Self {
+        XzPortError::Framing(format!("{e}"))
+    }
 }

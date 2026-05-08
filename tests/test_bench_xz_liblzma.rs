@@ -43,12 +43,8 @@
 
 use std::time::{Duration, Instant};
 
-use peel::decode::xz_liblzma::decoder::{lzma_decode_port, Lzma1Decoder, Sequence};
-use peel::decode::xz_liblzma::dict::LzmaDict;
-use peel::decode::xz_native::block::{
-    block_header_real_size, decode_lzma_properties, parse_block_header, parse_lzma2_chunk_header,
-    Lzma2ChunkHeader,
-};
+use peel::decode::xz_liblzma::lzma2::Lzma2Decoder;
+use peel::decode::xz_native::block::{block_header_real_size, parse_block_header};
 use peel::decode::xz_native::stream::STREAM_HEADER_LEN;
 
 #[path = "support/mod.rs"]
@@ -193,18 +189,14 @@ fn encode_xz(payload: &[u8]) -> Vec<u8> {
 
 // ---- peel-port decode harness --------------------------------------
 
-/// Decode a single-Block .xz stream by replaying each LZMA2 chunk
-/// through `lzma_decode_port`. Returns the decoded bytes plus the
-/// wall-clock spent in lzma_decode_port + chunk framing.
+/// Decode a single-Block .xz stream via the production
+/// `xz_liblzma::lzma2::Lzma2Decoder`. Returns the decoded
+/// bytes plus the wall-clock spent in the decoder + chunk
+/// framing.
 ///
-/// Chunk framing is inside the timed loop: parse_lzma2_chunk_header
-/// is ~10 ns/call and lzma_decode_port consumes the chunk's
-/// hundreds-to-thousands of compressed bytes per call, so the
-/// framing overhead is < 0.1 %.
-///
-/// Bypasses Stream Footer + Block Padding + Block-Check validation
-/// because Phase 4 is gating on inner-loop perf alone, not framing.
-/// Phase 6 adds those layers in production.
+/// Bypasses Stream Footer + Block Padding + Block-Check
+/// validation because Phase 4 is gating on inner-loop perf
+/// alone, not framing. Phase 6 adds those layers in production.
 fn run_peel_port(compressed: &[u8]) -> (Vec<u8>, Duration) {
     let started = Instant::now();
 
@@ -221,156 +213,11 @@ fn run_peel_port(compressed: &[u8]) -> (Vec<u8>, Duration) {
     let block_header = parse_block_header(&compressed[p..p + bh_len]).expect("parse_block_header");
     p += bh_len;
 
-    // ---- Decoder + dict ----
-    let mut decoder = Lzma1Decoder::new();
-    let mut dict = LzmaDict::new(block_header.dict_size as usize);
+    // ---- Drive Lzma2Decoder over the rest of the Block ----
+    let mut dec = Lzma2Decoder::new(block_header.dict_size);
     let mut output: Vec<u8> = Vec::with_capacity(compressed.len() * 4);
-
-    let mut chunk_idx: usize = 0;
-
-    // ---- LZMA2 chunks ----
-    loop {
-        chunk_idx += 1;
-        let header = parse_lzma2_chunk_header(&compressed[p..]).expect("parse chunk header");
-        match header {
-            Lzma2ChunkHeader::EndOfStream => break,
-            Lzma2ChunkHeader::Uncompressed {
-                reset_dict,
-                uncompressed_size,
-            } => {
-                if reset_dict {
-                    dict.reset();
-                    decoder.full_reset();
-                }
-                p += 3;
-                // Mirror of liblzma's wrap-loop in
-                // `lz_decoder.c::decode_buffer`: an
-                // uncompressed chunk may straddle the dict
-                // wrap, so we copy in segments — wrap dict.pos
-                // to 0 between segments and flush each segment
-                // to the output buffer.
-                let chunk = &compressed[p..p + uncompressed_size as usize];
-                output.extend_from_slice(chunk);
-                let mut in_pos = 0usize;
-                let mut left = uncompressed_size as usize;
-                while left > 0 {
-                    if dict.pos == dict.size {
-                        dict.pos = 0;
-                    }
-                    let chunk_avail = dict.size - dict.pos;
-                    let this_step = left.min(chunk_avail);
-                    dict.set_limit(dict.pos + this_step);
-                    let pre_in = in_pos;
-                    let pre_left = left;
-                    dict.dict_write(chunk, &mut in_pos, chunk.len(), &mut left);
-                    debug_assert_eq!(in_pos - pre_in, this_step);
-                    debug_assert_eq!(pre_left - left, this_step);
-                }
-                p += uncompressed_size as usize;
-            }
-            Lzma2ChunkHeader::Lzma {
-                reset_state,
-                reset_props,
-                reset_dict,
-                uncompressed_size,
-                compressed_size,
-                properties,
-            } => {
-                let header_len = if reset_props { 6 } else { 5 };
-                p += header_len;
-                if reset_dict {
-                    dict.reset();
-                    decoder.full_reset();
-                } else if reset_state {
-                    decoder.full_reset();
-                }
-                if let Some(props_byte) = properties {
-                    let (lc, lp, pb) =
-                        decode_lzma_properties(props_byte).expect("decode_lzma_properties");
-                    decoder.set_properties(u32::from(lc), u32::from(lp), u32::from(pb));
-                }
-                // The LZMA2 spec semantics: each LZMA chunk
-                // starts a fresh range coder. `full_reset`
-                // already gives us a fresh `RangeDecoder`; on
-                // a chunk that doesn't reset state we still
-                // need a fresh rc per the per-chunk init
-                // protocol. Mirror of liblzma's
-                // `rc_reset(coder->rc)` at chunk entry.
-                decoder.rc = peel::decode::xz_liblzma::range_coder::RangeDecoder::new();
-                decoder.sequence = peel::decode::xz_liblzma::decoder::Sequence::Normalize;
-
-                // Mirror of liblzma's `decode_buffer` loop in
-                // `lz_decoder.c`: a single LZMA chunk's
-                // `uncompressed_size` may straddle the dict's
-                // size boundary, so we may need multiple calls
-                // to `lzma_decode_port` per chunk — each call
-                // wraps `dict.pos` to 0 if it hit the dict
-                // size, sets a new limit, and runs again with
-                // the SAME `bytes_pos` cursor advanced past
-                // the bytes already consumed.
-                let chunk_payload = &compressed[p..p + compressed_size as usize];
-                let mut in_pos = 0usize;
-                let mut remaining = uncompressed_size as usize;
-                while remaining > 0 {
-                    if dict.pos == dict.size {
-                        dict.pos = 0;
-                    }
-                    let chunk_avail = dict.size - dict.pos;
-                    let this_step = remaining.min(chunk_avail);
-                    let dict_start = dict.pos;
-                    dict.set_limit(dict.pos + this_step);
-                    let _status = lzma_decode_port(
-                        &mut decoder,
-                        &mut dict,
-                        chunk_payload,
-                        &mut in_pos,
-                    )
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "lzma_decode_port at chunk_idx={chunk_idx} \
-                             output_pos={} dict.pos={dict_start} dict.full={} remaining={remaining}: {e:?}",
-                            output.len(),
-                            dict.full
-                        )
-                    });
-                    // The decoder may return NeedInput if a
-                    // long match-copy straddled the limit;
-                    // that's fine — the next iteration of
-                    // this loop wraps `dict.pos` (if it hit
-                    // dict.size) and re-enters
-                    // `lzma_decode_port` which has Copy-
-                    // resume support. We just need to make
-                    // sure we made forward progress (i.e.,
-                    // dict.pos == dict_start + this_step OR a
-                    // partial Copy that hit the limit).
-                    let produced = dict.pos - dict_start;
-                    assert_eq!(produced, this_step, "wrong byte count this step");
-                    for i in 0..produced {
-                        let d = (produced - 1 - i) as u32;
-                        output.push(dict.dict_get(d));
-                    }
-                    remaining -= produced;
-                }
-                // After the wrap loop, the chunk's full output
-                // has been delivered. The decoder's final state
-                // should be either IsMatch (clean end) or
-                // Normalize (also clean — happens when the
-                // last symbol was followed by a final
-                // rc_normalize that took us back to the top
-                // of the dispatch loop).
-                debug_assert!(
-                    matches!(decoder.sequence, Sequence::IsMatch | Sequence::Normalize),
-                    "chunk {chunk_idx} ended in unexpected sequence {:?}",
-                    decoder.sequence
-                );
-                assert_eq!(
-                    in_pos, compressed_size as usize,
-                    "decoder consumed wrong byte count (expected {compressed_size}, got {in_pos})"
-                );
-                p += compressed_size as usize;
-            }
-        }
-    }
+    dec.decode_stream(&compressed[p..], &mut output)
+        .expect("Lzma2Decoder::decode_stream");
 
     let elapsed = started.elapsed();
     (output, elapsed)
