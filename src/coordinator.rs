@@ -1022,6 +1022,11 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 // separately; pre-crediting from here would require
                 // re-reading entry sizes the resume plan doesn't carry.
                 SinkState::Zip { .. } => 0,
+                // Same shape as Zip: the 7z second-pipeline driver
+                // counts folder bytes itself; pre-crediting here
+                // would require re-reading folder sizes the resume
+                // plan doesn't carry.
+                SinkState::Sevenz { .. } => 0,
             };
             state.add_extracted(resumed_extracted);
         }
@@ -1684,6 +1689,7 @@ fn build_resume_plan(
         (OutputTarget::File(_), SinkState::Raw { .. })
             | (OutputTarget::Dir(_), SinkState::Tar { .. })
             | (OutputTarget::Dir(_), SinkState::Zip { .. })
+            | (OutputTarget::Dir(_), SinkState::Sevenz { .. })
     );
     if !sink_compat {
         return Err(CoordinatorError::SourceChanged {
@@ -2155,7 +2161,7 @@ fn run_zip(
                 current_entry_offset: *current_entry_offset,
                 current_entry_decoder_state: current_entry_decoder_state.clone(),
             },
-            SinkState::Raw { .. } | SinkState::Tar { .. } => {
+            SinkState::Raw { .. } | SinkState::Tar { .. } | SinkState::Sevenz { .. } => {
                 return Err(CoordinatorError::SourceChanged {
                     reason: "checkpoint sink_state is not Zip but the resolved format is zip"
                         .into(),

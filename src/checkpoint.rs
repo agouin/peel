@@ -167,7 +167,11 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   the saved `hash_state` (when present) as `active_part_idx =
 ///   0`. Older binaries refuse v8 with
 ///   [`CheckpointError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 8;
+/// - **v9** — adds [`SinkState::Sevenz`] with `folders_completed` +
+///   optional `current_folder` for the 7z second-pipeline driver
+///   (`docs/PLAN_7z_support.md` §9). Older binaries refuse v9 files
+///   with [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -176,6 +180,9 @@ const HEADER_LEN: usize = 8 + 4 + 8 + 8;
 const SINK_TAG_RAW: u8 = 0;
 /// Tag for [`SinkState::Tar`] in the on-disk format.
 const SINK_TAG_TAR: u8 = 1;
+/// Tag for [`SinkState::Sevenz`] in the on-disk format. Added in
+/// v9 of the format (`docs/PLAN_7z_support.md` §9).
+const SINK_TAG_SEVENZ: u8 = 3;
 /// Tag for [`SinkState::Zip`] in the on-disk format. Added in v2 of
 /// the checkpoint layout.
 const SINK_TAG_ZIP: u8 = 2;
@@ -514,6 +521,26 @@ pub enum SinkState {
         /// fall through to the per-entry "restart from byte 0" path.
         current_entry_decoder_state: Option<Vec<u8>>,
     },
+
+    /// State for [`crate::sink::SevenzSink`] (added in v9 of the
+    /// format, `docs/PLAN_7z_support.md` §9).
+    ///
+    /// 7z archives are extracted folder-by-folder in archive
+    /// order. The checkpoint records which folders are durable on
+    /// disk in `folders_completed`; when a crash interrupts a
+    /// folder, `current_folder` names it. Round-one resume
+    /// restarts the in-flight folder from byte 0 (mid-folder
+    /// resume is `O.32c` in `OPTIMIZATIONS.md` and depends on
+    /// `xz_liblzma::resume`'s sliding-window snapshot machinery).
+    Sevenz {
+        /// Folder indices (in archive order) that finished
+        /// extracting before this checkpoint was written.
+        folders_completed: Vec<u32>,
+        /// Index of the folder that was in flight when the
+        /// checkpoint was written, if any. `None` means the sink
+        /// was quiescent (between folders).
+        current_folder: Option<u32>,
+    },
 }
 
 /// One logical part of a multi-URL split source
@@ -813,6 +840,24 @@ impl Checkpoint {
                     None => body.push(0),
                 }
             }
+            SinkState::Sevenz {
+                folders_completed,
+                current_folder,
+            } => {
+                body.push(SINK_TAG_SEVENZ);
+                let count = u32::try_from(folders_completed.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for idx in folders_completed.iter().take(count as usize) {
+                    write_u32(&mut body, *idx);
+                }
+                match current_folder {
+                    Some(idx) => {
+                        body.push(1);
+                        write_u32(&mut body, *idx);
+                    }
+                    None => body.push(0),
+                }
+            }
         }
 
         match &self.hash_state {
@@ -966,7 +1011,7 @@ impl Checkpoint {
         // version so it can decide whether to read each trailer;
         // future versions that *change* the layout will branch
         // here.
-        debug_assert!(matches!(format_version, 1..=8));
+        debug_assert!(matches!(format_version, 1..=9));
         Self::decode_body(body, format_version)
     }
 
@@ -1164,6 +1209,28 @@ impl Checkpoint {
                     current_entry,
                     current_entry_offset,
                     current_entry_decoder_state,
+                }
+            }
+            SINK_TAG_SEVENZ => {
+                let count = cursor.read_count_capped("sink.sevenz.folders_completed.len", 4)?;
+                let mut folders: Vec<u32> = Vec::new();
+                for _ in 0..count {
+                    folders.push(cursor.read_u32("sink.sevenz.folders_completed[i]")?);
+                }
+                let current_present = cursor.read_u8("sink.sevenz.current_folder.is_some")?;
+                let current_folder = match current_present {
+                    0 => None,
+                    1 => Some(cursor.read_u32("sink.sevenz.current_folder")?),
+                    other => {
+                        return Err(CheckpointError::InvalidPresence {
+                            field: "sink.sevenz.current_folder",
+                            value: other,
+                        });
+                    }
+                };
+                SinkState::Sevenz {
+                    folders_completed: folders,
+                    current_folder,
                 }
             }
             other => {
@@ -2229,17 +2296,70 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_eight() {
+    fn checkpoint_format_version_is_nine() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
         // work (v6), `docs/PLAN_deflate_block_decoder.md` Phase 9b's
-        // zip per-entry decoder-state field (v7), and
+        // zip per-entry decoder-state field (v7),
         // `docs/PLAN_multi_url_source.md` §5's parts vec +
-        // active-part-aware hash state (v8) each bumped this when an
-        // optional trailer landed. If a future change resets it, this
-        // guards against silently dropping the upgrade-required signal
+        // active-part-aware hash state (v8), and
+        // `docs/PLAN_7z_support.md` §9's `SinkState::Sevenz`
+        // variant (v9) each bumped this when an optional trailer
+        // landed. If a future change resets it, this guards
+        // against silently dropping the upgrade-required signal
         // older readers depend on.
-        assert_eq!(FORMAT_VERSION, 8);
+        assert_eq!(FORMAT_VERSION, 9);
+    }
+
+    fn sample_sevenz(folders_completed: Vec<u32>, current_folder: Option<u32>) -> Checkpoint {
+        Checkpoint {
+            url: "https://example.com/dataset.7z".to_string(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            parts: vec![PartRecord {
+                url: "https://example.com/dataset.7z".to_string(),
+                size: 4_096_000,
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                expected_sha256: None,
+            }],
+            total_size: 4_096_000,
+            chunk_size: 65_536,
+            decoder_position: ByteOffset::new(123_456),
+            bitmap_completed: vec![0xFFu8; 16],
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            sink_state: SinkState::Sevenz {
+                folders_completed,
+                current_folder,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+        }
+    }
+
+    #[test]
+    fn round_trip_sevenz_sink_quiescent() {
+        let original = sample_sevenz(vec![0, 1, 2], None);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_sevenz_sink_mid_folder() {
+        let original = sample_sevenz(vec![0, 1], Some(2));
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_sevenz_sink_empty_folders_completed() {
+        let original = sample_sevenz(vec![], Some(0));
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
     }
 
     fn build_legacy_body_raw_sink() -> Vec<u8> {
