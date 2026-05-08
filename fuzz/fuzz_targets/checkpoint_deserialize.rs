@@ -15,7 +15,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let bytes = cp.serialize();
-    let cp2 = Checkpoint::deserialize(&bytes)
-        .expect("freshly serialized checkpoint must deserialize");
-    assert_eq!(cp, cp2, "Checkpoint serialize/deserialize round-trip mismatch");
+    let cp2 =
+        Checkpoint::deserialize(&bytes).expect("freshly serialized checkpoint must deserialize");
+    assert_eq!(
+        cp, cp2,
+        "Checkpoint serialize/deserialize round-trip mismatch"
+    );
 });

@@ -185,6 +185,24 @@ impl StreamingDecoder for Decoder {
     }
 }
 
+/// [`crate::decode::DecoderFactory`] adapter for [`Decoder`].
+///
+/// Same shape as
+/// [`super::xz_native::factory`]; lets the fuzz harness +
+/// bench grid plug the port decoder in via the same trait
+/// object as the production decoder. Not registered by
+/// [`crate::decode::DecoderRegistry::with_defaults`] —
+/// integration into the production path is gated on
+/// Phase 8 / 9.
+///
+/// # Errors
+///
+/// Forwards any error returned by [`Decoder::new`] (currently
+/// none).
+pub fn factory(src: Box<dyn Read + Send>) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+    Ok(Box::new(Decoder::new(src)?))
+}
+
 /// Validate the .xz framing around `compressed`, dispatch the
 /// Block body through [`Lzma2Decoder`], write the decoded
 /// payload to `sink`. Round-one: single-Block only.
