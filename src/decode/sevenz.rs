@@ -38,7 +38,15 @@
 //! - [`header::parse_decoded_header`] for the bytes produced by
 //!   running an `EncodedHeader`'s folder through the §6 folder
 //!   decoder; rejects nested encoded headers.
+//!
+//! # Phase 4 (`docs/PLAN_7z_support.md` §4)
+//!
+//! [`coders`] holds the [`coders::CoderImpl`] dispatch surface
+//! and the round-one COPY / DEFLATE coders. LZMA / LZMA2 land
+//! in §5 and slot into the same [`coders::dispatch`] match arm
+//! without changing any caller.
 
+pub mod coders;
 pub mod format;
 pub mod header;
 pub mod number;
