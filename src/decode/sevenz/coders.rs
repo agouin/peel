@@ -4,15 +4,19 @@
 //! Implements §4 of `docs/PLAN_7z_support.md` (COPY + DEFLATE)
 //! and provides the dispatch surface §5 plugs LZMA / LZMA2 into.
 //!
-//! The `CoderImpl` trait is object-safe (`Box<dyn Read + Send>`
-//! source, `&mut dyn Write` sink) so the §6 folder decoder can
-//! keep a chain of coders in a `Vec<Box<dyn CoderImpl>>` and
-//! run them in order. Owning the source matches what every
-//! in-tree single-format decoder ([`crate::decode::deflate_native`],
-//! [`crate::decode::xz_liblzma`], …) already takes — handing
-//! over ownership avoids both lifetime gymnastics on borrowed
-//! readers and the `unsafe` raw-pointer adapter that would
-//! otherwise be needed.
+//! The `CoderImpl` trait is object-safe (`&mut dyn Read` source,
+//! `&mut dyn Write` sink) so the §6 folder decoder can keep a
+//! chain of coders in a `Vec<Box<dyn CoderImpl>>` and run them
+//! in order. The borrowed-source shape lets the COPY hot path
+//! stream straight from the sparse file (no 256 MiB intermediate
+//! `Vec`) — that pull was the dominant cost in the §10 round-one
+//! 4× wall-clock gap at 10 Gbps × 256 MiB. DEFLATE wraps the
+//! borrowed reader in a small `unsafe` lifetime-extension
+//! adapter to satisfy
+//! [`crate::decode::deflate_native::Decoder::new`]'s owned-source
+//! constructor; the wrapper is constructed and dropped inside
+//! the same `decode_one_block` call, so the borrow it holds is
+//! valid for the whole decoder lifetime.
 //!
 //! # Round-one coder set
 //!
@@ -187,7 +191,7 @@ pub trait CoderImpl: Send {
     ///   produces fewer or more bytes than declared.
     fn decode_one_block(
         &mut self,
-        src: Box<dyn Read + Send>,
+        src: &mut dyn Read,
         dst: &mut dyn Write,
         expected_unpack_size: u64,
     ) -> Result<(), CoderError>;
@@ -260,11 +264,11 @@ struct CopyCoder;
 impl CoderImpl for CopyCoder {
     fn decode_one_block(
         &mut self,
-        mut src: Box<dyn Read + Send>,
+        src: &mut dyn Read,
         dst: &mut dyn Write,
         expected_unpack_size: u64,
     ) -> Result<(), CoderError> {
-        let copied = io::copy(&mut src, dst)?;
+        let copied = io::copy(src, dst)?;
         if copied != expected_unpack_size {
             return Err(CoderError::UnpackSizeMismatch {
                 coder: "copy",
@@ -288,11 +292,18 @@ struct DeflateCoder;
 impl CoderImpl for DeflateCoder {
     fn decode_one_block(
         &mut self,
-        src: Box<dyn Read + Send>,
+        src: &mut dyn Read,
         dst: &mut dyn Write,
         expected_unpack_size: u64,
     ) -> Result<(), CoderError> {
-        let mut decoder = DeflateDecoder::new(src).map_err(map_decode_err)?;
+        // [`DeflateDecoder::new`] takes `Box<dyn Read + Send +
+        // 'static>`. Wrap the borrowed `src` in a tiny adapter
+        // that lifetime-extends the borrow; the adapter is
+        // owned by the [`DeflateDecoder`] which is dropped
+        // before this function returns, so the borrow it holds
+        // is valid for the entire decoder lifetime.
+        let owned: Box<dyn Read + Send> = Box::new(BorrowedReadAdapter::new(src));
+        let mut decoder = DeflateDecoder::new(owned).map_err(map_decode_err)?;
         let mut counting = CountingWriter {
             inner: dst,
             count: 0,
@@ -315,6 +326,76 @@ impl CoderImpl for DeflateCoder {
     }
 }
 
+/// Owned `Read + Send + 'static` adapter that delegates to a
+/// borrowed `&mut dyn Read`.
+///
+/// Used by [`DeflateCoder`] to feed
+/// [`crate::decode::deflate_native::Decoder::new`] (which takes
+/// an owned `Box<dyn Read + Send>`) without an intermediate
+/// `Vec<u8>` slurp of the entire packed stream.
+///
+/// # Safety
+///
+/// The struct holds a raw pointer to a `dyn Read` whose
+/// referent is bounded by the calling stack frame. Constructing
+/// it requires a `&mut dyn Read` (so the borrow is alive at
+/// construction); the only consumer
+/// ([`DeflateCoder::decode_one_block`]) keeps the adapter
+/// inside a `DeflateDecoder` that is created *and* consumed
+/// inside the same function, so the adapter never outlives the
+/// borrow.
+///
+/// `Send` is sound because the entire lifecycle stays on a
+/// single thread (the §6 folder decoder calls
+/// `decode_one_block` synchronously); the `Send` claim only
+/// satisfies the `Box<dyn Read + Send>` bound the
+/// `DeflateDecoder` constructor wants.
+struct BorrowedReadAdapter {
+    inner: std::ptr::NonNull<dyn Read + 'static>,
+}
+
+impl BorrowedReadAdapter {
+    /// Wrap the borrowed reader. The caller must ensure the
+    /// adapter is dropped before `inner`'s borrow expires;
+    /// inside [`DeflateCoder::decode_one_block`] this is
+    /// guaranteed by the `DeflateDecoder` drop ordering.
+    fn new(inner: &mut dyn Read) -> Self {
+        // SAFETY: we lifetime-extend `inner`'s borrow to
+        // `'static` solely to satisfy the
+        // `Box<dyn Read + Send>` (= `+ 'static`) bound on
+        // [`crate::decode::deflate_native::Decoder::new`]. The
+        // type-level safety doc on [`Self`] guarantees the
+        // adapter never outlives the real borrow — it is
+        // constructed and dropped inside the same
+        // `decode_one_block` call. NonNull::new_unchecked is
+        // sound because `inner` is a live mutable reference.
+        let static_ptr: *mut (dyn Read + 'static) =
+            unsafe { std::mem::transmute::<*mut dyn Read, *mut (dyn Read + 'static)>(inner) };
+        let ptr = unsafe { std::ptr::NonNull::new_unchecked(static_ptr) };
+        Self { inner: ptr }
+    }
+}
+
+// SAFETY: the adapter is single-threaded by construction (see
+// the type's `# Safety` doc) — the `Send` claim is what the
+// `Box<dyn Read + Send>` bound on `DeflateDecoder::new`
+// demands, not an assertion that real cross-thread movement
+// happens.
+unsafe impl Send for BorrowedReadAdapter {}
+
+impl Read for BorrowedReadAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: `self.inner` was constructed from a
+        // `&mut dyn Read` in `BorrowedReadAdapter::new`. Per
+        // the type-level safety doc, the adapter never
+        // outlives that borrow, and we are the unique holder
+        // of the pointer (the adapter owns it; no clones).
+        // Re-materializing as `&mut *` is therefore unique.
+        let r = unsafe { self.inner.as_mut() };
+        r.read(buf)
+    }
+}
+
 /// LZMA1 coder. Slurps the source into a buffer (the per-
 /// coder packed-stream slice is bounded by the §3 parser) and
 /// runs the raw LZMA1 driver from
@@ -326,7 +407,7 @@ struct LzmaCoder {
 impl CoderImpl for LzmaCoder {
     fn decode_one_block(
         &mut self,
-        mut src: Box<dyn Read + Send>,
+        src: &mut dyn Read,
         dst: &mut dyn Write,
         expected_unpack_size: u64,
     ) -> Result<(), CoderError> {
@@ -355,7 +436,7 @@ struct Lzma2Coder {
 impl CoderImpl for Lzma2Coder {
     fn decode_one_block(
         &mut self,
-        mut src: Box<dyn Read + Send>,
+        src: &mut dyn Read,
         dst: &mut dyn Write,
         expected_unpack_size: u64,
     ) -> Result<(), CoderError> {
@@ -468,10 +549,10 @@ mod tests {
     fn dispatch_copy_round_trips_bytes() {
         let mut coder = dispatched(&fake_coder(&[0x00], &[]));
         let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
-        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(payload.clone()));
+        let mut src = std::io::Cursor::new(payload.clone());
         let mut dst = Vec::new();
         coder
-            .decode_one_block(src, &mut dst, payload.len() as u64)
+            .decode_one_block(&mut src, &mut dst, payload.len() as u64)
             .expect("decodes");
         assert_eq!(dst, payload);
     }
@@ -480,9 +561,9 @@ mod tests {
     fn dispatch_copy_rejects_size_mismatch() {
         let mut coder = dispatched(&fake_coder(&[0x00], &[]));
         let payload: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
-        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(payload.clone()));
+        let mut src = std::io::Cursor::new(payload.clone());
         let mut dst = Vec::new();
-        match coder.decode_one_block(src, &mut dst, payload.len() as u64 + 5) {
+        match coder.decode_one_block(&mut src, &mut dst, payload.len() as u64 + 5) {
             Err(CoderError::UnpackSizeMismatch {
                 coder,
                 expected,
@@ -533,10 +614,10 @@ mod tests {
         }
 
         let mut coder = dispatched(&fake_coder(&[0x04, 0x01, 0x08], &[]));
-        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(encoded));
+        let mut src = std::io::Cursor::new(encoded);
         let mut dst = Vec::new();
         coder
-            .decode_one_block(src, &mut dst, plaintext.len() as u64)
+            .decode_one_block(&mut src, &mut dst, plaintext.len() as u64)
             .expect("decodes");
         assert_eq!(dst, plaintext);
     }
@@ -556,9 +637,9 @@ mod tests {
         }
 
         let mut coder = dispatched(&fake_coder(&[0x04, 0x01, 0x08], &[]));
-        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(encoded));
+        let mut src = std::io::Cursor::new(encoded);
         let mut dst = Vec::new();
-        match coder.decode_one_block(src, &mut dst, 999) {
+        match coder.decode_one_block(&mut src, &mut dst, 999) {
             Err(CoderError::UnpackSizeMismatch { coder, .. }) => assert_eq!(coder, "deflate"),
             Ok(_) => panic!("expected UnpackSizeMismatch, got Ok"),
             Err(other) => panic!("expected UnpackSizeMismatch, got {other:?}"),
@@ -626,10 +707,10 @@ mod tests {
         let payload = encoded[13..].to_vec();
 
         let mut coder = dispatched(&fake_coder(&[0x03, 0x01, 0x01], &props));
-        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(payload));
+        let mut src = std::io::Cursor::new(payload);
         let mut dst = Vec::new();
         coder
-            .decode_one_block(src, &mut dst, plaintext.len() as u64)
+            .decode_one_block(&mut src, &mut dst, plaintext.len() as u64)
             .expect("decodes");
         assert_eq!(dst, plaintext);
     }
@@ -652,10 +733,10 @@ mod tests {
 
         // Props byte 0 → dict_size = 4 KiB (smallest LZMA2 dict).
         let mut coder = dispatched(&fake_coder(&[0x21], &[0]));
-        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(encoded));
+        let mut src = std::io::Cursor::new(encoded);
         let mut dst = Vec::new();
         coder
-            .decode_one_block(src, &mut dst, plaintext.len() as u64)
+            .decode_one_block(&mut src, &mut dst, plaintext.len() as u64)
             .expect("decodes");
         assert_eq!(dst, plaintext);
     }

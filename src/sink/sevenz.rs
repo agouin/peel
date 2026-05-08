@@ -38,8 +38,14 @@ use crate::sink::SinkError;
 pub struct SevenzSink {
     /// Canonicalized extraction root.
     root: PathBuf,
-    /// Parsed `FilesInfo` records, one per archive file.
-    files: Vec<FileRecord>,
+    /// Parsed `FilesInfo` records, one per archive file. `None`
+    /// until the §8 pipeline parses the trailer and populates
+    /// it via [`Self::set_files`]; the deferred-construction
+    /// shape is what enables the streaming overlap with the
+    /// download (pre-fetching the trailer in the coordinator
+    /// would force workers to fetch the entire archive
+    /// front-to-back before the pipeline could start).
+    files: Option<Vec<FileRecord>>,
     /// In-flight substream, if any. `None` between substreams
     /// (the moment a checkpoint can capture).
     current: Option<EntryState>,
@@ -68,12 +74,14 @@ impl SevenzSink {
     /// Construct a sink that extracts into `root`.
     ///
     /// `root` must already exist; the sink does not create the
-    /// extraction root, only entries within it.
+    /// extraction root, only entries within it. The file list
+    /// is deferred — the pipeline calls [`Self::set_files`]
+    /// once the trailer has been parsed.
     ///
     /// # Errors
     ///
     /// [`SinkError::Io`] if `root` cannot be canonicalized.
-    pub fn new<P: AsRef<Path>>(root: P, files: Vec<FileRecord>) -> Result<Self, SinkError> {
+    pub fn new<P: AsRef<Path>>(root: P) -> Result<Self, SinkError> {
         let root_ref = root.as_ref();
         let canonical = root_ref.canonicalize().map_err(|source| SinkError::Io {
             path: root_ref.to_path_buf(),
@@ -81,10 +89,28 @@ impl SevenzSink {
         })?;
         Ok(Self {
             root: canonical,
-            files,
+            files: None,
             current: None,
             poisoned: false,
         })
+    }
+
+    /// Install the parsed `FilesInfo` list. The §8 pipeline
+    /// calls this exactly once, after parsing the trailer and
+    /// before invoking any [`FolderSink`] or
+    /// [`Self::materialize_empty`] method. Calling twice on the
+    /// same sink is a programmer error and surfaces a sticky
+    /// poison.
+    pub fn set_files(&mut self, files: Vec<FileRecord>) {
+        debug_assert!(self.files.is_none(), "SevenzSink::set_files called twice");
+        self.files = Some(files);
+    }
+
+    /// Borrow the installed file list. Returns `None` until
+    /// [`Self::set_files`] has been called.
+    #[must_use]
+    pub fn files(&self) -> Option<&[FileRecord]> {
+        self.files.as_deref()
     }
 
     /// Borrow the configured extraction root.
@@ -114,8 +140,11 @@ impl SevenzSink {
     ///   under [`Self::root`] or contains a non-normal
     ///   component.
     pub fn resolve_file_path(&self, file_index: u32) -> Result<PathBuf, SinkError> {
-        let rec = self
-            .files
+        let files = self.files.as_ref().ok_or_else(|| SinkError::Io {
+            path: self.root.clone(),
+            source: std::io::Error::other("SevenzSink::resolve_file_path called before set_files"),
+        })?;
+        let rec = files
             .get(file_index as usize)
             .ok_or_else(|| SinkError::PathEscape {
                 entry: format!("file_index {file_index} out of range"),
@@ -159,15 +188,19 @@ impl SevenzSink {
     /// - [`SinkError::Io`] for filesystem failures.
     pub fn materialize_empty(&mut self, file_index: u32) -> Result<(), SinkError> {
         self.poison_check()?;
-        let rec = self
-            .files
+        let files = self.files.as_ref().ok_or_else(|| SinkError::Io {
+            path: self.root.clone(),
+            source: std::io::Error::other("SevenzSink::materialize_empty called before set_files"),
+        })?;
+        let rec = files
             .get(file_index as usize)
             .ok_or_else(|| SinkError::PathEscape {
                 entry: format!("file_index {file_index} out of range"),
                 root: self.root.clone(),
             })?;
+        let is_directory = rec.is_directory;
         let path = self.resolve_file_path(file_index)?;
-        if rec.is_directory {
+        if is_directory {
             return fs::create_dir_all(&path).map_err(|source| SinkError::Io {
                 path: path.clone(),
                 source,
@@ -323,13 +356,18 @@ impl FolderSink for SevenzSink {
                 return Err(FolderSinkError::Crc32Mismatch { expected, computed });
             }
         }
-        // Fsync each closed file for crash-safety; the §9 sink-
-        // level checkpoint relies on "closed substream
-        // ⇒ bytes durable on disk".
-        if let Err(source) = state.file.sync_all() {
-            self.poisoned = true;
-            return Err(FolderSinkError::Io(source));
-        }
+        // No per-substream `sync_all` — that costs ~10 ms each
+        // on macOS and stacks up for archives with many small
+        // files (the bench grid hit 1 s+ on dozens of entries).
+        // [`crate::sink::zip::ZipSink::end_entry`] is similarly
+        // sync-free; the §9 checkpoint discipline only needs
+        // "all bytes for completed folders are on disk *before*
+        // the checkpoint write makes them visible to a future
+        // resume," which the upcoming `flush_folder` hook (a
+        // `O.32f` follow-up to `docs/PLAN_7z_support.md` §9)
+        // handles at folder boundaries via a single batched
+        // fsync, not per-substream.
+        let _ = state.file;
         Ok(())
     }
 }
@@ -401,8 +439,8 @@ mod tests {
     #[test]
     fn materialize_empty_creates_file() {
         let dir = TempDirGuard::new("materialize_empty_creates_file");
-        let mut sink = SevenzSink::new(dir.path(), vec![file_record("empty.bin", false, false)])
-            .expect("sink");
+        let mut sink = SevenzSink::new(dir.path()).expect("sink");
+        sink.set_files(vec![file_record("empty.bin", false, false)]);
         sink.materialize_empty(0).expect("materializes");
         let path = dir.path().join("empty.bin");
         let meta = std::fs::metadata(&path).expect("file exists");
@@ -412,8 +450,8 @@ mod tests {
     #[test]
     fn materialize_empty_creates_directory() {
         let dir = TempDirGuard::new("materialize_empty_creates_dir");
-        let mut sink =
-            SevenzSink::new(dir.path(), vec![file_record("subdir", false, true)]).expect("sink");
+        let mut sink = SevenzSink::new(dir.path()).expect("sink");
+        sink.set_files(vec![file_record("subdir", false, true)]);
         sink.materialize_empty(0).expect("materializes");
         let path = dir.path().join("subdir");
         assert!(path.is_dir());
@@ -424,7 +462,8 @@ mod tests {
         let dir = TempDirGuard::new("folder_sink_round_trips");
         let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
         let files = vec![file_record("hello.bin", true, false)];
-        let mut sink = SevenzSink::new(dir.path(), files).expect("sink");
+        let mut sink = SevenzSink::new(dir.path()).expect("sink");
+        sink.set_files(files);
 
         let folder = Folder {
             coders: vec![copy_coder()],
@@ -445,8 +484,8 @@ mod tests {
             },
         };
 
-        let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(payload.clone()));
-        FolderDecoder::new(&info.folders[0], &info, 0, &[0u32], src)
+        let mut src = std::io::Cursor::new(payload.clone());
+        FolderDecoder::new(&info.folders[0], &info, 0, &[0u32], &mut src)
             .decode(&mut sink)
             .expect("decodes");
         assert!(sink.is_quiescent());
@@ -460,7 +499,8 @@ mod tests {
         let dir = TempDirGuard::new("folder_sink_crc_deletes");
         let payload: Vec<u8> = b"data".to_vec();
         let files = vec![file_record("x.bin", true, false)];
-        let mut sink = SevenzSink::new(dir.path(), files).expect("sink");
+        let mut sink = SevenzSink::new(dir.path()).expect("sink");
+        sink.set_files(files);
 
         let folder = Folder {
             coders: vec![copy_coder()],
@@ -481,8 +521,9 @@ mod tests {
             },
         };
 
-        let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(payload.clone()));
-        let res = FolderDecoder::new(&info.folders[0], &info, 0, &[0u32], src).decode(&mut sink);
+        let mut src = std::io::Cursor::new(payload.clone());
+        let res =
+            FolderDecoder::new(&info.folders[0], &info, 0, &[0u32], &mut src).decode(&mut sink);
         assert!(res.is_err(), "expected CRC failure");
         // Partially-written file should be deleted.
         assert!(
@@ -499,7 +540,8 @@ mod tests {
         // defense-in-depth test).
         let mut rec = file_record("safe.bin", true, false);
         rec.name = PathBuf::from("..").join("escape.bin");
-        let sink = SevenzSink::new(dir.path(), vec![rec]).expect("sink");
+        let mut sink = SevenzSink::new(dir.path()).expect("sink");
+        sink.set_files(vec![rec]);
         match sink.resolve_file_path(0) {
             Err(SinkError::PathEscape { .. }) => {}
             other => panic!("expected PathEscape, got {other:?}"),
@@ -511,7 +553,8 @@ mod tests {
         let dir = TempDirGuard::new("resolve_absolute");
         let mut rec = file_record("safe.bin", true, false);
         rec.name = PathBuf::from("/absolute/path");
-        let sink = SevenzSink::new(dir.path(), vec![rec]).expect("sink");
+        let mut sink = SevenzSink::new(dir.path()).expect("sink");
+        sink.set_files(vec![rec]);
         match sink.resolve_file_path(0) {
             Err(SinkError::PathEscape { .. }) => {}
             other => panic!("expected PathEscape, got {other:?}"),

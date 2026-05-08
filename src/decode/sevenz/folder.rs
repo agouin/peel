@@ -113,14 +113,17 @@ pub enum FolderSinkError {
 
 /// Streaming decoder for one [`Folder`].
 ///
-/// Owns the packed-bytes source. Constructed by
-/// [`Self::new`], consumed by [`Self::decode`].
+/// Borrows the packed-bytes source via `&mut dyn Read`. The
+/// borrowed shape lets the §8 pipeline stream straight from the
+/// sparse file (no intermediate `Vec<u8>` of the whole packed
+/// range) — which is the difference between ~250 ms and ~10 ms
+/// of overhead on a 256 MiB single-folder COPY archive.
 pub struct FolderDecoder<'a> {
     folder: &'a Folder,
     streams_info: &'a StreamsInfo,
     folder_idx: u32,
     file_indices_for_folder: &'a [u32],
-    packed_bytes: Box<dyn Read + Send>,
+    packed_bytes: &'a mut dyn Read,
 }
 
 impl<'a> FolderDecoder<'a> {
@@ -138,7 +141,7 @@ impl<'a> FolderDecoder<'a> {
         streams_info: &'a StreamsInfo,
         folder_idx: u32,
         file_indices_for_folder: &'a [u32],
-        packed_bytes: Box<dyn Read + Send>,
+        packed_bytes: &'a mut dyn Read,
     ) -> Self {
         Self {
             folder,
@@ -235,13 +238,15 @@ impl<'a> FolderDecoder<'a> {
             });
         }
 
-        // Run the chain. `current` is the source of the next
-        // coder; each intermediate stage replaces it with a
-        // `Cursor` over its decoded output. The last coder
-        // streams directly into the splitter — both paths
-        // unify when `coder_count == 1`, which skips the
-        // intermediate-stage loop entirely.
-        let mut current: Box<dyn Read + Send> = self.packed_bytes;
+        // Run the chain. The first coder reads from
+        // `self.packed_bytes` (a borrowed `&mut dyn Read`,
+        // typically over the sparse file). Intermediate stages
+        // produce a `Vec<u8>` and the next coder reads from a
+        // `Cursor` over it. The last coder streams directly
+        // into the splitter — both paths unify when
+        // `coder_count == 1`, which skips the buffered loop
+        // entirely.
+        let mut intermediate: Option<Cursor<Vec<u8>>> = None;
         if coder_count > 1 {
             for (i, coder) in self.folder.coders[..coder_count - 1].iter().enumerate() {
                 let coder_size = self.folder.unpack_sizes.get(i).copied().ok_or_else(|| {
@@ -251,10 +256,12 @@ impl<'a> FolderDecoder<'a> {
                 })?;
                 let mut coder_impl = dispatch(coder).map_err(coder_err_to_sevenz)?;
                 let mut buf: Vec<u8> = Vec::with_capacity(coder_size as usize);
-                coder_impl
-                    .decode_one_block(current, &mut buf, coder_size)
-                    .map_err(coder_err_to_sevenz)?;
-                current = Box::new(Cursor::new(buf));
+                let res = match intermediate.as_mut() {
+                    None => coder_impl.decode_one_block(self.packed_bytes, &mut buf, coder_size),
+                    Some(cur) => coder_impl.decode_one_block(cur, &mut buf, coder_size),
+                };
+                res.map_err(coder_err_to_sevenz)?;
+                intermediate = Some(Cursor::new(buf));
             }
         }
         let last_idx = coder_count - 1;
@@ -271,9 +278,11 @@ impl<'a> FolderDecoder<'a> {
                 })?
         };
         let mut last_impl = dispatch(last_coder).map_err(coder_err_to_sevenz)?;
-        last_impl
-            .decode_one_block(current, &mut splitter, last_size)
-            .map_err(coder_err_to_sevenz)?;
+        let res = match intermediate.as_mut() {
+            None => last_impl.decode_one_block(self.packed_bytes, &mut splitter, last_size),
+            Some(cur) => last_impl.decode_one_block(cur, &mut splitter, last_size),
+        };
+        res.map_err(coder_err_to_sevenz)?;
 
         splitter.finish_last_substream()?;
         splitter.validate_folder_crc()?;
@@ -549,8 +558,8 @@ mod tests {
         };
 
         let mut sink = VecSink::new();
-        let src: Box<dyn Read + Send> = Box::new(Cursor::new(payload.clone()));
-        FolderDecoder::new(&info.folders[0], &info, 0, &[42u32], src)
+        let mut src = Cursor::new(payload.clone());
+        FolderDecoder::new(&info.folders[0], &info, 0, &[42u32], &mut src)
             .decode(&mut sink)
             .expect("decodes");
         assert_eq!(sink.substreams.len(), 1);
@@ -580,8 +589,8 @@ mod tests {
         };
 
         let mut sink = VecSink::new();
-        let src: Box<dyn Read + Send> = Box::new(Cursor::new(payload.clone()));
-        FolderDecoder::new(&info.folders[0], &info, 0, &[10u32, 20u32], src)
+        let mut src = Cursor::new(payload.clone());
+        FolderDecoder::new(&info.folders[0], &info, 0, &[10u32, 20u32], &mut src)
             .decode(&mut sink)
             .expect("decodes");
         assert_eq!(sink.substreams.len(), 2);
@@ -613,8 +622,8 @@ mod tests {
         };
 
         let mut sink = VecSink::new();
-        let src: Box<dyn Read + Send> = Box::new(Cursor::new(payload.clone()));
-        FolderDecoder::new(&info.folders[0], &info, 0, &[1u32], src)
+        let mut src = Cursor::new(payload.clone());
+        FolderDecoder::new(&info.folders[0], &info, 0, &[1u32], &mut src)
             .decode(&mut sink)
             .expect("decodes");
         assert_eq!(sink.substreams[0], payload);
@@ -643,8 +652,8 @@ mod tests {
         };
 
         let mut sink = VecSink::new();
-        let src: Box<dyn Read + Send> = Box::new(Cursor::new(payload));
-        match FolderDecoder::new(&info.folders[0], &info, 0, &[1u32], src).decode(&mut sink) {
+        let mut src = Cursor::new(payload);
+        match FolderDecoder::new(&info.folders[0], &info, 0, &[1u32], &mut src).decode(&mut sink) {
             Err(SevenzError::CorruptHeader { reason }) => {
                 assert!(reason.contains("folder CRC32"), "got {reason}");
             }
@@ -676,8 +685,8 @@ mod tests {
         };
 
         let mut sink = VecSink::new();
-        let src: Box<dyn Read + Send> = Box::new(Cursor::new(payload));
-        match FolderDecoder::new(&info.folders[0], &info, 0, &[1u32], src).decode(&mut sink) {
+        let mut src = Cursor::new(payload);
+        match FolderDecoder::new(&info.folders[0], &info, 0, &[1u32], &mut src).decode(&mut sink) {
             Err(SevenzError::CorruptHeader { reason }) => {
                 assert!(reason.contains("CRC32"), "got {reason}");
             }
@@ -714,8 +723,8 @@ mod tests {
         };
 
         let mut sink = VecSink::new();
-        let src: Box<dyn Read + Send> = Box::new(Cursor::new(payload.clone()));
-        FolderDecoder::new(&info.folders[0], &info, 0, &[7u32], src)
+        let mut src = Cursor::new(payload.clone());
+        FolderDecoder::new(&info.folders[0], &info, 0, &[7u32], &mut src)
             .decode(&mut sink)
             .expect("decodes");
         assert_eq!(sink.substreams[0], payload);

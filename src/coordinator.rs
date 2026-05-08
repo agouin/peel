@@ -2596,17 +2596,19 @@ fn run_sevenz(
         },
     };
 
-    // The §7 sink needs the parsed FilesInfo at construction
-    // time. Round-one strategy: reach into the sparse file
-    // post-fetch and parse the trailer ourselves so the sink
-    // has a file list. The §8 pipeline re-parses when it runs,
-    // which is cheap (the trailer is small).
-    //
-    // This twice-parsing is worth a follow-on cleanup but it
-    // keeps the §10 wire-up small and the boundary between
-    // pipeline + coordinator clean.
-    let files = parse_sevenz_files_for_sink(sparse, total_size, bitmap, chunk_size)?;
-    let mut sink = SevenzSink::new(output_dir, files).map_err(CoordinatorError::Sink)?;
+    // Construct the sink without a file list — the §8 pipeline
+    // installs it via `set_files` after parsing the trailer
+    // (which it can do *while* workers stream the rest of the
+    // archive in parallel). Pre-parsing the trailer here would
+    // have to wait for the trailer's chunks to land first, but
+    // without cursor-steering knowledge the workers download
+    // byte-0-forward — so the wait would block on the entire
+    // archive instead of just the trailer, and we'd lose the
+    // streaming overlap that drives the wall-clock win at
+    // higher bandwidths. Push the trailer fetch into the
+    // pipeline where the cursor steering is already wired
+    // (`docs/PLAN_7z_support.md` §8 step 1).
+    let mut sink = SevenzSink::new(output_dir).map_err(CoordinatorError::Sink)?;
 
     let pipeline_cfg = SevenzPipelineConfig {
         total_size,
@@ -2637,88 +2639,6 @@ fn run_sevenz(
         Err(SevenzPipelineError::Sparse(e)) => Err(CoordinatorError::SparseFile(e)),
         Err(other) => Err(CoordinatorError::SevenzPipeline(other)),
     }
-}
-
-/// Read + parse the 7z trailer out of `sparse` to recover the
-/// FilesInfo list the sink needs at construction. Used by
-/// [`run_sevenz`].
-fn parse_sevenz_files_for_sink(
-    sparse: &SparseFile,
-    total_size: u64,
-    bitmap: &ChunkBitmap,
-    chunk_size: u64,
-) -> Result<Vec<crate::decode::sevenz::header::FileRecord>, CoordinatorError> {
-    use crate::decode::sevenz::format::{parse_signature_header, SIGNATURE_HEADER_LEN};
-    use crate::decode::sevenz::header::{parse_trailer, Trailer};
-
-    // Wait for byte range 0..32 in the bitmap.
-    wait_for_range_simple(bitmap, chunk_size, 0, SIGNATURE_HEADER_LEN as u64)?;
-    let mut sig_buf = [0u8; SIGNATURE_HEADER_LEN];
-    sparse
-        .read_exact_at(ByteOffset::ZERO, &mut sig_buf)
-        .map_err(CoordinatorError::SparseFile)?;
-    let sig = parse_signature_header(&sig_buf).map_err(CoordinatorError::Sevenz)?;
-    let (start, len) = sig
-        .trailer_range(total_size)
-        .map_err(CoordinatorError::Sevenz)?;
-    wait_for_range_simple(bitmap, chunk_size, start, start + len)?;
-    let mut trailer = vec![0u8; len as usize];
-    sparse
-        .read_exact_at(ByteOffset::new(start), &mut trailer)
-        .map_err(CoordinatorError::SparseFile)?;
-    match parse_trailer(&trailer).map_err(CoordinatorError::Sevenz)? {
-        Trailer::Plain(h) => Ok(h.files),
-        Trailer::Encoded { .. } => {
-            // Round-one EncodedHeader handling is inside the
-            // pipeline. The sink only needs files; for
-            // EncodedHeader archives we'd have to run the
-            // embedded folder here too, which duplicates
-            // pipeline work. For now, return an empty list and
-            // surface a helpful error so the user knows what
-            // hit.
-            Err(CoordinatorError::Sevenz(
-                crate::sevenz::SevenzError::UnsupportedFeature {
-                    feature: "EncodedHeader archives via run_sevenz \
-                          (round-one minimum-viable wiring \
-                          handles plain Header only — file a \
-                          §10 follow-up to share the trailer \
-                          parse with the pipeline)"
-                        .into(),
-                },
-            ))
-        }
-    }
-}
-
-/// Trivial bitmap-wait used by the trailer pre-fetch in
-/// [`parse_sevenz_files_for_sink`]. Unlike the pipeline's
-/// `wait_for_range`, this one does not poll the
-/// `download_done` flag — it's only called from the
-/// coordinator after the sparse file has been fully
-/// downloaded.
-fn wait_for_range_simple(
-    bitmap: &ChunkBitmap,
-    chunk_size: u64,
-    start: u64,
-    end: u64,
-) -> Result<(), CoordinatorError> {
-    if end <= start || chunk_size == 0 {
-        return Ok(());
-    }
-    let first = start / chunk_size;
-    let last = (end - 1) / chunk_size;
-    for c in first..=last {
-        let idx = u32::try_from(c).map_err(|_| CoordinatorError::SourceChanged {
-            reason: format!("chunk index {c} exceeds u32"),
-        })?;
-        loop {
-            if bitmap.is_complete(ChunkIndex::new(idx)) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-    Ok(())
 }
 
 /// Translate a [`SevenzExtractionStats`] into the wider

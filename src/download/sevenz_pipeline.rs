@@ -252,6 +252,20 @@ impl SevenzPipeline<'_> {
 
         let header = self.parse_full_header(&signature, &trailer_bytes)?;
 
+        // Install the parsed file list on the sink. The
+        // coordinator constructs the sink with no files (since
+        // the trailer hadn't been parsed yet); we hand it over
+        // here so begin_substream / materialize_empty can
+        // resolve paths. Constructing the sink later, after
+        // trailer parse, would force the coordinator to wait
+        // for trailer chunks to land before workers had any
+        // priority signal — which serializes the download
+        // (workers walk byte 0 → end) ahead of any extraction
+        // and kills the streaming overlap. Doing it here lets
+        // workers prioritize the trailer (per cursor steering
+        // above) AND the early pack data in parallel.
+        sink.set_files(header.files.clone());
+
         let folder_count = header
             .main_streams
             .as_ref()
@@ -318,23 +332,24 @@ impl SevenzPipeline<'_> {
                 self.cursor.store(start, Ordering::Release);
                 self.wait_for_range(start, end)?;
 
-                // Slurp the packed bytes into a Vec so the
-                // boxed `Read + Send + 'static` source the §4
-                // CoderImpl trait expects can be materialized
-                // without lifetime gymnastics. Round-one's
-                // memory budget allows this; mid-folder
-                // streaming + bounded-buffer decode is `O.32c`.
-                let mut packed_buf = vec![0u8; pack_size as usize];
-                self.sparse
-                    .read_exact_at(ByteOffset::new(start), &mut packed_buf)
-                    .map_err(SevenzPipelineError::Sparse)?;
+                // Stream the packed bytes straight from the
+                // sparse file via a 64 KiB-buffered pread
+                // adapter. Earlier round-one slurped the entire
+                // pack range into a Vec to satisfy a `Box<dyn
+                // Read + Send + 'static>` parameter; that
+                // 256 MiB-or-larger allocation+copy was the
+                // dominant overhead in the §10 wall-clock gap.
+                // Now the §4 CoderImpl trait takes a borrowed
+                // `&mut dyn Read` and we hand it a slice
+                // reader that pread's chunks on demand.
+                let mut packed_reader = SparseFileSliceReader::new(self.sparse, start, pack_size);
                 let file_indices = header.folder_to_files.get(i).cloned().unwrap_or_default();
                 let decoder = FolderDecoder::new(
                     &streams.folders[i],
                     streams,
                     idx,
                     &file_indices,
-                    Box::new(std::io::Cursor::new(packed_buf)),
+                    &mut packed_reader,
                 );
                 decoder
                     .decode(sink)
@@ -439,21 +454,21 @@ impl SevenzPipeline<'_> {
         // Wait for the embedded folder's packed range to land.
         self.cursor.store(inner_start, Ordering::Release);
         self.wait_for_range(inner_start, inner_end)?;
-        let mut packed_buf = vec![0u8; inner_size as usize];
-        self.sparse
-            .read_exact_at(ByteOffset::new(inner_start), &mut packed_buf)
-            .map_err(SevenzPipelineError::Sparse)?;
+
+        // The EncodedHeader's folder is small (a compressed
+        // copy of the trailer); stream it via the same slice
+        // reader the main folder loop uses.
+        let mut packed_reader = SparseFileSliceReader::new(self.sparse, inner_start, inner_size);
 
         // Run the embedded folder decoder against an in-memory
-        // sink that just collects bytes. The embedded header is
-        // tiny so allocating is fine.
+        // sink that just collects bytes.
         let mut collector = HeaderCollectorSink::default();
         FolderDecoder::new(
             &streams.folders[0],
             streams,
             0,
             &[u32::MAX], // dummy file index (not used by collector)
-            Box::new(std::io::Cursor::new(packed_buf)),
+            &mut packed_reader,
         )
         .decode(&mut collector)
         .map_err(SevenzPipelineError::FolderDecode)?;
@@ -544,6 +559,46 @@ impl SevenzPipeline<'_> {
             }
             Err(other) => Err(SevenzPipelineError::Sparse(other)),
         }
+    }
+}
+
+/// `Read` adapter over a fixed-length range of a `SparseFile`.
+/// Each `read` issues one `pread_at` for up to the caller's
+/// requested byte count, capped at the remaining range.
+///
+/// Used by the §8 pipeline to stream a folder's packed bytes
+/// into the §6 [`FolderDecoder`] without materializing the
+/// entire range as a `Vec<u8>` first. For multi-GiB folders
+/// that's the difference between an extra 256 MiB+ allocation
+/// (and zero-init + memcpy) and roughly nothing.
+struct SparseFileSliceReader<'a> {
+    sparse: &'a SparseFile,
+    cursor: u64,
+    end: u64,
+}
+
+impl<'a> SparseFileSliceReader<'a> {
+    fn new(sparse: &'a SparseFile, start: u64, len: u64) -> Self {
+        Self {
+            sparse,
+            cursor: start,
+            end: start.saturating_add(len),
+        }
+    }
+}
+
+impl io::Read for SparseFileSliceReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.end.saturating_sub(self.cursor);
+        if remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let take = (buf.len() as u64).min(remaining) as usize;
+        self.sparse
+            .read_exact_at(ByteOffset::new(self.cursor), &mut buf[..take])
+            .map_err(io::Error::other)?;
+        self.cursor += take as u64;
+        Ok(take)
     }
 }
 
@@ -795,11 +850,10 @@ mod tests {
         let _g_sparse = CleanupOnDrop(sparse_path.clone());
         let cursor = Arc::new(AtomicU64::new(0));
 
-        let files = match parse_trailer_for_files(&archive) {
-            Some(f) => f,
-            None => panic!("trailer parse failed"),
-        };
-        let mut sink = SevenzSink::new(&root, files).expect("sink");
+        // The pipeline now installs the file list on the sink
+        // after parsing the trailer; tests just hand it an
+        // empty sink and let `pipeline.run` populate it.
+        let mut sink = SevenzSink::new(&root).expect("sink");
 
         let pipeline = SevenzPipeline {
             config: SevenzPipelineConfig {
@@ -829,21 +883,7 @@ mod tests {
         assert_eq!(read_a, payload_a);
         let read_b = std::fs::read(root.join("b.bin")).expect("b.bin");
         assert_eq!(read_b, payload_b);
-    }
-
-    /// Helper: parse the archive's trailer (offline) to recover
-    /// the file list the sink needs at construction time. Real
-    /// callers do this after the pipeline reads the trailer
-    /// off the wire; for tests we have the bytes in hand.
-    fn parse_trailer_for_files(
-        archive: &[u8],
-    ) -> Option<Vec<crate::decode::sevenz::header::FileRecord>> {
-        let sig = parse_signature_header(&archive[..32]).ok()?;
-        let (start, len) = sig.trailer_range(archive.len() as u64).ok()?;
-        let trailer = &archive[start as usize..(start + len) as usize];
-        match parse_trailer(trailer).ok()? {
-            Trailer::Plain(h) => Some(h.files),
-            Trailer::Encoded { .. } => None,
-        }
+        // The sink received the file list from the pipeline.
+        assert!(sink.files().is_some());
     }
 }
