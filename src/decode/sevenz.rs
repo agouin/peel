@@ -53,8 +53,18 @@
 //! [`crate::decode::xz_liblzma::raw`]. The xz_liblzma side
 //! exposes new `decode_lzma1_raw` / `decode_lzma2_raw` entry
 //! points the §6 folder decoder will drive once it lands.
+//!
+//! # Phase 6 (`docs/PLAN_7z_support.md` §6)
+//!
+//! [`folder`] ties §4 + §5 together: [`folder::FolderDecoder`]
+//! takes a parsed [`header::Folder`] (linear coder chain) plus
+//! a packed-bytes source and feeds the decoded substream bytes
+//! into a [`folder::FolderSink`] in substream order. Per-folder
+//! CRC32 is validated at end-of-folder; the sink owns
+//! per-substream CRC validation.
 
 pub mod coders;
+pub mod folder;
 pub mod format;
 pub mod header;
 pub mod number;
