@@ -25,6 +25,20 @@
 //! magic, ArchiveVersion, StartHeaderCRC validation, and the
 //! trailer location the §8 pipeline drives the next ranged GET
 //! against.
+//!
+//! # Phase 3 (`docs/PLAN_7z_support.md` §3)
+//!
+//! [`header`] decodes the trailer the §2 parser pointed at into
+//! a typed [`header::Header`] / [`header::StreamsInfo`] /
+//! [`header::FileRecord`] tree. Two entry points cover the two
+//! trailer shapes:
+//!
+//! - [`header::parse_trailer`] for the outermost trailer, which
+//!   may be a plain `Header` or an `EncodedHeader`.
+//! - [`header::parse_decoded_header`] for the bytes produced by
+//!   running an `EncodedHeader`'s folder through the §6 folder
+//!   decoder; rejects nested encoded headers.
 
 pub mod format;
+pub mod header;
 pub mod number;

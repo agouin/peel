@@ -284,16 +284,19 @@ fn sanitize_name(name: &str) -> Result<PathBuf, SevenzError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod tests_support {
+    //! Test-only helpers shared with sibling test modules
+    //! (notably `header::tests`, which needs the same
+    //! `encode_number` to construct hand-built trailers).
 
     /// Re-encode `value` to its canonical 7z `Number` byte
     /// sequence. Picks the smallest size that fits.
     ///
     /// Only used by the test suite — production code never
-    /// emits a `Number`. Matches the parser by construction
-    /// because both follow `DOC/7zFormat.txt` directly.
-    fn encode_number(value: u64) -> Vec<u8> {
+    /// emits a `Number`. Matches
+    /// [`super::parse_number`] by construction because both
+    /// follow `DOC/7zFormat.txt` directly.
+    pub fn encode_number_helper(value: u64) -> Vec<u8> {
         if value < (1u64 << 7) {
             return vec![value as u8];
         }
@@ -306,10 +309,6 @@ mod tests {
             };
             if value <= max {
                 let leading_ones = size - 1;
-                // Top `leading_ones` bits set; the bit immediately
-                // below is the sentinel 0; the lowest `8 - size`
-                // bits of the header byte hold the high bits of
-                // the value.
                 let header_top = ((1u8 << leading_ones) - 1) << (8 - leading_ones);
                 let high_value = value >> (8 * (size as u64 - 1));
                 let header = header_top | (high_value as u8);
@@ -321,7 +320,6 @@ mod tests {
                 return out;
             }
         }
-        // size = 9: header `0xFF` + 8 little-endian trailing bytes.
         let mut out = Vec::with_capacity(9);
         out.push(0xFF);
         for i in 0..8 {
@@ -329,6 +327,12 @@ mod tests {
         }
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::encode_number_helper as encode_number;
+    use super::*;
 
     #[test]
     fn parse_number_single_byte_values() {
