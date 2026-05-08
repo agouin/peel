@@ -45,6 +45,14 @@
 //! and the round-one COPY / DEFLATE coders. LZMA / LZMA2 land
 //! in §5 and slot into the same [`coders::dispatch`] match arm
 //! without changing any caller.
+//!
+//! # Phase 5 (`docs/PLAN_7z_support.md` §5)
+//!
+//! [`coders::dispatch`] now resolves `[0x03, 0x01, 0x01]` /
+//! `[0x21]` to runtime LZMA / LZMA2 coders backed by
+//! [`crate::decode::xz_liblzma::raw`]. The xz_liblzma side
+//! exposes new `decode_lzma1_raw` / `decode_lzma2_raw` entry
+//! points the §6 folder decoder will drive once it lands.
 
 pub mod coders;
 pub mod format;

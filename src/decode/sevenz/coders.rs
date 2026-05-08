@@ -31,6 +31,7 @@ use std::io::{self, Read, Write};
 use thiserror::Error;
 
 use crate::decode::deflate_native::Decoder as DeflateDecoder;
+use crate::decode::xz_liblzma::raw::{decode_lzma1_raw, decode_lzma2_raw};
 use crate::decode::{DecodeStatus, StreamingDecoder};
 
 use super::header::Coder;
@@ -225,18 +226,28 @@ pub fn dispatch(coder: &Coder) -> Result<Box<dyn CoderImpl>, CoderError> {
             }
             Ok(Box::new(DeflateCoder))
         }
-        CoderId::Lzma => Err(CoderError::UnsupportedFeature {
-            feature: format!(
-                "coder id {} (LZMA) — round-one §5 plumbing pending",
-                id.hex_repr(),
-            ),
-        }),
-        CoderId::Lzma2 => Err(CoderError::UnsupportedFeature {
-            feature: format!(
-                "coder id {} (LZMA2) — round-one §5 plumbing pending",
-                id.hex_repr(),
-            ),
-        }),
+        CoderId::Lzma => {
+            if coder.props.len() != 5 {
+                return Err(CoderError::BadProps {
+                    coder: "lzma",
+                    reason: format!("LZMA props must be 5 bytes, got {}", coder.props.len()),
+                });
+            }
+            let mut props = [0u8; 5];
+            props.copy_from_slice(&coder.props);
+            Ok(Box::new(LzmaCoder { props }))
+        }
+        CoderId::Lzma2 => {
+            if coder.props.len() != 1 {
+                return Err(CoderError::BadProps {
+                    coder: "lzma2",
+                    reason: format!("LZMA2 props must be 1 byte, got {}", coder.props.len()),
+                });
+            }
+            Ok(Box::new(Lzma2Coder {
+                props_byte: coder.props[0],
+            }))
+        }
         CoderId::Unsupported(_) => Err(CoderError::UnsupportedFeature {
             feature: format!("coder id {}", id.hex_repr()),
         }),
@@ -301,6 +312,65 @@ impl CoderImpl for DeflateCoder {
 
     fn name(&self) -> &'static str {
         "deflate"
+    }
+}
+
+/// LZMA1 coder. Slurps the source into a buffer (the per-
+/// coder packed-stream slice is bounded by the §3 parser) and
+/// runs the raw LZMA1 driver from
+/// [`crate::decode::xz_liblzma::raw::decode_lzma1_raw`].
+struct LzmaCoder {
+    props: [u8; 5],
+}
+
+impl CoderImpl for LzmaCoder {
+    fn decode_one_block(
+        &mut self,
+        mut src: Box<dyn Read + Send>,
+        dst: &mut dyn Write,
+        expected_unpack_size: u64,
+    ) -> Result<(), CoderError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        decode_lzma1_raw(&self.props, &buf, dst, expected_unpack_size).map_err(|e| {
+            CoderError::Decode {
+                coder: "lzma",
+                source: io::Error::other(format!("{e}")),
+            }
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "lzma"
+    }
+}
+
+/// LZMA2 coder. Same shape as [`LzmaCoder`]: buffer the
+/// packed-stream slice, run
+/// [`crate::decode::xz_liblzma::raw::decode_lzma2_raw`].
+struct Lzma2Coder {
+    props_byte: u8,
+}
+
+impl CoderImpl for Lzma2Coder {
+    fn decode_one_block(
+        &mut self,
+        mut src: Box<dyn Read + Send>,
+        dst: &mut dyn Write,
+        expected_unpack_size: u64,
+    ) -> Result<(), CoderError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        decode_lzma2_raw(self.props_byte, &buf, dst, expected_unpack_size).map_err(|e| {
+            CoderError::Decode {
+                coder: "lzma2",
+                source: io::Error::other(format!("{e}")),
+            }
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "lzma2"
     }
 }
 
@@ -496,15 +566,98 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_lzma_returns_unsupported_until_phase_5_lands() {
-        match dispatch(&fake_coder(&[0x03, 0x01, 0x01], &[0; 5])) {
-            Err(CoderError::UnsupportedFeature { feature }) => {
-                assert!(feature.contains("LZMA"), "got {feature}");
-                assert!(feature.contains("§5"), "got {feature}");
+    fn dispatch_lzma_rejects_wrong_props_length() {
+        match dispatch(&fake_coder(&[0x03, 0x01, 0x01], &[0; 3])) {
+            Err(CoderError::BadProps { coder, reason }) => {
+                assert_eq!(coder, "lzma");
+                assert!(reason.contains("5 bytes"), "got {reason}");
             }
-            Ok(_) => panic!("expected UnsupportedFeature, got Ok"),
-            Err(other) => panic!("expected UnsupportedFeature, got {other:?}"),
+            Ok(_) => panic!("expected BadProps, got Ok"),
+            Err(other) => panic!("expected BadProps, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dispatch_lzma2_rejects_wrong_props_length() {
+        match dispatch(&fake_coder(&[0x21], &[0; 3])) {
+            Err(CoderError::BadProps { coder, reason }) => {
+                assert_eq!(coder, "lzma2");
+                assert!(reason.contains("1 byte"), "got {reason}");
+            }
+            Ok(_) => panic!("expected BadProps, got Ok"),
+            Err(other) => panic!("expected BadProps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_lzma_round_trips_through_xz_liblzma_backend() {
+        // Use xz2's LZMA1 (.lzma) encoder as a reference; the
+        // dev-dependency the existing xz_liblzma differential
+        // suite already uses. Strip the 13-byte .lzma header
+        // (5-byte props + 8-byte size) and feed the rest
+        // through our LzmaCoder.
+        use xz2::stream::{Action, LzmaOptions, Stream};
+
+        let plaintext: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .copied()
+            .cycle()
+            .take(4096)
+            .collect();
+        let opts = LzmaOptions::new_preset(6).expect("opts");
+        let mut enc = Stream::new_lzma_encoder(&opts).expect("encoder");
+        let mut encoded = Vec::with_capacity(plaintext.len());
+        let _ = enc
+            .process_vec(&plaintext, &mut encoded, Action::Finish)
+            .expect("encode");
+        // Drain.
+        loop {
+            let pre = enc.total_out();
+            let _ = enc
+                .process_vec(&[], &mut encoded, Action::Finish)
+                .expect("flush");
+            if enc.total_out() == pre {
+                break;
+            }
+        }
+        assert!(encoded.len() > 13, "lzma container is at least 13 bytes");
+        let mut props = [0u8; 5];
+        props.copy_from_slice(&encoded[0..5]);
+        let payload = encoded[13..].to_vec();
+
+        let mut coder = dispatched(&fake_coder(&[0x03, 0x01, 0x01], &props));
+        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(payload));
+        let mut dst = Vec::new();
+        coder
+            .decode_one_block(src, &mut dst, plaintext.len() as u64)
+            .expect("decodes");
+        assert_eq!(dst, plaintext);
+    }
+
+    #[test]
+    fn dispatch_lzma2_round_trips_uncompressed_chunks() {
+        // Hand-build an LZMA2 stream of all-uncompressed chunks
+        // and run it through Lzma2Coder. This validates the
+        // dispatch + buffering path without leaning on xz2.
+        let plaintext: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let mut encoded = Vec::new();
+        // First chunk: control 0x01 (uncompressed, dict reset),
+        // then 16-bit (size - 1) BE, then payload.
+        encoded.push(0x01);
+        let size_field = (plaintext.len() - 1) as u16;
+        encoded.push((size_field >> 8) as u8);
+        encoded.push((size_field & 0xFF) as u8);
+        encoded.extend_from_slice(&plaintext);
+        encoded.push(0x00); // EndOfStream
+
+        // Props byte 0 → dict_size = 4 KiB (smallest LZMA2 dict).
+        let mut coder = dispatched(&fake_coder(&[0x21], &[0]));
+        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(encoded));
+        let mut dst = Vec::new();
+        coder
+            .decode_one_block(src, &mut dst, plaintext.len() as u64)
+            .expect("decodes");
+        assert_eq!(dst, plaintext);
     }
 
     #[test]
