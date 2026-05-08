@@ -70,6 +70,7 @@ use crate::types::ByteOffset;
 pub mod gzip;
 pub mod identity;
 pub mod lz4;
+pub mod sevenz;
 pub mod xz;
 pub mod xz_liblzma;
 pub mod zstd;

@@ -106,6 +106,7 @@ pub mod io_backend;
 pub mod progress;
 #[cfg(unix)]
 pub mod punch;
+pub mod sevenz;
 pub mod sink;
 pub mod types;
 pub mod zip;
