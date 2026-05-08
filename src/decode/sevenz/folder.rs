@@ -25,8 +25,13 @@ use std::io::{self, Cursor, Read, Write};
 
 use thiserror::Error;
 
-use crate::hash::crc32::Crc32;
+// Use the slicing-by-16 CRC32 from `zip::crc32`, not the
+// byte-at-a-time `hash::crc32::Crc32`. The folder-wide CRC
+// runs over every decoded byte; on a 256 MiB folder the
+// difference between ~500 MB/s and ~5 GB/s is ~450 ms of
+// wall-clock at 10 Gbps × 256 MiB.
 use crate::sevenz::SevenzError;
+use crate::zip::crc32::Crc32;
 
 use super::coders::{dispatch, CoderError};
 use super::header::{Folder, StreamsInfo};

@@ -25,8 +25,10 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::decode::sevenz::folder::{FolderSink, FolderSinkError};
 use crate::decode::sevenz::header::FileRecord;
-use crate::hash::crc32::Crc32;
 use crate::sink::SinkError;
+// Slicing-by-16 CRC32. See the analogous import in
+// `crate::decode::sevenz::folder` for the perf reasoning.
+use crate::zip::crc32::Crc32;
 
 /// Streaming destination for a 7z extraction.
 ///

@@ -268,7 +268,27 @@ impl CoderImpl for CopyCoder {
         dst: &mut dyn Write,
         expected_unpack_size: u64,
     ) -> Result<(), CoderError> {
-        let copied = io::copy(src, dst)?;
+        // `io::copy`'s default 8 KiB stack buffer would issue
+        // ~32 K preads for a 256 MiB folder, each one going
+        // through the streaming reader's bitmap-poll path; the
+        // syscall + atomic-load tax is non-trivial at high
+        // bandwidth. A 256 KiB buffer issues ~1 K preads
+        // instead, which the kernel's readahead absorbs
+        // cheaply, and keeps the bitmap-check rate down to
+        // once per ~64 KiB of pread (well under any chunk
+        // size) — so the streaming-overlap behaviour the
+        // smaller buffer provided is preserved.
+        const COPY_BUF_BYTES: usize = 256 * 1024;
+        let mut buf = vec![0u8; COPY_BUF_BYTES];
+        let mut copied: u64 = 0;
+        loop {
+            let n = src.read(&mut buf).map_err(CoderError::Io)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n]).map_err(CoderError::Io)?;
+            copied = copied.saturating_add(n as u64);
+        }
         if copied != expected_unpack_size {
             return Err(CoderError::UnpackSizeMismatch {
                 coder: "copy",
