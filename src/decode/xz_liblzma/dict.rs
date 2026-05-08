@@ -313,7 +313,12 @@ impl LzmaDict {
                 self.full, self.size,
                 "wrap case requires the dict to have filled at least once",
             );
-            let copy_pos = self.pos - distance - 1 + self.size;
+            // Add `self.size` before subtracting `distance + 1` to
+            // avoid an intermediate underflow under debug
+            // overflow-checks: case-3 fires precisely when
+            // `distance >= self.pos`, so `self.pos - distance` is
+            // negative on its own. The sum is identical in u-arith.
+            let copy_pos = self.pos + self.size - distance - 1;
             let copy_size = (self.size - copy_pos) as u32;
 
             if copy_size < left {
