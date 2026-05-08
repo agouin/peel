@@ -16,5 +16,15 @@
 //! ([`number::read_name_utf16le_zero_terminated`]). Every later
 //! phase composes these primitives — getting them right once,
 //! with property tests, beats catching off-by-ones in §3 / §4.
+//!
+//! # Phase 2 (`docs/PLAN_7z_support.md` §2)
+//!
+//! [`format`] holds the fixed 32-byte
+//! [`format::parse_signature_header`] that reads the
+//! [`format::SignatureHeader`] every 7z archive begins with —
+//! magic, ArchiveVersion, StartHeaderCRC validation, and the
+//! trailer location the §8 pipeline drives the next ranged GET
+//! against.
 
+pub mod format;
 pub mod number;
