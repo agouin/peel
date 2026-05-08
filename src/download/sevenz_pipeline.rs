@@ -329,20 +329,29 @@ impl SevenzPipeline<'_> {
                         ),
                     }));
                 }
-                self.cursor.store(start, Ordering::Release);
-                self.wait_for_range(start, end)?;
-
                 // Stream the packed bytes straight from the
-                // sparse file via a 64 KiB-buffered pread
-                // adapter. Earlier round-one slurped the entire
-                // pack range into a Vec to satisfy a `Box<dyn
-                // Read + Send + 'static>` parameter; that
-                // 256 MiB-or-larger allocation+copy was the
-                // dominant overhead in the §10 wall-clock gap.
-                // Now the §4 CoderImpl trait takes a borrowed
-                // `&mut dyn Read` and we hand it a slice
-                // reader that pread's chunks on demand.
-                let mut packed_reader = SparseFileSliceReader::new(self.sparse, start, pack_size);
+                // sparse file via a chunk-blocking pread
+                // adapter. The reader publishes its position
+                // to `self.cursor` on every `read`, so the
+                // scheduler's `max_disk_buffer` throttle
+                // sees decoder progress and releases new
+                // dispatches as old chunks are consumed. This
+                // is what gives the 7z pipeline an
+                // extract-while-downloading overlap *and*
+                // bounds the on-disk footprint regardless of
+                // archive size — both prerequisites for
+                // resuming a multi-GiB extraction without
+                // re-downloading the prefix.
+                let mut packed_reader = SparseFileSliceReader::new(
+                    self.sparse,
+                    self.bitmap,
+                    self.config.chunk_size,
+                    self.download_done,
+                    self.config.poll_interval,
+                    self.cursor,
+                    start,
+                    pack_size,
+                );
                 let file_indices = header.folder_to_files.get(i).cloned().unwrap_or_default();
                 let decoder = FolderDecoder::new(
                     &streams.folders[i],
@@ -451,14 +460,21 @@ impl SevenzPipeline<'_> {
                 ),
             }));
         }
-        // Wait for the embedded folder's packed range to land.
-        self.cursor.store(inner_start, Ordering::Release);
-        self.wait_for_range(inner_start, inner_end)?;
-
         // The EncodedHeader's folder is small (a compressed
         // copy of the trailer); stream it via the same slice
-        // reader the main folder loop uses.
-        let mut packed_reader = SparseFileSliceReader::new(self.sparse, inner_start, inner_size);
+        // reader the main folder loop uses. The reader seeds
+        // the pipeline cursor at `inner_start` so workers
+        // prioritize the embedded-folder chunks immediately.
+        let mut packed_reader = SparseFileSliceReader::new(
+            self.sparse,
+            self.bitmap,
+            self.config.chunk_size,
+            self.download_done,
+            self.config.poll_interval,
+            self.cursor,
+            inner_start,
+            inner_size,
+        );
 
         // Run the embedded folder decoder against an in-memory
         // sink that just collects bytes.
@@ -562,25 +578,65 @@ impl SevenzPipeline<'_> {
     }
 }
 
-/// `Read` adapter over a fixed-length range of a `SparseFile`.
-/// Each `read` issues one `pread_at` for up to the caller's
-/// requested byte count, capped at the remaining range.
+/// `Read` adapter over a fixed-length range of a `SparseFile`,
+/// blocking per-chunk on the [`ChunkBitmap`] so the
+/// [`FolderDecoder`] can stream bytes from the front of a
+/// folder while workers are still fetching chunks at the back.
 ///
-/// Used by the §8 pipeline to stream a folder's packed bytes
-/// into the §6 [`FolderDecoder`] without materializing the
-/// entire range as a `Vec<u8>` first. For multi-GiB folders
-/// that's the difference between an extra 256 MiB+ allocation
-/// (and zero-init + memcpy) and roughly nothing.
+/// This is the key to extract-while-downloading for 7z. A naive
+/// pread-only reader (the predecessor of this type) silently
+/// returns sparse-zeros for chunks that haven't landed yet,
+/// which the §8 pipeline guarded against by waiting for the
+/// entire pack range up front — but that wait *serialized* the
+/// decode behind the download. Polling the bitmap per chunk
+/// inside `read` means the decoder gets bytes as soon as each
+/// chunk lands; the wire and the decoder run concurrently.
+///
+/// `download_done` is consulted on every poll iteration so a
+/// scheduler failure surfaces as a typed read error instead of
+/// hanging.
 struct SparseFileSliceReader<'a> {
     sparse: &'a SparseFile,
+    bitmap: &'a ChunkBitmap,
+    chunk_size: u64,
+    download_done: &'a Arc<AtomicBool>,
+    poll_interval: Duration,
+    /// The pipeline's priority cursor. Each successful `read`
+    /// publishes the new decoder position here so the
+    /// scheduler's `max_disk_buffer` throttle measures
+    /// lookahead from the *consumed* byte, not the static
+    /// folder-start offset. This is what bounds the on-disk
+    /// footprint to roughly `max_disk_buffer` regardless of
+    /// archive or folder size: the throttle releases dispatch
+    /// every time the decoder drains a chunk.
+    pipeline_cursor: &'a Arc<AtomicU64>,
     cursor: u64,
     end: u64,
 }
 
 impl<'a> SparseFileSliceReader<'a> {
-    fn new(sparse: &'a SparseFile, start: u64, len: u64) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        sparse: &'a SparseFile,
+        bitmap: &'a ChunkBitmap,
+        chunk_size: u64,
+        download_done: &'a Arc<AtomicBool>,
+        poll_interval: Duration,
+        pipeline_cursor: &'a Arc<AtomicU64>,
+        start: u64,
+        len: u64,
+    ) -> Self {
+        // Seed the cursor at `start` so the throttle releases
+        // dispatch for chunks at-or-past this folder before the
+        // first `read` even runs.
+        pipeline_cursor.store(start, Ordering::Release);
         Self {
             sparse,
+            bitmap,
+            chunk_size,
+            download_done,
+            poll_interval,
+            pipeline_cursor,
             cursor: start,
             end: start.saturating_add(len),
         }
@@ -593,12 +649,43 @@ impl io::Read for SparseFileSliceReader<'_> {
         if remaining == 0 || buf.is_empty() {
             return Ok(0);
         }
-        let take = (buf.len() as u64).min(remaining) as usize;
+
+        // Block until the chunk holding `self.cursor` is durable
+        // on disk. Cap each `pread` at the chunk boundary so we
+        // never read across a not-yet-complete chunk.
+        let chunk_idx_u64 = self.cursor / self.chunk_size.max(1);
+        let chunk_idx = u32::try_from(chunk_idx_u64).map_err(|_| {
+            io::Error::other(format!(
+                "chunk index {chunk_idx_u64} exceeds u32 in SparseFileSliceReader",
+            ))
+        })?;
+        loop {
+            if self.bitmap.is_complete(ChunkIndex::new(chunk_idx)) {
+                break;
+            }
+            if self.download_done.load(Ordering::Acquire)
+                && !self.bitmap.is_complete(ChunkIndex::new(chunk_idx))
+            {
+                return Err(io::Error::other(format!(
+                    "download finished without delivering chunk {chunk_idx}",
+                )));
+            }
+            std::thread::sleep(self.poll_interval);
+        }
+
+        let chunk_end = (chunk_idx_u64 + 1) * self.chunk_size.max(1);
+        let chunk_end = chunk_end.min(self.end);
+        let max_take = (chunk_end - self.cursor).min(buf.len() as u64) as usize;
         self.sparse
-            .read_exact_at(ByteOffset::new(self.cursor), &mut buf[..take])
+            .read_exact_at(ByteOffset::new(self.cursor), &mut buf[..max_take])
             .map_err(io::Error::other)?;
-        self.cursor += take as u64;
-        Ok(take)
+        self.cursor += max_take as u64;
+        // Publish the new decoder position. The throttle reads
+        // this on its next dispatch decision; if the lookahead
+        // (latest_downloaded - cursor) drops below the cap,
+        // workers can dispatch the next chunk in this folder.
+        self.pipeline_cursor.store(self.cursor, Ordering::Release);
+        Ok(max_take)
     }
 }
 

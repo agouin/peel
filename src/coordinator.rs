@@ -162,7 +162,7 @@ use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
 use crate::download::sevenz_pipeline::{
     SevenzExtractionStats, SevenzPipeline, SevenzPipelineConfig, SevenzPipelineError,
-    SevenzResumeState,
+    SevenzPipelineEvent, SevenzResumeState,
 };
 use crate::download::{
     chunk_count, discover_with_mirrors, run as run_scheduler, ChunkFingerprints, DownloadInfo,
@@ -1233,11 +1233,16 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     &download_done,
                     &download_outcome,
                     puncher.as_ref(),
+                    &ckpt_path,
+                    &info,
+                    &url,
                     chunk_size,
                     total_size,
                     &dir,
                     &resume_plan,
                     &config,
+                    progress_state.as_ref(),
+                    kill_switch.as_ref(),
                 )?
             } else {
                 // Resolve the integrity-tracking hasher (if any) up
@@ -2547,16 +2552,10 @@ fn run_zip(
 /// 7z second-pipeline driver wired into the coordinator (`§10`
 /// of `docs/PLAN_7z_support.md`).
 ///
-/// Round-one minimum-viable: parses the trailer + iterates
-/// folders + invokes the §7 sink + punches the source. Some of
-/// the polish that `run_zip` carries (kill-switch threading,
-/// progress event detail, periodic checkpoint cadence inside a
-/// folder) is deliberately deferred here — round-one is
-/// "extracts correctly + resumable at folder boundaries" and
-/// the cadence policy that subdivides one folder's work needs
-/// the `O.32c` mid-folder resume machinery to be useful. This
-/// function will grow toward `run_zip`'s shape as those
-/// optimizations land.
+/// Mirrors `run_zip`'s shape: per-folder checkpoint cadence,
+/// kill-switch threading, disk-buffer-cap override (7z is
+/// random-access just like zip — trailer at the end, pack
+/// data at the front).
 #[allow(clippy::too_many_arguments)]
 fn run_sevenz(
     sparse: &SparseFile,
@@ -2565,11 +2564,21 @@ fn run_sevenz(
     download_done: &Arc<AtomicBool>,
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
     chunk_size: u64,
     total_size: u64,
     output_dir: &Path,
     plan: &ResumePlan,
     config: &CoordinatorConfig,
+    // Carried for parity with `run_zip`'s signature; the
+    // round-one wiring doesn't push per-folder progress
+    // events through the renderer yet (the pipeline emits
+    // `FolderFinished { index, bytes_punched }` but not
+    // bytes_decoded — a small follow-up to the §10 wiring).
+    _progress_state: Option<&Arc<ProgressState>>,
+    kill_switch: Option<&Arc<AtomicBool>>,
 ) -> Result<ExtractionStats, CoordinatorError> {
     fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
         path: output_dir.to_path_buf(),
@@ -2597,17 +2606,7 @@ fn run_sevenz(
     };
 
     // Construct the sink without a file list — the §8 pipeline
-    // installs it via `set_files` after parsing the trailer
-    // (which it can do *while* workers stream the rest of the
-    // archive in parallel). Pre-parsing the trailer here would
-    // have to wait for the trailer's chunks to land first, but
-    // without cursor-steering knowledge the workers download
-    // byte-0-forward — so the wait would block on the entire
-    // archive instead of just the trailer, and we'd lose the
-    // streaming overlap that drives the wall-clock win at
-    // higher bandwidths. Push the trailer fetch into the
-    // pipeline where the cursor steering is already wired
-    // (`docs/PLAN_7z_support.md` §8 step 1).
+    // installs it via `set_files` after parsing the trailer.
     let mut sink = SevenzSink::new(output_dir).map_err(CoordinatorError::Sink)?;
 
     let pipeline_cfg = SevenzPipelineConfig {
@@ -2625,11 +2624,108 @@ fn run_sevenz(
         sparse_fd: sparse.as_fd(),
     };
 
-    match pipeline.run(&mut sink, puncher, resume, |_event| Ok(())) {
+    // The 7z pipeline respects `max_disk_buffer`. Unlike
+    // [`run_zip`] (which disables the throttle because zip's
+    // entries are scattered in non-monotone order), 7z's
+    // pack data is laid out front-to-back in archive order;
+    // a sequential folder walk plus a steered trailer fetch
+    // plays naturally with a cursor-relative lookahead cap.
+    // The pipeline:
+    //
+    //   1. Steers the cursor to the trailer to fetch
+    //      metadata. The cap measures lookahead *past* the
+    //      cursor, so chunks at the trailer are dispatchable
+    //      while the cursor is there. Trailer is small
+    //      (~KB to MB) and lands quickly.
+    //   2. Steers the cursor back to the pack-data origin
+    //      (byte 32) and walks folders in archive order. The
+    //      reader publishes its position to the cursor as it
+    //      drains chunks, so workers' dispatch window slides
+    //      forward and never carries more than
+    //      `max_disk_buffer` ahead of extraction. This bounds
+    //      the on-disk footprint regardless of archive size.
+    //
+    // (`run_zip`'s `set_max_disk_buffer(0)` bypass is the
+    // analogous fix waiting to happen for the zip pipeline —
+    // filed separately.)
+
+    let mut last_write_at = Instant::now()
+        .checked_sub(config.checkpoint_min_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_progress: u64 = 0;
+    let mut bytes_punched_total: u64 = 0;
+    let mut folders_completed: Vec<u32> = resume.folders_completed.clone();
+    let mut checkpoints_written: u64 = 0;
+
+    let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            SevenzPipelineEvent::Started { .. } => Ok(()),
+            SevenzPipelineEvent::FolderFinished {
+                index,
+                bytes_punched,
+            } => {
+                folders_completed.push(*index);
+                bytes_punched_total = bytes_punched_total.saturating_add(*bytes_punched);
+
+                // Throttle the checkpoint write per the same
+                // policy `run_zip` uses, with one simplification:
+                // there is no in-folder progress tracking yet
+                // (mid-folder resume is `O.32c`), so the only
+                // place a checkpoint can land is at folder
+                // boundaries. The throttle still applies — for
+                // archives with thousands of tiny folders the
+                // per-folder write would dominate.
+                let elapsed = last_write_at.elapsed();
+                let proxy = total_size.saturating_sub(bytes_punched_total.saturating_add(1));
+                let progressed = (folders_completed.len() as u64).saturating_sub(last_progress);
+                if progressed == 0 && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let _ = proxy;
+
+                let sparse_sync_result = sparse.order_writes();
+                sparse_sync_result
+                    .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+
+                let ckpt = Checkpoint {
+                    url: requested_url.to_string(),
+                    etag: info.fingerprint.etag.clone(),
+                    last_modified: info.fingerprint.last_modified.clone(),
+                    parts: Vec::new(),
+                    total_size: info.total_size,
+                    chunk_size,
+                    decoder_position: ByteOffset::new(0),
+                    bitmap_completed: bitmap.to_bytes(),
+                    created_at: SystemTime::now(),
+                    sink_state: SinkState::Sevenz {
+                        folders_completed: folders_completed.clone(),
+                        current_folder: None,
+                    },
+                    hash_state: None,
+                    chunk_crc32c: None,
+                    decoder_state: None,
+                };
+                ckpt.write_timed(ckpt_path)
+                    .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+                last_write_at = Instant::now();
+                last_progress = folders_completed.len() as u64;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                Ok(())
+            }
+            SevenzPipelineEvent::Complete { .. } => Ok(()),
+        }
+    });
+
+    match result {
         Ok(stats) => Ok(extraction_stats_from_sevenz(stats, total_size)),
         Err(SevenzPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
             Err(CoordinatorError::Aborted {
-                checkpoints_written: 0,
+                checkpoints_written,
             })
         }
         Err(SevenzPipelineError::Sevenz(e)) | Err(SevenzPipelineError::FolderDecode(e)) => {
