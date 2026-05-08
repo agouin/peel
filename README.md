@@ -26,8 +26,9 @@ peel https://example.com/dataset.tar.zst -C ./out
   to the filesystem as the decoder advances. Peak compressed-side disk
   is ~the download window, not the archive size.
 - **Multi-format.** `.tar`, `.tar.zst`/`.zst`, `.tar.xz`/`.xz`,
-  `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`, and `.zip` (STORED + DEFLATE +
-  zstd entries).
+  `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`, `.zip` (STORED + DEFLATE +
+  zstd entries), and `.7z` (COPY + DEFLATE + LZMA + LZMA2 coders;
+  plain and unencrypted-encoded headers; single-volume).
   Format detection is suffix-first with magic-byte fallback; mismatches
   fail closed unless you opt in with `--force-format-from-magic` or
   pin a decoder with `--format <name>`.
@@ -98,14 +99,17 @@ your workload starts.
 **CI runners and ephemeral disks.** Same story: bounded disk, resumable
 on flaky networks, no scratch space gymnastics.
 
-**Streaming `.zip` over HTTP at all.** `curl | unzip` does not work:
-the central directory lives at the end of the file, so a stdin-only
-unzipper has to buffer the entire archive before it can decode the
-first byte. Workarounds (download fully, then extract) defeat the
+**Streaming `.zip` and `.7z` over HTTP at all.** `curl | unzip` and
+`curl | 7z x` don't work: the ZIP central directory lives at the
+end of the file, and the 7z SignatureHeader points at a trailer at
+the end of the file — so a stdin-only decoder has to buffer the
+entire archive before it can decode the first byte. The canonical
+workaround (download fully, then extract, then delete) defeats the
 whole point of streaming. `peel` uses a ranged GET to fetch the
-central directory first, then streams entries in order while the rest
-of the archive is still arriving — same hole-punching, same resume
-guarantees as the tar formats.
+central directory / trailer first, then streams entries (zip) or
+folders (7z) in order while the rest of the archive is still
+arriving — same hole-punching, same resume guarantees as the tar
+formats.
 
 ## Benchmarks: peel vs `curl | <decompressor> | tar`
 
@@ -163,11 +167,99 @@ overhead is visible (payload is small enough that connection setup is
 a non-trivial fraction of wall-clock); everywhere else `peel` finishes
 ahead of `curl | tool | tar`.
 
+## Benchmarks: peel vs `curl -O && <extract> && rm`
+
+The streaming-pipe baseline above is a fair head-to-head for the
+`tar.*` family — the user has the option of `curl … | tool | tar`.
+For `.zip` and `.7z` they don't: the ZIP central directory and the
+7z trailer pointer both live at the *end* of the archive, so a
+stdin-only decoder has to buffer the whole file before it can decode
+the first byte. The canonical user-typed workflow for those formats
+collapses to:
+
+```sh
+curl -O https://example.com/dataset.zip
+unzip dataset.zip -d ./out
+rm dataset.zip
+```
+
+`peel` collapses that three-step sequence into one. A ranged GET
+fetches the central directory / trailer first, then entries (zip)
+or folders (7z) stream into the sink while the rest of the archive
+is still arriving — the compressed bytes never fully land on disk.
+For tar.{zst,xz,gz,lz4} the same happens, just against a `tar.*`
+baseline that *also* has to wait for `curl` to finish before
+extracting.
+
+Same machinery as the streaming grid; same rate × payload cells.
+The baseline is `curl --limit-rate <R> -o <file> $URL && <extract
+<file> into dir> && rm <file>`. p7zip 17.05 (Homebrew) for `7z`;
+everything else as in the streaming grid. Two consecutive runs
+averaged. Reproduce with:
+
+```sh
+cargo test --release --test test_bench_streaming \
+  bench_throttled_download_then_extract_grid -- --ignored --nocapture --test-threads=1
+```
+
+### Wall-clock ratio: `peel` ÷ `curl -O && <extract> && rm`
+
+Lower is better; **bold** = `peel` is faster than the
+download-then-extract sequence.
+
+| Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
+| --- | --- | --- | --- | --- |
+| `tar` | 1.07× | **0.93×** | **0.74×** | **0.70×** |
+| `tar.zst` | 1.09× | **0.92×** | **0.71×** | **0.49×** |
+| `tar.gz` | 1.01× | **0.92×** | **0.72×** | **0.73×** |
+| `tar.lz4` | 1.09× | **0.92×** | **0.71×** | **0.56×** |
+| `tar.xz` | 1.03× | **0.82×** | **0.75×** | **0.95×** |
+| `zip` | 1.04× | **0.90×** | **0.56×** | **0.23×** |
+| `7z`¹ | 1.00× | **0.98×** | 1.26× | 4.39× |
+
+¹ The round-one 7z second-pipeline driver
+(`docs/PLAN_7z_support.md` §8) carries roughly a second of fixed
+per-archive overhead today. At 10 Mbps and 100 Mbps the streaming
+overlap with the download absorbs it; at 1 Gbps and 10 Gbps the
+overhead exceeds the streaming benefit and `curl -O && 7z x && rm`
+wins by absolute wall-clock. Closing this gap is queued
+optimization work — the qualitative point ("`.7z` over HTTP is now
+a single-pass operation") holds; the quantitative one ("…and
+faster") is in progress.
+
+### Reading the grid
+
+For tar.* rows, peel's wall-clock is roughly the wire-time —
+decode runs in parallel with the download. The baseline's is
+`wire-time + extract-time + rm`. peel saves the trailing extract
+phase outright, and the savings widen with bandwidth: at 1 Gbps
+and above the baseline eats half a second to over a second of
+trailing wall-clock that peel never spends. `tar.xz` shows the
+slow-decode story most cleanly — at 100 Mbps peel is **0.82×** the
+baseline because xz decode runs during the in-flight download
+instead of after it.
+
+`zip` is the headline. There is no streaming-pipe baseline for
+`.zip`, so this grid is the only fair head-to-head. At 1 Gbps ×
+128 MiB peel finishes in roughly half the baseline's wall-clock;
+at 10 Gbps × 256 MiB it's a 4× speedup. peel writes each entry to
+its final path as soon as the entry's bytes arrive, while the
+baseline is structurally barred from starting `unzip` until `curl`
+finishes.
+
+`7z` newly supports the same single-pass shape. At realistic
+bandwidth (≤ 100 Mbps) peel ties or beats `curl -O && 7z x && rm`
+by overlapping extract with the download. At 1 Gbps and above the
+round-one driver's per-archive overhead exceeds the streaming
+benefit and the baseline wins on wall-clock — see footnote ¹.
+
 ### When to reach for `peel`
 
-`peel` is the right choice in every case the bench grid covers — it
-ties or beats `curl | tool | tar` at every codec / rate combination,
-and you get the full feature set on top:
+`peel` is the right choice in every case the bench grids cover —
+it ties or beats `curl | tool | tar` across the streaming grid,
+and against `curl -O && <extract> && rm` it widens the gap on
+every cell where the wire-time is non-trivial. On top of the
+wall-clock numbers you get the full feature set:
 
 - Disk for `archive_size + extracted_size` doesn't fit — PVCs,
   ephemeral runners, TB-scale datasets — only `peel` keeps the
@@ -176,6 +268,9 @@ and you get the full feature set on top:
   run — frame-aligned checkpoints resume exactly where they left off.
 - `--sha256` verified inline, `--mirror` fan-out across sources, and
   `--max-bandwidth` capping are first-class.
+- `.zip` and `.7z` over HTTP without ever materializing the full
+  archive on disk — a single-pass streaming workflow that simply
+  doesn't exist with `curl + unzip` or `curl + 7z`.
 
 ## Usage
 
@@ -256,6 +351,7 @@ planning.
 | `.lz4` / `.tar.lz4` | ✓ | per lz4 block | ✓ |
 | `.gz` / `.tar.gz` | ✓ | per deflate block¹ | ✓ |
 | `.zip` | per-entry² | per entry + intra-entry³ | ✓ |
+| `.7z` | per-folder⁴ | per folder⁴ | ✓ |
 
 ¹ Hand-rolled RFC 1951 inflate with a 32 KiB sliding-window snapshot
 plus running CRC32/ISIZE persisted in the checkpoint, so a `kill -9`
@@ -269,6 +365,14 @@ in round one; AES, Zip64, multi-disk filed as `O.8b`.
 deflate block via the same 32 KiB-window snapshot used for `.gz`; zstd
 entries resume per zstd block. Encoded into the checkpoint format
 (version 7) under each in-progress entry.
+⁴ 7z uses a separate per-folder pipeline (the "second-pipeline"
+driver from `docs/PLAN_7z_support.md` §8) because of the
+SignatureHeader → trailer-pointer layout. Round one: COPY, DEFLATE,
+LZMA, and LZMA2 coders; plain `Header` and unencrypted
+`EncodedHeader`; single-volume archives only. Resume granularity is
+one folder at a time — a `kill -9` mid-folder restarts that folder
+from the start of its packed range; per-coder intra-folder resume,
+BCJ filters, AES, and multi-volume archives are queued.
 
 ## For contributors and AI agents
 

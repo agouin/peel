@@ -9,5 +9,6 @@
 
 pub mod h2c_server;
 pub mod mock_server;
+pub mod sevenz_fixtures;
 pub mod tar_fixtures;
 pub mod zip_fixtures;

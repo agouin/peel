@@ -58,6 +58,7 @@ use peel::http::{Client, ClientConfig};
 mod support;
 
 use support::mock_server::{MockRequest, MockResponse, MockServer};
+use support::sevenz_fixtures::build_copy_sevenz;
 use support::tar_fixtures::build_simple_archive;
 use support::zip_fixtures::{build_zip, ZipEntrySpec};
 
@@ -1786,6 +1787,310 @@ fn assert_dir_matches(dir: &std::path::Path, entries: &[(String, Vec<u8>)]) {
         assert_eq!(actual.len(), body.len(), "size mismatch on {name}");
         assert_eq!(actual, *body, "contents mismatch on {name}");
     }
+}
+
+// ---- download-then-extract grid --------------------------------------
+
+/// Companion to [`bench_throttled_realistic_grid`] but with a different
+/// baseline: instead of `curl URL | tool -d | tar -xf -` (streaming
+/// pipe), this grid measures the download-fully-then-extract-then-
+/// delete-archive workflow:
+///
+/// ```text
+/// curl --limit-rate <R> -o <file> <URL> && <extract <file> into dir> && rm <file>
+/// ```
+///
+/// This is the canonical workflow forced on a user when:
+/// * The format has a tail-anchored index (`.zip` central directory,
+///   `.7z` SignatureHeader → trailer pointer) — there is no useful
+///   `curl | tool` pipeline because the decoder must seek to the end
+///   before it can decode the first byte.
+/// * The user is following a tutorial / install script that just says
+///   "download `foo.tar.zst`, then run `tar -xf foo.tar.zst`".
+/// * Tooling on the box doesn't compose into a pipeline (a Docker
+///   layer that has `curl` and `7z` but no shell-pipe glue).
+///
+/// `peel`'s wall-clock for these rows is fundamentally the wire-time
+/// (the decoder runs in parallel with the download). The baseline's
+/// is `wire-time + decode-time + extract-time + rm`. So peel saves
+/// the decode/extract phase outright, plus picks up some additional
+/// margin from parallel ranged GETs at higher rates.
+///
+/// `.zip` and `.7z` rows have no streaming-pipe baseline at all —
+/// peel turns them from "download-then-extract only" into
+/// "stream-as-you-go", which is the headline this grid exists to
+/// quantify.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_throttled_download_then_extract_grid() {
+    if !tool_present("curl") {
+        skip("dnx", "curl");
+        return;
+    }
+
+    let rates = &[
+        Rate {
+            label: "10 Mbps",
+            bytes_per_sec: 10_000_000 / 8,
+            payload_bytes: 8 * 1024 * 1024,
+        },
+        Rate {
+            label: "100 Mbps",
+            bytes_per_sec: 100_000_000 / 8,
+            payload_bytes: 32 * 1024 * 1024,
+        },
+        Rate {
+            label: "1 Gbps",
+            bytes_per_sec: 1_000_000_000 / 8,
+            payload_bytes: 128 * 1024 * 1024,
+        },
+        Rate {
+            label: "10 Gbps",
+            bytes_per_sec: 10_000_000_000 / 8,
+            payload_bytes: 256 * 1024 * 1024,
+        },
+    ];
+
+    println!(
+        "[dnx] {:>10}  {:>9}  {:<8}  {:>9}  {:>13}  {:>6}  tools",
+        "rate", "payload", "format", "peel", "curl+extract", "ratio"
+    );
+
+    for rate in rates {
+        let (archive, entries) = build_tar_payload_sized(rate.payload_bytes);
+        let mib = (rate.payload_bytes as f64) / (1024.0 * 1024.0);
+
+        // ---- plain tar -------------------------------------------------
+        if tool_present("tar") {
+            run_throttled_dnx_case(
+                rate,
+                mib,
+                "tar",
+                "curl+tar",
+                &archive,
+                &entries,
+                "bundle.tar",
+                |file, dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && tar -xf {file} -C {dir} && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.zst ---------------------------------------------------
+        if tool_present("tar") && tool_present("zstd") {
+            let body = encode_zstd(&archive);
+            run_throttled_dnx_case(
+                rate,
+                mib,
+                "tar.zst",
+                "curl+zstd+tar",
+                &body,
+                &entries,
+                "bundle.tar.zst",
+                |file, dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && zstd -dc -q {file} | tar -xf - -C {dir} && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.xz ----------------------------------------------------
+        if tool_present("tar") && tool_present("xz") {
+            let body = encode_xz(&archive);
+            run_throttled_dnx_case(
+                rate,
+                mib,
+                "tar.xz",
+                "curl+xz+tar",
+                &body,
+                &entries,
+                "bundle.tar.xz",
+                |file, dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && xz -dc -q {file} | tar -xf - -C {dir} && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.gz (single-member) ------------------------------------
+        if tool_present("tar") && tool_present("gzip") {
+            let body = encode_gzip(&archive);
+            run_throttled_dnx_case(
+                rate,
+                mib,
+                "tar.gz",
+                "curl+gzip+tar",
+                &body,
+                &entries,
+                "bundle.tar.gz",
+                |file, dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && gzip -dc -q {file} | tar -xf - -C {dir} && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- tar.lz4 (uncompressed frame) ------------------------------
+        if tool_present("tar") && tool_present("lz4") {
+            let body = encode_lz4_uncompressed_frame(&archive);
+            run_throttled_dnx_case(
+                rate,
+                mib,
+                "tar.lz4",
+                "curl+lz4+tar",
+                &body,
+                &entries,
+                "bundle.tar.lz4",
+                |file, dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && lz4 -dc -q {file} | tar -xf - -C {dir} && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- zip (STORED entries) --------------------------------------
+        // The streaming-pipe baseline is impossible here (central
+        // directory at the tail), so this is the *only* fair head-to-
+        // head: a real-world `curl -O && unzip && rm` sequence.
+        if tool_present("unzip") {
+            let zip_entries: Vec<ZipEntrySpec> = entries
+                .iter()
+                .map(|(n, b)| ZipEntrySpec::stored(n.clone(), b.clone()))
+                .collect();
+            let body = build_zip(&zip_entries);
+            run_throttled_dnx_case(
+                rate,
+                mib,
+                "zip",
+                "curl+unzip",
+                &body,
+                &entries,
+                "bundle.zip",
+                |file, dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && unzip -q {file} -d {dir} && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+
+        // ---- 7z (COPY-coded) -------------------------------------------
+        // Same story as zip: no streaming-pipe baseline exists; peel
+        // turns "download fully then extract" into "extract while
+        // downloading" via the second-pipeline driver
+        // (`docs/PLAN_7z_support.md` §8).
+        if tool_present("7z") {
+            let pairs: Vec<(&str, Vec<u8>)> = entries
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.clone()))
+                .collect();
+            let body = build_copy_sevenz(&pairs);
+            run_throttled_dnx_case(
+                rate,
+                mib,
+                "7z",
+                "curl+7z",
+                &body,
+                &entries,
+                "bundle.7z",
+                |file, dir| {
+                    // -y assume yes (no prompt); -bd no progress;
+                    // -bb0 quiet output.
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && 7z x -y -bd -bb0 -o{dir} {file} >/dev/null && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_throttled_dnx_case(
+    rate: &Rate,
+    payload_mib: f64,
+    format_label: &str,
+    tools_label: &str,
+    body: &[u8],
+    entries: &[(String, Vec<u8>)],
+    suffix: &str,
+    baseline_pipeline: impl Fn(&std::path::Path, &std::path::Path) -> String,
+) {
+    let server = MockServer::start(ok_handler(body.to_vec()));
+    let url = format!("{}/{suffix}", server.base_url());
+
+    // ---- peel ----
+    let work_p = unique_dir(&format!("dnx_{format_label}_peel"));
+    let _g_p = CleanupDir(work_p.clone());
+    let mut config = coord_config();
+    config.max_bandwidth_bps = Some(rate.bytes_per_sec);
+    let progress_state = std::sync::Arc::new(peel::progress::ProgressState::new());
+    let args = RunArgs {
+        url: url.clone(),
+        additional_urls: Vec::new(),
+        output: OutputTarget::Dir(work_p.clone()),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: Some(std::sync::Arc::clone(&progress_state)),
+        kill_switch: None,
+        io_backend: None,
+    };
+    let started = Instant::now();
+    let _stats = run(args).expect("peel run succeeds");
+    let peel_elapsed = started.elapsed();
+    assert_dir_matches(&work_p, entries);
+
+    // ---- curl -O && extract && rm ----
+    let work_b = unique_dir(&format!("dnx_{format_label}_baseline"));
+    let _g_b = CleanupDir(work_b.clone());
+    let archive_path = work_b.join(suffix);
+    let extract_dir = work_b.join("out");
+    fs::create_dir_all(&extract_dir).expect("mkdir extract");
+    let pipeline = baseline_pipeline(&archive_path, &extract_dir);
+    let base_elapsed = time_pipeline(&url, &pipeline);
+    assert_dir_matches(&extract_dir, entries);
+
+    let peel_s = peel_elapsed.as_secs_f64();
+    let base_s = base_elapsed.as_secs_f64();
+    println!(
+        "[dnx] {rate:>10}  {payload:>6.1} MiB  {fmt:<8}  {peel:>7.3}s  {base:>11.3}s  {ratio:>5.2}x  {tools}",
+        rate = rate.label,
+        payload = payload_mib,
+        fmt = format_label,
+        peel = peel_s,
+        base = base_s,
+        ratio = peel_s / base_s.max(1e-9),
+        tools = tools_label,
+    );
 }
 
 // ---- shell quoting (POSIX single-quote) -------------------------------
