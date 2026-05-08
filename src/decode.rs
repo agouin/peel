@@ -525,6 +525,24 @@ impl DecoderRegistry {
             ],
             crate::zip::streaming_factory_placeholder,
         );
+        // 7z (`docs/PLAN_7z_support.md` §10). Same pattern as
+        // ZIP — the coordinator dispatches to
+        // `crate::download::sevenz_pipeline` before the factory
+        // is invoked. Magic is the 6-byte `7z¼¯' \x1c`
+        // signature at offset 0; suffixes register both `.7z`
+        // and `.tar.7z` (the latter is rare in the wild but
+        // exists; round-one routes both through the same
+        // pipeline and the user runs `tar` on the decoded tree
+        // themselves).
+        r.register_format(
+            crate::sevenz::FORMAT_NAME,
+            &[".7z", ".tar.7z"],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &crate::sevenz::SIGNATURE_MAGIC,
+            }],
+            crate::sevenz::streaming_factory_placeholder,
+        );
         r
     }
 
@@ -1001,6 +1019,25 @@ mod tests {
         assert!(names.contains(&"xz"));
         assert!(names.contains(&"lz4"));
         assert!(names.contains(&"zip"));
+        assert!(names.contains(&"7z"));
+    }
+
+    #[test]
+    fn registry_with_defaults_registers_sevenz_suffix_and_magic() {
+        let r = DecoderRegistry::with_defaults();
+        // Suffix lookup, including the longer `.tar.7z` shadow.
+        assert!(r.factory_for_name("dataset.7z").is_some());
+        assert!(r.factory_for_name("dataset.tar.7z").is_some());
+        // Magic detection on the canonical 7z signature.
+        let prefix = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+        let by_magic = r.factory_for_prefix(&prefix).expect("7z magic registered");
+        assert_eq!(r.name_for_factory(by_magic), Some("7z"));
+        // Format-name override path.
+        let by_name = r.factory_for_format_name("7z").expect("name registered");
+        assert!(std::ptr::fn_addr_eq(
+            by_name,
+            crate::sevenz::streaming_factory_placeholder as DecoderFactory,
+        ));
     }
 
     #[test]

@@ -160,6 +160,10 @@ use thiserror::Error;
 use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
 use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
+use crate::download::sevenz_pipeline::{
+    SevenzExtractionStats, SevenzPipeline, SevenzPipelineConfig, SevenzPipelineError,
+    SevenzResumeState,
+};
 use crate::download::{
     chunk_count, discover_with_mirrors, run as run_scheduler, ChunkFingerprints, DownloadInfo,
     DownloadStats, MirrorSet, ProbeConfig, RetryConfig, SchedulerConfig, SchedulerError,
@@ -173,7 +177,8 @@ use crate::extractor::{
 use crate::http::{Client, ClientError, Url, UrlError};
 use crate::progress::ProgressState;
 use crate::punch::{default_puncher, NoopPuncher, PunchHole};
-use crate::sink::{RawSink, Sink, SinkError, TarSink, ZipSink};
+use crate::sevenz::FORMAT_NAME as SEVENZ_FORMAT_NAME;
+use crate::sink::{RawSink, SevenzSink, Sink, SinkError, TarSink, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
 use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
 
@@ -703,6 +708,17 @@ pub enum CoordinatorError {
     #[error("ZIP extraction failed")]
     Zip(#[source] ZipPipelineError),
 
+    /// The 7z parser surfaced a wire-format failure.
+    /// Surfaced via [`run_sevenz`] (`docs/PLAN_7z_support.md`
+    /// §10).
+    #[error("7z format error")]
+    Sevenz(#[source] crate::sevenz::SevenzError),
+
+    /// The 7z pipeline failed for a non-Sevenz reason
+    /// (download / IO / hole punching).
+    #[error("7z extraction failed")]
+    SevenzPipeline(#[source] SevenzPipelineError),
+
     /// The caller's [`RunArgs::kill_switch`] flipped to `true`
     /// between checkpoint writes. The .peel.part / .peel.ckpt
     /// sidecars are intentionally left on disk so the next call
@@ -1172,6 +1188,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             // free-function factories every shipping format uses.
             let format_name = registry.name_for_factory(factory).map(String::from);
             let is_zip = format_name.as_deref() == Some(ZIP_FORMAT_NAME);
+            let is_sevenz = format_name.as_deref() == Some(SEVENZ_FORMAT_NAME);
 
             let puncher: Box<dyn PunchHole> = make_puncher(&sparse);
 
@@ -1201,6 +1218,26 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     progress.as_mut(),
                     progress_state.as_ref(),
                     kill_switch.as_ref(),
+                )?
+            } else if is_sevenz {
+                let dir = match &output {
+                    OutputTarget::Dir(d) => d.clone(),
+                    OutputTarget::File(_) => {
+                        return Err(CoordinatorError::ZipNeedsDirectory);
+                    }
+                };
+                run_sevenz(
+                    &sparse,
+                    &bitmap,
+                    &cursor,
+                    &download_done,
+                    &download_outcome,
+                    puncher.as_ref(),
+                    chunk_size,
+                    total_size,
+                    &dir,
+                    &resume_plan,
+                    &config,
                 )?
             } else {
                 // Resolve the integrity-tracking hasher (if any) up
@@ -2504,6 +2541,206 @@ fn run_zip(
             })
         }
         Err(other) => Err(CoordinatorError::Zip(other)),
+    }
+}
+
+/// 7z second-pipeline driver wired into the coordinator (`§10`
+/// of `docs/PLAN_7z_support.md`).
+///
+/// Round-one minimum-viable: parses the trailer + iterates
+/// folders + invokes the §7 sink + punches the source. Some of
+/// the polish that `run_zip` carries (kill-switch threading,
+/// progress event detail, periodic checkpoint cadence inside a
+/// folder) is deliberately deferred here — round-one is
+/// "extracts correctly + resumable at folder boundaries" and
+/// the cadence policy that subdivides one folder's work needs
+/// the `O.32c` mid-folder resume machinery to be useful. This
+/// function will grow toward `run_zip`'s shape as those
+/// optimizations land.
+#[allow(clippy::too_many_arguments)]
+fn run_sevenz(
+    sparse: &SparseFile,
+    bitmap: &ChunkBitmap,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    puncher: &dyn PunchHole,
+    chunk_size: u64,
+    total_size: u64,
+    output_dir: &Path,
+    plan: &ResumePlan,
+    config: &CoordinatorConfig,
+) -> Result<ExtractionStats, CoordinatorError> {
+    fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+
+    // Translate the resume plan into the 7z-specific shape.
+    let resume = match plan {
+        ResumePlan::Fresh => SevenzResumeState::default(),
+        ResumePlan::Resume { sink_state, .. } => match sink_state {
+            SinkState::Sevenz {
+                folders_completed,
+                current_folder,
+            } => SevenzResumeState {
+                folders_completed: folders_completed.clone(),
+                current_folder: *current_folder,
+            },
+            SinkState::Raw { .. } | SinkState::Tar { .. } | SinkState::Zip { .. } => {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is not Sevenz but the resolved format is 7z"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    // The §7 sink needs the parsed FilesInfo at construction
+    // time. Round-one strategy: reach into the sparse file
+    // post-fetch and parse the trailer ourselves so the sink
+    // has a file list. The §8 pipeline re-parses when it runs,
+    // which is cheap (the trailer is small).
+    //
+    // This twice-parsing is worth a follow-on cleanup but it
+    // keeps the §10 wire-up small and the boundary between
+    // pipeline + coordinator clean.
+    let files = parse_sevenz_files_for_sink(sparse, total_size, bitmap, chunk_size)?;
+    let mut sink = SevenzSink::new(output_dir, files).map_err(CoordinatorError::Sink)?;
+
+    let pipeline_cfg = SevenzPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: config.reader_poll_interval,
+    };
+    let pipeline = SevenzPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        sparse_fd: sparse.as_fd(),
+    };
+
+    match pipeline.run(&mut sink, puncher, resume, |_event| Ok(())) {
+        Ok(stats) => Ok(extraction_stats_from_sevenz(stats, total_size)),
+        Err(SevenzPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written: 0,
+            })
+        }
+        Err(SevenzPipelineError::Sevenz(e)) | Err(SevenzPipelineError::FolderDecode(e)) => {
+            Err(CoordinatorError::Sevenz(e))
+        }
+        Err(SevenzPipelineError::Sink(e)) => Err(CoordinatorError::Sink(e)),
+        Err(SevenzPipelineError::Sparse(e)) => Err(CoordinatorError::SparseFile(e)),
+        Err(other) => Err(CoordinatorError::SevenzPipeline(other)),
+    }
+}
+
+/// Read + parse the 7z trailer out of `sparse` to recover the
+/// FilesInfo list the sink needs at construction. Used by
+/// [`run_sevenz`].
+fn parse_sevenz_files_for_sink(
+    sparse: &SparseFile,
+    total_size: u64,
+    bitmap: &ChunkBitmap,
+    chunk_size: u64,
+) -> Result<Vec<crate::decode::sevenz::header::FileRecord>, CoordinatorError> {
+    use crate::decode::sevenz::format::{parse_signature_header, SIGNATURE_HEADER_LEN};
+    use crate::decode::sevenz::header::{parse_trailer, Trailer};
+
+    // Wait for byte range 0..32 in the bitmap.
+    wait_for_range_simple(bitmap, chunk_size, 0, SIGNATURE_HEADER_LEN as u64)?;
+    let mut sig_buf = [0u8; SIGNATURE_HEADER_LEN];
+    sparse
+        .read_exact_at(ByteOffset::ZERO, &mut sig_buf)
+        .map_err(CoordinatorError::SparseFile)?;
+    let sig = parse_signature_header(&sig_buf).map_err(CoordinatorError::Sevenz)?;
+    let (start, len) = sig
+        .trailer_range(total_size)
+        .map_err(CoordinatorError::Sevenz)?;
+    wait_for_range_simple(bitmap, chunk_size, start, start + len)?;
+    let mut trailer = vec![0u8; len as usize];
+    sparse
+        .read_exact_at(ByteOffset::new(start), &mut trailer)
+        .map_err(CoordinatorError::SparseFile)?;
+    match parse_trailer(&trailer).map_err(CoordinatorError::Sevenz)? {
+        Trailer::Plain(h) => Ok(h.files),
+        Trailer::Encoded { .. } => {
+            // Round-one EncodedHeader handling is inside the
+            // pipeline. The sink only needs files; for
+            // EncodedHeader archives we'd have to run the
+            // embedded folder here too, which duplicates
+            // pipeline work. For now, return an empty list and
+            // surface a helpful error so the user knows what
+            // hit.
+            Err(CoordinatorError::Sevenz(
+                crate::sevenz::SevenzError::UnsupportedFeature {
+                    feature: "EncodedHeader archives via run_sevenz \
+                          (round-one minimum-viable wiring \
+                          handles plain Header only — file a \
+                          §10 follow-up to share the trailer \
+                          parse with the pipeline)"
+                        .into(),
+                },
+            ))
+        }
+    }
+}
+
+/// Trivial bitmap-wait used by the trailer pre-fetch in
+/// [`parse_sevenz_files_for_sink`]. Unlike the pipeline's
+/// `wait_for_range`, this one does not poll the
+/// `download_done` flag — it's only called from the
+/// coordinator after the sparse file has been fully
+/// downloaded.
+fn wait_for_range_simple(
+    bitmap: &ChunkBitmap,
+    chunk_size: u64,
+    start: u64,
+    end: u64,
+) -> Result<(), CoordinatorError> {
+    if end <= start || chunk_size == 0 {
+        return Ok(());
+    }
+    let first = start / chunk_size;
+    let last = (end - 1) / chunk_size;
+    for c in first..=last {
+        let idx = u32::try_from(c).map_err(|_| CoordinatorError::SourceChanged {
+            reason: format!("chunk index {c} exceeds u32"),
+        })?;
+        loop {
+            if bitmap.is_complete(ChunkIndex::new(idx)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    Ok(())
+}
+
+/// Translate a [`SevenzExtractionStats`] into the wider
+/// [`ExtractionStats`] shape the caller surfaces. Several
+/// fields the streaming-pipeline run carries (decode_time,
+/// write_time, punch_time) stay at `Default` because the §10
+/// minimum-viable wiring does not collect them; that lands as
+/// a follow-up alongside the kill-switch + checkpoint cadence
+/// integration.
+fn extraction_stats_from_sevenz(stats: SevenzExtractionStats, total_size: u64) -> ExtractionStats {
+    ExtractionStats {
+        bytes_in: total_size,
+        bytes_out: 0,
+        bytes_punched: stats.bytes_punched,
+        punch_calls: u64::from(stats.folders_extracted),
+        punch_unsupported: false,
+        frame_boundaries_observed: u64::from(stats.folders_extracted),
+        quiescent_checkpoints: 0,
+        decode_time: Duration::default(),
+        write_time: Duration::default(),
+        punch_time: Duration::default(),
+        ..ExtractionStats::default()
     }
 }
 

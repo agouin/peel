@@ -45,11 +45,44 @@ pub mod error;
 
 pub use error::SevenzError;
 
+use std::io::Read;
+
+use crate::decode::{DecodeError, StreamingDecoder};
+
 /// Format name [`crate::decode::DecoderRegistry::with_defaults`]
-/// will register 7z under once §10 of `docs/PLAN_7z_support.md`
-/// lands. Defined now so earlier phases that introduce parsers can
-/// reference the canonical name without forward-declaring it.
+/// registers 7z under (`docs/PLAN_7z_support.md` §10). The
+/// coordinator pre-checks the resolved factory against this
+/// constant and dispatches to
+/// [`crate::download::sevenz_pipeline`] instead of invoking the
+/// streaming decoder loop.
 pub const FORMAT_NAME: &str = "7z";
+
+/// Sentinel [`crate::decode::DecoderFactory`] registered for
+/// the [`FORMAT_NAME`] format.
+///
+/// 7z archives go through
+/// [`crate::download::sevenz_pipeline`], not the streaming-
+/// decoder loop, so this factory is **never invoked in normal
+/// operation**. It exists so the standard
+/// [`crate::decode::DecoderRegistry`] machinery (suffix
+/// matching, magic-byte sniffing, `--format <name>` override,
+/// format-mismatch detection) resolves `.7z` URLs the same way
+/// it resolves any other format. The coordinator pre-checks
+/// the resolved name against [`FORMAT_NAME`] and dispatches
+/// before invoking the factory; this body is reached only by a
+/// programming error and surfaces a clear diagnostic.
+///
+/// # Errors
+///
+/// Always returns [`DecodeError::Construct`] with an
+/// explanatory message.
+pub fn streaming_factory_placeholder(
+    _src: Box<dyn Read + Send>,
+) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+    Err(DecodeError::Construct(std::io::Error::other(
+        "internal error: 7z factory invoked instead of dispatching to the 7z pipeline",
+    )))
+}
 
 /// SignatureHeader magic that begins every 7z archive: `7z¼¯' \x1c`
 /// in ASCII view, `37 7A BC AF 27 1C` in hex. Defined here (rather
