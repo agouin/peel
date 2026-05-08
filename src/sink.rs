@@ -43,10 +43,12 @@
 //! (unsafe path, unsupported type), or in the local environment (IO).
 
 pub mod raw;
+pub mod sevenz;
 pub mod tar;
 pub mod zip;
 
 pub use raw::RawSink;
+pub use sevenz::SevenzSink;
 pub use tar::TarSink;
 pub use zip::{BeginEntryOutcome, EntryFinalize, ZipSink};
 
