@@ -41,17 +41,79 @@
 //! Write` sink. liblzma uses a per-call output buffer slice;
 //! we use a `dyn Write` sink to align with the existing
 //! `crate::decode::StreamingDecoder` shape.
+//!
+//! # Chunk-level streaming (Phase F.1)
+//!
+//! [`Lzma2Decoder::step`] consumes the caller's `input` slice
+//! incrementally, returning [`Lzma2StepStatus::NeedInput`] when
+//! the slice ends mid-chunk-header or mid-chunk-payload. The
+//! decoder maintains a [`Lzma2Stage`] state machine across
+//! calls so the caller can append more bytes and call again
+//! without losing progress.
+//!
+//! Each LZMA2 chunk is still decoded by a single
+//! [`super::decoder::lzma_decode_port`] call once its compressed
+//! payload is fully buffered (≤ 64 KiB by spec). This avoids
+//! per-bit Sequence-resume arms inside the inner loop while
+//! still letting [`super::Decoder::decode_step`] interleave
+//! source-reads with decode work — the slurp-first regression
+//! at low bandwidth (Phase 8 cells 10 Mbps / 100 Mbps) is gone
+//! once Phase F.2 wires this method into `Decoder::decode_step`.
 
 use std::io::Write;
 
-use crate::decode::xz_native::block::{
-    decode_lzma_properties, parse_lzma2_chunk_header, Lzma2ChunkHeader,
-};
+use super::block::{decode_lzma_properties, parse_lzma2_chunk_header, Lzma2ChunkHeader};
 
 use super::decoder::{lzma_decode_port, Lzma1Decoder, Sequence};
 use super::dict::LzmaDict;
 use super::error::XzPortError;
 use super::range_coder::RangeDecoder;
+
+/// Chunk-level state machine for [`Lzma2Decoder::step`]. Mirror
+/// of liblzma's `coder->sequence` member at the LZMA2 layer.
+#[derive(Debug, Clone, Copy)]
+enum Lzma2Stage {
+    /// Need 1 byte: the chunk control byte. Either decodes to
+    /// EndOfStream (single-byte chunk) or selects a header
+    /// length and transitions to [`Lzma2Stage::AwaitHeader`].
+    AwaitControl,
+    /// Have the chunk control byte; need `header_len - 1` more
+    /// bytes to parse the full header. `control` is reserved
+    /// for re-checking on resume; `header_len` is the total
+    /// header length on the wire (3 / 5 / 6 bytes).
+    AwaitHeader { control: u8, header_len: u8 },
+    /// Header parsed and applied; accumulating the chunk's
+    /// compressed payload. `compressed_size` is from the
+    /// header. `uncompressed_size` is the same. `is_lzma`
+    /// distinguishes uncompressed-chunk from LZMA-chunk
+    /// payload handling.
+    AwaitPayload {
+        is_lzma: bool,
+        uncompressed_size: u32,
+        compressed_size: u32,
+    },
+    /// EndOfStream chunk consumed; further calls report it.
+    EndOfStream,
+}
+
+/// Result of one [`Lzma2Decoder::step`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lzma2StepStatus {
+    /// Input slice exhausted before the in-flight stage could
+    /// complete. Caller should append more bytes (preserving
+    /// the prefix not yet consumed — `*in_pos` indicates how
+    /// many bytes were consumed) and call `step` again.
+    NeedInput,
+    /// One LZMA2 chunk's worth of output was decoded and
+    /// written to the sink. Caller may invoke `step` again to
+    /// continue with the next chunk.
+    Produced,
+    /// The LZMA2 EndOfStream chunk has been consumed. No more
+    /// LZMA2 work; the caller's stream-level walker should
+    /// validate Block padding / Block check / Index / Stream
+    /// Footer.
+    EndOfStream,
+}
 
 /// LZMA2 chunk dispatcher. Mirror of liblzma's
 /// `lzma2_coder` shape:
@@ -69,10 +131,10 @@ use super::range_coder::RangeDecoder;
 /// };
 /// ```
 ///
-/// Round-one shape: holds the full
-/// [`super::decoder::Lzma1Decoder`] + [`super::dict::LzmaDict`]
-/// inline. Phase 6 may split them apart if the public
-/// `Decoder` API needs separate ownership.
+/// Holds the full [`super::decoder::Lzma1Decoder`] +
+/// [`super::dict::LzmaDict`] inline. The chunk-level state
+/// machine ([`Lzma2Stage`]) lets the decoder pause between
+/// chunks (Phase F.1) so input can be streamed in incrementally.
 pub struct Lzma2Decoder {
     decoder: Lzma1Decoder,
     dict: LzmaDict,
@@ -95,6 +157,29 @@ pub struct Lzma2Decoder {
     /// or after a coder-level reset). Mirror of liblzma's
     /// `coder->need_dictionary_reset`.
     needs_dict_reset: bool,
+    /// Chunk-level state machine cursor. See [`Lzma2Stage`].
+    stage: Lzma2Stage,
+}
+
+/// Length on the wire of an LZMA2 chunk header given its
+/// control byte, before the compressed payload begins. Mirror
+/// of [`crate::decode::xz_native::block::Lzma2ChunkHeader::wire_size`]
+/// but derivable from the control byte alone — needed so the
+/// streaming dispatcher can wait for the right number of header
+/// bytes to arrive before parsing.
+fn lzma2_header_len(control: u8) -> Result<usize, XzPortError> {
+    match control {
+        0x00 => Ok(1),
+        0x01 | 0x02 => Ok(3),
+        0x03..=0x7F => Err(XzPortError::Framing(format!(
+            "reserved LZMA2 control byte 0x{control:02X}"
+        ))),
+        0x80..=0xFF => {
+            // bits 7-5 : reset mode; reset_props is mode >= 0b110.
+            let mode = (control >> 5) & 0b011;
+            Ok(if mode >= 2 { 6 } else { 5 })
+        }
+    }
 }
 
 impl Lzma2Decoder {
@@ -118,6 +203,77 @@ impl Lzma2Decoder {
             staging: Vec::with_capacity(64 * 1024),
             needs_props: true,
             needs_dict_reset: true,
+            stage: Lzma2Stage::AwaitControl,
+        }
+    }
+
+    /// `true` if the last [`Lzma2Decoder::step`] call consumed
+    /// the LZMA2 EndOfStream chunk. Useful for the stream-level
+    /// driver (Phase F.2) to decide when to transition to Block
+    /// Padding / Block-Check parsing.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        matches!(self.stage, Lzma2Stage::EndOfStream)
+    }
+
+    /// `true` if the decoder is between LZMA2 chunks (at
+    /// [`Lzma2Stage::AwaitControl`]) and at least one chunk has
+    /// already been processed (so `needs_dict_reset` is false
+    /// and either props are set or we've only seen Uncompressed
+    /// chunks). The Phase F.4 checkpoint blob captures only at
+    /// this boundary; other stages would need per-bit cursor
+    /// state we don't serialize.
+    #[must_use]
+    pub fn is_at_chunk_boundary(&self) -> bool {
+        matches!(self.stage, Lzma2Stage::AwaitControl) && !self.needs_dict_reset
+    }
+
+    /// Read-only accessor: borrowed [`Lzma1Decoder`] state.
+    /// Used by [`super::resume`] to snapshot probs / reps /
+    /// state.
+    #[must_use]
+    pub fn decoder(&self) -> &Lzma1Decoder {
+        &self.decoder
+    }
+
+    /// Read-only accessor: borrowed [`LzmaDict`].
+    #[must_use]
+    pub fn dict(&self) -> &LzmaDict {
+        &self.dict
+    }
+
+    /// Read-only accessor: `needs_props` flag.
+    #[must_use]
+    pub fn needs_props(&self) -> bool {
+        self.needs_props
+    }
+
+    /// Read-only accessor: `needs_dict_reset` flag.
+    #[must_use]
+    pub fn needs_dict_reset(&self) -> bool {
+        self.needs_dict_reset
+    }
+
+    /// Reconstruct a [`Lzma2Decoder`] from a
+    /// [`super::resume::XzPortResumeState`] capture. The
+    /// returned decoder is positioned at
+    /// [`Lzma2Stage::AwaitControl`] with the captured dict +
+    /// probs + reps + state restored. Used by the Phase F.5
+    /// resume_factory.
+    #[must_use]
+    pub fn from_resume(
+        decoder: Lzma1Decoder,
+        dict: LzmaDict,
+        needs_props: bool,
+        needs_dict_reset: bool,
+    ) -> Self {
+        Self {
+            decoder,
+            dict,
+            staging: Vec::with_capacity(64 * 1024),
+            needs_props,
+            needs_dict_reset,
+            stage: Lzma2Stage::AwaitControl,
         }
     }
 
@@ -127,9 +283,8 @@ impl Lzma2Decoder {
     /// `EndOfStream` chunk's 1-byte control).
     ///
     /// `input` must contain a complete LZMA2 stream terminated
-    /// by an `EndOfStream` chunk (`0x00` control byte).
-    /// Streaming-input shape with mid-stream resume comes in
-    /// Phase F.
+    /// by an `EndOfStream` chunk (`0x00` control byte). For
+    /// incremental input, use [`Self::step`] directly.
     ///
     /// # Errors
     ///
@@ -153,54 +308,159 @@ impl Lzma2Decoder {
     ) -> Result<usize, XzPortError> {
         let mut p: usize = 0;
         loop {
-            let header = parse_lzma2_chunk_header(&input[p..])?;
-            match header {
-                Lzma2ChunkHeader::EndOfStream => {
-                    p += 1;
-                    return Ok(p);
-                }
-                Lzma2ChunkHeader::Uncompressed {
-                    reset_dict,
-                    uncompressed_size,
-                } => {
-                    self.dispatch_uncompressed(input, &mut p, reset_dict, uncompressed_size, sink)?;
-                }
-                Lzma2ChunkHeader::Lzma {
-                    reset_state,
-                    reset_props,
-                    reset_dict,
-                    uncompressed_size,
-                    compressed_size,
-                    properties,
-                } => {
-                    self.dispatch_lzma(
-                        input,
-                        &mut p,
-                        reset_state,
-                        reset_props,
-                        reset_dict,
-                        uncompressed_size,
-                        compressed_size,
-                        properties,
-                        sink,
-                    )?;
+            match self.step(input, &mut p, sink)? {
+                Lzma2StepStatus::EndOfStream => return Ok(p),
+                Lzma2StepStatus::Produced => {}
+                Lzma2StepStatus::NeedInput => {
+                    // The full-slice API mandates the entire
+                    // LZMA2 stream is present; surfacing
+                    // NeedInput here means the caller's slice
+                    // was truncated mid-chunk.
+                    let avail = input.len().saturating_sub(p);
+                    return Err(XzPortError::ChunkTruncated {
+                        compressed_size: 0,
+                        available: avail,
+                    });
                 }
             }
         }
     }
 
-    fn dispatch_uncompressed(
+    /// Drive the decoder forward consuming bytes from `input`
+    /// (advancing `*in_pos`). Writes any decoded uncompressed
+    /// bytes to `sink`. Phase F.1's chunk-level streaming
+    /// entry point.
+    ///
+    /// Each call processes at most one LZMA2 chunk. If the
+    /// input slice ends mid-header or mid-payload, the call
+    /// returns [`Lzma2StepStatus::NeedInput`] without consuming
+    /// bytes from the partial header / payload (so the caller's
+    /// next call can re-supply them). The caller is responsible
+    /// for ensuring the slice grows monotonically (i.e., bytes
+    /// already inspected are still present at the same offsets
+    /// on a re-call) until the decoder advances past them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decode_stream`], minus [`XzPortError::ChunkTruncated`]
+    /// (the streaming model returns [`Lzma2StepStatus::NeedInput`]
+    /// instead).
+    pub fn step(
         &mut self,
         input: &[u8],
-        p: &mut usize,
-        reset_dict: bool,
-        uncompressed_size: u32,
+        in_pos: &mut usize,
         sink: &mut dyn Write,
+    ) -> Result<Lzma2StepStatus, XzPortError> {
+        loop {
+            match self.stage {
+                Lzma2Stage::EndOfStream => return Ok(Lzma2StepStatus::EndOfStream),
+                Lzma2Stage::AwaitControl => {
+                    if *in_pos >= input.len() {
+                        return Ok(Lzma2StepStatus::NeedInput);
+                    }
+                    let control = input[*in_pos];
+                    let header_len = lzma2_header_len(control)?;
+                    if control == 0x00 {
+                        // EndOfStream chunk: 1-byte header,
+                        // no payload.
+                        *in_pos += 1;
+                        self.stage = Lzma2Stage::EndOfStream;
+                        return Ok(Lzma2StepStatus::EndOfStream);
+                    }
+                    self.stage = Lzma2Stage::AwaitHeader {
+                        control,
+                        header_len: header_len as u8,
+                    };
+                    // Loop continues; AwaitHeader checks if we
+                    // already have enough bytes.
+                }
+                Lzma2Stage::AwaitHeader {
+                    control,
+                    header_len,
+                } => {
+                    let need = header_len as usize;
+                    if input.len() - *in_pos < need {
+                        return Ok(Lzma2StepStatus::NeedInput);
+                    }
+                    let header = parse_lzma2_chunk_header(&input[*in_pos..*in_pos + need])?;
+                    match header {
+                        Lzma2ChunkHeader::EndOfStream => {
+                            // Single-byte header — should have
+                            // taken the AwaitControl shortcut.
+                            // Belt-and-suspenders for forward
+                            // compat.
+                            *in_pos += 1;
+                            self.stage = Lzma2Stage::EndOfStream;
+                            return Ok(Lzma2StepStatus::EndOfStream);
+                        }
+                        Lzma2ChunkHeader::Uncompressed {
+                            reset_dict,
+                            uncompressed_size,
+                        } => {
+                            self.apply_uncompressed_resets(control, reset_dict)?;
+                            *in_pos += need;
+                            self.stage = Lzma2Stage::AwaitPayload {
+                                is_lzma: false,
+                                uncompressed_size,
+                                compressed_size: uncompressed_size,
+                            };
+                        }
+                        Lzma2ChunkHeader::Lzma {
+                            reset_state,
+                            reset_props,
+                            reset_dict,
+                            uncompressed_size,
+                            compressed_size,
+                            properties,
+                        } => {
+                            self.apply_lzma_resets(
+                                control,
+                                reset_state,
+                                reset_props,
+                                reset_dict,
+                                properties,
+                            )?;
+                            *in_pos += need;
+                            self.stage = Lzma2Stage::AwaitPayload {
+                                is_lzma: true,
+                                uncompressed_size,
+                                compressed_size,
+                            };
+                        }
+                    }
+                }
+                Lzma2Stage::AwaitPayload {
+                    is_lzma,
+                    uncompressed_size,
+                    compressed_size,
+                } => {
+                    let need = compressed_size as usize;
+                    if input.len() - *in_pos < need {
+                        return Ok(Lzma2StepStatus::NeedInput);
+                    }
+                    let payload = &input[*in_pos..*in_pos + need];
+                    if is_lzma {
+                        self.decode_lzma_chunk(payload, uncompressed_size, compressed_size, sink)?;
+                    } else {
+                        self.decode_uncompressed_chunk(payload, uncompressed_size, sink)?;
+                    }
+                    *in_pos += need;
+                    self.stage = Lzma2Stage::AwaitControl;
+                    return Ok(Lzma2StepStatus::Produced);
+                }
+            }
+        }
+    }
+
+    fn apply_uncompressed_resets(
+        &mut self,
+        control: u8,
+        reset_dict: bool,
     ) -> Result<(), XzPortError> {
         if self.needs_dict_reset && !reset_dict {
             // Liblzma also enforces this — first chunk in a
             // Block must reset the dict.
-            return Err(XzPortError::FirstChunkMustResetDict(input[*p]));
+            return Err(XzPortError::FirstChunkMustResetDict(control));
         }
         if reset_dict {
             self.dict.reset();
@@ -208,17 +468,53 @@ impl Lzma2Decoder {
             self.needs_props = true;
             self.needs_dict_reset = false;
         }
-        // Header is 3 bytes (control + 2-byte BE size-1).
-        *p += 3;
+        Ok(())
+    }
 
-        let chunk_end = p
-            .checked_add(uncompressed_size as usize)
-            .filter(|&e| e <= input.len())
-            .ok_or(XzPortError::ChunkTruncated {
-                compressed_size: uncompressed_size,
-                available: input.len() - *p,
-            })?;
-        let chunk = &input[*p..chunk_end];
+    fn apply_lzma_resets(
+        &mut self,
+        control: u8,
+        reset_state: bool,
+        _reset_props: bool,
+        reset_dict: bool,
+        properties: Option<u8>,
+    ) -> Result<(), XzPortError> {
+        if self.needs_dict_reset && !reset_dict {
+            return Err(XzPortError::FirstChunkMustResetDict(control));
+        }
+
+        if reset_dict {
+            self.dict.reset();
+            self.decoder.full_reset();
+            self.needs_props = true;
+            self.needs_dict_reset = false;
+        } else if reset_state {
+            self.decoder.full_reset();
+            // Spec quirk: state-only reset KEEPS the prior
+            // properties; needs_props stays as-is. But
+            // `reset_props` (mode 0b110) sets a new properties
+            // byte below.
+        }
+
+        if let Some(props_byte) = properties {
+            let (lc, lp, pb) = decode_lzma_properties(props_byte)?;
+            self.decoder
+                .set_properties(u32::from(lc), u32::from(lp), u32::from(pb));
+            self.needs_props = false;
+        } else if self.needs_props {
+            return Err(XzPortError::ChunkNeedsProperties);
+        }
+
+        Ok(())
+    }
+
+    fn decode_uncompressed_chunk(
+        &mut self,
+        chunk: &[u8],
+        uncompressed_size: u32,
+        sink: &mut dyn Write,
+    ) -> Result<(), XzPortError> {
+        debug_assert_eq!(chunk.len(), uncompressed_size as usize);
 
         // Send the bytes to the sink up front; the dict-write
         // loop below maintains the ring's `pos`/`full` so any
@@ -245,53 +541,17 @@ impl Lzma2Decoder {
             debug_assert_eq!(in_pos - pre_in, this_step);
             debug_assert_eq!(pre_left - left, this_step);
         }
-        *p = chunk_end;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_lzma(
+    fn decode_lzma_chunk(
         &mut self,
-        input: &[u8],
-        p: &mut usize,
-        reset_state: bool,
-        reset_props: bool,
-        reset_dict: bool,
+        chunk_payload: &[u8],
         uncompressed_size: u32,
         compressed_size: u32,
-        properties: Option<u8>,
         sink: &mut dyn Write,
     ) -> Result<(), XzPortError> {
-        if self.needs_dict_reset && !reset_dict {
-            return Err(XzPortError::FirstChunkMustResetDict(input[*p]));
-        }
-
-        if reset_dict {
-            self.dict.reset();
-            self.decoder.full_reset();
-            self.needs_props = true;
-            self.needs_dict_reset = false;
-        } else if reset_state {
-            self.decoder.full_reset();
-            // Spec quirk: state-only reset KEEPS the prior
-            // properties; needs_props stays as-is. But
-            // `reset_props` (mode 0b110) sets a new properties
-            // byte below.
-        }
-
-        // Header length: 5 bytes (control + 2-byte uncomp size
-        // + 2-byte comp size) plus 1 byte if reset_props.
-        let header_len = if reset_props { 6 } else { 5 };
-        *p += header_len;
-
-        if let Some(props_byte) = properties {
-            let (lc, lp, pb) = decode_lzma_properties(props_byte)?;
-            self.decoder
-                .set_properties(u32::from(lc), u32::from(lp), u32::from(pb));
-            self.needs_props = false;
-        } else if self.needs_props {
-            return Err(XzPortError::ChunkNeedsProperties);
-        }
+        debug_assert_eq!(chunk_payload.len(), compressed_size as usize);
 
         // Each LZMA chunk starts a fresh range coder per the
         // LZMA2 spec. Mirror of liblzma's `rc_reset` at chunk
@@ -299,14 +559,6 @@ impl Lzma2Decoder {
         self.decoder.rc = RangeDecoder::new();
         self.decoder.sequence = Sequence::Normalize;
 
-        let chunk_end = p
-            .checked_add(compressed_size as usize)
-            .filter(|&e| e <= input.len())
-            .ok_or(XzPortError::ChunkTruncated {
-                compressed_size,
-                available: input.len() - *p,
-            })?;
-        let chunk_payload = &input[*p..chunk_end];
         let mut in_pos = 0usize;
         let mut remaining = uncompressed_size as usize;
 
@@ -315,7 +567,7 @@ impl Lzma2Decoder {
         self.staging.clear();
         self.staging.reserve(uncompressed_size as usize);
 
-        // Wrap-loop: see `dispatch_uncompressed` for the
+        // Wrap-loop: see `decode_uncompressed_chunk` for the
         // rationale. liblzma's `decode_buffer` runs the same
         // shape for LZMA chunks too.
         while remaining > 0 {
@@ -357,7 +609,6 @@ impl Lzma2Decoder {
             });
         }
 
-        *p = chunk_end;
         Ok(())
     }
 
@@ -372,11 +623,9 @@ impl Lzma2Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::xz_native::block::{block_header_real_size, parse_block_header};
-    use crate::decode::xz_native::stream::STREAM_HEADER_LEN;
-    use crate::decode::xz_native::Decoder as XzNativeDecoder;
-    use crate::decode::{DecodeStatus, StreamingDecoder};
-    use std::io::Cursor;
+    use crate::decode::xz_liblzma::block::{block_header_real_size, parse_block_header};
+    use crate::decode::xz_liblzma::stream::STREAM_HEADER_LEN;
+    use std::io::{Cursor, Read};
 
     /// Encode `payload` with `xz2` at the given preset. Mirror
     /// of `tests/test_bench_xz_liblzma.rs::encode_xz`.
@@ -408,9 +657,8 @@ mod tests {
     }
 
     /// Decode an `.xz` stream via [`Lzma2Decoder`], using
-    /// `xz_native::block` to parse the Stream Header + Block
-    /// Header (Phase 6 will port those). Returns the decoded
-    /// bytes.
+    /// the local Stream Header / Block Header parsers. Returns
+    /// the decoded bytes.
     fn decode_via_port(compressed: &[u8]) -> Vec<u8> {
         let mut p = STREAM_HEADER_LEN;
         let bh_len = block_header_real_size(compressed[p]);
@@ -424,32 +672,26 @@ mod tests {
         out
     }
 
-    /// Decode the same .xz stream via the production
-    /// `xz_native` decoder. Reference for differential tests.
-    fn decode_via_xz_native(compressed: &[u8]) -> Vec<u8> {
-        let source = Cursor::new(compressed.to_vec());
-        let mut decoder = XzNativeDecoder::new(Box::new(source)).expect("xz_native decoder");
+    /// Decode the same .xz stream via `xz2` (the third-party
+    /// liblzma binding). Reference for differential tests.
+    fn decode_via_xz2(compressed: &[u8]) -> Vec<u8> {
+        let mut decoder = xz2::read::XzDecoder::new(Cursor::new(compressed.to_vec()));
         let mut sink: Vec<u8> = Vec::new();
-        loop {
-            match decoder.decode_step(&mut sink).expect("decode_step") {
-                DecodeStatus::Eof => break,
-                DecodeStatus::MoreData => {}
-            }
-        }
+        decoder.read_to_end(&mut sink).expect("xz2 decode");
         sink
     }
 
-    /// Differential gate: peel-port output == xz_native
-    /// output, both byte-identical to original payload.
+    /// Differential gate: peel-port output == xz2 output ==
+    /// original payload.
     fn diff_check(payload: &[u8], preset: u32) {
         let compressed = encode_xz(payload, preset);
         let port = decode_via_port(&compressed);
-        let native = decode_via_xz_native(&compressed);
+        let xz2_out = decode_via_xz2(&compressed);
         assert_eq!(port.len(), payload.len(), "port length mismatch");
-        assert_eq!(native.len(), payload.len(), "native length mismatch");
+        assert_eq!(xz2_out.len(), payload.len(), "xz2 length mismatch");
         assert_eq!(port, payload, "port bytes != payload");
-        assert_eq!(native, payload, "native bytes != payload");
-        assert_eq!(port, native, "port bytes != native bytes");
+        assert_eq!(xz2_out, payload, "xz2 bytes != payload");
+        assert_eq!(port, xz2_out, "port bytes != xz2 bytes");
     }
 
     /// Tiny: 32 bytes, single chunk.
@@ -538,4 +780,159 @@ mod tests {
     // first byte after the Stream Header is the Index
     // Indicator (`0x00`), not a Block Header. Phase 6's
     // Stream-level dispatcher will route Index vs Block.
+
+    // ===== Phase F.1: chunk-level streaming via `step` =====
+
+    /// Drive `Lzma2Decoder::step` against the LZMA2 substream
+    /// of `compressed` (the bytes after the Stream Header and
+    /// Block Header), exposing the input one byte at a time,
+    /// and verify that the streaming path produces the same
+    /// output as the bulk `decode_stream` path.
+    fn decode_via_step_byte_at_a_time(compressed: &[u8]) -> Vec<u8> {
+        let mut p = STREAM_HEADER_LEN;
+        let bh_len = block_header_real_size(compressed[p]);
+        let block_header = parse_block_header(&compressed[p..p + bh_len]).expect("block header");
+        p += bh_len;
+        let lzma2_full = &compressed[p..];
+
+        let mut dec = Lzma2Decoder::new(block_header.dict_size);
+        let mut out: Vec<u8> = Vec::new();
+        let mut visible: usize = 0;
+        let mut consumed: usize = 0;
+        loop {
+            let mut local_pos = consumed;
+            match dec
+                .step(&lzma2_full[..visible], &mut local_pos, &mut out)
+                .expect("step")
+            {
+                Lzma2StepStatus::EndOfStream => return out,
+                Lzma2StepStatus::Produced => {
+                    consumed = local_pos;
+                }
+                Lzma2StepStatus::NeedInput => {
+                    consumed = local_pos;
+                    if visible >= lzma2_full.len() {
+                        panic!(
+                            "step asked for input past end of LZMA2 stream \
+                             (visible={visible}, consumed={consumed})"
+                        );
+                    }
+                    visible += 1;
+                }
+            }
+        }
+    }
+
+    /// Same shape as `decode_via_step_byte_at_a_time` but
+    /// reveals randomly-sized chunks, exercising the
+    /// AwaitHeader / AwaitPayload partial paths under varied
+    /// boundaries.
+    fn decode_via_step_random_chunks(compressed: &[u8], seed: u64) -> Vec<u8> {
+        let mut p = STREAM_HEADER_LEN;
+        let bh_len = block_header_real_size(compressed[p]);
+        let block_header = parse_block_header(&compressed[p..p + bh_len]).expect("block header");
+        p += bh_len;
+        let lzma2_full = &compressed[p..];
+
+        let mut state = seed;
+        let mut next_chunk = || {
+            // Tiny LCG; uniform on 1..=4096.
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) as usize % 4096) + 1
+        };
+
+        let mut dec = Lzma2Decoder::new(block_header.dict_size);
+        let mut out: Vec<u8> = Vec::new();
+        let mut visible: usize = 0;
+        let mut consumed: usize = 0;
+        loop {
+            let mut local_pos = consumed;
+            match dec
+                .step(&lzma2_full[..visible], &mut local_pos, &mut out)
+                .expect("step")
+            {
+                Lzma2StepStatus::EndOfStream => return out,
+                Lzma2StepStatus::Produced => {
+                    consumed = local_pos;
+                }
+                Lzma2StepStatus::NeedInput => {
+                    consumed = local_pos;
+                    if visible >= lzma2_full.len() {
+                        panic!(
+                            "step asked for input past end of LZMA2 stream \
+                             (visible={visible}, consumed={consumed})"
+                        );
+                    }
+                    let bump = next_chunk().min(lzma2_full.len() - visible);
+                    visible += bump;
+                }
+            }
+        }
+    }
+
+    /// Compressible payload via byte-at-a-time streaming.
+    /// Validates that step()'s NeedInput / AwaitControl /
+    /// AwaitHeader / AwaitPayload state machine reaches the
+    /// same output as the bulk path.
+    #[test]
+    fn step_byte_at_a_time_compressible() {
+        let mut payload = Vec::new();
+        for _ in 0..32 {
+            payload.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+        }
+        let compressed = encode_xz(&payload, 6);
+        let got = decode_via_step_byte_at_a_time(&compressed);
+        assert_eq!(got, payload);
+    }
+
+    /// Larger compressible payload (multi-chunk LZMA2 stream),
+    /// random-chunk streaming. Exercises the dispatcher with
+    /// hundreds of NeedInput / Produced transitions.
+    #[test]
+    fn step_random_chunks_multi_chunk_compressible() {
+        let mut payload = Vec::with_capacity(256 * 1024);
+        for i in 0..2000 {
+            payload
+                .extend_from_slice(format!("entry {i:08}: status=ok action=ingest\n").as_bytes());
+        }
+        let compressed = encode_xz(&payload, 6);
+        let got = decode_via_step_random_chunks(&compressed, 0xDEAD_BEEF_CAFE);
+        assert_eq!(got, payload);
+    }
+
+    /// LCG (incompressible) payload — xz emits uncompressed
+    /// chunks here, so the streaming path exercises the
+    /// uncompressed-chunk branch heavily.
+    #[test]
+    fn step_random_chunks_incompressible_lcg() {
+        let mut state: u64 = 0x00C0_FFEE_DEAD;
+        let payload: Vec<u8> = (0..256 * 1024)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (state >> 24) as u8
+            })
+            .collect();
+        let compressed = encode_xz(&payload, 6);
+        let got = decode_via_step_random_chunks(&compressed, 0xFEED_FACE);
+        assert_eq!(got, payload);
+    }
+
+    /// Cross-preset streaming: same payload at presets 1/3/6/9
+    /// via random-chunk streaming.
+    #[test]
+    fn step_random_chunks_across_presets() {
+        let mut payload = Vec::new();
+        for i in 0..1000 {
+            payload.extend_from_slice(format!("row {i:05} | data | value\n").as_bytes());
+        }
+        for preset in [1u32, 3, 6, 9] {
+            let compressed = encode_xz(&payload, preset);
+            let got = decode_via_step_random_chunks(&compressed, 0x1234_5678 ^ u64::from(preset));
+            assert_eq!(got, payload, "preset {preset} streaming round-trip failed");
+        }
+    }
 }

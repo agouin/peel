@@ -34,7 +34,6 @@
 use std::io::{Cursor, Read, Write};
 
 use peel::decode::xz_liblzma::Decoder as XzLiblzmaDecoder;
-use peel::decode::xz_native::Decoder as XzNativeDecoder;
 use peel::decode::{DecodeStatus, StreamingDecoder};
 
 // ---- xz2 round-trip helpers ----------------------------------------
@@ -70,23 +69,10 @@ fn liblzma_port_decompress(stream: &[u8]) -> Vec<u8> {
     out
 }
 
-fn xz_native_decompress(stream: &[u8]) -> Vec<u8> {
-    let mut decoder: XzNativeDecoder =
-        XzNativeDecoder::new(Box::new(Cursor::new(stream.to_vec()))).expect("construct native");
-    let mut out = Vec::new();
-    loop {
-        match decoder.decode_step(&mut out).expect("decode_step (native)") {
-            DecodeStatus::Eof => break,
-            DecodeStatus::MoreData => continue,
-        }
-    }
-    out
-}
-
-/// Three-way differential gate.
+/// Two-way differential gate (Phase F.6 retired `xz_native`;
+/// `xz2` is now the sole external reference).
 fn assert_three_way(payload: &[u8], stream: &[u8], label: &str) {
     let port = liblzma_port_decompress(stream);
-    let native = xz_native_decompress(stream);
     let xz2 = xz2_decompress(stream);
     assert_eq!(
         port.len(),
@@ -96,9 +82,7 @@ fn assert_three_way(payload: &[u8], stream: &[u8], label: &str) {
         payload.len(),
     );
     assert_eq!(port, payload, "{label}: port != payload");
-    assert_eq!(native, payload, "{label}: native != payload");
     assert_eq!(xz2, payload, "{label}: xz2 != payload");
-    assert_eq!(port, native, "{label}: port != native");
     assert_eq!(port, xz2, "{label}: port != xz2");
 }
 

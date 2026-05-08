@@ -3,7 +3,7 @@
 //!
 //! Drives the new [`peel::decode::xz_liblzma::decoder::lzma_decode_port`]
 //! against a full `.xz`-encoded payload by parsing the LZMA2 chunk
-//! framing (via [`peel::decode::xz_native::block`]'s public parsers)
+//! framing (via [`peel::decode::xz_liblzma::block`]'s public parsers)
 //! and replaying each chunk's compressed bytes through the new
 //! decoder. Compares wall-clock against `xz2`'s liblzma-backed
 //! decoder over the same `.xz` bytes.
@@ -43,9 +43,9 @@
 
 use std::time::{Duration, Instant};
 
+use peel::decode::xz_liblzma::block::{block_header_real_size, parse_block_header};
 use peel::decode::xz_liblzma::lzma2::Lzma2Decoder;
-use peel::decode::xz_native::block::{block_header_real_size, parse_block_header};
-use peel::decode::xz_native::stream::STREAM_HEADER_LEN;
+use peel::decode::xz_liblzma::stream::STREAM_HEADER_LEN;
 
 #[path = "support/mod.rs"]
 mod support;

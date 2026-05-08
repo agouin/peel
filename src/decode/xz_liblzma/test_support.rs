@@ -1,10 +1,9 @@
-//! Test-only helpers shared by the `xz_native` submodules.
+//! Test-only helpers shared by the `xz_liblzma` submodules.
 //!
 //! Compiles only under `#[cfg(test)]`. The reference LZMA range
-//! *encoder* lives here so the Phase 2 (range coder) and Phase 3
-//! (LZMA literal/length/distance) test suites can both use it
-//! without duplication; Phase 4's chunk-decoder tests will lean on
-//! the same helper.
+//! *encoder* lives here so the range-coder + LZMA1-decoder
+//! tests can drive synthetic streams without the .xz framing
+//! layer.
 //!
 //! The encoder is transcribed from the LZMA specification's
 //! reference encoder pseudocode (Igor Pavlov,
@@ -12,11 +11,14 @@
 //! a stream the production decoder reads back is the simplest way
 //! to assert byte-for-byte agreement on the spec's tricky
 //! corners — sign-bit math, normalization carry, probability
-//! adaptation step. If the encoder were wrong, round-trips would
-//! "succeed" only when it were wrong in a way that exactly
-//! mirrored the decoder; the real-`xz`-payload pin in
-//! [`super::range_coder::tests::real_lzma_payload_init_round_trip`]
-//! catches that mode.
+//! adaptation step.
+
+// Some helper methods (e.g. bit-tree encoders) are referenced
+// only by the original `xz_native` test suite that Phase F.6
+// retired. They're kept here for symmetry with the LZMA spec
+// (and so future tests can pick them up), so silence the
+// unused-method lint at the impl level rather than per-method.
+#![allow(dead_code)]
 
 // Constants are re-stated locally so this file doesn't depend on
 // `pub`-leaking spec-internal numbers from `range_coder`. The

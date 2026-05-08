@@ -142,6 +142,23 @@ impl LzmaDict {
         self.full > distance
     }
 
+    /// Read-only raw pointer to the ring buffer. Used by the
+    /// resume-blob serializer ([`super::resume::dict_recent`])
+    /// to snapshot the chronological history.
+    #[inline]
+    #[must_use]
+    pub fn dict_raw_ptr(&self) -> *const u8 {
+        self.buf.as_ptr()
+    }
+
+    /// Mutable raw pointer to the ring buffer. Used by the
+    /// resume-blob deserializer ([`super::resume::dict_restore`])
+    /// to restore the chronological history bytes.
+    #[inline]
+    pub fn dict_raw_mut_ptr(&mut self) -> *mut u8 {
+        self.buf.as_mut_ptr()
+    }
+
     /// Get the byte at offset `distance + 1` back from the
     /// cursor. `distance == 0` returns the most-recently
     /// pushed byte.

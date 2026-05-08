@@ -21,8 +21,8 @@
 //!   (`0x00`); LZMA chunks (control bytes `0x80..=0xFF`) surface
 //!   [`XzError::LzmaChunkUnimplemented`] until Phase 4.
 
-use super::error::XzError;
 use super::stream::{crc32, read_multibyte, DICT_SIZE_CAP};
+use super::xz_error::XzError;
 
 /// Filter ID for LZMA2 (the only filter Phase 1 accepts).
 pub const LZMA2_FILTER_ID: u64 = 0x21;

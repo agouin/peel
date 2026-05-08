@@ -20,16 +20,14 @@ fuzz_target!(|data: &[u8]| {
     let Some((selector, body)) = data.split_first() else {
         return;
     };
-    let factory: DecoderFactory = match selector % 5 {
+    let factory: DecoderFactory = match selector % 4 {
         0 => decode::zstd::factory,
-        1 => decode::xz_native::factory,
-        2 => decode::gzip::factory,
-        3 => decode::lz4::factory,
-        // Phase 7 of `docs/PLAN_xz_liblzma_port.md`: extend
-        // the existing fuzz coverage to the new
-        // `xz_liblzma::Decoder`. Same input shape (adversarial
-        // .xz framing); the new decoder is required to neither
-        // panic nor produce UB on any adversarial input.
+        1 => decode::gzip::factory,
+        2 => decode::lz4::factory,
+        // Phase F.6 of `docs/PLAN_xz_liblzma_phase_f.md`
+        // retired `xz_native`; `xz_liblzma` is now the sole
+        // xz decoder and inherits the existing fuzz contract
+        // (no panic, no UB on any adversarial .xz framing).
         _ => decode::xz_liblzma::factory,
     };
 

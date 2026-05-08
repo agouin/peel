@@ -72,7 +72,6 @@ pub mod identity;
 pub mod lz4;
 pub mod xz;
 pub mod xz_liblzma;
-pub mod xz_native;
 pub mod zstd;
 
 // Hand-rolled DEFLATE decoder (`docs/PLAN_deflate_block_decoder.md`).

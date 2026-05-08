@@ -14,7 +14,7 @@
 //! chunks and for the byte-stream path of uncompressed chunks.
 //! At Block end the [`BlockCheckHasher::verify`] method consumes
 //! the read trailer bytes and surfaces a clean
-//! [`super::error::XzError::BlockCheckMismatch`] on disagreement.
+//! [`super::xz_error::XzError::BlockCheckMismatch`] on disagreement.
 //!
 //! # Why an enum
 //!
@@ -29,8 +29,8 @@
 
 use crate::hash::{crc32::Crc32, crc64::Crc64, sha256::Sha256};
 
-use super::error::XzError;
 use super::stream::CheckId;
+use super::xz_error::XzError;
 
 /// Streaming hasher for the Block-Check trailer.
 ///
@@ -110,9 +110,9 @@ impl BlockCheckHasher {
     ///
     /// # Errors
     ///
-    /// - [`super::error::XzError::ResumeBlobLength`] if `bytes`
+    /// - [`super::xz_error::XzError::ResumeBlobLength`] if `bytes`
     ///   length doesn't match the variant's expected size.
-    /// - [`super::error::XzError::ResumeBlobTruncated`] if a
+    /// - [`super::xz_error::XzError::ResumeBlobTruncated`] if a
     ///   variant-internal deserializer (e.g. SHA-256) rejects
     ///   the slice as malformed.
     pub fn deserialize_state(check: CheckId, bytes: &[u8]) -> Result<Self, XzError> {

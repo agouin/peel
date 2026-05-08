@@ -356,10 +356,10 @@ mod tests {
 
     #![allow(unused_assignments)]
 
+    use super::super::test_support::TestRangeEncoder;
     use super::*;
     use crate::decode::xz_liblzma::decoder::{Lzma1Decoder, Sequence};
     use crate::decode::xz_liblzma::error::XzPortError;
-    use crate::decode::xz_native::test_support::TestRangeEncoder;
 
     /// Drive the rc init prefix + N rc_bit calls; return the
     /// decoded bits.

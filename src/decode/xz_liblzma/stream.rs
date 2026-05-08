@@ -33,7 +33,7 @@
 //!
 //! [tukaani.org/xz/xz-file-format.txt]: https://tukaani.org/xz/xz-file-format.txt
 
-use super::error::XzError;
+use super::xz_error::XzError;
 
 /// Stream Header magic: `0xFD '7' 'z' 'X' 'Z' 0x00`. The 6-byte
 /// prefix that identifies an .xz stream on the wire.

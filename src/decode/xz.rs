@@ -1,26 +1,24 @@
 //! xz / LZMA streaming decoder ([XZ file format]).
 //!
-//! Phase 7 of `docs/PLAN_xz_block_decoder.md` swapped the old
-//! `xz2`/liblzma binding wrapper out for the hand-rolled,
-//! pure-Rust implementation in [`super::xz_native`]. This file
-//! is now a thin re-export so [`crate::decode::xz::factory`] and
-//! [`crate::decode::xz::resume_factory`] resolve to the new
-//! implementations without forcing every external caller to
-//! migrate to the `xz_native::` path.
+//! Phase F.6 of `docs/PLAN_xz_liblzma_phase_f.md` swapped the
+//! production xz path from the original hand-rolled
+//! `xz_native` decoder over to the structural port at
+//! [`super::xz_liblzma`]. This module is a thin re-export so
+//! `crate::decode::xz::factory` and `crate::decode::xz::resume_factory`
+//! resolve to the new implementations without forcing every
+//! external caller to migrate to the `xz_liblzma::` path.
 //!
-//! See [`super::xz_native`] for the implementation, the wire-
-//! format coverage, and the resume contract. The plan's exit
-//! criterion for Phase 7 is "the `xz2` crate is no longer a
-//! *runtime* dependency for our decode path"; that is now true.
-//! `xz2` remains as a `[dev-dependencies]` entry for the
-//! differential test suite in `tests/test_xz_native.rs` only.
+//! See [`super::xz_liblzma`] for the implementation, the wire-
+//! format coverage (single-Block, multi-Block, multi-Stream),
+//! the per-LZMA2-chunk frame-boundary contract, and the
+//! checkpoint blob format (`PLZM` v1).
 //!
 //! [XZ file format]: https://tukaani.org/xz/xz-file-format.txt
 
-pub use super::xz_native::factory;
-pub use super::xz_native::resume_factory;
-pub use super::xz_native::Decoder;
+pub use super::xz_liblzma::factory;
+pub use super::xz_liblzma::resume_factory;
+pub use super::xz_liblzma::Decoder;
 
-/// Public alias matching the pre-Phase-7 spelling so existing
+/// Public alias matching the pre-port spelling so existing
 /// callers that name the type by `xz::XzDecoder` keep working.
 pub use Decoder as XzDecoder;

@@ -149,10 +149,10 @@ pub enum XzPortError {
     },
 }
 
-// --- conversion from xz_native errors used by the borrowed parser ---
+// --- conversion from the framing-layer parsers' XzError ---
 
-impl From<crate::decode::xz_native::error::XzError> for XzPortError {
-    fn from(e: crate::decode::xz_native::error::XzError) -> Self {
+impl From<super::xz_error::XzError> for XzPortError {
+    fn from(e: super::xz_error::XzError) -> Self {
         XzPortError::Framing(format!("{e}"))
     }
 }

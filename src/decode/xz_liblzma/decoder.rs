@@ -1410,9 +1410,9 @@ impl std::fmt::Debug for Lzma1Decoder {
 
 #[cfg(test)]
 mod tests {
+    use super::super::dict::LzmaDict;
+    use super::super::test_support::TestRangeEncoder;
     use super::*;
-    use crate::decode::xz_liblzma::dict::LzmaDict;
-    use crate::decode::xz_native::test_support::TestRangeEncoder;
 
     // ===== LZMA encoder test helper =====
     //
