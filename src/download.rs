@@ -30,6 +30,7 @@ pub mod mmap_region;
 pub mod multi_url;
 pub mod rate_limit;
 pub mod scheduler;
+pub mod sevenz_pipeline;
 pub mod sparse_file;
 pub mod worker;
 pub mod zip_pipeline;
