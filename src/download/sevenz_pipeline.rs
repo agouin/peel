@@ -499,10 +499,7 @@ impl SevenzPipeline<'_> {
                             })
                         })
                         .unwrap_or_else(|| "unknown".into());
-                    return Err(SevenzPipelineError::DownloadFinishedEarly {
-                        chunk: idx,
-                        detail,
-                    });
+                    return Err(SevenzPipelineError::DownloadFinishedEarly { chunk: idx, detail });
                 }
                 thread::sleep(self.config.poll_interval);
             }

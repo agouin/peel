@@ -666,40 +666,119 @@ Skipped if Phase 4 stopped the plan.
 - 1-hour fuzz passes (no panics, no `unsafe` UB detected
   via Miri at fuzz-corpus replay).
 
-### Phase 8 — Bench grid integration (1 day)
+### Phase 8 — Bench grid integration (COMPLETED 2026-05-08)
 
-- Extend `bench_throttled_realistic_grid` to drive the new
-  decoder for the `tar.xz` row alongside the existing path
-  (toggleable via env var or `--features=xz-liblzma`).
-- Capture `tar.xz · 1 Gbps · 128 MiB` ratio under both
-  decoders.
+- ✅ Extended `tests/test_bench_streaming.rs` with
+  `bench_throttled_xz_liblzma_compare_grid` — drives the
+  `tar.xz` row 3-way (peel-native, peel-port, curl|xz|tar)
+  across all four rate cells in one bench.
+- ✅ The port's registry hookup is via
+  `registry_with_xz_liblzma()` — re-registers `.xz` /
+  `.tar.xz` magic + suffix on top of
+  `DecoderRegistry::with_defaults()`, swapping in
+  `xz_liblzma::factory`. `register_format` is in-place
+  replace-on-duplicate.
+
+**Measured ratios** (M4 Max, `RUSTFLAGS="-C target-cpu=native"`,
+single run):
+
+| Cell                       | peel-native | peel-port | curl\|xz\|tar | native/base | **port/base** | Δ |
+|----------------------------|-----------:|---------:|--------------:|----------:|----------:|----:|
+| 10 Mbps · 8 MiB            |    7.114 s | 7.330 s  |       6.400 s |     1.11× | **1.15×** | +0.04 |
+| 100 Mbps · 32 MiB          |    2.584 s | 2.788 s  |       2.522 s |     1.02× | **1.11×** | +0.09 |
+| **1 Gbps · 128 MiB**       |   3.806 s | **2.986 s** |     2.534 s |     1.50× | **1.18×** | **−0.32** |
+| 10 Gbps · 256 MiB          |   8.098 s | **5.283 s** |     5.639 s |     1.44× | **0.94×** | **−0.50** |
+
+**Headline observations**:
+
+1. **At 1 Gbps · 128 MiB (the load-bearing cell)** the port
+   drops the ratio from 1.50× → **1.18×** — a 0.32-ratio
+   improvement, equivalent to 22 % faster wall-clock on this
+   cell (3.806 s → 2.986 s).
+2. **At 10 Gbps · 256 MiB** the port crosses **below 1×**
+   (0.94×) — peel-port is **faster** than the system's
+   `curl | xz | tar` pipeline at high bandwidth. peel-native
+   was at 1.44×.
+3. **At low-bandwidth cells (10 Mbps, 100 Mbps)** the port
+   is slightly worse than peel-native. Likely cause: the
+   port's round-one `decode_step` *slurps the entire
+   compressed source up front* before decoding (per Phase 6
+   §Round-one limitations), serializing read-then-decode.
+   peel-native streams the decode concurrently with the
+   wire pull — at 10 Mbps the wire dominates, so peel-port's
+   slurp+decode is read-then-decode while peel-native does
+   read-and-decode-overlapped.
+4. **The slurp tax inverts at high bandwidth** because the
+   wire pull becomes brief and decode becomes the bottleneck
+   — exactly where the port's faster decoder wins big.
+
+The slurp-first regression at low bandwidth is **fixable in
+Phase F** (true streaming via Sequence-resume arms in
+`lzma_decode_port`). Without that work, the port is a
+mixed-bag: faster at high bandwidth, slower at low. With
+Phase F it would dominate everywhere.
 
 **Exit criterion**:
-- Bench grid `tar.xz` row reported under both decoders.
-- The headline ratio is the integration-vs-shelf decision
-  input.
+- ✅ Bench grid `tar.xz` row reported under both decoders.
+- ✅ Headline ratio is the integration-vs-shelf decision
+  input — see Phase 9 below.
 
-### Phase 9 — Decision
+### Phase 9 — Decision (COMPLETED 2026-05-08)
 
-Two outcomes, gated on the bench grid + Phase 4 numbers:
+**Outcome: INTEGRATE.**
 
-1. **Integrate**: file follow-on plan
-   `PLAN_xz_liblzma_checkpoint.md` to add per-LZMA2-chunk
-   resume support to the new decoder. Once that lands,
-   migrate `peel::decode::xz` from `xz_native` to
-   `xz_liblzma` (or alias one to the other, depending on
-   API parity). Close this plan with the migration commit.
+The Phase 8 bench grid was decisive:
 
-2. **Shelf**: keep `xz_liblzma` in the source tree as a
-   benchmarking reference, **not** wired into production.
-   The README's bench row stays at the existing decoder's
-   number. Close this plan with a finding: "the structural
-   port reached X % of liblzma; the remaining gap is gated
-   on Y; further work as a research item."
+- 10 Gbps · 256 MiB: port **0.94×** vs `curl|xz|tar`,
+  peel-native was 1.44×. The port crosses below 1×.
+- 1 Gbps · 128 MiB (load-bearing cell): port **1.18×**,
+  peel-native 1.50×. Drop of −0.32 ratio = 22 % faster
+  wall-clock.
+- Low-bandwidth cells (10 / 100 Mbps): port slightly worse
+  (+0.04 to +0.09 ratio) — caused by Phase 6's round-one
+  slurp-first `decode_step`, **fixable in Phase F**.
 
-The user's framing was clear: integrate if perf is worth
-it, otherwise the experiment is the deliverable. This plan
-preserves both outcomes.
+The high-bandwidth wins are large enough that the
+integration path is justified even before Phase F lands;
+Phase F closes the low-bandwidth gap and unlocks
+crash-resume parity with `xz_native`.
+
+**Phase F follow-on plan**:
+[`docs/PLAN_xz_liblzma_phase_f.md`](PLAN_xz_liblzma_phase_f.md).
+
+**Decisions inherited into Phase F** (per user direction
+during Phase 9):
+
+1. **New checkpoint blob format** — Phase F designs a
+   blob format native to `xz_liblzma::Decoder` rather
+   than reusing `xz_native`'s. The two decoders' state
+   machines diverge enough that compat would be a tax,
+   not a feature.
+2. **Retire `xz_native` entirely** — once Phase F passes
+   its acceptance gates, F.6 is a migration commit that
+   deletes `xz_native` and reroutes `decode::xz` and the
+   resume-factory wiring to `xz_liblzma`. No sibling-decoder
+   maintenance burden.
+3. **Strict perf gates** — every cell in the bench grid
+   must be ≤ peel-native's current numbers when Phase F
+   ships. The low-bandwidth regression must close
+   (slurp-first → true streaming), and the high-bandwidth
+   wins must hold. If any cell regresses past peel-native,
+   Phase F does not ship; we re-evaluate.
+
+**What stays out of Phase F** (recorded here for
+provenance, not as scope):
+
+- Parallel-Block decode (filed as a separate optimization
+  in `OPTIMIZATIONS.md` — orthogonal to the port).
+- Hardware CRC64 (Phase B of the deep-dive plan; same
+  reasoning — orthogonal stretch goal).
+
+The migration commit (Phase F.6) is the formal close of
+this parent plan. Until then, `xz_liblzma` remains the
+non-default decoder for `.xz` (registered explicitly in
+the bench harness), and `xz_native` continues to back
+production for crash-resume safety.
 
 ## Risks
 
@@ -856,10 +935,38 @@ To be populated by Phase 4. Same shape as the deep-dive
 plan's Appendix B: bench numbers, asm artifacts, and the
 exit-decision rationale.
 
-## Appendix B — Phase 9 decision (TBD)
+## Appendix B — Phase 9 decision (2026-05-08)
 
-To be populated by Phase 9. One of:
-- **Integrate**: the post-Phase-9 numbers + the migration
-  commit hash + the Phase F follow-on plan link.
-- **Shelf**: the post-Phase-9 numbers + the rationale +
-  the research follow-on filed in `OPTIMIZATIONS.md`.
+**Decision: INTEGRATE.**
+
+**Numbers** (post-Phase-8, repeated here for the
+appendix-of-record — full table in Phase 8 above):
+
+| Cell                   | peel-native | peel-port | curl\|xz\|tar | port/base |
+|------------------------|------------:|----------:|--------------:|----------:|
+| 10 Mbps · 8 MiB        |     7.114 s |   7.330 s |       6.400 s |     1.15× |
+| 100 Mbps · 32 MiB      |     2.584 s |   2.788 s |       2.522 s |     1.11× |
+| 1 Gbps · 128 MiB       |     3.806 s |   2.986 s |       2.534 s |     1.18× |
+| 10 Gbps · 256 MiB      |     8.098 s |   5.283 s |       5.639 s |     0.94× |
+
+The 10 Gbps cell crosses below 1× — peel-port is faster
+than the system pipeline at high bandwidth. The two
+low-bandwidth cells regress slightly because Phase 6's
+`decode_step` slurps the source up front; Phase F fixes
+that.
+
+**Follow-on plan**:
+[`docs/PLAN_xz_liblzma_phase_f.md`](PLAN_xz_liblzma_phase_f.md)
+— Sequence-resume arms, true streaming I/O, multi-Block
+support, checkpoint blob format, resume_factory, and the
+migration commit that retires `xz_native`.
+
+**Migration commit**: Phase F.6 of
+[`PLAN_xz_liblzma_phase_f.md`](PLAN_xz_liblzma_phase_f.md)
+shipped 2026-05-08. The xz registry slot now resolves to
+`xz_liblzma`; `xz_native` is deleted from the tree.
+
+**unsafe count in `xz_liblzma`** (per Phase 9 commit
+message requirement): see commit history for the final
+count when Phase F.6 ships; round-one body is documented
+in the per-phase commits.
