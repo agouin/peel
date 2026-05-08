@@ -75,10 +75,7 @@ fn xz_native_decompress(stream: &[u8]) -> Vec<u8> {
         XzNativeDecoder::new(Box::new(Cursor::new(stream.to_vec()))).expect("construct native");
     let mut out = Vec::new();
     loop {
-        match decoder
-            .decode_step(&mut out)
-            .expect("decode_step (native)")
-        {
+        match decoder.decode_step(&mut out).expect("decode_step (native)") {
             DecodeStatus::Eof => break,
             DecodeStatus::MoreData => continue,
         }
@@ -251,9 +248,7 @@ fn random_fixture(seed: u64) -> Vec<u8> {
             while payload.len() < size {
                 let want = (size - payload.len()).min(1024);
                 if emit_lcg {
-                    a_state = a_state
-                        .wrapping_mul(1_664_525)
-                        .wrapping_add(1_013_904_223);
+                    a_state = a_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                     let chunk = lcg_bytes(a_state, want);
                     payload.extend_from_slice(&chunk);
                 } else {
