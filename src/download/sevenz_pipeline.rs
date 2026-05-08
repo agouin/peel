@@ -191,7 +191,13 @@ pub struct SevenzPipeline<'a> {
     pub sparse: &'a SparseFile,
     /// Bitmap recording which chunks are durable.
     pub bitmap: &'a ChunkBitmap,
-    /// Steering cursor.
+    /// Steering cursor. Workers preferentially dispatch chunks
+    /// at-or-past this byte offset. The pipeline steers it to
+    /// the trailer first (so the small metadata region lands
+    /// quickly), then to the start of pack data, and finally
+    /// the [`crate::progress::ProgressState`] thread keeps it
+    /// in sync with extraction progress via the streaming
+    /// reader's per-`read` updates.
     pub cursor: &'a Arc<AtomicU64>,
     /// `true` once the download thread has exited.
     pub download_done: &'a Arc<AtomicBool>,
@@ -199,6 +205,13 @@ pub struct SevenzPipeline<'a> {
     pub download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     /// Borrowed file descriptor for hole punching.
     pub sparse_fd: BorrowedFd<'a>,
+    /// Shared progress state. The streaming reader publishes
+    /// `bytes_decoded_input` on each pread so the scheduler's
+    /// `max_disk_buffer` throttle measures real lookahead. When
+    /// `None`, the throttle is effectively disabled (zero
+    /// lookahead) and the pipeline runs without bound — useful
+    /// for tests but never the production path.
+    pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
 }
 
 impl SevenzPipeline<'_> {
@@ -233,7 +246,21 @@ impl SevenzPipeline<'_> {
             .trailer_range(self.config.total_size)
             .map_err(SevenzPipelineError::Sevenz)?;
         let trailer_end = trailer_start.saturating_add(trailer_len);
+        // Steer worker priority *and* the cap window to the
+        // trailer. Without the `bytes_decoded_input` bump,
+        // an archive whose trailer sits past `max_disk_buffer`
+        // would deadlock here: the cap would have fired on
+        // bytes downloaded so far (front-of-file) and refuse
+        // to dispatch trailer chunks. By advancing
+        // `bytes_decoded_input` to `trailer_start`, the cap
+        // sees real-lookahead ≈ 0 around the trailer, workers
+        // dispatch trailer chunks immediately, and once we
+        // hand off to the per-folder reader the cap re-anchors
+        // to the folder's start.
         self.cursor.store(trailer_start, Ordering::Release);
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(trailer_start);
+        }
         self.wait_for_range(trailer_start, trailer_end)?;
 
         let mut trailer_bytes = vec![0u8; trailer_len as usize];
@@ -349,6 +376,7 @@ impl SevenzPipeline<'_> {
                     self.download_done,
                     self.config.poll_interval,
                     self.cursor,
+                    self.progress_state,
                     start,
                     pack_size,
                 );
@@ -472,6 +500,7 @@ impl SevenzPipeline<'_> {
             self.download_done,
             self.config.poll_interval,
             self.cursor,
+            self.progress_state,
             inner_start,
             inner_size,
         );
@@ -601,15 +630,18 @@ struct SparseFileSliceReader<'a> {
     chunk_size: u64,
     download_done: &'a Arc<AtomicBool>,
     poll_interval: Duration,
-    /// The pipeline's priority cursor. Each successful `read`
-    /// publishes the new decoder position here so the
-    /// scheduler's `max_disk_buffer` throttle measures
-    /// lookahead from the *consumed* byte, not the static
-    /// folder-start offset. This is what bounds the on-disk
-    /// footprint to roughly `max_disk_buffer` regardless of
-    /// archive or folder size: the throttle releases dispatch
-    /// every time the decoder drains a chunk.
+    /// Worker-priority cursor. `read` publishes the new
+    /// position here so the scheduler steers fetches around
+    /// the chunk that the decoder is about to consume.
     pipeline_cursor: &'a Arc<AtomicU64>,
+    /// Optional [`crate::progress::ProgressState`]. The reader
+    /// publishes `bytes_decoded_input` on every successful
+    /// `read`. Together with the scheduler's `max_disk_buffer`
+    /// cap, that bounds `bytes_downloaded - bytes_decoded_input`
+    /// to the cap value — i.e., bounds the on-disk-but-not-
+    /// extracted footprint to the cap regardless of archive
+    /// size.
+    progress: Option<&'a Arc<crate::progress::ProgressState>>,
     cursor: u64,
     end: u64,
 }
@@ -623,13 +655,21 @@ impl<'a> SparseFileSliceReader<'a> {
         download_done: &'a Arc<AtomicBool>,
         poll_interval: Duration,
         pipeline_cursor: &'a Arc<AtomicU64>,
+        progress: Option<&'a Arc<crate::progress::ProgressState>>,
         start: u64,
         len: u64,
     ) -> Self {
-        // Seed the cursor at `start` so the throttle releases
-        // dispatch for chunks at-or-past this folder before the
-        // first `read` even runs.
+        // Seed both the priority cursor (steering) and the
+        // decoded-input counter (cap) at the folder's start.
+        // The `bytes_decoded_input` jump matters: between
+        // folders, the bytes between this folder's start and
+        // the previous folder's end are already-extracted (or
+        // skipped on resume), so the lookahead is "downloaded
+        // beyond *this* folder's start", not "downloaded total".
         pipeline_cursor.store(start, Ordering::Release);
+        if let Some(p) = progress {
+            p.set_bytes_decoded_input(start);
+        }
         Self {
             sparse,
             bitmap,
@@ -637,6 +677,7 @@ impl<'a> SparseFileSliceReader<'a> {
             download_done,
             poll_interval,
             pipeline_cursor,
+            progress,
             cursor: start,
             end: start.saturating_add(len),
         }
@@ -680,11 +721,15 @@ impl io::Read for SparseFileSliceReader<'_> {
             .read_exact_at(ByteOffset::new(self.cursor), &mut buf[..max_take])
             .map_err(io::Error::other)?;
         self.cursor += max_take as u64;
-        // Publish the new decoder position. The throttle reads
-        // this on its next dispatch decision; if the lookahead
-        // (latest_downloaded - cursor) drops below the cap,
-        // workers can dispatch the next chunk in this folder.
+        // Publish the new decoder position. The priority
+        // cursor steers worker dispatch toward the chunk we
+        // need next; `bytes_decoded_input` shrinks the
+        // lookahead the cap measures, releasing dispatch as
+        // the decoder drains chunks.
         self.pipeline_cursor.store(self.cursor, Ordering::Release);
+        if let Some(p) = self.progress {
+            p.set_bytes_decoded_input(self.cursor);
+        }
         Ok(max_take)
     }
 }
@@ -954,6 +999,7 @@ mod tests {
             download_done: &done,
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
+            progress_state: None,
         };
         let puncher = NoopPuncher::new();
         let stats = pipeline

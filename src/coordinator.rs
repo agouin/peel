@@ -2572,12 +2572,12 @@ fn run_sevenz(
     output_dir: &Path,
     plan: &ResumePlan,
     config: &CoordinatorConfig,
-    // Carried for parity with `run_zip`'s signature; the
-    // round-one wiring doesn't push per-folder progress
-    // events through the renderer yet (the pipeline emits
-    // `FolderFinished { index, bytes_punched }` but not
-    // bytes_decoded — a small follow-up to the §10 wiring).
-    _progress_state: Option<&Arc<ProgressState>>,
+    // The pipeline reads this through to its
+    // `SparseFileSliceReader`, which publishes
+    // `bytes_decoded_input` on every successful pread. That
+    // is what makes `max_disk_buffer` actually bound the
+    // on-disk-but-not-yet-extracted footprint.
+    progress_state: Option<&Arc<ProgressState>>,
     kill_switch: Option<&Arc<AtomicBool>>,
 ) -> Result<ExtractionStats, CoordinatorError> {
     fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
@@ -2622,6 +2622,7 @@ fn run_sevenz(
         download_done,
         download_outcome,
         sparse_fd: sparse.as_fd(),
+        progress_state,
     };
 
     // The 7z pipeline respects `max_disk_buffer`. Unlike
