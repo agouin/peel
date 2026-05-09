@@ -209,23 +209,13 @@ download-then-extract sequence.
 
 | Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
 | --- | --- | --- | --- | --- |
-| `tar` | 1.07× | **0.93×** | **0.74×** | **0.70×** |
-| `tar.zst` | 1.09× | **0.92×** | **0.71×** | **0.49×** |
-| `tar.gz` | 1.01× | **0.92×** | **0.72×** | **0.73×** |
-| `tar.lz4` | 1.09× | **0.92×** | **0.71×** | **0.56×** |
-| `tar.xz` | 1.03× | **0.82×** | **0.75×** | **0.95×** |
-| `zip` | 1.04× | **0.90×** | **0.56×** | **0.23×** |
-| `7z`¹ | 1.00× | **0.98×** | 1.26× | 4.39× |
-
-¹ The round-one 7z second-pipeline driver
-(`docs/PLAN_7z_support.md` §8) carries roughly a second of fixed
-per-archive overhead today. At 10 Mbps and 100 Mbps the streaming
-overlap with the download absorbs it; at 1 Gbps and 10 Gbps the
-overhead exceeds the streaming benefit and `curl -O && 7z x && rm`
-wins by absolute wall-clock. Closing this gap is queued
-optimization work — the qualitative point ("`.7z` over HTTP is now
-a single-pass operation") holds; the quantitative one ("…and
-faster") is in progress.
+| `tar` | 1.11× | **0.93×** | **0.74×** | **0.70×** |
+| `tar.zst` | 1.11× | **0.93×** | **0.72×** | **0.54×** |
+| `tar.gz` | 1.13× | **0.92×** | **0.71×** | **0.62×** |
+| `tar.lz4` | 1.08× | **0.93×** | **0.72×** | **0.59×** |
+| `tar.xz` | 1.06× | **0.83×** | **0.78×** | **0.96×** |
+| `zip` | 1.08× | **0.90×** | **0.58×** | **0.24×** |
+| `7z` | 1.06× | **0.93×** | **0.78×** | 1.04× |
 
 ### Reading the grid
 
@@ -247,11 +237,13 @@ its final path as soon as the entry's bytes arrive, while the
 baseline is structurally barred from starting `unzip` until `curl`
 finishes.
 
-`7z` newly supports the same single-pass shape. At realistic
-bandwidth (≤ 100 Mbps) peel ties or beats `curl -O && 7z x && rm`
-by overlapping extract with the download. At 1 Gbps and above the
-round-one driver's per-archive overhead exceeds the streaming
-benefit and the baseline wins on wall-clock — see footnote ¹.
+`7z` supports the same single-pass shape: peel beats the
+baseline at every bandwidth from 100 Mbps through 1 Gbps and
+ties at 10 Gbps. The 10 Gbps cell is essentially a draw because
+the 256 MiB archive fits inside a sub-300 ms wire window — once
+wire-time drops below ~300 ms the per-archive overhead of any
+extraction tool dominates, and `curl -O && 7z x && rm` and peel
+both finish within ~10 ms of each other.
 
 ### When to reach for `peel`
 
