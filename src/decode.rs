@@ -83,6 +83,14 @@ pub mod zstd;
 // (`src/zip/decode.rs`) still uses it; Phase 9 swaps that too.
 pub mod deflate_native;
 
+// Hand-rolled RAR5 decoder (`docs/PLAN_rar5_decoder.md`). Gated
+// behind the `rar` Cargo feature alongside the rest of the RAR5
+// module tree (`docs/PLAN_rar.md` §0.5). Phase A1 ships the
+// MSB-first bitstream reader; subsequent phases land the Huffman /
+// LZSS / filter VM / PPMd-II layers and the integration trait.
+#[cfg(feature = "rar")]
+pub mod rar_native;
+
 /// Status returned by [`StreamingDecoder::decode_step`].
 ///
 /// Does not indicate whether *any* output was produced this step;
