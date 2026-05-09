@@ -24,15 +24,38 @@ Mainstream Rust BLAKE2sp / RAR5 ref crates don't help —
 pure-Rust RAR ports examined on crates.io 2026-05 covered RAR5
 minimally or not at all.
 
+### Update 2026-05-09: spec source is libarchive
+
+§0.1's first plan assumed the RAR5 algorithm was specified
+somewhere public. **It is not.** The official RARLAB technote
+covers the container format only ("If you need information about
+algorithms or more detailed information on data structures,
+please use UnRAR source code"). The compression algorithm —
+LZSS Huffman alphabets, length / distance encoding tables,
+filter VM bytecode, PPMd-II model — has no published spec.
+
+The §0.1 resolution is therefore amended: rather than working
+"from memory of the technote," the hand-roll is **clean-roomed
+from libarchive's RAR5 decoder**
+(`libarchive/archive_read_support_format_rar5.c`, by
+Grzegorz Antoniak, 2018). libarchive ships under the **BSD
+2-Clause license**, which is OSI-approved and compatible with
+`peel`'s `MIT OR Apache-2.0`. We extract algorithm constants
+(meta-Huffman codes, repeat-code semantics, alphabet sizes,
+length / distance base tables, filter type IDs) and structural
+understanding from libarchive, and reimplement them in Rust.
+The resulting Rust code is original work; libarchive is
+documented as the spec reference (in module-level comments and
+in [`NOTICE`](../NOTICE) at the repo root) per BSD's
+attribution requirement.
+
 Hand-rolling is comparable in scope to
 `docs/PLAN_zstd_block_decoder.md` (10 phases, ~12 weeks) but
-materially harder: the RAR5 wire format is author-provided by
-RARLAB rather than IETF-standardized, the corpus of public test
-vectors is smaller, and the algorithm has more moving parts
+materially harder: the algorithm has more moving parts
 (LZSS + filter VM + optional PPMd-II contexts + adaptive
-Huffman re-coding per block).
-
-The cost is the price of staying fully OSI-licensed.
+Huffman re-coding per block). Having libarchive as the spec
+reference removes the "verify each constant from memory"
+problem that pre-2026-05-09 §A3 left as `// VERIFY:` markers.
 
 ## Hard constraints (carried forward from `PLAN_rar.md`)
 

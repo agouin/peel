@@ -40,3 +40,4 @@ pub mod bits;
 pub mod bootstrap;
 pub mod dict;
 pub mod huffman;
+pub mod ppmd_range;
