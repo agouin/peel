@@ -1678,6 +1678,128 @@ fn bench_throttled_realistic_grid() {
     }
 }
 
+/// Diagnostic: sweep `workers` at the 10 Mbps × 8 MiB cell to test the
+/// hypothesis that `peel`'s 4–14% slowdown vs `curl --limit-rate | tar`
+/// at this row is dominated by trailing-edge drain across multiple
+/// ranged GETs (workers idle out one by one as the body finishes; the
+/// last worker drains the token bucket alone, so the trailing edge
+/// runs below the cap). If the hypothesis holds, `workers=1` should
+/// tie or beat the curl baseline.
+///
+/// Methodology mirrors `bench_throttled_realistic_grid`'s tar row:
+/// in-process mock server on loopback, blocking IO backend, two
+/// consecutive runs averaged.
+#[test]
+#[ignore = "diagnostic; opt-in via --ignored"]
+fn diag_throttled_10mbps_tar_worker_sweep() {
+    if !tool_present("curl") || !tool_present("tar") {
+        skip("net", "curl/tar");
+        return;
+    }
+
+    let rate = Rate {
+        label: "10 Mbps",
+        bytes_per_sec: 10_000_000 / 8,
+        payload_bytes: 8 * 1024 * 1024,
+    };
+    let (archive, entries) = build_tar_payload_sized(rate.payload_bytes);
+    let body_len = archive.len() as u64;
+
+    let server = MockServer::start(ok_handler(archive.clone()));
+    let url = format!("{}/bundle.tar", server.base_url());
+
+    type VariantBuilder = fn(u64, u64) -> CoordinatorConfig;
+    let variants: &[(&str, VariantBuilder)] = &[
+        ("workers=1, adaptive=off, chunk=body  ", |body, rate_bps| {
+            let mut c = coord_config();
+            c.workers = 1;
+            c.chunk_size = body;
+            c.adaptive_chunk_size = false;
+            c.max_bandwidth_bps = Some(rate_bps);
+            c
+        }),
+        ("workers=2, adaptive=on               ", |_, rate_bps| {
+            let mut c = coord_config();
+            c.workers = 2;
+            c.max_bandwidth_bps = Some(rate_bps);
+            c
+        }),
+        ("workers=4, adaptive=on (current grid)", |_, rate_bps| {
+            let mut c = coord_config();
+            c.workers = 4;
+            c.max_bandwidth_bps = Some(rate_bps);
+            c
+        }),
+        ("workers=8, adaptive=on (prod default)", |_, rate_bps| {
+            let mut c = coord_config();
+            c.workers = 8;
+            c.max_bandwidth_bps = Some(rate_bps);
+            c
+        }),
+    ];
+
+    println!(
+        "[diag] {label:<40} {r1:>9} {r2:>9}  {avg:>9}",
+        label = "variant",
+        r1 = "run1",
+        r2 = "run2",
+        avg = "avg"
+    );
+
+    for (label, build) in variants {
+        let mut runs = [0.0f64; 2];
+        for (i, slot) in runs.iter_mut().enumerate() {
+            let work = unique_dir(&format!("diag_sweep_{i}"));
+            let _g = CleanupDir(work.clone());
+            let args = RunArgs {
+                url: url.clone(),
+                additional_urls: Vec::new(),
+                output: OutputTarget::Dir(work.clone()),
+                config: build(body_len, rate.bytes_per_sec),
+                client: build_client(),
+                registry: DecoderRegistry::with_defaults(),
+                progress: None,
+                progress_state: None,
+                kill_switch: None,
+                io_backend: None,
+            };
+            let started = Instant::now();
+            let stats = run(args).expect("peel run succeeds");
+            *slot = started.elapsed().as_secs_f64();
+            assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
+            assert_dir_matches(&work, &entries);
+        }
+        let avg = (runs[0] + runs[1]) / 2.0;
+        println!(
+            "[diag] {label:<40} {r1:>8.3}s {r2:>8.3}s  {avg:>8.3}s",
+            r1 = runs[0],
+            r2 = runs[1],
+        );
+    }
+
+    // curl baseline (single TCP, --limit-rate). Runs twice.
+    let mut curl_runs = [0.0f64; 2];
+    for (i, slot) in curl_runs.iter_mut().enumerate() {
+        let work = unique_dir(&format!("diag_sweep_curl_{i}"));
+        let _g = CleanupDir(work.clone());
+        let pipeline = format!(
+            r#"curl -sS --limit-rate {limit} "$URL" | tar -xf - -C {dir}"#,
+            limit = rate.bytes_per_sec,
+            dir = shell_quote(&work),
+        );
+        *slot = time_pipeline(&url, &pipeline).as_secs_f64();
+        assert_dir_matches(&work, &entries);
+    }
+    let curl_avg = (curl_runs[0] + curl_runs[1]) / 2.0;
+    println!(
+        "[diag] {label:<40} {r1:>8.3}s {r2:>8.3}s  {avg:>8.3}s",
+        label = "curl|tar baseline                    ",
+        r1 = curl_runs[0],
+        r2 = curl_runs[1],
+        avg = curl_avg,
+    );
+}
+
 /// One throttled (peel, curl|tool) comparison row.
 ///
 /// `body` is the on-the-wire bytes (post-encoding); `archive` is the

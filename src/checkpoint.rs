@@ -171,7 +171,18 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   optional `current_folder` for the 7z second-pipeline driver
 ///   (`docs/PLAN_7z_support.md` §9). Older binaries refuse v9 files
 ///   with [`CheckpointError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 9;
+/// - **v10** — adds [`SinkState::Rar`] with `entries_completed`,
+///   optional `current_entry`, and `current_entry_offset` for the
+///   RAR5 STORED-method pipeline (`docs/PLAN_rar.md` §3). Round-one
+///   resume restarts the in-flight entry from
+///   `current_entry_offset` (the on-disk file is truncated to that
+///   length and the running BLAKE2sp / CRC-32 are seeded by
+///   re-reading the prefix). Newer formats will add a serialized
+///   BLAKE2sp / RAR5-decoder snapshot on top of this same variant
+///   when §4 lands the hand-rolled compressed-method decoder.
+///   Older binaries refuse v10 files with
+///   [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 10;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -186,6 +197,9 @@ const SINK_TAG_SEVENZ: u8 = 3;
 /// Tag for [`SinkState::Zip`] in the on-disk format. Added in v2 of
 /// the checkpoint layout.
 const SINK_TAG_ZIP: u8 = 2;
+/// Tag for [`SinkState::Rar`] in the on-disk format. Added in v10
+/// of the format (`docs/PLAN_rar.md` §3).
+const SINK_TAG_RAR: u8 = 4;
 
 /// Maximum length of the v5 [`Checkpoint::decoder_state`] blob.
 ///
@@ -520,6 +534,31 @@ pub enum SinkState {
         /// Added in checkpoint format v7; v6 readers see `None` and
         /// fall through to the per-entry "restart from byte 0" path.
         current_entry_decoder_state: Option<Vec<u8>>,
+    },
+
+    /// State for [`crate::sink::RarSink`] (added in v10 of the
+    /// format, `docs/PLAN_rar.md` §3).
+    ///
+    /// RAR5 archives are extracted entry-by-entry in archive
+    /// order. The checkpoint records which entries are durable on
+    /// disk via `entries_completed`, and (when a crash interrupts
+    /// an entry) the in-flight entry index plus the byte offset
+    /// within it. STORED entries (round-one §3) resume from
+    /// `current_entry_offset`; the hand-rolled decoder §4 will
+    /// add a parallel `current_entry_decoder_state` blob when it
+    /// lands.
+    Rar {
+        /// Indices (in archive order) of entries that finished
+        /// extracting before this checkpoint was written. Ordered
+        /// and deduplicated by the producer.
+        entries_completed: Vec<u32>,
+        /// Index of the entry that was in flight when the
+        /// checkpoint was written, if any. `None` means the sink
+        /// was quiescent.
+        current_entry: Option<u32>,
+        /// Bytes already written into the in-flight entry. `0`
+        /// when `current_entry` is `None`.
+        current_entry_offset: u64,
     },
 
     /// State for [`crate::sink::SevenzSink`] (added in v9 of the
@@ -858,6 +897,26 @@ impl Checkpoint {
                     None => body.push(0),
                 }
             }
+            SinkState::Rar {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+            } => {
+                body.push(SINK_TAG_RAR);
+                let count = u32::try_from(entries_completed.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for idx in entries_completed.iter().take(count as usize) {
+                    write_u32(&mut body, *idx);
+                }
+                match current_entry {
+                    Some(idx) => {
+                        body.push(1);
+                        write_u32(&mut body, *idx);
+                    }
+                    None => body.push(0),
+                }
+                write_u64(&mut body, *current_entry_offset);
+            }
         }
 
         match &self.hash_state {
@@ -1011,7 +1070,7 @@ impl Checkpoint {
         // version so it can decide whether to read each trailer;
         // future versions that *change* the layout will branch
         // here.
-        debug_assert!(matches!(format_version, 1..=9));
+        debug_assert!(matches!(format_version, 1..=10));
         Self::decode_body(body, format_version)
     }
 
@@ -1231,6 +1290,33 @@ impl Checkpoint {
                 SinkState::Sevenz {
                     folders_completed: folders,
                     current_folder,
+                }
+            }
+            SINK_TAG_RAR => {
+                // v10: same layout as `SinkState::Zip` minus the
+                // optional decoder-state blob (round-one §3 ships
+                // STORED only; §4 will add a follow-on field).
+                let count = cursor.read_count_capped("sink.rar.entries_completed.len", 4)?;
+                let mut entries: Vec<u32> = Vec::new();
+                for _ in 0..count {
+                    entries.push(cursor.read_u32("sink.rar.entries_completed[i]")?);
+                }
+                let current_present = cursor.read_u8("sink.rar.current_entry.is_some")?;
+                let current_entry = match current_present {
+                    0 => None,
+                    1 => Some(cursor.read_u32("sink.rar.current_entry")?),
+                    other => {
+                        return Err(CheckpointError::InvalidPresence {
+                            field: "sink.rar.current_entry",
+                            value: other,
+                        });
+                    }
+                };
+                let current_entry_offset = cursor.read_u64("sink.rar.current_entry_offset")?;
+                SinkState::Rar {
+                    entries_completed: entries,
+                    current_entry,
+                    current_entry_offset,
                 }
             }
             other => {
@@ -2296,19 +2382,20 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_nine() {
+    fn checkpoint_format_version_is_ten() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
         // work (v6), `docs/PLAN_deflate_block_decoder.md` Phase 9b's
         // zip per-entry decoder-state field (v7),
         // `docs/PLAN_multi_url_source.md` §5's parts vec +
-        // active-part-aware hash state (v8), and
+        // active-part-aware hash state (v8),
         // `docs/PLAN_7z_support.md` §9's `SinkState::Sevenz`
-        // variant (v9) each bumped this when an optional trailer
-        // landed. If a future change resets it, this guards
-        // against silently dropping the upgrade-required signal
-        // older readers depend on.
-        assert_eq!(FORMAT_VERSION, 9);
+        // variant (v9), and `docs/PLAN_rar.md` §3's
+        // `SinkState::Rar` variant (v10) each bumped this when an
+        // optional trailer landed. If a future change resets it,
+        // this guards against silently dropping the
+        // upgrade-required signal older readers depend on.
+        assert_eq!(FORMAT_VERSION, 10);
     }
 
     fn sample_sevenz(folders_completed: Vec<u32>, current_folder: Option<u32>) -> Checkpoint {
@@ -2357,6 +2444,62 @@ mod tests {
     #[test]
     fn round_trip_sevenz_sink_empty_folders_completed() {
         let original = sample_sevenz(vec![], Some(0));
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    fn sample_rar(
+        entries_completed: Vec<u32>,
+        current_entry: Option<u32>,
+        current_entry_offset: u64,
+    ) -> Checkpoint {
+        Checkpoint {
+            url: "https://example.com/dataset.rar".to_string(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            parts: vec![PartRecord {
+                url: "https://example.com/dataset.rar".to_string(),
+                size: 8_192_000,
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                expected_sha256: None,
+            }],
+            total_size: 8_192_000,
+            chunk_size: 65_536,
+            decoder_position: ByteOffset::new(123_456),
+            bitmap_completed: vec![0xFFu8; 16],
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            sink_state: SinkState::Rar {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+        }
+    }
+
+    #[test]
+    fn round_trip_rar_sink_quiescent() {
+        let original = sample_rar(vec![0, 1, 2], None, 0);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_rar_sink_mid_entry() {
+        let original = sample_rar(vec![0, 1], Some(2), 12_345);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_rar_sink_empty_entries_completed() {
+        let original = sample_rar(vec![], Some(0), 0);
         let bytes = original.serialize();
         let parsed = Checkpoint::deserialize(&bytes).expect("decode");
         assert_eq!(parsed, original);

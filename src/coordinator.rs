@@ -177,6 +177,8 @@ use crate::extractor::{
 use crate::http::{Client, ClientError, Url, UrlError};
 use crate::progress::ProgressState;
 use crate::punch::{default_puncher, NoopPuncher, PunchHole};
+#[cfg(feature = "rar")]
+use crate::rar::FORMAT_NAME as RAR_FORMAT_NAME;
 use crate::sevenz::FORMAT_NAME as SEVENZ_FORMAT_NAME;
 use crate::sink::{RawSink, SevenzSink, Sink, SinkError, TarSink, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
@@ -719,6 +721,13 @@ pub enum CoordinatorError {
     #[error("7z extraction failed")]
     SevenzPipeline(#[source] SevenzPipelineError),
 
+    /// The RAR pipeline failed (`docs/PLAN_rar.md` §3).
+    /// Wraps any [`crate::download::RarPipelineError`] variant
+    /// (format error, sink failure, sparse / punch IO).
+    #[cfg(feature = "rar")]
+    #[error("RAR extraction failed")]
+    Rar(#[source] crate::download::rar_pipeline::RarPipelineError),
+
     /// The caller's [`RunArgs::kill_switch`] flipped to `true`
     /// between checkpoint writes. The .peel.part / .peel.ckpt
     /// sidecars are intentionally left on disk so the next call
@@ -1043,6 +1052,11 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 // would require re-reading folder sizes the resume
                 // plan doesn't carry.
                 SinkState::Sevenz { .. } => 0,
+                // Same shape as Zip / Sevenz: the RAR pipeline
+                // counts entry bytes itself; pre-crediting here
+                // would require re-reading entry sizes the resume
+                // plan doesn't carry.
+                SinkState::Rar { .. } => 0,
             };
             state.add_extracted(resumed_extracted);
         }
@@ -1181,14 +1195,19 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             )?;
 
             // Look up the resolved factory's name to decide which
-            // pipeline to drive. ZIP archives go through the
-            // per-entry pipeline; everything else goes through the
-            // streaming decoder loop. The name lookup is reverse-
-            // resolved by fn-pointer identity, which works for the
-            // free-function factories every shipping format uses.
+            // pipeline to drive. ZIP / 7z / RAR archives go through
+            // their per-entry pipelines; everything else goes
+            // through the streaming decoder loop. The name lookup
+            // is reverse-resolved by fn-pointer identity, which
+            // works for the free-function factories every shipping
+            // format uses.
             let format_name = registry.name_for_factory(factory).map(String::from);
             let is_zip = format_name.as_deref() == Some(ZIP_FORMAT_NAME);
             let is_sevenz = format_name.as_deref() == Some(SEVENZ_FORMAT_NAME);
+            #[cfg(feature = "rar")]
+            let is_rar = format_name.as_deref() == Some(RAR_FORMAT_NAME);
+            #[cfg(not(feature = "rar"))]
+            let is_rar = false;
 
             let puncher: Box<dyn PunchHole> = make_puncher(&sparse);
 
@@ -1219,6 +1238,40 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     progress_state.as_ref(),
                     kill_switch.as_ref(),
                 )?
+            } else if is_rar {
+                #[cfg(feature = "rar")]
+                {
+                    let dir = match &output {
+                        OutputTarget::Dir(d) => d.clone(),
+                        OutputTarget::File(_) => {
+                            return Err(CoordinatorError::ZipNeedsDirectory);
+                        }
+                    };
+                    run_rar(
+                        &sparse,
+                        &bitmap,
+                        &fingerprints,
+                        &cursor,
+                        &download_done,
+                        &download_outcome,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &info,
+                        &url,
+                        chunk_size,
+                        total_size,
+                        &dir,
+                        &resume_plan,
+                        &config,
+                        progress.as_mut(),
+                        progress_state.as_ref(),
+                        kill_switch.as_ref(),
+                    )?
+                }
+                #[cfg(not(feature = "rar"))]
+                {
+                    unreachable!("is_rar can only be true when the `rar` feature is enabled")
+                }
             } else if is_sevenz {
                 let dir = match &output {
                     OutputTarget::Dir(d) => d.clone(),
@@ -1732,6 +1785,7 @@ fn build_resume_plan(
             | (OutputTarget::Dir(_), SinkState::Tar { .. })
             | (OutputTarget::Dir(_), SinkState::Zip { .. })
             | (OutputTarget::Dir(_), SinkState::Sevenz { .. })
+            | (OutputTarget::Dir(_), SinkState::Rar { .. })
     );
     if !sink_compat {
         return Err(CoordinatorError::SourceChanged {
@@ -2203,7 +2257,10 @@ fn run_zip(
                 current_entry_offset: *current_entry_offset,
                 current_entry_decoder_state: current_entry_decoder_state.clone(),
             },
-            SinkState::Raw { .. } | SinkState::Tar { .. } | SinkState::Sevenz { .. } => {
+            SinkState::Raw { .. }
+            | SinkState::Tar { .. }
+            | SinkState::Sevenz { .. }
+            | SinkState::Rar { .. } => {
                 return Err(CoordinatorError::SourceChanged {
                     reason: "checkpoint sink_state is not Zip but the resolved format is zip"
                         .into(),
@@ -2549,6 +2606,291 @@ fn run_zip(
     }
 }
 
+/// RAR per-entry pipeline driver wired into the coordinator
+/// (`docs/PLAN_rar.md` §3).
+///
+/// Mirrors `run_zip`'s shape: per-entry checkpoint cadence,
+/// kill-switch threading, mid-entry progress emission so the
+/// resumed run can pick the in-flight entry up at byte
+/// `current_entry_offset` without restarting from byte 0.
+/// Round-one §3 supports STORED entries only; the §4 hand-rolled
+/// decoder will plug into the same flow.
+#[cfg(feature = "rar")]
+#[allow(clippy::too_many_arguments)]
+fn run_rar(
+    sparse: &SparseFile,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
+    chunk_size: u64,
+    total_size: u64,
+    output_dir: &Path,
+    plan: &ResumePlan,
+    config: &CoordinatorConfig,
+    mut progress: Option<&mut ProgressFn>,
+    progress_state: Option<&Arc<ProgressState>>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+) -> Result<ExtractionStats, CoordinatorError> {
+    use crate::download::rar_pipeline::{
+        RarPipeline, RarPipelineConfig, RarPipelineError, RarPipelineEvent, RarResumeState,
+    };
+    use crate::sink::RarSink;
+
+    fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+    let mut sink = RarSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+
+    let resume = match plan {
+        ResumePlan::Fresh => RarResumeState::default(),
+        ResumePlan::Resume { sink_state, .. } => match sink_state {
+            SinkState::Rar {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+            } => RarResumeState {
+                entries_completed: entries_completed.clone(),
+                current_entry: *current_entry,
+                current_entry_offset: *current_entry_offset,
+            },
+            SinkState::Raw { .. }
+            | SinkState::Tar { .. }
+            | SinkState::Zip { .. }
+            | SinkState::Sevenz { .. } => {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is not Rar but the resolved format is rar"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    let pipeline_cfg = RarPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: config.reader_poll_interval,
+        initial_header_window: 64 * 1024,
+    };
+    let pipeline = RarPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        sparse_fd: sparse.as_fd(),
+        progress_state,
+    };
+
+    let mut last_write_at = Instant::now()
+        .checked_sub(config.checkpoint_min_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_progress: u64 = 0;
+    let mut bytes_extracted_total: u64 = 0;
+    let mut bytes_punched_total: u64 = 0;
+    let mut entries_completed: Vec<u32> = resume.entries_completed.clone();
+    let mut entries_extracted_this_run: u64 = 0;
+    let mut checkpoints_written: u64 = 0;
+    let mut obs_stats = CheckpointObserverStats::default();
+    let rate = if !config.checkpoint_target_interval.is_zero() && progress_state.is_some() {
+        let initial_bytes = progress_state
+            .map(|p| p.snapshot().bytes_downloaded)
+            .unwrap_or(0);
+        Some(RealizedRate::new(Instant::now(), initial_bytes))
+    } else {
+        None
+    };
+    let live_floor = || -> u64 {
+        match (rate, progress_state) {
+            (Some(r), Some(p)) => {
+                let bytes = p.snapshot().bytes_downloaded;
+                let bps = r.rate(Instant::now(), bytes);
+                rate_aware_floor(
+                    config.checkpoint_min_bytes,
+                    bps,
+                    config.checkpoint_target_interval,
+                )
+            }
+            _ => config.checkpoint_min_bytes,
+        }
+    };
+
+    // Helper: serialize and write a checkpoint capturing the
+    // supplied SinkState::Rar shape. Encapsulated so the
+    // mid-entry and end-of-entry paths share one
+    // sparse-sync + write code path.
+    let write_ckpt = |sink_state: SinkState, obs: &mut CheckpointObserverStats| -> io::Result<()> {
+        let sparse_sync_start = Instant::now();
+        let sparse_sync_result = sparse.order_writes();
+        obs.sparse_sync_time = obs
+            .sparse_sync_time
+            .saturating_add(sparse_sync_start.elapsed());
+        obs.sparse_sync_calls = obs.sparse_sync_calls.saturating_add(1);
+        sparse_sync_result.map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+        let serialize_prep_start = Instant::now();
+        let chunk_crc32c = if fingerprints.is_empty() {
+            None
+        } else {
+            Some(fingerprints.to_vec())
+        };
+        let ckpt = Checkpoint {
+            url: requested_url.to_string(),
+            etag: info.fingerprint.etag.clone(),
+            last_modified: info.fingerprint.last_modified.clone(),
+            parts: Vec::new(),
+            total_size: info.total_size,
+            chunk_size,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: bitmap.to_bytes(),
+            created_at: SystemTime::now(),
+            sink_state,
+            hash_state: None,
+            chunk_crc32c,
+            decoder_state: None,
+        };
+        let prep_time = serialize_prep_start.elapsed();
+        let write_timings = ckpt
+            .write_timed(ckpt_path)
+            .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+        obs.serialize_time = obs
+            .serialize_time
+            .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+        obs.tmp_write_time = obs
+            .tmp_write_time
+            .saturating_add(write_timings.tmp_write_time);
+        obs.tmp_fsync_time = obs
+            .tmp_fsync_time
+            .saturating_add(write_timings.tmp_fsync_time);
+        obs.rename_time = obs.rename_time.saturating_add(write_timings.rename_time);
+        obs.dir_fsync_time = obs
+            .dir_fsync_time
+            .saturating_add(write_timings.dir_fsync_time);
+        if write_timings.dir_fsync_called {
+            obs.dir_fsync_calls = obs.dir_fsync_calls.saturating_add(1);
+        }
+        Ok(())
+    };
+
+    let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            RarPipelineEvent::Started { .. } => Ok(()),
+            RarPipelineEvent::InEntryProgress {
+                index,
+                bytes_written,
+            } => {
+                let elapsed = last_write_at.elapsed();
+                let in_flight_progress = bytes_extracted_total.saturating_add(*bytes_written);
+                let progressed = in_flight_progress.saturating_sub(last_progress);
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let observer_start = Instant::now();
+                let sink_state = SinkState::Rar {
+                    entries_completed: entries_completed.clone(),
+                    current_entry: Some(*index),
+                    current_entry_offset: *bytes_written,
+                };
+                write_ckpt(sink_state, &mut obs_stats)?;
+                last_write_at = Instant::now();
+                last_progress = in_flight_progress;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: in_flight_progress,
+                        bytes_out: in_flight_progress,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+            RarPipelineEvent::EntryFinished {
+                index,
+                bytes_written,
+                bytes_punched,
+                ..
+            } => {
+                entries_completed.push(*index);
+                bytes_extracted_total = bytes_extracted_total.saturating_add(*bytes_written);
+                bytes_punched_total = bytes_punched_total.saturating_add(*bytes_punched);
+                entries_extracted_this_run = entries_extracted_this_run.saturating_add(1);
+                if let Some(p) = progress_state {
+                    p.add_extracted(*bytes_written);
+                }
+                let elapsed = last_write_at.elapsed();
+                let progressed = bytes_extracted_total.saturating_sub(last_progress);
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let observer_start = Instant::now();
+                let sink_state = SinkState::Rar {
+                    entries_completed: entries_completed.clone(),
+                    current_entry: None,
+                    current_entry_offset: 0,
+                };
+                write_ckpt(sink_state, &mut obs_stats)?;
+                last_write_at = Instant::now();
+                last_progress = bytes_extracted_total;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: bytes_extracted_total,
+                        bytes_out: bytes_extracted_total,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+        }
+    });
+
+    match result {
+        Ok(stats) => {
+            sink.close().map_err(CoordinatorError::Sink)?;
+            let mut out = ExtractionStats {
+                bytes_in: total_size,
+                bytes_out: stats.bytes_written,
+                bytes_punched: stats.bytes_punched,
+                punch_calls: u64::from(stats.entries_extracted),
+                punch_unsupported: false,
+                frame_boundaries_observed: u64::from(stats.entries_extracted),
+                quiescent_checkpoints: checkpoints_written,
+                decode_time: Duration::default(),
+                write_time: Duration::default(),
+                punch_time: Duration::default(),
+                ..ExtractionStats::default()
+            };
+            obs_stats.merge_into(&mut out);
+            Ok(out)
+        }
+        Err(RarPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Rar(other)),
+    }
+}
+
 /// 7z second-pipeline driver wired into the coordinator (`§10`
 /// of `docs/PLAN_7z_support.md`).
 ///
@@ -2596,7 +2938,10 @@ fn run_sevenz(
                 folders_completed: folders_completed.clone(),
                 current_folder: *current_folder,
             },
-            SinkState::Raw { .. } | SinkState::Tar { .. } | SinkState::Zip { .. } => {
+            SinkState::Raw { .. }
+            | SinkState::Tar { .. }
+            | SinkState::Zip { .. }
+            | SinkState::Rar { .. } => {
                 return Err(CoordinatorError::SourceChanged {
                     reason: "checkpoint sink_state is not Sevenz but the resolved format is 7z"
                         .into(),

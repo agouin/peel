@@ -42,11 +42,17 @@
 //! (malformed header, bad checksum), in the entry being written
 //! (unsafe path, unsupported type), or in the local environment (IO).
 
+// `rar` lives behind the `rar` Cargo feature alongside the rest of
+// the RAR5 module tree (`docs/PLAN_rar.md` §0.5 / §3).
+#[cfg(feature = "rar")]
+pub mod rar;
 pub mod raw;
 pub mod sevenz;
 pub mod tar;
 pub mod zip;
 
+#[cfg(feature = "rar")]
+pub use rar::RarSink;
 pub use raw::RawSink;
 pub use sevenz::SevenzSink;
 pub use tar::TarSink;

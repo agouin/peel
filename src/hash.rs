@@ -30,6 +30,12 @@
 //! the source-reader boundary; production callers go through the
 //! `--sha256` CLI flag rather than touching this module directly.
 
+// BLAKE2sp lives behind the `rar` Cargo feature: it's used only by
+// the RAR5 file-data integrity path (`docs/PLAN_rar.md` §2). When
+// the feature is disabled the module is excluded entirely so the
+// 250-LOC compression core doesn't ship in the slim binary.
+#[cfg(feature = "rar")]
+pub mod blake2sp;
 pub mod crc32;
 pub mod crc32c;
 pub mod crc64;

@@ -9,6 +9,11 @@
 
 pub mod h2c_server;
 pub mod mock_server;
+// Gated behind the `rar` Cargo feature: the fixture builder
+// references `peel::rar::format::*`, which only exists when the
+// feature is on (`docs/PLAN_rar.md` §0.5).
+#[cfg(feature = "rar")]
+pub mod rar_fixtures;
 pub mod sevenz_fixtures;
 pub mod tar_fixtures;
 pub mod zip_fixtures;

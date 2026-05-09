@@ -27,11 +27,18 @@ peel https://example.com/dataset.tar.zst -C ./out
   is ~the download window, not the archive size.
 - **Multi-format.** `.tar`, `.tar.zst`/`.zst`, `.tar.xz`/`.xz`,
   `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`, `.zip` (STORED + DEFLATE +
-  zstd entries), and `.7z` (COPY + DEFLATE + LZMA + LZMA2 coders;
-  plain and unencrypted-encoded headers; single-volume).
-  Format detection is suffix-first with magic-byte fallback; mismatches
-  fail closed unless you opt in with `--force-format-from-magic` or
-  pin a decoder with `--format <name>`.
+  zstd entries), `.7z` (COPY + DEFLATE + LZMA + LZMA2 coders;
+  plain and unencrypted-encoded headers; single-volume), and
+  `.rar` (RAR5; STORED entries today via the `rar` Cargo feature
+  on by default — non-encrypted, single-volume only; the
+  hand-rolled compressed-method decoder lands per
+  `docs/PLAN_rar5_decoder.md`). Format detection is suffix-first
+  with magic-byte fallback; mismatches fail closed unless you opt
+  in with `--force-format-from-magic` or pin a decoder with
+  `--format <name>`. Build with `cargo build --no-default-features`
+  (or any subset that excludes `rar`) to drop the RAR5 module
+  entirely; `.rar` URLs then surface a precise "compiled without
+  the `rar` feature" diagnostic instead of "unknown format".
 - **Resumable by construction.** Frame-aligned checkpoints (atomic
   `write+fsync+rename`) plus per-chunk fingerprints. A `kill -9`
   mid-extraction resumes exactly where it left off. The crash-test
@@ -159,13 +166,21 @@ Absolute wall-clock for the 10 Gbps · 256 MiB column, for scale:
 
 ### Reading the grid
 
-`peel` ties or beats the system pipeline across every codec at every
-rate cell. Four parallel ranged GETs put more bandwidth in flight than
-curl's single TCP connection, which more than pays for the part-file
-double-hop and checkpoint syncs. The 10 Mbps row is the only place the
-overhead is visible (payload is small enough that connection setup is
-a non-trivial fraction of wall-clock); everywhere else `peel` finishes
-ahead of `curl | tool | tar`.
+At 100 Mbps and up, `peel` ties or beats the system pipeline across
+every codec. Four parallel ranged GETs put more bandwidth in flight
+than curl's single TCP connection, and that win more than pays for the
+part-file double-hop and checkpoint syncs.
+
+The 10 Mbps row is the one place the parallel-GET shape costs more
+than it earns. With 8 MiB of payload, ranged-GET parallelism has
+nothing to amortize over: as the body finishes, workers idle out one
+by one and the last worker drains the token bucket alone, so the
+trailing edge runs below the cap. Add post-wire finalization (final
+checkpoint, manifest, sink fsync) and `peel` lands ~500 ms over the
+6.7 s wire-time floor; `curl --limit-rate` lands within ~40 ms of it.
+The gap is widest in codecs (`tar`, `tar.lz4`) whose baseline decoder
+is too cheap to soak it up, and disappears in `tar.xz` / `tar.gz`
+where the baseline's slower decoder absorbs most of it.
 
 ## Benchmarks: peel vs `curl -O && <extract> && rm`
 
@@ -219,15 +234,20 @@ download-then-extract sequence.
 
 ### Reading the grid
 
-For tar.* rows, peel's wall-clock is roughly the wire-time —
-decode runs in parallel with the download. The baseline's is
-`wire-time + extract-time + rm`. peel saves the trailing extract
-phase outright, and the savings widen with bandwidth: at 1 Gbps
-and above the baseline eats half a second to over a second of
-trailing wall-clock that peel never spends. `tar.xz` shows the
-slow-decode story most cleanly — at 100 Mbps peel is **0.82×** the
-baseline because xz decode runs during the in-flight download
-instead of after it.
+For tar.* rows at 100 Mbps and up, peel's wall-clock is roughly the
+wire-time — decode runs in parallel with the download. The baseline's
+is `wire-time + extract-time + rm`. peel saves the trailing extract
+phase outright, and the savings widen with bandwidth: at 1 Gbps and
+above the baseline eats half a second to over a second of trailing
+wall-clock that peel never spends. `tar.xz` shows the slow-decode
+story most cleanly — at 100 Mbps peel is **0.82×** the baseline
+because xz decode runs during the in-flight download instead of after
+it.
+
+The 10 Mbps row trails the baseline by 4–13% for the same reason as
+the streaming grid above: 8 MiB is too small for parallel ranged GETs
+to amortize, so trailing-edge drain plus post-wire finalization land
+peel ~300–500 ms over the wire-time floor.
 
 `zip` is the headline. There is no streaming-pipe baseline for
 `.zip`, so this grid is the only fair head-to-head. At 1 Gbps ×

@@ -80,6 +80,14 @@
 //!   path on the blocking backend. The `--io-backend` CLI flag picks
 //!   between `auto` (default; tries uring, falls back to blocking with
 //!   a warning), `blocking`, `uring`, and `mmap`.
+//! - [`rar`] — RAR5 archive support (`docs/PLAN_rar.md`). Round-one
+//!   ships the hand-rolled framing layer (§1), BLAKE2sp file-data
+//!   integrity (§2), the STORED-method pipeline (§3), and a
+//!   hand-rolled RAR5 decompressor (§4 / `PLAN_rar5_decoder.md`).
+//!   Gated behind the `rar` Cargo feature, on by default; building
+//!   `--no-default-features` drops the decoder LOC from the binary
+//!   while still surfacing a precise "compiled without RAR support"
+//!   diagnostic for `.rar` URLs.
 //!
 //! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
 //! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
@@ -106,6 +114,7 @@ pub mod io_backend;
 pub mod progress;
 #[cfg(unix)]
 pub mod punch;
+pub mod rar;
 pub mod sevenz;
 pub mod sink;
 pub mod types;

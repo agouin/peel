@@ -1,0 +1,668 @@
+//! Per-entry extraction driver for RAR5 archives downloaded via
+//! the shared sparse-file pipeline.
+//!
+//! Mirrors the second-pipeline architecture used by ZIP and 7z
+//! (`docs/PLAN_v2.md` §5 / `docs/PLAN_7z_support.md` §8 /
+//! `docs/PLAN_rar.md` §3) but with RAR5's simpler layout: the
+//! archive header is at offset 0 and per-entry data immediately
+//! follows each file header. There is no central-directory
+//! trailing-fetch dance — we walk forward, header by header, from
+//! offset 0 to the end-of-archive marker.
+//!
+//! Round-one §3 ships STORED-method (`compression method = 0`)
+//! extraction. The hand-rolled RAR5 decoder lands in §4 via
+//! `docs/PLAN_rar5_decoder.md` and plugs into the same per-entry
+//! flow described below.
+//!
+//! # Workflow
+//!
+//! 1. Wait for the chunk(s) covering the magic at offset 0 and
+//!    validate it ([`crate::rar::format::parse_signature`]).
+//! 2. Walk generic headers from offset 8:
+//!    - Wait for an estimated header-window's worth of chunks.
+//!    - Parse one generic header. On `Truncated` widen the window
+//!      and retry until either the header parses or the window
+//!      reaches the archive's end.
+//!    - Dispatch on the header type:
+//!      * **MainArchive** — capture archive-wide flags. Reject
+//!        multi-volume.
+//!      * **File** — record the entry's metadata for the entry
+//!        loop. Reject compression methods other than STORED.
+//!      * **Service** — skip past the data area.
+//!      * **ArchiveEncryption** — refuse with
+//!        [`crate::rar::RarError::UnsupportedFeature`].
+//!      * **EndOfArchive** — terminate the walk.
+//!    - Advance the cursor past header + data area.
+//! 3. For each `File` entry not already in `entries_completed`:
+//!    a. Steer the cursor to the entry's data offset.
+//!    b. Wait for the chunks covering the entry's data range.
+//!    c. Begin (or resume) the entry on the [`crate::sink::RarSink`].
+//!    d. Stream the entry's bytes through the sink's
+//!    `write_entry` (round-one §3: STORED — pure copy from
+//!    sparse file to sink with running BLAKE2sp + CRC-32).
+//!    e. End the entry — sink validates hashes against the file
+//!    header.
+//!    f. Punch the entry's data range.
+//!    g. Emit a [`RarPipelineEvent::EntryFinished`] so the
+//!    coordinator can write a checkpoint.
+//! 4. After the last entry, punch the trailing region (header +
+//!    end-of-archive bytes the entries didn't cover).
+
+#![cfg(unix)]
+
+use std::collections::HashSet;
+use std::io;
+use std::os::fd::BorrowedFd;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use thiserror::Error;
+
+use crate::bitmap::ChunkBitmap;
+use crate::download::scheduler::{DownloadStats, SchedulerError};
+use crate::download::sparse_file::{SparseFile, SparseFileError};
+use crate::punch::{align_down, align_up, PunchError, PunchHole};
+use crate::rar::archive::FileEntry;
+use crate::rar::format::{
+    parse_end_of_archive_header, parse_file_header, parse_generic_header,
+    parse_main_archive_header, parse_signature, HeaderType,
+};
+use crate::rar::{RarError, SIGNATURE_MAGIC};
+use crate::sink::rar::{BeginEntryOutcome, EntryFinalize, RarSink};
+use crate::sink::SinkError;
+use crate::types::{ByteOffset, ChunkIndex};
+
+/// Configuration for a [`RarPipeline::run`] invocation.
+#[derive(Debug, Clone)]
+pub struct RarPipelineConfig {
+    /// Total source size in bytes. The pipeline never reads past
+    /// this offset.
+    pub total_size: u64,
+    /// Chunk size the scheduler is using to slice the source.
+    pub chunk_size: u64,
+    /// Sleep between bitmap polls when waiting for a chunk to
+    /// land. Tests use a small value (1–5 ms); production uses the
+    /// coordinator default.
+    pub poll_interval: Duration,
+    /// Initial header-window size. The pipeline doubles this as
+    /// needed when a header's `Truncated` parser surfaces a
+    /// "needed N more bytes" hint. Defaults to 64 KiB which is
+    /// large enough for the common case (RAR5 file headers tend
+    /// to be a few hundred bytes including the file name).
+    pub initial_header_window: u64,
+}
+
+impl Default for RarPipelineConfig {
+    fn default() -> Self {
+        Self {
+            total_size: 0,
+            chunk_size: 0,
+            poll_interval: Duration::from_millis(5),
+            initial_header_window: 64 * 1024,
+        }
+    }
+}
+
+/// Resume state forwarded from a prior checkpoint, mirroring
+/// [`crate::checkpoint::SinkState::Rar`].
+#[derive(Debug, Clone, Default)]
+pub struct RarResumeState {
+    /// Indices of entries already extracted to disk before the
+    /// prior run crashed.
+    pub entries_completed: Vec<u32>,
+    /// Index of the entry that was in flight when the checkpoint
+    /// was written, if any.
+    pub current_entry: Option<u32>,
+    /// Bytes already written into the in-flight entry.
+    pub current_entry_offset: u64,
+}
+
+/// Diagnostic events the pipeline emits during a run.
+///
+/// The coordinator's progress callback uses these to throttle the
+/// checkpoint cadence (same shape as [`ZipPipelineEvent`]).
+#[derive(Debug, Clone)]
+pub enum RarPipelineEvent {
+    /// The archive header walk finished; entry extraction is
+    /// about to start.
+    Started {
+        /// Total file-header entries the walk discovered (after
+        /// service / encryption / end-of-archive headers were
+        /// filtered).
+        entry_count: u32,
+        /// Indices of entries the resume state already had marked
+        /// complete (extraction will skip them).
+        already_complete: Vec<u32>,
+        /// Whether the main archive header carried `MHD_SOLID`.
+        /// Round-one §3 supports STORED entries only, so the flag
+        /// is informational; §4 will switch to single-stream
+        /// sequential decode when set.
+        solid: bool,
+    },
+    /// One entry just had bytes flowed into it. Emitted on a
+    /// mid-entry boundary so the coordinator can capture
+    /// `current_entry_offset` for resume.
+    InEntryProgress {
+        /// Entry's index in archive order.
+        index: u32,
+        /// Bytes written so far into the in-flight entry.
+        bytes_written: u64,
+    },
+    /// One entry just finished extracting cleanly.
+    EntryFinished {
+        /// Entry's index in archive order.
+        index: u32,
+        /// Entry's filename (as recorded in the file header).
+        name: String,
+        /// Uncompressed bytes written for this entry.
+        bytes_written: u64,
+        /// Source byte range the pipeline punched after this
+        /// entry's data area.
+        bytes_punched: u64,
+    },
+}
+
+/// Failure modes for [`RarPipeline::run`].
+#[derive(Debug, Error)]
+pub enum RarPipelineError {
+    /// A RAR wire-format failure surfaced. Wraps any [`RarError`]
+    /// variant; unsupported features carry the same message the
+    /// user-facing CLI prints.
+    #[error("RAR format error")]
+    Rar(#[source] RarError),
+
+    /// The sink rejected an operation outside the decode loop
+    /// (begin / end of an entry, mkdir of a directory entry,
+    /// close).
+    #[error("RAR sink failed")]
+    Sink(#[source] SinkError),
+
+    /// Reading from or writing to the sparse file failed.
+    #[error("sparse file IO failed")]
+    Sparse(#[source] SparseFileError),
+
+    /// Hole punching failed in a way the coordinator should
+    /// surface (the [`PunchHole`] trait already swallows
+    /// recoverable `Unsupported`; this variant only fires for
+    /// unexpected errnos).
+    #[error("hole punch failed")]
+    Punch(#[source] PunchError),
+
+    /// The download scheduler reported that all chunks are done
+    /// but a chunk the pipeline needed never landed. This means
+    /// the scheduler errored out and the failure has been ferried
+    /// through the shared [`Mutex`].
+    #[error("download finished early without delivering chunk {chunk}")]
+    DownloadFinishedEarly {
+        /// Index of the chunk the pipeline was waiting on.
+        chunk: u32,
+        /// Detail from the scheduler's stored failure, if any.
+        detail: String,
+    },
+
+    /// The caller's progress callback returned an error (the
+    /// kill-switch path uses this to abort cleanly).
+    #[error("pipeline aborted by progress callback")]
+    Aborted(#[source] io::Error),
+}
+
+/// Aggregate stats the pipeline returns on a clean run.
+#[derive(Debug, Default, Clone)]
+pub struct RarExtractionStats {
+    /// Number of entries extracted (i.e. file-header count minus
+    /// the resume-skipped ones).
+    pub entries_extracted: u32,
+    /// Total uncompressed bytes written across all entries this
+    /// run.
+    pub bytes_written: u64,
+    /// Total source bytes punched (per-entry data ranges + the
+    /// trailing region).
+    pub bytes_punched: u64,
+}
+
+/// Per-entry extraction driver.
+pub struct RarPipeline<'a> {
+    /// Configuration knobs.
+    pub config: RarPipelineConfig,
+    /// Sparse file the workers are filling.
+    pub sparse: &'a SparseFile,
+    /// Bitmap recording which chunks are durable on disk.
+    pub bitmap: &'a ChunkBitmap,
+    /// Steering cursor the scheduler reads. The pipeline writes
+    /// "byte offset I'm waiting for" here so worker priority
+    /// follows the extraction order.
+    pub cursor: &'a Arc<AtomicU64>,
+    /// `true` when the download thread has exited (success or
+    /// failure). Reading this lets us surface a scheduler failure
+    /// as [`RarPipelineError::DownloadFinishedEarly`] rather than
+    /// a hang.
+    pub download_done: &'a Arc<AtomicBool>,
+    /// Optional scheduler outcome stashed by the download thread.
+    pub download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    /// Borrowed file descriptor for hole punching. The pipeline
+    /// itself does not write to the sparse file; the workers do.
+    pub sparse_fd: BorrowedFd<'a>,
+    /// Shared progress state (`bytes_decoded_input` is published
+    /// per-pread so the scheduler's `max_disk_buffer` throttle
+    /// can bound the on-disk-but-not-yet-extracted footprint).
+    /// `None` is supported for tests but is never the production
+    /// path.
+    pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
+}
+
+impl<'a> RarPipeline<'a> {
+    /// Drive the extraction.
+    ///
+    /// `sink` is opened by the caller; resume is reflected via
+    /// `resume.current_entry` / `resume.current_entry_offset`.
+    /// `puncher` is the coordinator-supplied [`PunchHole`].
+    /// `callback` fires for each meaningful state change.
+    ///
+    /// # Errors
+    ///
+    /// See [`RarPipelineError`].
+    pub fn run<F>(
+        &self,
+        sink: &mut RarSink,
+        puncher: &dyn PunchHole,
+        resume: RarResumeState,
+        mut callback: F,
+    ) -> Result<RarExtractionStats, RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let mut stats = RarExtractionStats::default();
+
+        // Step 1: wait for the magic and validate.
+        self.cursor.store(0, Ordering::Release);
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(0);
+        }
+        self.wait_for_range(0, SIGNATURE_MAGIC.len() as u64)?;
+        let mut sig_buf = [0u8; SIGNATURE_MAGIC.len()];
+        self.sparse
+            .read_exact_at(ByteOffset::new(0), &mut sig_buf)
+            .map_err(RarPipelineError::Sparse)?;
+        let sig_size = parse_signature(&sig_buf).map_err(RarPipelineError::Rar)? as u64;
+
+        // Step 2: walk headers from offset `sig_size`. Capture
+        // the main archive header's flags and the per-file
+        // entries; reject the round-one out-of-scope features.
+        let mut cursor: u64 = sig_size;
+        let mut entries: Vec<FileEntry> = Vec::new();
+        let mut solid = false;
+        let mut saw_main = false;
+        loop {
+            if cursor >= self.config.total_size {
+                return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: cursor,
+                    reason: "archive ends before end-of-archive marker".to_string(),
+                }));
+            }
+            let (header_buf, header_buf_start) = self.read_header_window(cursor)?;
+            let header =
+                parse_generic_header(&header_buf[(cursor - header_buf_start) as usize..], cursor)
+                    .map_err(RarPipelineError::Rar)?;
+            // Re-slice so per-header parsers see byte 0 = start of
+            // their own header.
+            let local_buf = &header_buf[(cursor - header_buf_start) as usize..];
+            match header.header_type {
+                HeaderType::MainArchive => {
+                    if saw_main {
+                        return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                            archive_offset: header.archive_offset,
+                            reason: "second main archive header encountered".to_string(),
+                        }));
+                    }
+                    saw_main = true;
+                    let main = parse_main_archive_header(&header, local_buf)
+                        .map_err(RarPipelineError::Rar)?;
+                    if main.archive_flags.is_volume() {
+                        let label = match main.volume_number {
+                            Some(n) => format!("multi-volume archive (volume {n})"),
+                            None => "multi-volume archive".to_string(),
+                        };
+                        return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                            feature: label,
+                        }));
+                    }
+                    solid = main.archive_flags.is_solid();
+                }
+                HeaderType::File => {
+                    let file =
+                        parse_file_header(&header, local_buf).map_err(RarPipelineError::Rar)?;
+                    let method = file.compression.method();
+                    if method != 0 {
+                        return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                            feature: format!(
+                                "compression method {method} (RAR5 standard \
+                                 algorithm) — round-one ships STORED only; \
+                                 the hand-rolled decoder lands in §4 \
+                                 (PLAN_rar5_decoder.md)"
+                            ),
+                        }));
+                    }
+                    let packed_size = header.data_size.unwrap_or(0);
+                    let data_offset = cursor + header.total_header_bytes as u64;
+                    entries.push(FileEntry {
+                        header: file,
+                        data_offset,
+                        packed_size,
+                    });
+                }
+                HeaderType::Service => {
+                    // Skip past header + data area.
+                }
+                HeaderType::ArchiveEncryption => {
+                    return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                        feature: "encryption (header)".to_string(),
+                    }));
+                }
+                HeaderType::EndOfArchive => {
+                    let _eof = parse_end_of_archive_header(&header, local_buf)
+                        .map_err(RarPipelineError::Rar)?;
+                    cursor = cursor.saturating_add(header.total_bytes_with_data());
+                    break;
+                }
+                HeaderType::Other(code) => {
+                    if header.header_flags & crate::rar::format::hdr_flags::SKIP_IF_UNKNOWN == 0 {
+                        return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                            feature: format!(
+                                "unknown RAR header type {code} without \
+                                 SKIP_IF_UNKNOWN flag"
+                            ),
+                        }));
+                    }
+                }
+            }
+            cursor = cursor.saturating_add(header.total_bytes_with_data());
+        }
+        let trailer_end = cursor;
+
+        let entry_count = u32::try_from(entries.len()).map_err(|_| {
+            RarPipelineError::Rar(RarError::CorruptHeader {
+                archive_offset: 0,
+                reason: "archive has more than u32::MAX entries".to_string(),
+            })
+        })?;
+
+        let already_complete: Vec<u32> = resume.entries_completed.to_vec();
+        callback(&RarPipelineEvent::Started {
+            entry_count,
+            already_complete: already_complete.clone(),
+            solid,
+        })
+        .map_err(RarPipelineError::Aborted)?;
+
+        // Step 3: per-entry extraction in archive order.
+        let completed_set: HashSet<u32> = resume.entries_completed.iter().copied().collect();
+        for (idx, entry) in entries.iter().enumerate() {
+            let idx = idx as u32;
+            if completed_set.contains(&idx) {
+                continue;
+            }
+            let resume_offset = if Some(idx) == resume.current_entry {
+                resume.current_entry_offset
+            } else {
+                0
+            };
+            let (bytes_written, bytes_punched) =
+                self.extract_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?;
+            stats.entries_extracted = stats.entries_extracted.saturating_add(1);
+            stats.bytes_written = stats.bytes_written.saturating_add(bytes_written);
+            stats.bytes_punched = stats.bytes_punched.saturating_add(bytes_punched);
+        }
+
+        // Step 4: punch the trailing region (the bytes after the
+        // last entry's data area through end-of-archive). Same
+        // best-effort discipline as `zip_pipeline::punch_range`:
+        // partial blocks at either edge are skipped via inward
+        // alignment.
+        if trailer_end < self.config.total_size {
+            let punched = self.punch_range(puncher, trailer_end, self.config.total_size)?;
+            stats.bytes_punched = stats.bytes_punched.saturating_add(punched);
+        }
+        // Also punch the leading region (signature + main + service
+        // headers) — they're tiny but punching them costs nothing.
+        if let Some(first_entry) = entries.first() {
+            if first_entry.data_offset > 0 {
+                let punched = self.punch_range(puncher, 0, first_entry.data_offset)?;
+                stats.bytes_punched = stats.bytes_punched.saturating_add(punched);
+            }
+        } else if trailer_end > 0 {
+            // No entries; punch the whole archive (header + EOA).
+            let punched = self.punch_range(puncher, 0, trailer_end)?;
+            stats.bytes_punched = stats.bytes_punched.saturating_add(punched);
+        }
+
+        Ok(stats)
+    }
+
+    fn extract_entry<F>(
+        &self,
+        idx: u32,
+        entry: &FileEntry,
+        resume_offset: u64,
+        sink: &mut RarSink,
+        puncher: &dyn PunchHole,
+        callback: &mut F,
+    ) -> Result<(u64, u64), RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let data_offset = entry.data_offset;
+        let packed_size = entry.packed_size;
+        let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
+            RarPipelineError::Rar(RarError::CorruptHeader {
+                archive_offset: data_offset,
+                reason: "entry data range overflows u64".to_string(),
+            })
+        })?;
+
+        // Steer the scheduler toward this entry's range.
+        self.cursor.store(data_offset, Ordering::Release);
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(data_offset);
+        }
+        self.wait_for_range(data_offset, data_end)?;
+
+        let begin_outcome = if resume_offset > 0 {
+            sink.begin_entry_resume(
+                idx,
+                &entry.header.name,
+                entry.header.file_flags.is_directory(),
+                entry.header.unpacked_size,
+                entry.header.crc32,
+                None, // BLAKE2sp from extra-record subtypes lands in a follow-on
+                resume_offset,
+            )
+        } else {
+            sink.begin_entry(
+                idx,
+                &entry.header.name,
+                entry.header.file_flags.is_directory(),
+                entry.header.unpacked_size,
+                entry.header.crc32,
+                None,
+            )
+        }
+        .map_err(RarPipelineError::Sink)?;
+
+        if matches!(begin_outcome, BeginEntryOutcome::Directory { .. }) {
+            // Directory entry: data area is zero bytes (RAR5 directories
+            // don't carry payload). Verified at parse time. Punch
+            // anything that managed to reserve space (defensive — usually
+            // packed_size == 0).
+            let punched = if packed_size > 0 {
+                self.punch_range(puncher, data_offset, data_end)?
+            } else {
+                0
+            };
+            callback(&RarPipelineEvent::EntryFinished {
+                index: idx,
+                name: entry.header.name.clone(),
+                bytes_written: 0,
+                bytes_punched: punched,
+            })
+            .map_err(RarPipelineError::Aborted)?;
+            return Ok((0, punched));
+        }
+
+        // Stream the entry's data bytes from the sparse file into
+        // the sink. STORED is a passthrough so packed_size ==
+        // unpacked_size; we copy directly. Resume picks up at the
+        // sink's `resume_offset` without re-reading the prefix
+        // from the source — the sink already replayed the on-disk
+        // file to seed its running hashes.
+        let copy_start = data_offset.saturating_add(resume_offset);
+        let mut cursor_in_entry = copy_start;
+        let mut buf = vec![0u8; 64 * 1024];
+        while cursor_in_entry < data_end {
+            let want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
+            self.sparse
+                .read_exact_at(ByteOffset::new(cursor_in_entry), &mut buf[..want])
+                .map_err(RarPipelineError::Sparse)?;
+            sink.write_entry(&buf[..want])
+                .map_err(RarPipelineError::Sink)?;
+            cursor_in_entry = cursor_in_entry.saturating_add(want as u64);
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(cursor_in_entry);
+            }
+            // Emit a mid-entry progress event after each chunk so
+            // the coordinator can throttle a checkpoint.
+            callback(&RarPipelineEvent::InEntryProgress {
+                index: idx,
+                bytes_written: sink.current_entry_offset(),
+            })
+            .map_err(RarPipelineError::Aborted)?;
+        }
+
+        let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;
+
+        let punched = self.punch_range(puncher, data_offset, data_end)?;
+        callback(&RarPipelineEvent::EntryFinished {
+            index: idx,
+            name: entry.header.name.clone(),
+            bytes_written: entry.header.unpacked_size,
+            bytes_punched: punched,
+        })
+        .map_err(RarPipelineError::Aborted)?;
+
+        Ok((entry.header.unpacked_size, punched))
+    }
+
+    /// Ensure the chunks covering `[start, start + initial_window)`
+    /// (clamped to `total_size`) have landed and return a buffer
+    /// holding those bytes. The buffer's start offset is `start`
+    /// itself; the caller indexes into it with `byte - start`.
+    ///
+    /// The window grows on retry when the parser surfaces
+    /// `Truncated` (handled at the call site).
+    fn read_header_window(&self, start: u64) -> Result<(Vec<u8>, u64), RarPipelineError> {
+        let mut window = self.config.initial_header_window.max(64);
+        loop {
+            let end = (start.saturating_add(window)).min(self.config.total_size);
+            self.cursor.store(start, Ordering::Release);
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(start);
+            }
+            self.wait_for_range(start, end)?;
+            let mut buf = vec![0u8; (end - start) as usize];
+            self.sparse
+                .read_exact_at(ByteOffset::new(start), &mut buf)
+                .map_err(RarPipelineError::Sparse)?;
+            // Try to parse a generic header; if it surfaces
+            // Truncated, double the window and retry. Cap at the
+            // archive's remaining length — beyond that the input
+            // is genuinely malformed.
+            match parse_generic_header(&buf, start) {
+                Ok(_) => return Ok((buf, start)),
+                Err(RarError::Truncated { needed, .. }) => {
+                    if end == self.config.total_size {
+                        return Err(RarPipelineError::Rar(RarError::Truncated {
+                            what: format!(
+                                "header at archive offset {start} \
+                                 exceeds remaining archive size"
+                            ),
+                            needed,
+                        }));
+                    }
+                    window = window
+                        .saturating_mul(2)
+                        .max(needed as u64 + 64)
+                        .min(self.config.total_size - start);
+                }
+                Err(other) => return Err(RarPipelineError::Rar(other)),
+            }
+        }
+    }
+
+    /// Block until every chunk overlapping `[start, end)` is in
+    /// the bitmap. Returns early if the download thread reports
+    /// completion before the chunks land.
+    fn wait_for_range(&self, start: u64, end: u64) -> Result<(), RarPipelineError> {
+        if start >= end || self.config.chunk_size == 0 {
+            return Ok(());
+        }
+        let first = start / self.config.chunk_size;
+        let last = (end - 1) / self.config.chunk_size;
+        for c in first..=last {
+            let idx = u32::try_from(c).unwrap_or(u32::MAX);
+            let chunk = ChunkIndex::new(idx);
+            loop {
+                if self.bitmap.is_complete(chunk) {
+                    break;
+                }
+                if self.download_done.load(Ordering::Acquire) {
+                    let detail = match self.download_outcome.lock() {
+                        Ok(slot) => match &*slot {
+                            Some(Err(e)) => format!("{e}"),
+                            _ => String::new(),
+                        },
+                        Err(_) => "download outcome poisoned".into(),
+                    };
+                    return Err(RarPipelineError::DownloadFinishedEarly { chunk: idx, detail });
+                }
+                thread::sleep(self.config.poll_interval);
+            }
+        }
+        Ok(())
+    }
+
+    /// Punch the inward-aligned block-sized hole within
+    /// `[start, end)`. Partial blocks at either edge are skipped
+    /// (the §10 puncher's `align_up`/`align_down` semantics) so
+    /// the leading + trailing edges of each entry's range stay
+    /// covered until the sidecar deletion proves the run is done.
+    fn punch_range(
+        &self,
+        puncher: &dyn PunchHole,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, RarPipelineError> {
+        if start >= end {
+            return Ok(0);
+        }
+        let block = puncher.block_size_hint().max(1);
+        // Inward-align: a partial leading or trailing block stays
+        // covered until the sidecar deletion proves the run is done.
+        let aligned_start = match align_up(start, block) {
+            Some(v) => v,
+            None => return Ok(0),
+        };
+        let aligned_end = match align_down(end, block) {
+            Some(v) => v,
+            None => return Ok(0),
+        };
+        if aligned_start >= aligned_end {
+            return Ok(0);
+        }
+        let len = aligned_end - aligned_start;
+        puncher
+            .punch(self.sparse_fd, ByteOffset::new(aligned_start), len)
+            .map_err(RarPipelineError::Punch)?;
+        Ok(len)
+    }
+}

@@ -19,6 +19,31 @@ path = "src/lib.rs"
 name = "peel"
 path = "src/main.rs"
 
+# §1 demo binary for `docs/PLAN_rar.md`. Reads a local RAR5 file and
+# prints the entry list + archive flags. Gated behind the `rar`
+# feature so `cargo build --no-default-features` doesn't try to
+# compile against the (then-absent) walker module.
+[[example]]
+name = "rar_list"
+path = "examples/rar_list.rs"
+required-features = ["rar"]
+
+[features]
+# Default feature set. Includes `rar` so a `cargo build` with no flags
+# produces the standard `peel` binary. Distros / users who want to
+# shave the RAR5 decoder out of the binary build with
+# `--no-default-features`. See `docs/PLAN_rar.md` §0.5 for the
+# rationale (post-resolution, the rationale is binary size and
+# modular gating of the §4 decoder rollout — the OSI-licensing
+# concern that originally motivated this flag evaporated when §0.1
+# resolved to hand-roll).
+default = ["rar"]
+# RAR5 archive support (`docs/PLAN_rar.md`). When disabled, the
+# crate still registers `.rar` and the RAR5 magic against a
+# diagnostic-only factory, so the user sees a precise "compiled
+# without `rar` feature" error rather than "unknown format".
+rar = []
+
 [dependencies]
 thiserror = "2"
 # TLS dependencies are pre-approved per docs/ENGINEERING_STANDARDS.md §2.4.
@@ -88,6 +113,13 @@ io-uring = { version = "0.7", default-features = false }
 # (`PLAN_v2.md` §10 / `docs/ENGINEERING_STANDARDS.md` §2.2). The
 # runtime binary does not link `sha2`.
 sha2 = "0.10"
+# Dev-only reference implementation used by `hash::blake2sp` tests to
+# cross-check the hand-rolled BLAKE2sp against a battle-tested
+# upstream (`docs/PLAN_rar.md` §2). RAR5 file-data integrity uses
+# BLAKE2sp (parallel BLAKE2s, 8 lanes); the upstream `blake2` crate
+# stays at `dev-dependencies` scope so the runtime binary doesn't
+# link it. Same precedent as `sha2` for SHA-256.
+blake2 = "0.10"
 # Dev-only: liblzma binding kept for the differential test suite in
 # `tests/test_xz_native.rs` (encodes fixtures with `xz2`, decodes with
 # both xz2 and the hand-rolled decoder, byte-compares). Phase 7 of

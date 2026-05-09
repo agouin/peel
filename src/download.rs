@@ -28,6 +28,10 @@ pub mod chunk_policy;
 pub mod mirrors;
 pub mod mmap_region;
 pub mod multi_url;
+// `rar_pipeline` is gated behind the `rar` feature alongside the
+// rest of the RAR5 module tree (`docs/PLAN_rar.md` §0.5 / §3).
+#[cfg(feature = "rar")]
+pub mod rar_pipeline;
 pub mod rate_limit;
 pub mod scheduler;
 pub mod sevenz_pipeline;
@@ -46,6 +50,11 @@ pub use mirrors::{
 pub use mmap_region::MmapRegion;
 pub use multi_url::{
     DispatchSegments, MultiPartSource, MultiPartSourceError, PartDescriptor, PartSegment,
+};
+#[cfg(feature = "rar")]
+pub use rar_pipeline::{
+    RarExtractionStats, RarPipeline, RarPipelineConfig, RarPipelineError, RarPipelineEvent,
+    RarResumeState,
 };
 pub use rate_limit::{
     parse_bandwidth, ParseBandwidthError, RateLimitedReader, RateLimiter, MAX_PER_READ,

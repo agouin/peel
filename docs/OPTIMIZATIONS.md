@@ -756,6 +756,117 @@ attack vector).
 
 ---
 
+## RAR5 follow-ons (filed 2026-05-09 from `docs/PLAN_rar.md`)
+
+These items were filed when `docs/PLAN_rar.md` §§1–3 landed
+(STORED-method extraction). The hand-rolled standard-RAR5 decoder
+that unblocks the rest is itself a multi-phase sub-plan
+(`docs/PLAN_rar5_decoder.md`); promote items here as that plan
+makes them tractable.
+
+### O.RAR.MV Multi-volume RAR archives
+
+**What**: extract `archive.part01.rar` … `archive.partNN.rar`
+without first concatenating the volumes locally.
+
+**Why deferred**: the §1 walker rejects multi-volume archives
+with a precise `RarError::UnsupportedFeature` naming the
+detected volume number, and the §3 pipeline never reaches the
+data area. Round-one is single-volume only. Adding multi-volume
+needs either a CLI affordance for naming the parts (`peel
+arch.part01.rar --rar-volumes 'arch.part??.rar'`) or
+URL-pattern detection.
+
+### O.RAR.ENC RAR5 encryption
+
+**What**: AES-256 header-encryption and per-file encryption with
+a passphrase prompt.
+
+**Why deferred**: round-one rejects encryption headers with
+`UnsupportedFeature { feature: "encryption (header)" }`.
+Implementing the AES path is straightforward (the existing TLS
+stack already pulls `ring`), but the passphrase-prompt UX, the
+key-derivation parameters (PBKDF2-SHA256), and the key-cache
+semantics warrant their own design pass.
+
+### O.RAR.SFX Self-extracting archives
+
+**What**: detect the RAR5 magic past offset 0 (typical SFX
+archives prepend an executable preamble) by scanning the first
+N bytes — same logic as `find_eocd` in `src/zip/format.rs`.
+
+**Why deferred**: round-one's magic-byte detector deliberately
+scans only offset 0 (`PLAN_rar.md` §0.3). SFX users today must
+pass `--format rar` or strip the preamble themselves.
+
+### O.RAR.RECOVERY Reed-Solomon recovery records
+
+**What**: validate (and offer to repair) corrupted entries
+using RAR5's optional Reed-Solomon recovery records.
+
+**Why deferred**: recovery records ride in service headers
+(type 3) which round-one's pipeline skips. Parsing them is
+straightforward; the repair logic and the on-disk fallback
+ergonomics need more thought.
+
+### O.RAR.HASH_EXTRA File-header BLAKE2sp digest from extra-record
+
+**What**: decode the `BLAKE2sp` digest that lives in the
+file-header extra area (record type `0x02`) and feed it to the
+sink as the per-entry expected-hash. Today the sink computes
+the running BLAKE2sp internally but only validates against an
+expected digest when one is plumbed through; the §1 parser
+does not yet decode extra-record subtypes.
+
+**Why deferred**: round-one §3 captures the field-direct
+`data_crc32` path (file-flags bit 2). The extra-record path
+adds wider parser surface and richer extras (encryption salt,
+high-precision time, redirect). Filed so the sink stays
+forward-compatible: when the parser surfaces an
+`expected_blake2sp`, the sink already validates it.
+
+### O.RAR.CUSTOMFILTER RAR-VM custom filter slot
+
+**What**: support archive-defined filters (the RAR5 spec lets
+the encoder ship a custom bytecode filter).
+
+**Why deferred**: see `docs/PLAN_rar5_decoder.md` §C2. `rar a`
+does not emit custom filters by default, so the corpus is
+small. Files alongside the §C/§D lift.
+
+### O.RAR.PPMD_RESUME Mid-entry resume across PPMd-II / LZSS
+
+**What**: serialize the PPMd-II range-coder state in the
+mid-entry decoder snapshot so resume across a PPMd-II block
+boundary produces byte-identical output.
+
+**Why deferred**: see `docs/PLAN_rar5_decoder.md` §F1. The LZSS
+case is straightforward; PPMd-II's context-model state is
+larger and more error-prone to serialize.
+
+### O.RAR.MULTITHREAD Multi-threaded RAR5 decode
+
+**What**: parallel decode within a single entry (or across
+non-solid entries) to reduce wall-clock for big archives.
+
+**Why deferred**: §G of `docs/PLAN_rar5_decoder.md` profiles
+the hot paths first; promote this only if profiling shows the
+single-threaded decode bound.
+
+### O.RAR4 RAR4 legacy format
+
+**What**: support the pre-2013 RAR4 format alongside RAR5.
+
+**Why deferred**: the RAR4 format and its compression methods
+are wholly different from RAR5 — supporting both doubles the
+scope without doubling the value (the corpus has been migrating
+to RAR5 for a decade). Lower priority than `O.RAR.ENC` /
+`O.RAR.MV`. Round-one rejects with a precise
+`RarError::UnsupportedFormatVersion { major: 4, minor: 0 }` so
+the diagnostic is specific.
+
+---
+
 ## When to revisit this list
 
 **This is the moment, again.** The MVP shipped 2026-04-29, round

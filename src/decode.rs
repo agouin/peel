@@ -543,6 +543,27 @@ impl DecoderRegistry {
             }],
             crate::sevenz::streaming_factory_placeholder,
         );
+        // RAR5 (`docs/PLAN_rar.md` §1). Same shape as ZIP / 7z —
+        // the coordinator dispatches to `crate::download::rar_pipeline`
+        // (lands in §3) before the factory is invoked. Magic is the
+        // 8-byte `Rar!\x1A\x07\x01\x00` signature at offset 0; the
+        // RAR4 magic is deliberately *not* registered (`PLAN_rar.md`
+        // §0.3) — `.rar` URLs containing RAR4 bytes still reach the
+        // RAR5 factory by way of the suffix path and surface a
+        // precise [`RarError::UnsupportedFormatVersion`] there. When
+        // the `rar` Cargo feature is disabled, the registered
+        // factory still owns the `.rar` suffix and the RAR5 magic
+        // but emits a "compiled without `rar` feature" diagnostic
+        // instead of the dispatch placeholder (`PLAN_rar.md` §0.5).
+        r.register_format(
+            crate::rar::FORMAT_NAME,
+            &[".rar"],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &crate::rar::SIGNATURE_MAGIC,
+            }],
+            crate::rar::streaming_factory_placeholder,
+        );
         r
     }
 
