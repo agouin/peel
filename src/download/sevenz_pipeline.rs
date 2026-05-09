@@ -246,20 +246,31 @@ impl SevenzPipeline<'_> {
             .trailer_range(self.config.total_size)
             .map_err(SevenzPipelineError::Sevenz)?;
         let trailer_end = trailer_start.saturating_add(trailer_len);
-        // Steer worker priority *and* the cap window to the
-        // trailer. Without the `bytes_decoded_input` bump,
-        // an archive whose trailer sits past `max_disk_buffer`
-        // would deadlock here: the cap would have fired on
-        // bytes downloaded so far (front-of-file) and refuse
-        // to dispatch trailer chunks. By advancing
-        // `bytes_decoded_input` to `trailer_start`, the cap
-        // sees real-lookahead ≈ 0 around the trailer, workers
-        // dispatch trailer chunks immediately, and once we
-        // hand off to the per-folder reader the cap re-anchors
-        // to the folder's start.
+        // Steer worker priority to the trailer and *exempt the
+        // trailer fetch from the cap*. The trailer is small in
+        // a plain-Header archive (KB to a few MB) but an
+        // EncodedHeader's compressed trailer can easily exceed
+        // a tightly-configured `max_disk_buffer`. Forcing it
+        // through the cap would deadlock: workers can't
+        // dispatch enough chunks to land the whole trailer,
+        // the trailer parse can't run, the per-folder reader
+        // can't start, and the cap never releases. Exempting
+        // is the right move — the trailer is a fixed metadata
+        // region, not bulk pack data, and once it's parsed
+        // we re-anchor the cap to the pack-data origin so the
+        // *folder* extraction respects the cap.
+        //
+        // Implementation: temporarily advance
+        // `bytes_decoded_input` to `total_size`. The cap reads
+        // `bytes_downloaded - bytes_decoded_input`; when
+        // `bytes_decoded_input >= bytes_downloaded` the
+        // saturating-sub yields 0 and the cap never fires.
+        // After the trailer parse, the per-folder
+        // [`SparseFileSliceReader`] resets the anchor to its
+        // folder's start.
         self.cursor.store(trailer_start, Ordering::Release);
         if let Some(p) = self.progress_state {
-            p.set_bytes_decoded_input(trailer_start);
+            p.set_bytes_decoded_input(self.config.total_size);
         }
         self.wait_for_range(trailer_start, trailer_end)?;
 
