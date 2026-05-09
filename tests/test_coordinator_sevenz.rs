@@ -32,7 +32,7 @@ use peel::http::{Client, ClientConfig};
 mod support;
 
 use support::mock_server::{MockResponse, MockServer};
-use support::sevenz_fixtures::build_copy_sevenz;
+use support::sevenz_fixtures::{build_copy_sevenz, build_copy_sevenz_with_trailer_padding};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -241,6 +241,50 @@ fn extracts_many_files_with_tight_cap() {
         assert_eq!(got_name, want_name);
         assert_eq!(got_body, want_body);
     }
+}
+
+/// Headline scenario: trailer larger than `max_disk_buffer`.
+/// An EncodedHeader trailer compressed to a few hundred KiB is
+/// realistic in the wild; if the trailer fetch were forced
+/// through the cap, an archive whose trailer exceeds the cap
+/// would deadlock — the wait would block on chunks the throttle
+/// has refused to dispatch.
+///
+/// The test pads the trailer to 256 KiB and sets the cap to
+/// 64 KiB (4× smaller than the trailer). If the cap exemption
+/// regresses, this test will time out instead of completing.
+#[test]
+fn extracts_with_trailer_larger_than_max_disk_buffer() {
+    // Tiny pack data so the test stays fast; the focus is the
+    // trailer, not throughput.
+    let payload = b"contents".to_vec();
+    let body =
+        build_copy_sevenz_with_trailer_padding(&[("data/small.bin", payload.clone())], 256 * 1024);
+    // The trailer is the trailing region of the archive; we
+    // expect it to be roughly `padding_bytes + ~150 B` of real
+    // metadata. Sanity-check that the synthesized archive's
+    // trailer indeed exceeds the cap we're about to set.
+    assert!(
+        body.len() > 256 * 1024 + 32 + payload.len(),
+        "synthesized archive smaller than expected: {} bytes",
+        body.len(),
+    );
+
+    let server = MockServer::start(ok_handler(body));
+    let work = unique_dir("trailer_gt_cap");
+    let _g = CleanupDir(work.clone());
+
+    // Cap (64 KiB) is 4× smaller than the trailer body
+    // (256 KiB). Chunk size 8 KiB so the trailer spans ~32
+    // chunks — plenty of room for a wrong cap to fire.
+    let config = coord_config(8 * 1024, Some(64 * 1024));
+    let args = make_args(&server, OutputTarget::Dir(work.clone()), config);
+    let _stats = run(args).expect("extracts under tight cap with fat trailer");
+
+    let extracted = read_dir_recursive(&work);
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].0, "data/small.bin");
+    assert_eq!(extracted[0].1, payload);
 }
 
 /// Resume scenario: extract once, simulate a kill by walking

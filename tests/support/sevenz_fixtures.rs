@@ -78,15 +78,53 @@ fn crc32_ieee(bytes: &[u8]) -> u32 {
 /// on the wire); `payload` is the raw uncompressed bytes for that
 /// file.
 pub fn build_copy_sevenz(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    assert!(!files.is_empty(), "build_copy_sevenz: at least one file");
+    build_copy_sevenz_with_trailer_padding(files, 0)
+}
+
+/// Variant of [`build_copy_sevenz`] that pads the trailer with
+/// `padding_bytes` of `kArchiveProperties` body. Useful for
+/// testing the "trailer larger than `max_disk_buffer`" path:
+/// peel's pipeline exempts the trailer fetch from the cap, so a
+/// trailer that spans many chunks must still extract under a
+/// tight cap. The §3 parser accepts and skips
+/// `kArchiveProperties` bodies, so the padding is invisible to
+/// the rest of the extractor.
+///
+/// `padding_bytes` is the size of the inflated property's body;
+/// the on-the-wire trailer overhead is roughly `padding_bytes +
+/// a few bytes of variable-length integer headers`.
+pub fn build_copy_sevenz_with_trailer_padding(
+    files: &[(&str, Vec<u8>)],
+    padding_bytes: usize,
+) -> Vec<u8> {
+    assert!(
+        !files.is_empty(),
+        "build_copy_sevenz_with_trailer_padding: at least one file"
+    );
 
     // Concatenated packed bytes (all files' raw bytes).
     let pack_bytes: Vec<u8> = files.iter().flat_map(|(_, p)| p.clone()).collect();
     let pack_size = pack_bytes.len() as u64;
     let primary_unpack_size = pack_size;
 
-    // Trailer: Header (0x01) + MainStreamsInfo + FilesInfo + End.
+    // Trailer: Header (0x01) + (optional ArchiveProperties)
+    // + MainStreamsInfo + FilesInfo + End.
     let mut trailer = vec![nid::HEADER];
+
+    // Optional ArchiveProperties block sized to the requested
+    // padding. The §3 parser's `skip_archive_properties` walks
+    // a sequence of `(propid, size, body)` pairs terminated by
+    // `kEnd`; one big property with a `padding_bytes`-sized
+    // body is the simplest shape that's still legal.
+    if padding_bytes > 0 {
+        trailer.push(nid::ARCHIVE_PROPERTIES);
+        // Inner property: propid 0x42 (arbitrary unused), size
+        // = padding_bytes, body = padding_bytes zero bytes.
+        trailer.push(0x42);
+        trailer.extend(encode_number(padding_bytes as u64));
+        trailer.extend(std::iter::repeat_n(0u8, padding_bytes));
+        trailer.push(nid::END);
+    }
 
     // MainStreamsInfo
     trailer.push(nid::MAIN_STREAMS_INFO);
