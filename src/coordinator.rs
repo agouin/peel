@@ -2226,19 +2226,19 @@ fn run_zip(
         download_done,
         download_outcome,
         sparse_fd: sparse.as_fd(),
+        progress_state,
     };
 
-    // Disable the disk-buffer throttle for the ZIP path. ZIP is
-    // random-access (the pipeline jumps to the EOCD, then to each
-    // entry's LFH), so the streaming "lookahead = downloaded -
-    // decoded" metric the scheduler uses does not apply: the entire
-    // archive is effectively "downloaded ahead of the cursor" but
-    // none of it is wasted, since the pipeline will read from any
-    // chunk the bitmap reports complete. Override the live cap to 0
-    // (= disabled) for the duration of this run.
-    if let Some(p) = progress_state {
-        p.set_max_disk_buffer(0);
-    }
+    // The zip pipeline now respects `max_disk_buffer`. Same
+    // shape as `run_sevenz`: entries are processed in
+    // ascending lfh_offset order so `bytes_decoded_input`
+    // advances monotonically, the per-entry
+    // `BoundedSparseReader` publishes its position on every
+    // pread, and the EOCD/CD fetches are exempt from the cap
+    // (they're metadata, not bulk entry data). Older
+    // revisions called `set_max_disk_buffer(0)` here to
+    // dodge the issue at the cost of unbounded disk
+    // footprint — that bypass is gone.
 
     // Checkpoint cadence state, mirroring `run_one`.
     let mut last_write_at = Instant::now()

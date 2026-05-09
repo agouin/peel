@@ -75,6 +75,24 @@ impl ZipEntrySpec {
 /// extra fields, no comments). Suitable for end-to-end coordinator
 /// tests.
 pub fn build_zip(entries: &[ZipEntrySpec]) -> Vec<u8> {
+    build_zip_with_comment(entries, b"")
+}
+
+/// Variant of [`build_zip`] that appends a freeform EOCD
+/// comment (≤ 65535 bytes per the PKWARE APPNOTE). Used to
+/// test the "EOCD region larger than `max_disk_buffer`" path:
+/// peel's pipeline exempts the EOCD/CD fetches from the cap,
+/// so a fat-comment archive must still extract under a tight
+/// cap.
+pub fn build_zip_with_comment(entries: &[ZipEntrySpec], comment: &[u8]) -> Vec<u8> {
+    assert!(
+        comment.len() <= u16::MAX as usize,
+        "EOCD comment limited to 65535 bytes",
+    );
+    build_zip_inner(entries, comment)
+}
+
+fn build_zip_inner(entries: &[ZipEntrySpec], comment: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut cd_specs = Vec::new();
     for entry in entries {
@@ -146,7 +164,8 @@ pub fn build_zip(entries: &[ZipEntrySpec]) -> Vec<u8> {
     out.extend_from_slice(&(cd_specs.len() as u16).to_le_bytes());
     out.extend_from_slice(&cd_size.to_le_bytes());
     out.extend_from_slice(&cd_offset.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // comment_length
+    out.extend_from_slice(&(comment.len() as u16).to_le_bytes()); // comment_length
+    out.extend_from_slice(comment);
     out
 }
 

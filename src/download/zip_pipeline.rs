@@ -254,6 +254,13 @@ pub struct ZipPipeline<'a> {
     /// Borrowed file descriptor for hole punching. The pipeline
     /// itself does not write to the sparse file; the workers do.
     pub sparse_fd: BorrowedFd<'a>,
+    /// Shared progress state. The bounded reader publishes
+    /// `bytes_decoded_input` on each pread so the scheduler's
+    /// `max_disk_buffer` throttle measures real lookahead and
+    /// the on-disk-but-not-yet-extracted footprint stays
+    /// bounded by the cap. `None` is supported for tests but
+    /// is never the production path.
+    pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
 }
 
 impl<'a> ZipPipeline<'a> {
@@ -283,10 +290,20 @@ impl<'a> ZipPipeline<'a> {
 
         // Step 1: steer the cursor to the trailing region and wait
         // for the chunks covering at least the EOCD's max-size
-        // window.
+        // window. Like 7z's trailer, the EOCD (and CD) are
+        // metadata regions that the cap should not constrain —
+        // they live at the end of the archive, but a cap-anchor
+        // at front-of-file would refuse to dispatch them. Bump
+        // `bytes_decoded_input = total_size` so the cap can
+        // never fire during the tail/CD reads; the per-entry
+        // BoundedSparseReader resets the anchor to its entry
+        // start once extraction begins.
         let initial_window = self.config.initial_tail_window.min(self.config.total_size);
         let trailing_start = self.config.total_size.saturating_sub(initial_window);
         self.cursor.store(trailing_start, Ordering::Release);
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(self.config.total_size);
+        }
         self.wait_for_range(trailing_start, self.config.total_size)?;
 
         // Step 2: read the tail and locate the EOCD.
@@ -320,15 +337,29 @@ impl<'a> ZipPipeline<'a> {
         })
         .map_err(ZipPipelineError::Aborted)?;
 
-        // Step 4: per-entry extraction.
+        // Step 4: per-entry extraction. We process entries in
+        // ascending `lfh_offset` order, not central-directory
+        // order, so `bytes_decoded_input` advances monotonically
+        // as the per-entry reader drains chunks — which is what
+        // makes the `max_disk_buffer` cap actually bound the
+        // on-disk-but-not-yet-extracted footprint. CD order is
+        // preserved for the resume contract via the original
+        // index we keep alongside the entry.
         let completed_set: HashSet<u32> = resume.entries_completed.iter().copied().collect();
-        for (i, entry) in entries.iter().enumerate() {
-            let idx = u32::try_from(i).map_err(|_| {
-                ZipPipelineError::Zip(ZipError::MalformedHeader {
-                    archive_offset: 0,
-                    reason: "central directory has more than u32::MAX entries".into(),
+        let mut sorted_entries: Vec<(u32, &CentralDirectoryEntry)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                u32::try_from(i).map(|idx| (idx, e)).map_err(|_| {
+                    ZipPipelineError::Zip(ZipError::MalformedHeader {
+                        archive_offset: 0,
+                        reason: "central directory has more than u32::MAX entries".into(),
+                    })
                 })
-            })?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        sorted_entries.sort_by_key(|(_, e)| e.lfh_offset);
+        for (idx, entry) in sorted_entries {
             if completed_set.contains(&idx) {
                 continue;
             }
@@ -434,7 +465,15 @@ impl<'a> ZipPipeline<'a> {
                 ),
             }));
         }
-        self.wait_for_range(data_start, data_end)?;
+        // No bulk wait_for_range here. The BoundedSparseReader
+        // built below blocks per-chunk on the bitmap, so the
+        // decoder streams bytes the moment the chunks they live
+        // on land — which is what gives the zip pipeline an
+        // extract-while-downloading overlap. A bulk wait would
+        // serialize: the entire entry would have to be on disk
+        // before the codec started, defeating the cap (the
+        // whole entry sits on disk simultaneously) and the
+        // streaming win.
 
         // Phase 9b: figure out whether this entry can mid-resume,
         // and how. STORED entries always can (sink-side resume);
@@ -491,7 +530,7 @@ impl<'a> ZipPipeline<'a> {
             data_start
         };
 
-        let reader = BoundedSparseReader::new(
+        let reader = BoundedSparseReader::with_progress(
             self.sparse,
             self.bitmap,
             self.config.chunk_size,
@@ -500,6 +539,7 @@ impl<'a> ZipPipeline<'a> {
             self.download_done,
             self.download_outcome,
             self.config.poll_interval,
+            self.progress_state,
         );
 
         // Build the decompress_entry resume context, if any.
@@ -764,6 +804,22 @@ impl<'a> ZipPipeline<'a> {
 /// Construction does not perform IO; the first `read` call is the
 /// first one that may block. The reader returns `Ok(0)` once it
 /// has yielded `end - start` bytes.
+///
+/// When `progress` is `Some`, every successful read publishes
+/// the new cursor position to
+/// `ProgressState::set_bytes_decoded_input`. This is what makes
+/// the scheduler's `max_disk_buffer` throttle bound the
+/// on-disk-but-not-yet-extracted footprint: the cap measures
+/// `bytes_downloaded - bytes_decoded_input`, so as the reader
+/// drains chunks the lookahead window slides forward and
+/// workers can dispatch new chunks. Without the publish, the
+/// cap fires once `bytes_downloaded` reaches its threshold and
+/// never releases — the historical reason `run_zip` worked
+/// around it by setting `max_disk_buffer = 0`.
+///
+/// The constructor seeds `bytes_decoded_input` to `start` so
+/// the cap re-anchors when a new range opens (e.g. moving from
+/// one entry's data range to the next).
 pub struct BoundedSparseReader<'a> {
     sparse: &'a SparseFile,
     bitmap: &'a ChunkBitmap,
@@ -773,6 +829,7 @@ pub struct BoundedSparseReader<'a> {
     download_done: &'a Arc<AtomicBool>,
     download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     poll_interval: Duration,
+    progress: Option<&'a Arc<crate::progress::ProgressState>>,
 }
 
 impl<'a> BoundedSparseReader<'a> {
@@ -788,6 +845,40 @@ impl<'a> BoundedSparseReader<'a> {
         download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
         poll_interval: Duration,
     ) -> Self {
+        Self::with_progress(
+            sparse,
+            bitmap,
+            chunk_size,
+            start,
+            end,
+            download_done,
+            download_outcome,
+            poll_interval,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::new`] that publishes
+    /// `bytes_decoded_input` on every successful read. Required
+    /// for `max_disk_buffer` to function correctly; the §10
+    /// pipeline uses this on the production path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_progress(
+        sparse: &'a SparseFile,
+        bitmap: &'a ChunkBitmap,
+        chunk_size: u64,
+        start: u64,
+        end: u64,
+        download_done: &'a Arc<AtomicBool>,
+        download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+        poll_interval: Duration,
+        progress: Option<&'a Arc<crate::progress::ProgressState>>,
+    ) -> Self {
+        // Seed `bytes_decoded_input` at `start` so the cap
+        // re-anchors when a new range opens.
+        if let Some(p) = progress {
+            p.set_bytes_decoded_input(start);
+        }
         Self {
             sparse,
             bitmap,
@@ -797,6 +888,7 @@ impl<'a> BoundedSparseReader<'a> {
             download_done,
             download_outcome,
             poll_interval,
+            progress,
         }
     }
 }
@@ -853,6 +945,16 @@ impl<'a> Read for BoundedSparseReader<'a> {
                 ));
             }
             self.cursor = self.cursor.saturating_add(n as u64);
+            // Publish the new decoder position. The throttle
+            // reads `bytes_decoded_input` on its next dispatch
+            // decision; if the lookahead drops below the cap,
+            // workers can dispatch the next chunk in this
+            // entry. Per `Self::with_progress`, the seed at
+            // `start` already re-anchored the cap when this
+            // reader was constructed.
+            if let Some(p) = self.progress {
+                p.set_bytes_decoded_input(self.cursor);
+            }
             return Ok(n);
         }
     }
@@ -1046,6 +1148,7 @@ mod tests {
             download_done: &download_done,
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
+            progress_state: None,
         };
         let mut sink = ZipSink::new(&root).expect("sink");
         let puncher = NoopPuncher::new();
@@ -1107,6 +1210,7 @@ mod tests {
             download_done: &download_done,
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
+            progress_state: None,
         };
         let mut sink = ZipSink::new(&root).expect("sink");
         let puncher = NoopPuncher::new();
@@ -1159,6 +1263,7 @@ mod tests {
             download_done: &download_done,
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
+            progress_state: None,
         };
         let mut sink = ZipSink::new(&root).expect("sink");
         let puncher = NoopPuncher::new();
@@ -1197,6 +1302,7 @@ mod tests {
             download_done: &download_done,
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
+            progress_state: None,
         };
         let mut sink = ZipSink::new(&root).expect("sink");
         let puncher = NoopPuncher::new();
@@ -1240,6 +1346,7 @@ mod tests {
             download_done: &download_done,
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
+            progress_state: None,
         };
         let mut sink = ZipSink::new(&root).expect("sink");
         let puncher = NoopPuncher::new();
@@ -1275,6 +1382,7 @@ mod tests {
             download_done: &download_done,
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
+            progress_state: None,
         };
         let mut sink = ZipSink::new(&root).expect("sink");
         let puncher = NoopPuncher::new();
