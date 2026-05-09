@@ -37,5 +37,6 @@
 //! build does not compile this module.
 
 pub mod bits;
+pub mod bootstrap;
 pub mod dict;
 pub mod huffman;
