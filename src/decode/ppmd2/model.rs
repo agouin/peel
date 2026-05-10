@@ -1804,6 +1804,261 @@ mod round_trip_tests {
 }
 
 #[cfg(test)]
+mod edge_case_tests {
+    //! §B2c — edge-case stress.
+    //!
+    //! Round-trips at every supported model order, repeated-session
+    //! tests verifying [`Model::restart`] is clean across uses, the
+    //! "small arena, big input" path where the model restarts
+    //! internally mid-stream, and decoder-only paths that surface
+    //! [`DecodeError`] variants without panicking.
+
+    use super::*;
+    use crate::decode::ppmd2::range_dec::{RangeDecoder, RangeEncoder};
+
+    fn round_trip(input: &[u8], order: u32, arena_bytes: usize) {
+        let mut enc_model = Model::new(arena_bytes, order).expect("encoder model");
+        let mut enc = RangeEncoder::new();
+        for &b in input {
+            enc_model.encode_symbol(&mut enc, b);
+        }
+        let bytes = enc.finish();
+        let mut dec_model = Model::new(arena_bytes, order).expect("decoder model");
+        let mut dec = RangeDecoder::new(&bytes).expect("range decoder init");
+        let mut got = Vec::with_capacity(input.len());
+        for _ in 0..input.len() {
+            let b = dec_model.decode_symbol(&mut dec).expect("decode");
+            got.push(b);
+        }
+        assert_eq!(got, input);
+    }
+
+    /// Pseudorandom byte stream of `len` bytes, seeded from `seed`.
+    /// Used by the order-grid and exhaustion tests. The LCG is the
+    /// Numerical Recipes constants — sufficient for spreading bytes
+    /// across the alphabet without committing the test to a real
+    /// PRNG dependency.
+    fn lcg_stream(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 16) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn round_trip_works_at_every_supported_order() {
+        // Same input, varying orders. Each combination drives
+        // create_successors to a different depth before the model
+        // levels off. 32 KiB arena keeps every order from hitting
+        // the internal restart branch.
+        let input = lcg_stream(512, 0xDEADBEEF);
+        for &order in &[MIN_ORDER, 3, 4, 8, 16, 32, MAX_ORDER] {
+            round_trip(&input, order, 32 * 1024);
+        }
+    }
+
+    #[test]
+    fn round_trip_with_two_sessions_separated_by_restart() {
+        // Two independent payloads through a single Model instance,
+        // with `restart()` between them. Verifies the model fully
+        // wipes its state between blocks — legacy RAR's solid mode
+        // does NOT call this, but `m=4` / `m=5` non-solid blocks do.
+        let payload_a = b"first session payload";
+        let payload_b = b"second session, different data";
+        let order = 4;
+        let arena = 16 * 1024;
+
+        let mut enc_a = RangeEncoder::new();
+        let mut m_enc = Model::new(arena, order).expect("enc");
+        for &b in payload_a {
+            m_enc.encode_symbol(&mut enc_a, b);
+        }
+        let bytes_a = enc_a.finish();
+
+        m_enc.restart();
+        let mut enc_b = RangeEncoder::new();
+        for &b in payload_b {
+            m_enc.encode_symbol(&mut enc_b, b);
+        }
+        let bytes_b = enc_b.finish();
+
+        let mut m_dec = Model::new(arena, order).expect("dec");
+        let mut rc_a = RangeDecoder::new(&bytes_a).expect("init A");
+        let got_a: Vec<u8> = (0..payload_a.len())
+            .map(|_| m_dec.decode_symbol(&mut rc_a).expect("decode A"))
+            .collect();
+        assert_eq!(got_a, payload_a);
+
+        m_dec.restart();
+        let mut rc_b = RangeDecoder::new(&bytes_b).expect("init B");
+        let got_b: Vec<u8> = (0..payload_b.len())
+            .map(|_| m_dec.decode_symbol(&mut rc_b).expect("decode B"))
+            .collect();
+        assert_eq!(got_b, payload_b);
+    }
+
+    #[test]
+    fn round_trip_long_stream_does_not_run_out_of_arena() {
+        // 32 KiB pseudorandom payload through a 256 KiB arena.
+        // Comfortably exceeds the initial 7/8-of-arena unit region
+        // so the freelists, glue-driven coalescing, and shrink_units
+        // all fire in production. Worth running in --release too
+        // to catch any release-mode-only arithmetic surprises (CI
+        // does this via the `cargo test --release` lane).
+        let input = lcg_stream(32 * 1024, 0x12345678);
+        round_trip(&input, 8, 256 * 1024);
+    }
+
+    #[test]
+    fn round_trip_with_internal_restart_on_small_arena() {
+        // 16 KiB pseudorandom stream through the canonical 2 KiB
+        // arena. The model will hit the "text catches up to
+        // UnitsStart" path repeatedly and call `restart()`
+        // internally; encoder and decoder must do so in lockstep
+        // for the round-trip to remain byte-identical.
+        let input = lcg_stream(16 * 1024, 0xCAFEBABE);
+        round_trip(&input, 4, MIN_MEM_SIZE);
+    }
+
+    #[test]
+    fn round_trip_repeating_256_byte_pattern() {
+        // A 4 KiB stream of the pattern (0, 1, 2, ..., 255) repeated.
+        // Cycles the model through every possible order-1 transition
+        // and stress-tests the masked-escape walk on near-miss bytes.
+        let pattern: Vec<u8> = (0..=255u8).collect();
+        let input: Vec<u8> = pattern.iter().cycle().take(4 * 1024).copied().collect();
+        round_trip(&input, 4, 32 * 1024);
+    }
+
+    #[test]
+    fn round_trip_max_order_with_compressible_input() {
+        // MAX_ORDER (= 64) on highly redundant input. The first
+        // ~64 bytes establish the order-64 chain; subsequent
+        // repetitions exercise the deep-context fast path.
+        let unit = b"AAAAAAAA";
+        let input: Vec<u8> = unit.iter().cycle().take(2048).copied().collect();
+        round_trip(&input, MAX_ORDER, 64 * 1024);
+    }
+
+    #[test]
+    fn decoder_surfaces_truncated_input_as_range_error() {
+        // Encode a payload, then truncate the wire bytes to less
+        // than the 5-byte range-coder init prefix. The decoder
+        // must surface a typed Range error rather than panic.
+        let mut enc = RangeEncoder::new();
+        let mut m_enc = Model::new(MIN_MEM_SIZE, 4).expect("enc");
+        for &b in b"hello" {
+            m_enc.encode_symbol(&mut enc, b);
+        }
+        let bytes = enc.finish();
+        let truncated = &bytes[..bytes.len().min(3)];
+        // RangeDecoder::new itself errors on < 5 bytes.
+        let dec_init = RangeDecoder::new(truncated);
+        assert!(matches!(
+            dec_init,
+            Err(crate::decode::ppmd2::range_dec::RangeDecoderError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn decoder_surfaces_mid_stream_truncation() {
+        // 5-byte init succeeds; mid-stream renormalisation hits EOF.
+        let mut enc = RangeEncoder::new();
+        let mut m_enc = Model::new(MIN_MEM_SIZE, 4).expect("enc");
+        for &b in b"the quick brown fox jumps over the lazy dog".iter() {
+            m_enc.encode_symbol(&mut enc, b);
+        }
+        let bytes = enc.finish();
+        // Keep just the 5-byte init prefix; every subsequent decode
+        // step must surface a Truncated error at the first byte
+        // the n-ary decode would need from past the init prefix.
+        let truncated = &bytes[..5];
+        let mut m_dec = Model::new(MIN_MEM_SIZE, 4).expect("dec");
+        let mut dec = RangeDecoder::new(truncated).expect("init");
+        // The first decode will succeed only as long as the range
+        // coder doesn't need to renormalize. After enough symbols
+        // it will, and that surfaces as DecodeError::Range. The
+        // important behaviour is "no panic" — verify by consuming
+        // many symbols and asserting we eventually see an error.
+        let mut saw_error = false;
+        for _ in 0..256 {
+            match m_dec.decode_symbol(&mut dec) {
+                Ok(_) => continue,
+                Err(DecodeError::Range(_)) => {
+                    saw_error = true;
+                    break;
+                }
+                Err(e) => panic!("expected Range error, got {e:?}"),
+            }
+        }
+        assert!(saw_error, "expected Range error within 256 decode attempts");
+    }
+
+    #[test]
+    fn allocator_view_exposes_arena_size() {
+        let m = Model::new(16 * 1024, 4).expect("model");
+        let alloc = m.allocator();
+        // 16 KiB arena → 16380 bytes of working region (16384 -
+        // 4 align - 0 since 16380 % 12 = 0). The exact post-pad
+        // size is allocator-internal; we just verify the accessor
+        // returns something plausible.
+        assert!(alloc.size() > 0);
+        assert!(alloc.size() <= 16 * 1024);
+    }
+
+    #[test]
+    fn max_order_accessor_returns_constructor_value() {
+        let m = Model::new(16 * 1024, 7).expect("model");
+        assert_eq!(m.max_order(), 7);
+    }
+
+    #[test]
+    fn round_trip_single_byte_streams_at_every_order() {
+        // One-byte payloads exercise the very first context lookup
+        // at every order. At restart, MinContext is the order-0
+        // root with NumStats=256 — every byte is decoded via the
+        // multi-state path on the first call regardless of order.
+        for &order in &[MIN_ORDER, 3, 16, MAX_ORDER] {
+            round_trip(b"!", order, MIN_MEM_SIZE);
+            round_trip(&[0u8], order, MIN_MEM_SIZE);
+            round_trip(&[255u8], order, MIN_MEM_SIZE);
+        }
+    }
+
+    #[test]
+    fn restart_after_decode_does_not_leak_state() {
+        // Decode a stream, restart, encode-and-decode a different
+        // stream. Verifies the model's restart() wipes all of
+        // FoundState / MinContext / MaxContext / OrderFall /
+        // PrevSuccess / RunLength back to canonical post-init.
+        let mut m = Model::new(16 * 1024, 4).expect("model");
+        let mut enc = RangeEncoder::new();
+        for &b in b"first" {
+            m.encode_symbol(&mut enc, b);
+        }
+        let _bytes_a = enc.finish();
+        // Snapshot post-encode state (irrelevant — we restart).
+        m.restart();
+        // Round-trip a *different* payload now.
+        let payload = b"second";
+        let mut enc_b = RangeEncoder::new();
+        for &b in payload {
+            m.encode_symbol(&mut enc_b, b);
+        }
+        let bytes_b = enc_b.finish();
+        m.restart();
+        let mut dec = RangeDecoder::new(&bytes_b).expect("init");
+        let got: Vec<u8> = (0..payload.len())
+            .map(|_| m.decode_symbol(&mut dec).expect("decode"))
+            .collect();
+        assert_eq!(got, payload);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
