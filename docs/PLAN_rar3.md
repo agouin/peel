@@ -6,11 +6,13 @@
 > archives extract end-to-end. **§B0 (e730509)** lands the PPMd-II
 > range coder under `src/decode/ppmd2/` — round-tripped against a
 > test-only sister encoder across uniform / skewed / adaptive-binary
-> distributions. §B1 (suballocator) is next; §B2 (context tree +
-> decode loop) is the bulk of Phase B. This plan resolves
-> follow-on `O.RAR4` from `docs/PLAN_rar.md`. It is a sibling
-> sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
-> `docs/PLAN_rar.md`, not a supersession.
+> distributions. **§B1 (62bc41c)** lands the PPMd-II suballocator
+> alongside it: 38 freelist size classes, two-direction unit region,
+> GlueCount-driven coalescing. §B2 (context tree + decode loop) is
+> the bulk of Phase B. This plan resolves follow-on `O.RAR4` from
+> `docs/PLAN_rar.md`. It is a sibling sub-plan to
+> `docs/PLAN_rar5_decoder.md` — additive to `docs/PLAN_rar.md`, not
+> a supersession.
 >
 > **Sequencing.** `PLAN_rar.md` §1–§4 plus `PLAN_rar5_decoder.md`
 > Phases A–E must be on `main` first. The hand-rolled RAR5 decoder
@@ -342,36 +344,98 @@ through it, the legacy crash-resume scenario will land alongside
 > - **§B0** ✅ (commit e730509) — range coder. Bit-level entropy
 >   primitive. Self-contained, round-trippable against a sister
 >   encoder.
-> - **§B1** (next) — suballocator. The custom slab allocator the
->   PPMd model uses for its variable-order context tree. ~12-byte
->   units, freelists indexed by unit count, GlueCount-driven
+> - **§B1** ✅ (commit 62bc41c) — suballocator. The custom slab
+>   allocator the PPMd model uses for its variable-order context
+>   tree. 12-byte units, 38 freelist size classes, GlueCount-driven
 >   compaction.
-> - **§B2** — context tree + symbol-decode loop. Bulk of the
->   algorithm; consumes both §B0 and §B1.
+> - **§B2** (next) — context tree + symbol-decode loop. Bulk of
+>   the algorithm; consumes both §B0 and §B1.
 > - **§B3** — differential cross-check against `unrar`-produced
 >   fixtures.
 
-### §B1. PPMd-II model (suballocator + tree + decode loop)
+### §B1. PPMd-II suballocator ✅ (commit 62bc41c)
 
-**What**: hand-rolled PPMd-II decoder. Lives at
-`src/decode/ppmd2/` per §0.4. New crate-internal module.
+**What landed**: hand-rolled port of the LZMA SDK Ppmd7 allocator
+at [src/decode/ppmd2/alloc.rs](../src/decode/ppmd2/alloc.rs). One
+contiguous arena (`Box<[u8]>`) with three regions — a 4-byte
+alignment pad reserving the `Ref(0)` null sentinel, a text region
+the model layer will populate in §B2, and a unit region split
+between `lo_unit` (grows up, multi-unit allocs) and `hi_unit`
+(grows down, one-unit context allocs). 38 freelist size classes
+quantised by the PPMd7 step rule (`step = i >= 12 ? 4 : (i >> 2) +
+1`); lookup tables are computed at compile time. The rare-alloc
+path scans larger size classes for a block to split, falls back to
+lowering `units_start`, and triggers `glue_free_blocks` when
+`glue_count` decays to zero (insertion-sort by address, merge
+physically-adjacent runs, redistribute with `> 128`-unit splits).
+
+**Public surface** (consumed by §B2):
+
+- `Allocator::new(arena_bytes)`, `Allocator::restart()`.
+- `alloc_units(indx) -> Option<Ref>`, `alloc_context() -> Option<Ref>`,
+  `free_units(ptr, indx)`, `shrink_units(ptr, old, new) -> Ref`.
+- `slot(ptr, indx) -> &[u8]` / `slot_mut`, plus 1-unit
+  `context_slot` variants.
+- `glue_free_blocks()` (called automatically; exposed for tests).
+- `Allocator::units_to_indx` / `Allocator::indx_to_units` lookup
+  helpers.
+
+**What turned out NOT to need** (vs. the original sketch):
+
+- **No `Stamp` field in free nodes.** The LZMA SDK reserves the
+  first u32 of a free node for an integrity marker, but our glue
+  walks the freelists themselves rather than scanning the arena
+  linearly — the marker carries no information the freelist heads
+  don't already.
+- **No text-region API.** The plan's "text grows from the bottom"
+  story is real, but round-one keeps `text` pinned at
+  `align_offset`. The §B2 model layer is the first consumer that
+  needs to write byte-stream history, and the API shape (per-byte
+  bump? per-context buffered? boundary check) reads better when
+  the model is in scope.
+
+**Tests**: 23 unit tests in
+[src/decode/ppmd2/alloc.rs](../src/decode/ppmd2/alloc.rs) cover
+the freelist round-trip across all 38 size classes, LIFO ordering,
+shrink in-place vs. via the target freelist, split-block remainder
+placement (exact-fit + inexact), the rare-path larger-bucket steal
+and the `units_start` fallback, and glue's adjacency /
+non-adjacency / oversize-split behaviour. **1470 lib tests pass
+total** (was 1447 at §B0).
+
+**Demo**: `cargo test decode::ppmd2::alloc` passes; the allocator
+round-trips arbitrary alloc / free / shrink / glue sequences.
+
+### §B2. PPMd-II context tree + symbol-decode loop
+
+**What**: hand-rolled PPMd-II model. Lives alongside §B0 + §B1
+under `src/decode/ppmd2/`. Consumes the range coder
+([`range_dec`](../src/decode/ppmd2/range_dec.rs)) and the
+suballocator ([`alloc`](../src/decode/ppmd2/alloc.rs)) landed in
+§B0 + §B1.
 
 **Sketch**.
 
-1. Bit-level range coder (PPM uses range coding, not Huffman).
-2. Context tree + suffix links. Order-N modelling with escape
+1. Context tree + suffix links. Order-N modelling with escape
    probabilities.
-3. State-machine decode loop: `decode_symbol(ctx) -> u8`.
-4. Initialisation parameters: order, sub-allocator size, restart
+2. State-machine decode loop: `decode_symbol(ctx) -> u8`.
+3. Initialisation parameters: order, sub-allocator size, restart
    policy. Legacy RAR sets all three at the start of each
    `m=4`/`m=5` block.
+4. Text-region API on the suballocator — per-byte writes the
+   model uses to track the order-N context history. The shape
+   stays open until the model is in scope (see §B1 "what turned
+   out NOT to need").
 
 **Reference.** libarchive's `archive_read_support_format_rar.c`
 PPMd code, plus Shkarin's original PPMd-II paper. `7zip`'s
-`PPMd7Decoder.c` is closely related and is the cleaner read.
+`Ppmd7Dec.c` / `Ppmd7.c` are closely related and are the cleaner
+read.
 
-**Tests**: differential — encode a small payload with `rar a -m5`,
-decode with our PPMd, byte-compare. ~50 fixture vectors.
+### §B3. Differential cross-check
+
+**What**: encode a small payload with `rar a -m5`, decode with the
+§B2 model, byte-compare. ~50 fixture vectors.
 
 **Demo**: `cargo test decode::ppmd2` passes including a corpus of
 ~50 reference vectors.
