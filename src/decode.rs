@@ -551,25 +551,37 @@ impl DecoderRegistry {
             }],
             crate::sevenz::streaming_factory_placeholder,
         );
-        // RAR5 (`docs/PLAN_rar.md` §1). Same shape as ZIP / 7z —
-        // the coordinator dispatches to `crate::download::rar_pipeline`
-        // (lands in §3) before the factory is invoked. Magic is the
-        // 8-byte `Rar!\x1A\x07\x01\x00` signature at offset 0; the
-        // RAR4 magic is deliberately *not* registered (`PLAN_rar.md`
-        // §0.3) — `.rar` URLs containing RAR4 bytes still reach the
-        // RAR5 factory by way of the suffix path and surface a
-        // precise [`RarError::UnsupportedFormatVersion`] there. When
-        // the `rar` Cargo feature is disabled, the registered
-        // factory still owns the `.rar` suffix and the RAR5 magic
-        // but emits a "compiled without `rar` feature" diagnostic
-        // instead of the dispatch placeholder (`PLAN_rar.md` §0.5).
+        // RAR (`docs/PLAN_rar.md` §1 + `docs/PLAN_rar3.md` §A2b).
+        // Same shape as ZIP / 7z — the coordinator dispatches to
+        // `crate::download::rar_pipeline` before the factory is
+        // invoked. Two magics are registered:
+        //   * 8-byte `Rar!\x1A\x07\x01\x00` (RAR5)
+        //   * 7-byte `Rar!\x1A\x07\x00`     (legacy RAR3 / RAR4)
+        // The pipeline's `detect_signature` dispatches between them
+        // post-fetch. When the `rar` Cargo feature is disabled the
+        // registered factory still owns the `.rar` suffix and both
+        // magics but emits a "compiled without `rar` feature"
+        // diagnostic.
+        #[cfg(feature = "rar")]
+        let rar_magics: &[MagicSignature] = &[
+            MagicSignature {
+                offset: 0,
+                bytes: &crate::rar::SIGNATURE_MAGIC,
+            },
+            MagicSignature {
+                offset: 0,
+                bytes: &crate::rar::LEGACY_SIGNATURE_MAGIC,
+            },
+        ];
+        #[cfg(not(feature = "rar"))]
+        let rar_magics: &[MagicSignature] = &[MagicSignature {
+            offset: 0,
+            bytes: &crate::rar::SIGNATURE_MAGIC,
+        }];
         r.register_format(
             crate::rar::FORMAT_NAME,
             &[".rar"],
-            &[MagicSignature {
-                offset: 0,
-                bytes: &crate::rar::SIGNATURE_MAGIC,
-            }],
+            rar_magics,
             crate::rar::streaming_factory_placeholder,
         );
         r

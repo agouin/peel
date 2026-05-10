@@ -230,3 +230,129 @@ pub fn build_rar5_encrypted_header(entries: &[RarEntrySpec]) -> Vec<u8> {
 pub fn build_rar4_magic_only() -> Vec<u8> {
     RAR4_SIGNATURE_MAGIC.to_vec()
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Legacy (RAR3 / RAR4) fixture builder
+// ─────────────────────────────────────────────────────────────────
+//
+// The legacy archive format uses fixed-layout little-endian headers
+// with a CRC-16 (low 16 of CRC-32 IEEE) prefix. See
+// `peel::rar::legacy::format` for the parser side and
+// `docs/PLAN_rar3.md` §A1 for the layout.
+
+const LEGACY_HEAD_FLAG_LONG_BLOCK: u16 = 0x8000;
+const LEGACY_BASE_BLOCK_LEN: usize = 7;
+
+/// Build a legacy base-block-prefixed header. CRCs the body and
+/// returns the wire bytes; the caller appends the data area
+/// separately (when `add_size` is `Some(n)`, `n` bytes of data are
+/// expected to follow the header in the archive stream).
+pub fn build_legacy_block(
+    head_type: u8,
+    head_flags: u16,
+    body: &[u8],
+    add_size: Option<u32>,
+) -> Vec<u8> {
+    let mut head_flags = head_flags;
+    if add_size.is_some() {
+        head_flags |= LEGACY_HEAD_FLAG_LONG_BLOCK;
+    }
+    let header_extra = if add_size.is_some() { 4 } else { 0 };
+    let head_size = (LEGACY_BASE_BLOCK_LEN + header_extra + body.len()) as u16;
+    let mut bytes = Vec::with_capacity(head_size as usize);
+    bytes.extend_from_slice(&[0, 0]); // head_crc placeholder
+    bytes.push(head_type);
+    bytes.extend_from_slice(&head_flags.to_le_bytes());
+    bytes.extend_from_slice(&head_size.to_le_bytes());
+    if let Some(add) = add_size {
+        bytes.extend_from_slice(&add.to_le_bytes());
+    }
+    bytes.extend_from_slice(body);
+    let crc16 = (header_crc32(&bytes[2..]) & 0xFFFF) as u16;
+    bytes[..2].copy_from_slice(&crc16.to_le_bytes());
+    bytes
+}
+
+/// Build a legacy `MAIN_HEAD` (block type `0x73`).
+///
+/// `archive_flags` is the wire-level flag word (bit 0x0008 = SOLID,
+/// 0x0001 = MULTI_VOLUME, etc.). The 6-byte reserved tail
+/// (`high_pos_av` + `pos_av`) is zeroed.
+pub fn build_legacy_main_header(archive_flags: u16) -> Vec<u8> {
+    let body = [0u8; 6];
+    build_legacy_block(0x73, archive_flags, &body, None)
+}
+
+/// Build a legacy `ENDARC_HEAD` (block type `0x7B`).
+pub fn build_legacy_endarc_header() -> Vec<u8> {
+    build_legacy_block(0x7B, 0, &[], None)
+}
+
+/// Spec for a STORED-method legacy file-header entry.
+#[derive(Clone, Debug)]
+pub struct LegacyEntrySpec {
+    /// Entry name (UTF-8).
+    pub name: String,
+    /// Pre-encoding payload. STORED means `pack_size == unp_size`.
+    pub uncompressed: Vec<u8>,
+    /// Compression-version × 10 (e.g. `36` for RAR 3.6 / 4.x).
+    /// The legacy parser accepts `[29, 36]`.
+    pub unp_ver: u8,
+}
+
+impl LegacyEntrySpec {
+    /// New STORED entry tagged with `unp_ver = 36` (the RAR 4.x
+    /// default).
+    pub fn stored(name: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            uncompressed: payload.into(),
+            unp_ver: 36,
+        }
+    }
+}
+
+/// Build a legacy `FILE_HEAD` (block type `0x74`) for a STORED entry,
+/// returning `(header_bytes, data_area_bytes)`. The caller
+/// concatenates them in order so the walker observes the data area
+/// immediately after the header.
+pub fn build_legacy_file_header(entry: &LegacyEntrySpec) -> (Vec<u8>, Vec<u8>) {
+    let pack_size: u32 = entry.uncompressed.len() as u32;
+    let unp_size_low: u32 = pack_size; // STORED
+    let host_os: u8 = 3; // Unix
+    let file_crc32: u32 = header_crc32(&entry.uncompressed);
+    let dos_mtime: u32 = 0x4949_4949; // arbitrary
+    let method: u8 = 0x30; // m=0 STORED
+    let attr: u32 = 0o644;
+
+    let mut body = Vec::with_capacity(25 + entry.name.len());
+    body.extend_from_slice(&unp_size_low.to_le_bytes());
+    body.push(host_os);
+    body.extend_from_slice(&file_crc32.to_le_bytes());
+    body.extend_from_slice(&dos_mtime.to_le_bytes());
+    body.push(entry.unp_ver);
+    body.push(method);
+    body.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
+    body.extend_from_slice(&attr.to_le_bytes());
+    body.extend_from_slice(entry.name.as_bytes());
+
+    let head_flags: u16 = 0; // no LARGE / UNICODE / SALT / EXTTIME
+    let header = build_legacy_block(0x74, head_flags, &body, Some(pack_size));
+    (header, entry.uncompressed.clone())
+}
+
+/// Build a complete legacy STORED archive: 7-byte magic + MAIN_HEAD
+/// (with the supplied flags) + N FILE_HEADs (each followed by data) +
+/// ENDARC_HEAD.
+pub fn build_legacy_archive(archive_flags: u16, entries: &[LegacyEntrySpec]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&peel::rar::LEGACY_SIGNATURE_MAGIC);
+    out.extend_from_slice(&build_legacy_main_header(archive_flags));
+    for entry in entries {
+        let (header, data) = build_legacy_file_header(entry);
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&data);
+    }
+    out.extend_from_slice(&build_legacy_endarc_header());
+    out
+}

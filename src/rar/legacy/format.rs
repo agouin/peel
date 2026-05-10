@@ -1033,6 +1033,7 @@ mod tests {
 
     /// Synthesize a FILE_HEAD body for the given parameters, with no
     /// optional fields (no LARGE / SALT / EXTTIME).
+    #[allow(clippy::too_many_arguments)]
     fn build_file_head_body(
         unp_size_low: u32,
         host_os: u8,

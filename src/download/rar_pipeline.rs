@@ -70,9 +70,17 @@ use crate::punch::{align_down, align_up, PunchError, PunchHole};
 use crate::rar::archive::FileEntry;
 use crate::rar::format::{
     parse_end_of_archive_header, parse_file_header, parse_generic_header,
-    parse_main_archive_header, parse_signature, HeaderType,
+    parse_main_archive_header, HeaderType,
 };
-use crate::rar::{RarError, SIGNATURE_MAGIC};
+use crate::rar::legacy::format::{
+    parse_endarc_header as parse_legacy_endarc_header,
+    parse_file_header as parse_legacy_file_header,
+    parse_generic_header as parse_legacy_generic_header,
+    parse_main_archive_header as parse_legacy_main_archive_header, BlockType,
+};
+use crate::rar::{
+    detect_signature, RarError, SignatureKind, LEGACY_SIGNATURE_MAGIC, SIGNATURE_MAGIC,
+};
 use crate::sink::rar::{BeginEntryOutcome, EntryFinalize, RarSink};
 use crate::sink::SinkError;
 use crate::types::{ByteOffset, ChunkIndex};
@@ -254,6 +262,37 @@ pub struct RarExtractionStats {
     pub bytes_punched: u64,
 }
 
+/// Per-entry record the legacy walker hands to the legacy
+/// extractor. Distinct from [`crate::rar::archive::FileEntry`] (the
+/// RAR5 walker's record) because the legacy file header carries a
+/// different field set: CRC-32 is unconditionally present (no
+/// `Option<u32>`), there is no BLAKE2sp slot, and the
+/// dictionary-size / compression-info vint shape is RAR5-only.
+#[derive(Debug, Clone)]
+struct LegacyEntryRecord {
+    /// Entry name decoded from the legacy file header (UTF-8, with
+    /// `LHD_UNICODE` UCS-2 forms already converted).
+    name: String,
+    /// `true` for directory marker entries (`LHD_WINDOW` field set
+    /// to 0xE0). Their data area is always zero bytes.
+    is_directory: bool,
+    /// Decompressed size in bytes (legacy `unp_size` low + optional
+    /// high32 when `LHD_LARGE`).
+    unpacked_size: u64,
+    /// Wire-format CRC-32 IEEE of the unpacked payload. Always
+    /// present in legacy file headers — the sink validates it on
+    /// `end_entry`.
+    expected_crc32: u32,
+    /// Byte offset of the entry's compressed data within the
+    /// archive (the offset of the first byte of the data area
+    /// following the file header).
+    data_offset: u64,
+    /// Compressed-data length in bytes (legacy `pack_size` low +
+    /// optional high32 when `LHD_LARGE`). For STORED entries this
+    /// equals [`Self::unpacked_size`].
+    packed_size: u64,
+}
+
 /// Per-entry extraction driver.
 pub struct RarPipeline<'a> {
     /// Configuration knobs.
@@ -307,7 +346,12 @@ impl<'a> RarPipeline<'a> {
     {
         let mut stats = RarExtractionStats::default();
 
-        // Step 1: wait for the magic and validate.
+        // Step 1: wait for the magic and dispatch on the format.
+        // The RAR5 magic is 8 bytes; the legacy (RAR3 / RAR4) magic
+        // is 7. We fetch the longer of the two so a single read
+        // serves both branches (`detect_signature` reads only what
+        // it needs and ignores any trailing byte for the legacy
+        // case).
         self.cursor.store(0, Ordering::Release);
         if let Some(p) = self.progress_state {
             p.set_bytes_decoded_input(0);
@@ -317,7 +361,21 @@ impl<'a> RarPipeline<'a> {
         self.sparse
             .read_exact_at(ByteOffset::new(0), &mut sig_buf)
             .map_err(RarPipelineError::Sparse)?;
-        let sig_size = parse_signature(&sig_buf).map_err(RarPipelineError::Rar)? as u64;
+        let (kind, sig_len) = detect_signature(&sig_buf).map_err(RarPipelineError::Rar)?;
+        let sig_size = sig_len as u64;
+        if matches!(kind, SignatureKind::Legacy) {
+            // Hand off to the legacy walker. `docs/PLAN_rar3.md`
+            // §A2b: round-one supports STORED-method (`m=0`) legacy
+            // entries end-to-end; `m≥1` surfaces a precise
+            // `UnsupportedFeature` naming the version + method, and
+            // the decoder generations land in §B / §C.
+            return self.run_legacy(sig_size, sink, puncher, resume, stats, callback);
+        }
+        debug_assert_eq!(sig_size, SIGNATURE_MAGIC.len() as u64);
+        // Suppress dead_code on the legacy magic re-export when it
+        // is reached only via the dispatcher above (the import
+        // makes the symbol available for future inline checks).
+        let _ = LEGACY_SIGNATURE_MAGIC;
 
         // Step 2: walk headers from offset `sig_size`. Capture
         // the main archive header's flags and the per-file
@@ -846,6 +904,292 @@ impl<'a> RarPipeline<'a> {
         Ok(())
     }
 
+    /// Drive the extraction of a legacy (RAR3 / RAR4) archive.
+    ///
+    /// Mirrors [`Self::run`] in shape but uses the legacy header
+    /// parsers from [`crate::rar::legacy::format`]. Round-one
+    /// (`docs/PLAN_rar3.md` §A2b) supports STORED-method (`m=0`,
+    /// wire byte `0x30`) entries end-to-end; compressed methods
+    /// surface a precise [`RarError::UnsupportedFeature`] naming
+    /// the version + method byte and the decoder lands in
+    /// §B / §C.
+    ///
+    /// The signature has already been validated by the caller;
+    /// `sig_size` is the number of bytes the magic occupied
+    /// (`7` for the legacy format).
+    fn run_legacy<F>(
+        &self,
+        sig_size: u64,
+        sink: &mut RarSink,
+        puncher: &dyn PunchHole,
+        resume: RarResumeState,
+        mut stats: RarExtractionStats,
+        mut callback: F,
+    ) -> Result<RarExtractionStats, RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let mut cursor: u64 = sig_size;
+        let mut entries: Vec<LegacyEntryRecord> = Vec::new();
+        let mut solid = false;
+        let mut saw_main = false;
+        loop {
+            if cursor >= self.config.total_size {
+                return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: cursor,
+                    reason: "legacy archive ends before ENDARC_HEAD".to_string(),
+                }));
+            }
+            let (header_buf, header_buf_start) = self.read_legacy_header_window(cursor)?;
+            let local_buf = &header_buf[(cursor - header_buf_start) as usize..];
+            let block =
+                parse_legacy_generic_header(local_buf, cursor).map_err(RarPipelineError::Rar)?;
+            match block.block_type {
+                BlockType::Mark => {
+                    return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                        archive_offset: block.archive_offset,
+                        reason: "MARK_HEAD encountered after the leading signature".to_string(),
+                    }));
+                }
+                BlockType::Main => {
+                    if saw_main {
+                        return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                            archive_offset: block.archive_offset,
+                            reason: "second MAIN_HEAD encountered".to_string(),
+                        }));
+                    }
+                    saw_main = true;
+                    let main = parse_legacy_main_archive_header(&block, local_buf)
+                        .map_err(RarPipelineError::Rar)?;
+                    solid = main.archive_flags.is_solid();
+                }
+                BlockType::File => {
+                    if !saw_main {
+                        return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                            archive_offset: block.archive_offset,
+                            reason: "FILE_HEAD encountered before MAIN_HEAD".to_string(),
+                        }));
+                    }
+                    let file = parse_legacy_file_header(&block, local_buf)
+                        .map_err(RarPipelineError::Rar)?;
+                    // Round-one §A2b ships STORED only; compressed
+                    // methods surface a precise diagnostic that
+                    // callers / users can correlate with the §B/§C
+                    // sub-plans. The legacy on-disk method byte is
+                    // ASCII '0'..'5' (i.e. 0x30..0x35).
+                    const LEGACY_METHOD_STORED: u8 = 0x30;
+                    if file.method != LEGACY_METHOD_STORED {
+                        return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                            feature: format!(
+                                "legacy RAR compression method 0x{:02x} (m={}, unp_ver={}.{}); \
+                                 round-one (PLAN_rar3.md §A2b) ships STORED-only legacy, \
+                                 PPMd-II + LZ + RarVM land in §B / §C",
+                                file.method,
+                                file.method.wrapping_sub(LEGACY_METHOD_STORED),
+                                file.unp_ver / 10,
+                                file.unp_ver % 10,
+                            ),
+                        }));
+                    }
+                    let data_offset = cursor + u64::from(block.head_size);
+                    let packed_size = u64::from(block.add_size.unwrap_or(0));
+                    entries.push(LegacyEntryRecord {
+                        name: file.name.clone(),
+                        is_directory: file.file_flags.is_directory(),
+                        unpacked_size: file.unpacked_size,
+                        expected_crc32: file.file_crc32,
+                        data_offset,
+                        packed_size,
+                    });
+                }
+                BlockType::EndArchive => {
+                    let _end = parse_legacy_endarc_header(&block, local_buf)
+                        .map_err(RarPipelineError::Rar)?;
+                    cursor = cursor.saturating_add(block.total_bytes_with_data());
+                    break;
+                }
+                BlockType::Comment
+                | BlockType::AuthenticityVerification
+                | BlockType::Sub
+                | BlockType::Protect
+                | BlockType::Sign
+                | BlockType::NewSub => {
+                    // Skipped silently — round-one does not surface
+                    // comments / AV / recovery / signatures / ACL
+                    // records.
+                }
+                BlockType::Other(code) => {
+                    return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                        feature: format!(
+                            "unknown legacy RAR block type 0x{code:02x} (no SKIP_IF_UNKNOWN \
+                             affordance in legacy format)"
+                        ),
+                    }));
+                }
+            }
+            cursor = cursor.saturating_add(block.total_bytes_with_data());
+        }
+        let trailer_end = cursor;
+
+        let entry_count = u32::try_from(entries.len()).map_err(|_| {
+            RarPipelineError::Rar(RarError::CorruptHeader {
+                archive_offset: 0,
+                reason: "legacy archive has more than u32::MAX entries".to_string(),
+            })
+        })?;
+
+        let already_complete: Vec<u32> = resume.entries_completed.to_vec();
+        callback(&RarPipelineEvent::Started {
+            entry_count,
+            already_complete: already_complete.clone(),
+            solid,
+        })
+        .map_err(RarPipelineError::Aborted)?;
+
+        // Per-entry STORED extraction.
+        let completed_set: HashSet<u32> = resume.entries_completed.iter().copied().collect();
+        for (idx, entry) in entries.iter().enumerate() {
+            let idx = idx as u32;
+            if completed_set.contains(&idx) {
+                continue;
+            }
+            let resume_offset = if Some(idx) == resume.current_entry {
+                resume.current_entry_offset
+            } else {
+                0
+            };
+            let (bytes_written, bytes_punched) =
+                self.extract_legacy_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?;
+            stats.entries_extracted = stats.entries_extracted.saturating_add(1);
+            stats.bytes_written = stats.bytes_written.saturating_add(bytes_written);
+            stats.bytes_punched = stats.bytes_punched.saturating_add(bytes_punched);
+        }
+
+        // Trailing + leading punch, identical to the RAR5 path.
+        if trailer_end < self.config.total_size {
+            let punched = self.punch_range(puncher, trailer_end, self.config.total_size)?;
+            stats.bytes_punched = stats.bytes_punched.saturating_add(punched);
+        }
+        if let Some(first_entry) = entries.first() {
+            if first_entry.data_offset > 0 {
+                let punched = self.punch_range(puncher, 0, first_entry.data_offset)?;
+                stats.bytes_punched = stats.bytes_punched.saturating_add(punched);
+            }
+        } else if trailer_end > 0 {
+            let punched = self.punch_range(puncher, 0, trailer_end)?;
+            stats.bytes_punched = stats.bytes_punched.saturating_add(punched);
+        }
+
+        Ok(stats)
+    }
+
+    /// STORED-method per-entry extractor for legacy archives.
+    ///
+    /// Mirrors the STORED arm of [`Self::extract_entry`] but uses
+    /// the legacy entry record (no BLAKE2sp slot — legacy file
+    /// headers carry CRC-32 only). Compressed entries are rejected
+    /// at walk time in [`Self::run_legacy`], so this function is
+    /// never called for `method != 0x30`.
+    fn extract_legacy_entry<F>(
+        &self,
+        idx: u32,
+        entry: &LegacyEntryRecord,
+        resume_offset: u64,
+        sink: &mut RarSink,
+        puncher: &dyn PunchHole,
+        callback: &mut F,
+    ) -> Result<(u64, u64), RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let data_offset = entry.data_offset;
+        let packed_size = entry.packed_size;
+        let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
+            RarPipelineError::Rar(RarError::CorruptHeader {
+                archive_offset: data_offset,
+                reason: "legacy entry data range overflows u64".to_string(),
+            })
+        })?;
+
+        self.cursor.store(data_offset, Ordering::Release);
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(data_offset);
+        }
+        self.wait_for_range(data_offset, data_end)?;
+
+        let begin_outcome = if resume_offset > 0 {
+            sink.begin_entry_resume(
+                idx,
+                &entry.name,
+                entry.is_directory,
+                entry.unpacked_size,
+                Some(entry.expected_crc32),
+                None, // legacy FILE_HEAD has no BLAKE2sp slot
+                resume_offset,
+            )
+        } else {
+            sink.begin_entry(
+                idx,
+                &entry.name,
+                entry.is_directory,
+                entry.unpacked_size,
+                Some(entry.expected_crc32),
+                None,
+            )
+        }
+        .map_err(RarPipelineError::Sink)?;
+
+        if matches!(begin_outcome, BeginEntryOutcome::Directory { .. }) {
+            let punched = if packed_size > 0 {
+                self.punch_range(puncher, data_offset, data_end)?
+            } else {
+                0
+            };
+            callback(&RarPipelineEvent::EntryFinished {
+                index: idx,
+                name: entry.name.clone(),
+                bytes_written: 0,
+                bytes_punched: punched,
+            })
+            .map_err(RarPipelineError::Aborted)?;
+            return Ok((0, punched));
+        }
+
+        let copy_start = data_offset.saturating_add(resume_offset);
+        let mut cursor_in_entry = copy_start;
+        let mut buf = vec![0u8; 64 * 1024];
+        while cursor_in_entry < data_end {
+            let want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
+            self.sparse
+                .read_exact_at(ByteOffset::new(cursor_in_entry), &mut buf[..want])
+                .map_err(RarPipelineError::Sparse)?;
+            sink.write_entry(&buf[..want])
+                .map_err(RarPipelineError::Sink)?;
+            cursor_in_entry = cursor_in_entry.saturating_add(want as u64);
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(cursor_in_entry);
+            }
+            callback(&RarPipelineEvent::InEntryProgress {
+                index: idx,
+                bytes_written: sink.current_entry_offset(),
+            })
+            .map_err(RarPipelineError::Aborted)?;
+        }
+
+        let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;
+
+        let punched = self.punch_range(puncher, data_offset, data_end)?;
+        callback(&RarPipelineEvent::EntryFinished {
+            index: idx,
+            name: entry.name.clone(),
+            bytes_written: entry.unpacked_size,
+            bytes_punched: punched,
+        })
+        .map_err(RarPipelineError::Aborted)?;
+
+        Ok((entry.unpacked_size, punched))
+    }
+
     /// Ensure the chunks covering `[start, start + initial_window)`
     /// (clamped to `total_size`) have landed and return a buffer
     /// holding those bytes. The buffer's start offset is `start`
@@ -877,6 +1221,46 @@ impl<'a> RarPipeline<'a> {
                         return Err(RarPipelineError::Rar(RarError::Truncated {
                             what: format!(
                                 "header at archive offset {start} \
+                                 exceeds remaining archive size"
+                            ),
+                            needed,
+                        }));
+                    }
+                    window = window
+                        .saturating_mul(2)
+                        .max(needed as u64 + 64)
+                        .min(self.config.total_size - start);
+                }
+                Err(other) => return Err(RarPipelineError::Rar(other)),
+            }
+        }
+    }
+
+    /// Same shape as [`Self::read_header_window`] but probes with
+    /// the legacy (RAR3/RAR4) header parser. Used by the
+    /// [`Self::run_legacy`] walker; kept distinct from the RAR5
+    /// helper so a single archive's wire format never crosses
+    /// parsers mid-walk.
+    fn read_legacy_header_window(&self, start: u64) -> Result<(Vec<u8>, u64), RarPipelineError> {
+        let mut window = self.config.initial_header_window.max(64);
+        loop {
+            let end = (start.saturating_add(window)).min(self.config.total_size);
+            self.cursor.store(start, Ordering::Release);
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(start);
+            }
+            self.wait_for_range(start, end)?;
+            let mut buf = vec![0u8; (end - start) as usize];
+            self.sparse
+                .read_exact_at(ByteOffset::new(start), &mut buf)
+                .map_err(RarPipelineError::Sparse)?;
+            match parse_legacy_generic_header(&buf, start) {
+                Ok(_) => return Ok((buf, start)),
+                Err(RarError::Truncated { needed, .. }) => {
+                    if end == self.config.total_size {
+                        return Err(RarPipelineError::Rar(RarError::Truncated {
+                            what: format!(
+                                "legacy header at archive offset {start} \
                                  exceeds remaining archive size"
                             ),
                             needed,

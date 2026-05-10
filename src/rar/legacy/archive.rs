@@ -222,6 +222,7 @@ mod tests {
         bytes
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_file_head_body(
         unp_size_low: u32,
         host_os: u8,
