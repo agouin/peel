@@ -325,3 +325,28 @@ fn crash_resume_mid_entry_produces_identical_output() {
         "resumed extraction must be byte-identical"
     );
 }
+
+// `crash_resume_mid_compressed_entry_produces_identical_output` —
+// the §F1 compressed-entry sibling — is deferred behind a
+// concrete decoder bug, not a fixture-availability problem.
+//
+// The round-one `RarStreamDecoder` treats each RAR5 block's
+// bitstream as bit-isolated. RAR5's encoder splits compressed
+// entries above ~2.8 KB packed into multiple blocks and leaves
+// the trailing symbol partially encoded across the block
+// boundary; the decoder under-runs by 2 bits at the seam. A
+// curated minimal repro lives at
+// `tests/fixtures/rar5/multi_block_p27.rar` and is pinned by
+// the `#[ignore]`'d `multi_block_archive_decodes_byte_identical`
+// test in `tests/test_rar_decoder_resume.rs`.
+//
+// Once the multi-block gap closes, this test slot lights up
+// directly — the `multi_block_p27.rar` fixture (67.5 MB unpacked,
+// 2.8 KB compressed) is the Goldilocks the original §F1 plan
+// asked for: large enough that
+// `coord_config(checkpoint_min_bytes = 1)` lands a mid-entry
+// `CheckpointWritten` before the entry finishes.
+//
+// See `docs/PLAN_rar5_multi_block_decode.md` for the full
+// diagnosis + fix sketch and `docs/PLAN_rar5_decoder.md` §F1
+// for the parent plan.

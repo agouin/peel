@@ -37,6 +37,18 @@ const FIXTURE_UNPACKED: &[u8] = b"Testing 123\n";
 /// 3`: `128 KiB << 3 = 1 MiB`.
 const FIXTURE_DICT_CAPACITY: usize = 1024 * 1024;
 
+/// Multi-block regression fixture. See
+/// `tests/fixtures/rar5/README.md` and
+/// `docs/PLAN_rar5_multi_block_decode.md` for the open gap this
+/// pins.
+const MB_FIXTURE: &[u8] = include_bytes!("fixtures/rar5/multi_block_p27.rar");
+const MB_DATA_OFFSET: usize = 70;
+const MB_PACKED_SIZE: usize = 2841;
+/// Dict size from the entry header (selector = 8 → 128 KiB << 8 =
+/// 32 MiB). Pulled from the `rar_list` example's reading of the
+/// fixture.
+const MB_DICT_CAPACITY: usize = 32 * 1024 * 1024;
+
 fn fixture_bitstream() -> &'static [u8] {
     &FIXTURE[FIXTURE_DATA_OFFSET..FIXTURE_DATA_OFFSET + FIXTURE_PACKED_SIZE]
 }
@@ -209,4 +221,41 @@ fn resume_rejects_dict_capacity_mismatch() {
         "expected dict_capacity diagnostic, got: {msg}"
     );
     let _ = MAX_DICT_BYTES; // keep the import in scope for readability
+}
+
+/// Regression: the smallest known archive whose compressed entry
+/// spans two RAR5 blocks (`block 0` has `is_last_block=False`).
+/// The round-one decoder underruns the bitstream by 2 bits at the
+/// block-0 boundary because it treats each block's bitstream as
+/// bit-isolated; see `docs/PLAN_rar5_multi_block_decode.md` for
+/// the diagnosis and fix sketch. The test is `#[ignore]` until
+/// that gap is closed; un-ignoring it should be one line of the
+/// fix commit.
+#[test]
+#[ignore = "multi-block decode gap; see docs/PLAN_rar5_multi_block_decode.md"]
+fn multi_block_archive_decodes_byte_identical() {
+    let bitstream = MB_FIXTURE[MB_DATA_OFFSET..MB_DATA_OFFSET + MB_PACKED_SIZE].to_vec();
+    let src: Box<dyn std::io::Read + Send> = Box::new(Cursor::new(bitstream));
+    let mut dec = RarStreamDecoder::new(src, MB_DICT_CAPACITY).expect("construct decoder");
+    let mut out = Vec::new();
+    // Use a generous step cap — the entry decompresses to 67.5 MB
+    // and each `decode_step` does at most one block of work.
+    for _ in 0..1_000_000 {
+        match dec.decode_step(&mut out).expect("decode_step") {
+            DecodeStatus::Eof => break,
+            DecodeStatus::MoreData => continue,
+        }
+    }
+    // The payload was `b'X' * 27 * 2_500_000`; every byte is `b'X'`.
+    let expected_len = 27usize * 2_500_000;
+    assert_eq!(
+        out.len(),
+        expected_len,
+        "decoded length mismatch: got {}, want {expected_len}",
+        out.len(),
+    );
+    assert!(
+        out.iter().all(|&b| b == b'X'),
+        "decoded bytes contained a non-'X' byte"
+    );
 }

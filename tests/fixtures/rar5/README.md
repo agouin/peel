@@ -15,3 +15,16 @@ they're safe to redistribute.
   round-trip test in [`tests/test_rar_decoder_resume.rs`](../../test_rar_decoder_resume.rs)
   and [`src/decode/rar_native/stream.rs`](../../../src/decode/rar_native/stream.rs)'s
   unit tests.
+
+- `multi_block_p27.rar` (2.9 KB) — non-solid RAR5 archive,
+  compression method 5, payload `b'X' * 27 * 2_500_000` (67.5 MB
+  of period-27 repetition). The smallest known archive whose
+  compressed output spans two RAR5 blocks (block 0 has
+  `is_last_block=False`); pins the multi-block decode-gap
+  regression in
+  [`tests/test_rar_decoder_resume.rs`](../../test_rar_decoder_resume.rs)
+  via an `#[ignore]`'d test that activates when the gap is
+  closed. Source / fix plan:
+  [`docs/PLAN_rar5_multi_block_decode.md`](../../../docs/PLAN_rar5_multi_block_decode.md).
+  Regenerate with
+  `python3 -c 'import sys; sys.stdout.buffer.write(b"X"*27*2_500_000)' > p27-fails.txt && rar a -ma5 -m5 -tsm- -tsa- -tsc- -ep multi_block_p27.rar p27-fails.txt`.
