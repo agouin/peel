@@ -42,6 +42,7 @@ pub mod bootstrap;
 pub mod dict;
 pub mod dist_cache;
 pub mod distance;
+pub mod filters;
 pub mod huffman;
 pub mod length;
 pub mod ppmd_range;
