@@ -46,8 +46,12 @@
 //! one feature, both formats, no separate flag.
 
 #[cfg(feature = "rar")]
+pub mod archive;
+#[cfg(feature = "rar")]
 pub mod format;
 
+#[cfg(feature = "rar")]
+pub use archive::{walk_archive, LegacyArchiveSummary, LegacyFileEntry};
 #[cfg(feature = "rar")]
 pub use format::{
     parse_endarc_header, parse_file_header, parse_generic_header, parse_main_archive_header,

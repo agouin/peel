@@ -102,6 +102,8 @@ pub use format::{
     parse_generic_header, parse_main_archive_header, ArchiveFlags, FileFlags, GenericHeader,
     HeaderType, MainArchiveHeader, Vint,
 };
+#[cfg(feature = "rar")]
+pub use legacy::format::LEGACY_SIGNATURE_MAGIC;
 
 use std::io::Read;
 
@@ -125,6 +127,67 @@ pub const FORMAT_NAME: &str = "rar";
 /// way of the suffix path and surface a precise
 /// [`RarError::UnsupportedFormatVersion`].
 pub const SIGNATURE_MAGIC: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+
+/// Which on-disk RAR archive format begins at offset 0 of the input
+/// buffer. Returned by [`detect_signature`].
+///
+/// The two formats share the leading six bytes (`Rar!\x1A\x07`) and
+/// diverge at byte 6: legacy is a single zero byte (7-byte magic);
+/// RAR5 is `0x01 0x00` (8-byte magic). Pipeline integration in
+/// `docs/PLAN_rar3.md` §A2 dispatches on this enum.
+#[cfg(feature = "rar")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SignatureKind {
+    /// 8-byte RAR5 magic ([`SIGNATURE_MAGIC`]).
+    Rar5,
+    /// 7-byte legacy magic ([`LEGACY_SIGNATURE_MAGIC`]) — RAR3 / RAR4
+    /// archive (WinRAR 1.5–4.x).
+    Legacy,
+}
+
+/// Detect the RAR archive format at the start of `buf` and return the
+/// [`SignatureKind`] together with the number of bytes the signature
+/// occupies (`7` for legacy, `8` for RAR5).
+///
+/// `buf` must start at the very beginning of the archive (byte 0).
+///
+/// # Errors
+///
+/// - [`RarError::Truncated`] if `buf` is shorter than 7 bytes (the
+///   minimum required to disambiguate legacy from RAR5).
+/// - [`RarError::BadSignature`] if the leading bytes match neither
+///   format.
+#[cfg(feature = "rar")]
+pub fn detect_signature(buf: &[u8]) -> Result<(SignatureKind, usize), RarError> {
+    // The first six bytes (`Rar!\x1A\x07`) are common; the
+    // discriminator byte at offset 6 is `0x00` for legacy and
+    // `0x01` for RAR5. A RAR5 signature requires one further byte
+    // at offset 7 (the trailing `0x00`).
+    if buf.len() < legacy::format::LEGACY_SIGNATURE_MAGIC.len() {
+        return Err(RarError::Truncated {
+            what: "RAR magic (need ≥ 7 bytes to disambiguate legacy vs RAR5)".to_string(),
+            needed: legacy::format::LEGACY_SIGNATURE_MAGIC.len() - buf.len(),
+        });
+    }
+    if buf[..legacy::format::LEGACY_SIGNATURE_MAGIC.len()] == legacy::format::LEGACY_SIGNATURE_MAGIC
+    {
+        return Ok((
+            SignatureKind::Legacy,
+            legacy::format::LEGACY_SIGNATURE_MAGIC.len(),
+        ));
+    }
+    if buf.len() < SIGNATURE_MAGIC.len() {
+        return Err(RarError::Truncated {
+            what: "RAR5 magic (8 bytes)".to_string(),
+            needed: SIGNATURE_MAGIC.len() - buf.len(),
+        });
+    }
+    if buf[..SIGNATURE_MAGIC.len()] == SIGNATURE_MAGIC {
+        Ok((SignatureKind::Rar5, SIGNATURE_MAGIC.len()))
+    } else {
+        Err(RarError::BadSignature)
+    }
+}
 
 /// Sentinel [`crate::decode::DecoderFactory`] registered for the
 /// [`FORMAT_NAME`] format.
@@ -168,5 +231,57 @@ pub fn streaming_factory_placeholder(
             "this build of `peel` was compiled without the `rar` feature; \
              rebuild with default features (or `--features rar`) to extract RAR archives",
         )))
+    }
+}
+
+#[cfg(all(test, feature = "rar"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_signature_recognizes_rar5() {
+        let (kind, size) = detect_signature(&SIGNATURE_MAGIC).expect("detects");
+        assert_eq!(kind, SignatureKind::Rar5);
+        assert_eq!(size, 8);
+    }
+
+    #[test]
+    fn detect_signature_recognizes_legacy() {
+        let (kind, size) = detect_signature(&LEGACY_SIGNATURE_MAGIC).expect("detects");
+        assert_eq!(kind, SignatureKind::Legacy);
+        assert_eq!(size, 7);
+    }
+
+    #[test]
+    fn detect_signature_rejects_garbage() {
+        assert!(matches!(
+            detect_signature(b"hello!!!").unwrap_err(),
+            RarError::BadSignature
+        ));
+    }
+
+    #[test]
+    fn detect_signature_truncated_below_seven() {
+        let err = detect_signature(b"Rar!").unwrap_err();
+        assert!(matches!(err, RarError::Truncated { needed: 3, .. }));
+    }
+
+    #[test]
+    fn detect_signature_truncated_between_seven_and_eight() {
+        // Leading 7 bytes look RAR5-y (last byte 0x01), so we need
+        // to read byte 7 to disambiguate. Buffer is 7 bytes.
+        let buf: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01];
+        let err = detect_signature(&buf).unwrap_err();
+        assert!(matches!(err, RarError::Truncated { needed: 1, .. }));
+    }
+
+    #[test]
+    fn detect_signature_eight_byte_legacy_takes_legacy_branch() {
+        // Trailing byte after the 7-byte legacy magic is irrelevant —
+        // the dispatcher returns `Legacy, 7` regardless.
+        let buf: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00, 0xFF];
+        let (kind, size) = detect_signature(&buf).expect("detects");
+        assert_eq!(kind, SignatureKind::Legacy);
+        assert_eq!(size, 7);
     }
 }
