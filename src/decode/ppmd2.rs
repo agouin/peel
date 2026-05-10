@@ -21,8 +21,10 @@
 //! 1. **§B0** — range coder ([`range_dec`]). Bit-level entropy
 //!    primitive every layer above depends on. Self-contained,
 //!    round-trippable against a test-only sister encoder.
-//! 2. **§B1** — sub-allocator (next). Custom slab allocator the
-//!    PPMd model uses for its variable-order context tree.
+//! 2. **§B1** — sub-allocator ([`alloc`]). Custom slab allocator
+//!    the PPMd model uses for its variable-order context tree.
+//!    12-byte units, freelists indexed by unit count, GlueCount-
+//!    driven compaction.
 //! 3. **§B2** — context tree + symbol-decode loop. Bulk of the
 //!    algorithm.
 //! 4. **§B3** — differential cross-check against `unrar`-produced
@@ -32,7 +34,13 @@
 //! next one begins, mirroring the `PLAN_rar5_decoder.md` discipline.
 
 #[cfg(feature = "rar")]
+pub mod alloc;
+
+#[cfg(feature = "rar")]
 pub mod range_dec;
+
+#[cfg(feature = "rar")]
+pub use alloc::{AllocError, Allocator, Ref};
 
 #[cfg(feature = "rar")]
 pub use range_dec::{RangeDecoder, RangeDecoderError};
