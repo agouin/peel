@@ -91,6 +91,15 @@ pub mod deflate_native;
 #[cfg(feature = "rar")]
 pub mod rar_native;
 
+// Hand-rolled PPMd-II decoder (`docs/PLAN_rar3.md` §B). Sibling of
+// `rar_native` so it can be reused by the legacy RAR decoder
+// (§B's first consumer), by hypothetical PPMd-encoded RAR5
+// archives (`O.RAR.PPM5` follow-on), and by 7z's PPMd-II method.
+// Round-one ships the range coder (§B0); subsequent phases land
+// the sub-allocator, context tree, and the symbol-decode loop.
+#[cfg(feature = "rar")]
+pub mod ppmd2;
+
 /// Status returned by [`StreamingDecoder::decode_step`].
 ///
 /// Does not indicate whether *any* output was produced this step;
