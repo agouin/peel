@@ -37,10 +37,16 @@
 pub mod alloc;
 
 #[cfg(feature = "rar")]
+pub mod model;
+
+#[cfg(feature = "rar")]
 pub mod range_dec;
 
 #[cfg(feature = "rar")]
 pub use alloc::{AllocError, Allocator, Ref};
+
+#[cfg(feature = "rar")]
+pub use model::{Model, ModelError, MAX_MEM_SIZE, MAX_ORDER, MIN_MEM_SIZE, MIN_ORDER};
 
 #[cfg(feature = "rar")]
 pub use range_dec::{RangeDecoder, RangeDecoderError};

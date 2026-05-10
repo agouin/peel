@@ -20,18 +20,21 @@
 //!                                   grows up  grows down
 //! ```
 //!
-//! - `text` grows upward from `align_offset` (the byte-stream area
-//!   PPMd's context tree references for pattern matching). Round-one
-//!   does not expose text writes — the boundary stays at
-//!   `align_offset` and the unit region effectively owns the whole
-//!   working area until §B2 wires the model layer.
+//! - `text` grows upward from `align_offset`. The model writes one
+//!   byte per emitted symbol (the linear stream the order-N context
+//!   graph's [`Ref`]-typed Successor fields point into).
 //! - `lo_unit` grows up, `hi_unit` grows down. Multi-unit
 //!   allocations come off the bottom; one-unit "context"
 //!   allocations come off the top.
 //! - `units_start` is the lower bound of the unit region; rare-path
 //!   allocations can move it down (toward `text`) to claim more
 //!   space when the freelists and the central gap are both
-//!   exhausted.
+//!   exhausted. The initial split puts 7/8 of the working area in
+//!   the unit region and 1/8 in the text region — matching the
+//!   canonical LZMA SDK Ppmd7 layout, which is sized so that the
+//!   model's initial 129-unit working set (1× root context + 128×
+//!   state-array units for 256 order-0 states) fits without taking
+//!   the rare path.
 //!
 //! # Refs
 //!
@@ -300,10 +303,12 @@ impl Allocator {
         self.free_list.fill(0);
         self.text = self.align_offset;
         self.hi_unit = self.text + self.size;
-        // Carve off ~1/8 of the arena as the initial unit region
-        // (rounded down to UNIT_SIZE); the rest belongs to the text
-        // region and can be reclaimed by the rare-path allocator.
-        let initial_units_bytes = (self.size / 8 / UNIT_SIZE as u32) * UNIT_SIZE as u32;
+        // Initial 7:1 unit-to-text split, matching the LZMA SDK Ppmd7
+        // RestartModel layout. The model's first action is to allocate
+        // 129 units (1 root context + 128-unit state array) — sizing
+        // the unit region at ≥ 7/8 of the working area lets that
+        // succeed on a 2 KiB arena without taking the rare path.
+        let initial_units_bytes = (self.size / 8 / UNIT_SIZE as u32) * 7 * UNIT_SIZE as u32;
         self.lo_unit = self.hi_unit - initial_units_bytes;
         self.units_start = self.lo_unit;
         self.glue_count = 0;
@@ -379,6 +384,84 @@ impl Allocator {
     pub fn context_slot_mut(&mut self, ptr: Ref) -> &mut [u8] {
         let off = ptr.byte_offset() as usize;
         &mut self.arena[off..off + UNIT_SIZE]
+    }
+
+    /// Read one arbitrary byte from the arena. The model uses this to
+    /// look up text-region bytes referenced by a state's Successor
+    /// field (which doubles as a byte offset when the upstream chain
+    /// has not yet been promoted into the unit region).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `off >= self.arena_bytes()`.
+    #[must_use]
+    pub fn read_byte(&self, off: u32) -> u8 {
+        self.arena[off as usize]
+    }
+
+    /// Current text high-water mark (next free text-region byte).
+    /// Bytes `[align_offset, text)` hold the model's emitted byte
+    /// stream; bytes `[text, units_start)` are unwritten.
+    #[must_use]
+    pub fn text(&self) -> u32 {
+        self.text
+    }
+
+    /// Lower bound of the unit region. The model checks
+    /// `text >= units_start` after each text-region write to detect
+    /// arena exhaustion.
+    #[must_use]
+    pub fn units_start(&self) -> u32 {
+        self.units_start
+    }
+
+    /// Append one byte to the text region and return the offset where
+    /// it was written. Advances `text` by 1.
+    ///
+    /// The model is expected to check `text() < units_start()` after
+    /// the call; if the inequality has flipped, the arena is
+    /// exhausted and the model must restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if writing would land outside the arena bounds. In
+    /// practice this cannot happen: `text` advances at most one byte
+    /// past `units_start`, and the [`TAIL_PAD`] = `UNIT_SIZE` bytes
+    /// of slack at the end of the arena absorb that overshoot.
+    pub fn write_text_byte(&mut self, b: u8) -> u32 {
+        let pos = self.text;
+        self.arena[pos as usize] = b;
+        self.text += 1;
+        pos
+    }
+
+    /// Decrement `text` by 1. Used by the model when a context
+    /// transition rolls back the most recent text-region write
+    /// because the new `MaxContext` already covers the byte.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `text == align_offset`. The model layer guards
+    /// against this by only calling `dec_text` after a paired
+    /// [`Self::write_text_byte`].
+    pub fn dec_text(&mut self) {
+        // INVARIANT: every call site is paired with a prior
+        // write_text_byte that bumped text past align_offset.
+        debug_assert!(self.text > self.align_offset);
+        self.text -= 1;
+    }
+
+    /// Raw view of the arena bytes. The model layer reads multi-byte
+    /// state and context fields directly off this slice.
+    #[must_use]
+    pub fn arena(&self) -> &[u8] {
+        &self.arena
+    }
+
+    /// Mutable raw view of the arena bytes. The model layer writes
+    /// state and context fields directly through this slice.
+    pub fn arena_mut(&mut self) -> &mut [u8] {
+        &mut self.arena
     }
 
     /// Allocate a block of `INDX_TO_UNITS[indx]` units.
@@ -707,11 +790,6 @@ impl Allocator {
     /// Test-only accessor for `hi_unit`.
     pub(crate) fn hi_unit(&self) -> u32 {
         self.hi_unit
-    }
-
-    /// Test-only accessor for `units_start`.
-    pub(crate) fn units_start(&self) -> u32 {
-        self.units_start
     }
 
     /// Test-only accessor for `glue_count`.
@@ -1080,6 +1158,65 @@ mod tests {
             .expect("rare alloc finds glue-merged block");
         assert_eq!(r.byte_offset(), r1.byte_offset());
         assert_eq!(a.glue_count(), GLUE_REFRESH);
+    }
+
+    #[test]
+    fn restart_uses_canonical_seven_eighths_unit_split() {
+        // Match the LZMA SDK Ppmd7 layout: unit region = 7/8 of size,
+        // text region = 1/8. Concretely, on a 1024-byte arena the
+        // working size is 1008 bytes (1024 - 4 align - 12 tail), and
+        // (1008 / 96) * 7 * 12 = 840 bytes belong to the unit region.
+        let a = Allocator::new(1024).expect("alloc");
+        assert_eq!(a.size(), 1008);
+        let unit_region = a.hi_unit() - a.lo_unit();
+        assert_eq!(unit_region, 840, "unit region should be 7/8 of size");
+        // text starts pinned at align_offset (the post-alignment-pad position).
+        assert_eq!(a.text(), 4);
+        assert_eq!(a.units_start(), a.lo_unit());
+    }
+
+    #[test]
+    fn restart_keeps_room_for_initial_model_allocations() {
+        // A 2 KiB arena (the canonical PPMD7_MIN_MEM_SIZE) must hold
+        // the model's initial 129-unit (1548-byte) working set:
+        //   1× root context (HiUnit -= 12 bytes)
+        // + 128 units (1536 bytes) of state array (LoUnit += 128*12).
+        let a = Allocator::new(2048).expect("alloc");
+        let unit_region = a.hi_unit() - a.lo_unit();
+        assert!(
+            unit_region >= 1548,
+            "unit region {unit_region} bytes should hold 129-unit \
+             initial allocations on 2 KiB arena"
+        );
+    }
+
+    #[test]
+    fn write_text_byte_advances_text_high_water_mark() {
+        let mut a = Allocator::new(BIG_ARENA_BYTES).expect("alloc");
+        let initial_text = a.text();
+        let pos = a.write_text_byte(0xAA);
+        assert_eq!(pos, initial_text);
+        assert_eq!(a.text(), initial_text + 1);
+        assert_eq!(a.read_byte(pos), 0xAA);
+        // Second write lands at the next position.
+        let pos2 = a.write_text_byte(0x55);
+        assert_eq!(pos2, initial_text + 1);
+        assert_eq!(a.read_byte(pos2), 0x55);
+        assert_eq!(a.text(), initial_text + 2);
+    }
+
+    #[test]
+    fn dec_text_rolls_back_one_byte() {
+        let mut a = Allocator::new(BIG_ARENA_BYTES).expect("alloc");
+        let initial = a.text();
+        a.write_text_byte(0xCC);
+        a.dec_text();
+        assert_eq!(a.text(), initial);
+        // The byte itself is still in the arena; dec_text only adjusts
+        // the high-water mark. The next write overwrites it.
+        let pos = a.write_text_byte(0xDD);
+        assert_eq!(pos, initial);
+        assert_eq!(a.read_byte(pos), 0xDD);
     }
 
     /// Drain `lo_unit..hi_unit` by alternating 1-unit allocations
