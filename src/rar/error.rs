@@ -92,6 +92,26 @@ pub enum RarError {
         computed: u32,
     },
 
+    /// Header CRC-16 in a legacy (RAR3/RAR4) base-block header did
+    /// not match the CRC-16 the parser computed over the rest of the
+    /// header. RAR3/4 stores the low 16 bits of the IEEE CRC-32 over
+    /// the bytes from `head_type` onward; see
+    /// [`crate::rar::legacy::format`] for the layout. Structural
+    /// counterpart to [`Self::HeaderCrc32Mismatch`].
+    #[error(
+        "RAR legacy header CRC-16 mismatch at archive offset {archive_offset}: \
+         expected {expected:#06x}, computed {computed:#06x}"
+    )]
+    HeaderCrc16Mismatch {
+        /// Byte offset within the archive where the failing header
+        /// begins (the offset of the `head_crc` field).
+        archive_offset: u64,
+        /// CRC-16 the header recorded for itself.
+        expected: u16,
+        /// CRC-16 the parser computed over the header body.
+        computed: u16,
+    },
+
     /// A file name in the archive failed UTF-8 decode or path-safety
     /// validation. Caught at parse time so the pipeline never plans
     /// a download for an entry it would later reject.

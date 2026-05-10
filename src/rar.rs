@@ -84,6 +84,14 @@ pub mod archive;
 pub mod error;
 #[cfg(feature = "rar")]
 pub mod format;
+/// Legacy (RAR3 / RAR4) format support — sibling of [`format`].
+///
+/// Phase A1 of `docs/PLAN_rar3.md` lands the wire-format parser
+/// here. Pipeline dispatch (`parse_signature` enum, walker
+/// integration) follows in §A2; the decoder generations land in
+/// §B / §C.
+#[cfg(feature = "rar")]
+pub mod legacy;
 
 #[cfg(feature = "rar")]
 pub use archive::{walk_archive, ArchiveSummary, FileEntry};
