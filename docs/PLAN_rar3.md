@@ -1,17 +1,16 @@
 ## Plan: legacy RAR (RAR3 / RAR4) archive support
 
-> **Status: drafted 2026-05-10, Phase A landed.** §0 resolved
-> 2026-05-10. **§A1 landed (commit 6c96328).** **§A2a landed (commit
-> 38ff665).** **§A2b landed (commit cc60bf8)** — pipeline now
-> dispatches on signature; STORED-method legacy archives extract
-> end-to-end through the existing sparse-file / punch / sink
-> machinery; compressed methods surface precise diagnostics naming
-> the version + method byte. Phase B (PPMd-II) is the next
-> milestone — it is the chunk that turns this into useful real-archive
-> support, since the public corpus is overwhelmingly `m=3`/`m=5`.
-> This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`.
-> It is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` —
-> additive to `docs/PLAN_rar.md`, not a supersession.
+> **Status: drafted 2026-05-10, Phase A landed, Phase B in
+> progress.** §0 resolved 2026-05-10. **§A1 (6c96328) + §A2a
+> (38ff665) + §A2b (cc60bf8)** complete: STORED-method legacy
+> archives extract end-to-end. **§B0 (e730509)** lands the PPMd-II
+> range coder under `src/decode/ppmd2/` — round-tripped against a
+> test-only sister encoder across uniform / skewed / adaptive-binary
+> distributions. §B1 (suballocator) is next; §B2 (context tree +
+> decode loop) is the bulk of Phase B. This plan resolves
+> follow-on `O.RAR4` from `docs/PLAN_rar.md`. It is a sibling
+> sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
+> `docs/PLAN_rar.md`, not a supersession.
 >
 > **Sequencing.** `PLAN_rar.md` §1–§4 plus `PLAN_rar5_decoder.md`
 > Phases A–E must be on `main` first. The hand-rolled RAR5 decoder
@@ -335,7 +334,24 @@ through it, the legacy crash-resume scenario will land alongside
 
 ## Phase B — PPMd-II
 
-### §B1. PPMd-II model
+> **Phase B sub-phasing** (resolved during §B0 implementation): the
+> original "§B1. PPMd-II model" item turned out to be too coarse —
+> the model decomposes into three weakly-coupled layers that should
+> land separately so each one's acceptance criteria are real.
+>
+> - **§B0** ✅ (commit e730509) — range coder. Bit-level entropy
+>   primitive. Self-contained, round-trippable against a sister
+>   encoder.
+> - **§B1** (next) — suballocator. The custom slab allocator the
+>   PPMd model uses for its variable-order context tree. ~12-byte
+>   units, freelists indexed by unit count, GlueCount-driven
+>   compaction.
+> - **§B2** — context tree + symbol-decode loop. Bulk of the
+>   algorithm; consumes both §B0 and §B1.
+> - **§B3** — differential cross-check against `unrar`-produced
+>   fixtures.
+
+### §B1. PPMd-II model (suballocator + tree + decode loop)
 
 **What**: hand-rolled PPMd-II decoder. Lives at
 `src/decode/ppmd2/` per §0.4. New crate-internal module.
