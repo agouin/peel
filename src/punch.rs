@@ -572,14 +572,34 @@ mod macos {
     const EINVAL: i32 = 22;
 
     /// `fcntl(2)` `F_PUNCHHOLE` argument struct, mirroring the
-    /// `fpunchhole_t` definition in Darwin's `<sys/fcntl.h>`. The header
-    /// declares only three fields; `repr(C)` inserts the natural
-    /// 4-byte pad between `fp_flags` and `fp_offset` so the struct is
-    /// 24 bytes total — matching `sizeof(struct fpunchhole)` in C.
+    /// `fpunchhole_t` definition in Darwin's `<sys/fcntl.h>`.
+    ///
+    /// The Darwin SDK declares **four** fields — the kernel reads all
+    /// 24 bytes of the struct via `copyin(2)` and validates them
+    /// (release-build APFS rejects nonzero `reserved` with `EINVAL`,
+    /// even though the SDK header comments mark the field "for
+    /// alignment"). The previous version of this struct declared only
+    /// three fields and relied on `repr(C)` to insert the 4-byte
+    /// padding between `fp_flags` and `fp_offset`; that padding was
+    /// **uninitialized stack memory**, and any nonzero garbage in it
+    /// surfaced as `Punch(Unsupported { errno: 22 })` from the
+    /// puncher.
+    ///
+    /// The Rust crash-resume regression test
+    /// (`tests/test_coordinator_rar.rs::
+    /// crash_resume_mid_entry_produces_identical_output`) fired this
+    /// reliably in release mode (where the optimizer reuses dirty
+    /// stack slots) but not in debug. Declaring `reserved`
+    /// explicitly forces all 24 bytes to be initialized to known
+    /// values.
     #[repr(C)]
     struct Fpunchhole {
-        /// Reserved by the kernel for future flags; must be zero today.
+        /// Currently unused by the kernel; must be zero.
         fp_flags: u32,
+        /// Reserved by the kernel for 8-byte alignment of `fp_offset`;
+        /// must be zero. The SDK header comment says "to maintain
+        /// 8-byte alignment", but APFS validates the field anyway.
+        reserved: u32,
         /// Byte offset of the first byte to deallocate.
         fp_offset: i64,
         /// Length of the region to deallocate, in bytes.
@@ -635,8 +655,14 @@ mod macos {
                 length,
             })?;
 
+            // The kernel reads all 24 bytes of `fpunchhole_t` via
+            // `copyin(2)` and APFS validates `reserved == 0` even
+            // though the SDK header marks the field "for alignment"
+            // — see the doc comment on [`Fpunchhole`] for the full
+            // story.
             let mut arg = Fpunchhole {
                 fp_flags: 0,
+                reserved: 0,
                 fp_offset: i_offset,
                 fp_length: i_length,
             };

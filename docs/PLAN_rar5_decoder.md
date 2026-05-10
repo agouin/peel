@@ -257,6 +257,16 @@ account.
 **Demo**: the `tests/test_coordinator_rar.rs` crash-test now
 also covers compressed entries.
 
+**Postmortem note** (2026-05-10): landing §F1 surfaced a latent
+struct-layout bug in `MacosPuncher` — small code-gen changes from
+F1 left nonzero garbage in the `fpunchhole_t` struct's
+previously-implicit padding bytes, and APFS rejects the call
+with `EINVAL` when `reserved != 0`. The bug was not in F1; it
+had been latent since `MacosPuncher` shipped. Full investigation
+in [`PLAN_macos_puncher_race.md`](PLAN_macos_puncher_race.md).
+The crash-resume test now passes 100/100 on macOS arm64 in both
+debug and release.
+
 ---
 
 ## Phase G — Throughput

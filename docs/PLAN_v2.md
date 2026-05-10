@@ -724,6 +724,16 @@ with sooner.
 **Demo**: full extraction round-trip on a macOS runner; on-disk
 source footprint shrinks during extraction same as on Linux.
 
+**Implementation note** (added 2026-05-10): the `Fpunchhole`
+struct must mirror Darwin's `fpunchhole_t` **including the
+`reserved: u32` field** between `fp_flags` and `fp_offset`. APFS's
+kernel-side validator rejects `F_PUNCHHOLE` with `EINVAL` if that
+field reads as nonzero, even though the SDK header marks it "for
+alignment". Relying on `#[repr(C)]` to insert the padding leaves
+the bytes uninitialized, which is a bug — see
+[`PLAN_macos_puncher_race.md`](PLAN_macos_puncher_race.md) for the
+investigation.
+
 ---
 
 ### §13. Multi-mirror downloads (`O.10`)
