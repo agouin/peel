@@ -29,8 +29,7 @@ Hand-rolling is comparable in scope to
 materially harder: the RAR5 wire format is author-provided by
 RARLAB rather than IETF-standardized, the corpus of public test
 vectors is smaller, and the algorithm has more moving parts
-(LZSS + filter VM + optional PPMd-II contexts + adaptive
-Huffman re-coding per block).
+(LZSS + filter VM + adaptive Huffman re-coding per block).
 
 The cost is the price of staying fully OSI-licensed.
 
@@ -48,9 +47,9 @@ The cost is the price of staying fully OSI-licensed.
   new resume state bumps `Checkpoint::format_version` per
   `PLAN.md` §9.2.
 - Hand-rolled wire-format parsing. Every layer (bitstream
-  reader, Huffman tables, LZSS dictionary, filter VM,
-  PPMd-II coder) is hand-rolled. No transitive linking against
-  RAR-licensed C code.
+  reader, Huffman tables, LZSS dictionary, filter VM) is
+  hand-rolled. No transitive linking against RAR-licensed C
+  code.
 
 ## What this plan deliberately does not include
 
@@ -65,6 +64,13 @@ The cost is the price of staying fully OSI-licensed.
 - Encryption (`O.RAR.ENC` follow-on). The decoder ships unencrypted-only.
 - Multi-volume (`O.RAR.MV`).
 - SFX archives (`O.RAR.SFX`).
+- PPMd-II / PPM compression. RAR4 supported a PPM mode; RAR5
+  dropped it. libarchive's RAR5 decoder
+  (`archive_read_support_format_rar5.c`) lists method values
+  STORE..BEST and never invokes its bundled PPMd7 functions for
+  RAR5 entries; the `FILTER_PPM` filter slot is explicitly
+  marked "not used in RARv5". Hypothetical PPMd-encoded entries
+  surface as `RarError::UnsupportedMethod` at parse time.
 
 ---
 
@@ -75,10 +81,10 @@ The cost is the price of staying fully OSI-licensed.
 **What**: hand-rolled MSB-first bitstream reader over the entry's
 data area. Lives in `src/decode/rar_native/bits.rs`.
 
-**Why first**: every layer above (Huffman, LZSS, filter VM,
-PPMd-II) reads bits and groups of bits from the same stream;
-getting the bitstream wrong corrupts everything else. Validates
-the foundation cheaply.
+**Why first**: every layer above (Huffman, LZSS, filter VM)
+reads bits and groups of bits from the same stream; getting the
+bitstream wrong corrupts everything else. Validates the
+foundation cheaply.
 
 **Sketch**.
 
@@ -198,30 +204,6 @@ follow-on in `OPTIMIZATIONS.md` (`O.RAR.CUSTOMFILTER`).
 
 ---
 
-## Phase D — PPMd-II contexts
-
-### §D1. PPMd-II coder
-
-**What**: PPMd-II range coder + model state. Lives in
-`src/decode/rar_native/ppmd.rs`.
-
-**Sketch**.
-
-1. Hand-roll the PPMd-II range coder (the same model RAR5 uses
-   for high-redundancy content; per-block opt-in by the
-   encoder).
-2. Tests: differential against `rar a -mt1 -ma5 -m5` on a
-   curated repetitive-text corpus.
-
-**Why D and not earlier**: PPMd-II is opt-in. Many real-world
-RAR5 archives never trigger it (the encoder picks LZSS for
-typical mixed content). Deferring it lets §B+§C land a working
-"most archives" decoder before the PPMd-II surface arrives.
-
-**Demo**: `cargo test decode::rar_native::ppmd` passes.
-
----
-
 ## Phase E — Integration
 
 ### §E1. `StreamingDecoder` wiring
@@ -234,7 +216,7 @@ with a fully-method-aware dispatcher. Lives in
 
 **Sketch**.
 
-1. `RarStreamDecoder { bits, dict, vm, ppmd, ... }` —
+1. `RarStreamDecoder { bits, dict, vm, ... }` —
    per-entry instance.
 2. `decode_step(sink)` — bounded work per call, same contract
    as every other decoder.
@@ -257,8 +239,8 @@ downloaded over the mock server.
 
 **What**: serializable decoder snapshot so a `kill -9`
 mid-entry resumes byte-identical. Lives next to §B1's dict
-snapshot but takes the bitstream + Huffman + VM + PPMd state
-into account.
+snapshot but takes the bitstream + Huffman + VM state into
+account.
 
 **Sketch**.
 
@@ -304,8 +286,7 @@ All of the following are true:
    solid and non-solid modes; resumes still produce
    byte-identical output.
 3. `OPTIMIZATIONS.md` follow-ons have been amended with the
-   leftover items (`O.RAR.CUSTOMFILTER`, `O.RAR.PPMD_RESUME`,
-   etc.).
+   leftover items (`O.RAR.CUSTOMFILTER`, etc.).
 4. The §3 pipeline's "compression method != 0" rejection has
    been deleted; round-one §4's hand-rolled decoder handles
    methods 1..5.
@@ -318,21 +299,13 @@ All of the following are true:
 
 Phases are sequenced; do them in order, do each phase
 completely. Phase A → B → C → E is the critical path for
-"general-purpose RAR5 extraction"; Phase D is required for
-correctness on a non-trivial fraction of real-world archives
-(but the harness can short-circuit blocks that opt into PPMd-II
-during the §B/§C phases, surfacing a clean
-`UnsupportedFeature { feature: "PPMd-II block in RAR5 entry" }`
-diagnostic until §D lands). Phase F (resume) can land any time
-after §E. Phase G (throughput) is optional for the milestone
-but expected before the matrix loses its "RAR5 only" caveat.
+"general-purpose RAR5 extraction". Phase F (resume) can land
+any time after §E. Phase G (throughput) is optional for the
+milestone but expected before the matrix loses its "RAR5 only"
+caveat.
 
 ## Filed follow-ons (added to `OPTIMIZATIONS.md` after §G ships)
 
-- **`O.RAR.PPMD_RESUME`** — mid-entry resume across a
-  PPMd-II / LZSS boundary. §F1's snapshot covers the LZSS
-  case directly; the PPMd-II coder's range-coder state needs
-  its own serializer.
 - **`O.RAR.CUSTOMFILTER`** — RAR-VM custom filter slot
   (§C2's deferred follow-up).
 - **`O.RAR.MULTITHREAD`** — multi-threaded decode for solid

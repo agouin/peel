@@ -16,10 +16,8 @@
 //!   dispatcher.
 //! - **Phase C** — RAR-VM filter bytecode interpreter for the
 //!   standard filter set (e8/e9/itanium/rgb/audio/delta).
-//! - **Phase D** — PPMd-II range coder + model state for
-//!   RAR5's opt-in alternate coding mode.
 //! - **Phase E** — `RarStreamDecoder` that owns the bitstream +
-//!   dict + filter VM + PPMd state and exposes the
+//!   dict + filter VM and exposes the
 //!   [`crate::decode::StreamingDecoder`] trait.
 //! - **Phase F** — mid-entry serialize/deserialize for resume.
 //! - **Phase G** — throughput.
