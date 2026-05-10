@@ -87,6 +87,15 @@ pub struct RarStreamDecoder {
     /// release the underlying file handle as soon as the
     /// last-block marker fires.
     src: Option<Box<dyn Read + Send>>,
+    /// Bytes that were pulled from `src` past the end of a non-last
+    /// block's bitstream as **lookahead** for the LZSS dispatcher's
+    /// peek_bits — see [`Self::BLOCK_LOOKAHEAD_BYTES`] and the
+    /// libarchive parity discussion in
+    /// `docs/PLAN_rar5_multi_block_decode.md`. Replayed at the
+    /// start of the next [`Self::read_block`] call so the next
+    /// block's prologue parses normally; never re-pulled from
+    /// `src`. Empty between block reads.
+    prepend_buf: Vec<u8>,
     /// Cumulative bytes pulled from `src`. Combined with
     /// [`Self::src_start_offset`] to produce the global
     /// [`Self::bytes_consumed`] value.
@@ -164,6 +173,7 @@ impl RarStreamDecoder {
         })?;
         Ok(Self {
             src: Some(src),
+            prepend_buf: Vec::new(),
             src_consumed: 0,
             src_start_offset: 0,
             lzss,
@@ -176,18 +186,56 @@ impl RarStreamDecoder {
         })
     }
 
+    /// Number of lookahead bytes the dispatcher needs past a
+    /// non-last block's bitstream so the LD-symbol Huffman peek
+    /// (libarchive's `read_bits_16`, our [`super::huffman::HuffTable::decode`])
+    /// doesn't underrun on a symbol whose bits straddle the block
+    /// boundary. Libarchive's `process_block` reserves the same 4
+    /// bytes via `read_ahead(a, 4 + cur_block_size, &p)`. The
+    /// peeked-but-not-consumed lookahead bytes are replayed via
+    /// [`Self::prepend_buf`] as the next block's prologue.
+    const BLOCK_LOOKAHEAD_BYTES: usize = 4;
+
     /// Read exactly `n` bytes from `src` into a fresh `Vec<u8>`.
+    ///
+    /// Drains [`Self::prepend_buf`] first (bytes pulled-but-replayed
+    /// from the previous block's lookahead), then pulls the
+    /// remainder from `src`.
     ///
     /// Returns `Ok(None)` only when the very first read returns 0
     /// (clean EOF before any byte was read for this block);
     /// otherwise either fills a full buffer or surfaces
     /// [`ErrorKind::UnexpectedEof`].
     fn read_exact(&mut self, n: usize) -> Result<Option<Vec<u8>>, DecodeError> {
-        let Some(src) = self.src.as_mut() else {
-            return Ok(None);
-        };
         let mut buf = vec![0u8; n];
         let mut filled = 0usize;
+        // Drain replayed lookahead first. The bytes were pulled
+        // from `src` already (and counted in `src_consumed` at that
+        // time), so we don't re-bump the counter here.
+        if !self.prepend_buf.is_empty() {
+            let take = self.prepend_buf.len().min(n);
+            buf[..take].copy_from_slice(&self.prepend_buf[..take]);
+            self.prepend_buf.drain(..take);
+            filled = take;
+            if filled == n {
+                return Ok(Some(buf));
+            }
+        }
+        let Some(src) = self.src.as_mut() else {
+            if filled == 0 {
+                return Ok(None);
+            }
+            return Err(DecodeError::Read {
+                consumed: self.src_start_offset + self.src_consumed,
+                source: std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!(
+                        "RAR5 stream decoder: short read mid-block: \
+                         wanted {n} bytes, got {filled} (src closed)"
+                    ),
+                ),
+            });
+        };
         while filled < n {
             match src.read(&mut buf[filled..]) {
                 Ok(0) => {
@@ -218,10 +266,16 @@ impl RarStreamDecoder {
     }
 
     /// Read one full block (prologue + size field + bitstream)
-    /// off `src`. Returns `Ok(None)` if the source EOF'd at a
-    /// clean block boundary before any byte was pulled — that is
-    /// only valid when the previous block had `is_last_block` set,
-    /// which the caller validates.
+    /// off `src`. For non-last blocks, also pulls
+    /// [`Self::BLOCK_LOOKAHEAD_BYTES`] from `src` and appends them
+    /// to the returned buffer so the LZSS dispatcher's last-symbol
+    /// peek can read past the block boundary; the same bytes are
+    /// saved in [`Self::prepend_buf`] so the next [`Self::read_block`]
+    /// call replays them as the next block's prologue. Returns
+    /// `Ok(None)` if the source EOF'd at a clean block boundary
+    /// before any byte was pulled — that is only valid when the
+    /// previous block had `is_last_block` set, which the caller
+    /// validates.
     fn read_block(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
         // Prologue is 2 bytes; the second's checksum lets us
         // sanity-check the first before allocating for the size
@@ -231,6 +285,7 @@ impl RarStreamDecoder {
             None => return Ok(None),
         };
         let flags = prologue[0];
+        let is_last_block = (flags & 0b0100_0000) != 0;
         let byte_count = (((flags >> 3) & 0b111) + 1) as usize;
         let mut block = prologue;
         // Size field: `byte_count` LE bytes after the prologue.
@@ -259,6 +314,33 @@ impl RarStreamDecoder {
         }
         let bitstream = self.read_exact_required(block_size as usize)?;
         block.extend_from_slice(&bitstream);
+
+        // Non-last blocks: pull lookahead so the dispatcher can
+        // peek past the block boundary into the next block's
+        // prologue bytes (libarchive parity, see
+        // `docs/PLAN_rar5_multi_block_decode.md`). Whatever we
+        // pull goes into both `block` (for the dispatcher to see)
+        // and `prepend_buf` (so the next prologue read sees the
+        // same bytes). For the last block we don't bother — the
+        // entry's bit budget terminates the loop cleanly without
+        // any lookahead.
+        if !is_last_block {
+            let mut lookahead = Vec::with_capacity(Self::BLOCK_LOOKAHEAD_BYTES);
+            // Try to fill `BLOCK_LOOKAHEAD_BYTES`; tolerate a
+            // short pull (entry-final block whose successor is
+            // shorter than 4 bytes, rare but possible in adversarial
+            // archives).
+            while lookahead.len() < Self::BLOCK_LOOKAHEAD_BYTES {
+                let want = Self::BLOCK_LOOKAHEAD_BYTES - lookahead.len();
+                match self.read_exact(want)? {
+                    Some(chunk) => lookahead.extend_from_slice(&chunk),
+                    None => break,
+                }
+            }
+            block.extend_from_slice(&lookahead);
+            self.prepend_buf.extend_from_slice(&lookahead);
+        }
+
         Ok(Some(block))
     }
 
@@ -788,6 +870,11 @@ impl RarStreamDecoder {
 
         Ok(Self {
             src: Some(src),
+            // Resume from snapshot starts mid-entry but at a clean
+            // block boundary — the snapshot format reseats the bit
+            // cursor at the start of the next block, so no
+            // pending lookahead carries forward.
+            prepend_buf: Vec::new(),
             src_consumed,
             src_start_offset,
             lzss,

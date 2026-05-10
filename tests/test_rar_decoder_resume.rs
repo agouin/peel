@@ -225,14 +225,14 @@ fn resume_rejects_dict_capacity_mismatch() {
 
 /// Regression: the smallest known archive whose compressed entry
 /// spans two RAR5 blocks (`block 0` has `is_last_block=False`).
-/// The round-one decoder underruns the bitstream by 2 bits at the
-/// block-0 boundary because it treats each block's bitstream as
-/// bit-isolated; see `docs/PLAN_rar5_multi_block_decode.md` for
-/// the diagnosis and fix sketch. The test is `#[ignore]` until
-/// that gap is closed; un-ignoring it should be one line of the
-/// fix commit.
+/// Pins the libarchive-parity 4-byte lookahead fix in
+/// [`super::stream::RarStreamDecoder::read_block`] — without
+/// the lookahead the round-one decoder underran the bitstream
+/// by 2 bits at the block-0 boundary. See
+/// `docs/PLAN_rar5_multi_block_decode.md` for the original
+/// diagnosis and `docs/PLAN_rar5_decoder.md` §F2 for the fix
+/// landing.
 #[test]
-#[ignore = "multi-block decode gap; see docs/PLAN_rar5_multi_block_decode.md"]
 fn multi_block_archive_decodes_byte_identical() {
     let bitstream = MB_FIXTURE[MB_DATA_OFFSET..MB_DATA_OFFSET + MB_PACKED_SIZE].to_vec();
     let src: Box<dyn std::io::Read + Send> = Box::new(Cursor::new(bitstream));

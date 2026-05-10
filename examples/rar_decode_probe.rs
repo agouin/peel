@@ -23,6 +23,13 @@
 //! - `err name=<name> err=<diagnostic>` when `decode_step` returns an
 //!   error.
 //!
+//! When `PEEL_RAR_DECODE_PROBE_HASH=1` is set in the env, the
+//! probe also prints a Fowler-Noll-Vo (FNV-1a) 64-bit hash of each
+//! entry's decoded output (cheap, std-only, byte-by-byte order
+//! sensitive). Compare against the same hash of the original source
+//! to verify byte-equality without committing large reference
+//! `*.expected.bin` blobs.
+//!
 //! Exit status: `0` only when every non-directory entry decoded
 //! cleanly and matched its `unpacked_size`. Otherwise `1`.
 
@@ -146,11 +153,17 @@ fn main() {
 
         match result {
             Ok(()) if out.len() as u64 == entry.header.unpacked_size => {
+                let hash_suffix = if std::env::var_os("PEEL_RAR_DECODE_PROBE_HASH").is_some() {
+                    format!(" fnv1a64={:016x}", fnv1a64(&out))
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  ok    name={} unpacked={} steps={}",
+                    "  ok    name={} unpacked={} steps={}{}",
                     entry.header.name,
                     out.len(),
                     steps,
+                    hash_suffix,
                 );
             }
             Ok(()) => {
@@ -175,6 +188,18 @@ fn main() {
     if !all_ok {
         std::process::exit(1);
     }
+}
+
+/// FNV-1a 64-bit hash. Order-sensitive, cheap, std-only — adequate
+/// for "do these two byte sequences match?" sanity checks (collisions
+/// are negligible at the scale of one entry's worth of data).
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Trim a multi-line decode error to its first line for one-per-entry

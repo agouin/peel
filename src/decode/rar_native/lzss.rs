@@ -347,8 +347,20 @@ impl LzssDecoder {
                 buf_len,
             });
         }
-        let bitstream = &block[hdr.header_bytes..bitstream_end];
-        let mut reader = BitReader::new(bitstream);
+        // The bitstream proper covers `[header_bytes, bitstream_end)`.
+        // Anything beyond `bitstream_end` in `block` is **lookahead**
+        // (4 bytes pulled past a non-last block's bitstream, see
+        // [`super::stream::RarStreamDecoder::read_block`]). The
+        // lookahead is included in the [`BitReader`]'s view so
+        // `peek_bits` past the block boundary doesn't underrun on
+        // a symbol whose Huffman code straddles the boundary; the
+        // loop's `bits_consumed >= total_bits` exit still uses the
+        // bitstream's bit budget, so any "consumed lookahead bits"
+        // are budgeted to the next block (where they are replayed
+        // as the next prologue + bitstream). Mirrors libarchive's
+        // `read_ahead(a, 4 + cur_block_size, &p)` discipline.
+        let bitstream_with_lookahead = &block[hdr.header_bytes..];
+        let mut reader = BitReader::new(bitstream_with_lookahead);
 
         if hdr.is_table_present {
             self.parse_tables(&mut reader)?;
