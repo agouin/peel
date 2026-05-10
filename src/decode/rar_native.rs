@@ -37,7 +37,11 @@
 //! build does not compile this module.
 
 pub mod bits;
+pub mod block_header;
 pub mod bootstrap;
 pub mod dict;
+pub mod dist_cache;
+pub mod distance;
 pub mod huffman;
+pub mod length;
 pub mod ppmd_range;
