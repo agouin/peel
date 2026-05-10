@@ -191,9 +191,12 @@ pub enum AllocError {
 pub struct Ref(NonZeroU32);
 
 impl Ref {
-    /// Construct a `Ref` from a non-zero byte offset.
+    /// Construct a `Ref` from a byte offset. Returns `None` if
+    /// `offset == 0` (the [`crate::decode::ppmd2`] null sentinel).
+    /// `pub(super)` so the model layer can wrap raw offsets when it
+    /// needs to call back into [`Allocator`] APIs that take a `Ref`.
     #[must_use]
-    fn new(offset: u32) -> Option<Self> {
+    pub(super) fn new(offset: u32) -> Option<Self> {
         NonZeroU32::new(offset).map(Self)
     }
 
