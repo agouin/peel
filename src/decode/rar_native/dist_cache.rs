@@ -45,6 +45,19 @@ impl DistCache {
         }
     }
 
+    /// Construct a cache with the given slot values. Used by the
+    /// §F1 resume path to restore LRU state from a snapshot.
+    #[must_use]
+    pub fn from_slots(slots: [u32; DIST_CACHE_SLOTS]) -> Self {
+        Self { slots }
+    }
+
+    /// Borrow the underlying slot array, for §F1 resume snapshot.
+    #[must_use]
+    pub fn slots(&self) -> [u32; DIST_CACHE_SLOTS] {
+        self.slots
+    }
+
     /// Return the current contents of slot `idx` (0..[`DIST_CACHE_SLOTS`)
     /// without modifying the cache. Useful for diagnostics / tests.
     #[must_use]

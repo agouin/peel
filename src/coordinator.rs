@@ -2655,10 +2655,12 @@ fn run_rar(
                 entries_completed,
                 current_entry,
                 current_entry_offset,
+                current_entry_decoder_state,
             } => RarResumeState {
                 entries_completed: entries_completed.clone(),
                 current_entry: *current_entry,
                 current_entry_offset: *current_entry_offset,
+                current_entry_decoder_state: current_entry_decoder_state.clone(),
             },
             SinkState::Raw { .. }
             | SinkState::Tar { .. }
@@ -2802,6 +2804,42 @@ fn run_rar(
                     entries_completed: entries_completed.clone(),
                     current_entry: Some(*index),
                     current_entry_offset: *bytes_written,
+                    current_entry_decoder_state: None,
+                };
+                write_ckpt(sink_state, &mut obs_stats)?;
+                last_write_at = Instant::now();
+                last_progress = in_flight_progress;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: in_flight_progress,
+                        bytes_out: in_flight_progress,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+            RarPipelineEvent::InEntryProgressCompressed {
+                index,
+                bytes_written,
+                decoder_state,
+            } => {
+                let elapsed = last_write_at.elapsed();
+                let in_flight_progress = bytes_extracted_total.saturating_add(*bytes_written);
+                let progressed = in_flight_progress.saturating_sub(last_progress);
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let observer_start = Instant::now();
+                let sink_state = SinkState::Rar {
+                    entries_completed: entries_completed.clone(),
+                    current_entry: Some(*index),
+                    current_entry_offset: *bytes_written,
+                    current_entry_decoder_state: decoder_state.clone(),
                 };
                 write_ckpt(sink_state, &mut obs_stats)?;
                 last_write_at = Instant::now();
@@ -2843,6 +2881,7 @@ fn run_rar(
                     entries_completed: entries_completed.clone(),
                     current_entry: None,
                     current_entry_offset: 0,
+                    current_entry_decoder_state: None,
                 };
                 write_ckpt(sink_state, &mut obs_stats)?;
                 last_write_at = Instant::now();

@@ -120,6 +120,12 @@ pub struct RarResumeState {
     pub current_entry: Option<u32>,
     /// Bytes already written into the in-flight entry.
     pub current_entry_offset: u64,
+    /// Opaque [`crate::decode::rar_native::RarStreamDecoder`]
+    /// snapshot for compressed (`method >= 1`) entries
+    /// (`PLAN_rar5_decoder.md` §F1). `None` for STORED entries
+    /// or for v10-and-earlier checkpoints — the pipeline falls
+    /// back to "restart entry from byte 0" in that case.
+    pub current_entry_decoder_state: Option<Vec<u8>>,
 }
 
 /// Diagnostic events the pipeline emits during a run.
@@ -144,14 +150,37 @@ pub enum RarPipelineEvent {
         /// sequential decode when set.
         solid: bool,
     },
-    /// One entry just had bytes flowed into it. Emitted on a
-    /// mid-entry boundary so the coordinator can capture
+    /// One STORED entry just had bytes flowed into it. Emitted
+    /// on a mid-entry boundary so the coordinator can capture
     /// `current_entry_offset` for resume.
     InEntryProgress {
         /// Entry's index in archive order.
         index: u32,
         /// Bytes written so far into the in-flight entry.
         bytes_written: u64,
+    },
+    /// One compressed entry (`compression.method() >= 1`) just
+    /// had bytes flowed into it. Emitted on a mid-entry boundary
+    /// so the coordinator can capture `current_entry_offset`
+    /// **and** the [`crate::decode::rar_native::RarStreamDecoder`]
+    /// snapshot needed to resume byte-identically. Distinct from
+    /// [`Self::InEntryProgress`] so the STORED event shape stays
+    /// stable across the §F1 transition (its serialized
+    /// representation is monitored by tight timing-sensitive
+    /// crash-resume tests).
+    InEntryProgressCompressed {
+        /// Entry's index in archive order.
+        index: u32,
+        /// Bytes written so far into the in-flight entry.
+        bytes_written: u64,
+        /// Opaque snapshot of the in-flight RAR5 decoder
+        /// (`PLAN_rar5_decoder.md` §F1). `None` when the
+        /// decoder has not yet reached a snapshotable boundary
+        /// inside the entry; otherwise `Some(blob)` carries the
+        /// `RarStreamDecoder::decoder_state_into` output the
+        /// coordinator persists into the checkpoint's
+        /// `current_entry_decoder_state` field.
+        decoder_state: Option<Vec<u8>>,
     },
     /// One entry just finished extracting cleanly.
     EntryFinished {
@@ -412,8 +441,35 @@ impl<'a> RarPipeline<'a> {
             } else {
                 0
             };
-            let (bytes_written, bytes_punched) =
-                self.extract_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?;
+            // §F1 dispatch: a compressed entry whose checkpoint
+            // carried a saved [`RarStreamDecoder`] snapshot
+            // routes through the dedicated resume helper. Every
+            // other case (STORED, fresh-start compressed,
+            // legacy-checkpoint compressed) goes through the
+            // unchanged [`Self::extract_entry`] so the STORED
+            // hot path's calling convention stays byte-identical
+            // to round-one §3 (a tight crash-resume test is
+            // sensitive to its event timing).
+            let resume_blob: Option<&[u8]> =
+                if Some(idx) == resume.current_entry && entry.header.compression.method() != 0 {
+                    resume.current_entry_decoder_state.as_deref()
+                } else {
+                    None
+                };
+            let (bytes_written, bytes_punched) = match resume_blob {
+                Some(blob) => self.extract_compressed_entry_with_resume(
+                    idx,
+                    entry,
+                    resume_offset,
+                    blob,
+                    sink,
+                    puncher,
+                    &mut callback,
+                )?,
+                None => {
+                    self.extract_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?
+                }
+            };
             stats.entries_extracted = stats.entries_extracted.saturating_add(1);
             stats.bytes_written = stats.bytes_written.saturating_add(bytes_written);
             stats.bytes_punched = stats.bytes_punched.saturating_add(bytes_punched);
@@ -472,12 +528,14 @@ impl<'a> RarPipeline<'a> {
         }
         self.wait_for_range(data_offset, data_end)?;
 
-        // Compressed entries (method >= 1) cannot resume mid-entry
-        // until §F1 of `PLAN_rar5_decoder.md` lands the serialized
-        // decoder snapshot. Round-one §E1 falls back to a fresh
-        // begin (truncating the on-disk prefix and re-extracting
-        // from byte 0) so resume still produces byte-identical
-        // output, just at the cost of redoing the entry's decode.
+        // STORED entries always resume from the byte-offset alone
+        // (the sink's prefix-replay seeds the running hashes, and
+        // there's no decoder state to migrate). Compressed
+        // entries always restart from byte 0 in this code path —
+        // the §F1 decoder-state-aware dispatch lives in
+        // [`Self::extract_compressed_entry_with_resume`] and is
+        // selected by `run` ahead of `extract_entry` for `method
+        // != 0` entries with a saved decoder-state blob.
         let method = entry.header.compression.method();
         let effective_resume_offset = if method == 0 { resume_offset } else { 0 };
 
@@ -551,8 +609,111 @@ impl<'a> RarPipeline<'a> {
                 .map_err(RarPipelineError::Aborted)?;
             }
         } else {
-            self.decompress_entry_to_sink(idx, entry, data_offset, data_end, sink, callback)?;
+            self.decompress_entry_to_sink(
+                idx,
+                entry,
+                data_offset,
+                data_end,
+                0,    // no §F1 mid-entry resume on this path
+                None, // §F1 dispatch lives in `extract_compressed_entry_with_resume`
+                sink,
+                callback,
+            )?;
         }
+
+        let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;
+
+        let punched = self.punch_range(puncher, data_offset, data_end)?;
+        callback(&RarPipelineEvent::EntryFinished {
+            index: idx,
+            name: entry.header.name.clone(),
+            bytes_written: entry.header.unpacked_size,
+            bytes_punched: punched,
+        })
+        .map_err(RarPipelineError::Aborted)?;
+
+        Ok((entry.header.unpacked_size, punched))
+    }
+
+    /// §F1 mid-entry-resume dispatch for compressed entries.
+    /// Mirrors the structure of [`Self::extract_entry`] but uses
+    /// [`RarSink::begin_entry_resume`] to seed the running hashes
+    /// from the on-disk prefix and seeds the
+    /// [`RarStreamDecoder`] from the saved snapshot. STORED
+    /// entries never reach this path — `run` dispatches them
+    /// through the unmodified [`Self::extract_entry`] so the
+    /// crash-resume test's tight event timing stays unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_compressed_entry_with_resume<F>(
+        &self,
+        idx: u32,
+        entry: &FileEntry,
+        resume_offset: u64,
+        resume_decoder_state: &[u8],
+        sink: &mut RarSink,
+        puncher: &dyn PunchHole,
+        callback: &mut F,
+    ) -> Result<(u64, u64), RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let data_offset = entry.data_offset;
+        let packed_size = entry.packed_size;
+        let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
+            RarPipelineError::Rar(RarError::CorruptHeader {
+                archive_offset: data_offset,
+                reason: "entry data range overflows u64".to_string(),
+            })
+        })?;
+
+        self.cursor.store(data_offset, Ordering::Release);
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(data_offset);
+        }
+        self.wait_for_range(data_offset, data_end)?;
+
+        let begin_outcome = sink
+            .begin_entry_resume(
+                idx,
+                &entry.header.name,
+                entry.header.file_flags.is_directory(),
+                entry.header.unpacked_size,
+                entry.header.crc32,
+                None,
+                resume_offset,
+            )
+            .map_err(RarPipelineError::Sink)?;
+
+        if matches!(begin_outcome, BeginEntryOutcome::Directory { .. }) {
+            // A directory-flagged entry with a decoder-state blob
+            // is a malformed checkpoint, but we treat it the same
+            // way the non-resume path does (mkdir + 0-byte data
+            // area) so the resumed extraction can still complete.
+            let punched = if packed_size > 0 {
+                self.punch_range(puncher, data_offset, data_end)?
+            } else {
+                0
+            };
+            callback(&RarPipelineEvent::EntryFinished {
+                index: idx,
+                name: entry.header.name.clone(),
+                bytes_written: 0,
+                bytes_punched: punched,
+            })
+            .map_err(RarPipelineError::Aborted)?;
+            return Ok((0, punched));
+        }
+
+        self.decompress_entry_to_sink(
+            idx,
+            entry,
+            data_offset,
+            data_end,
+            resume_offset,
+            Some(resume_decoder_state),
+            sink,
+            callback,
+        )?;
 
         let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;
 
@@ -582,12 +743,23 @@ impl<'a> RarPipeline<'a> {
     /// `O.RAR.STREAMING_DECOMPRESS` will lift this to a
     /// chunk-by-chunk reader once the decoder has stabilised
     /// against a real corpus.
+    ///
+    /// Round-one §F1 wires resume: `resume_offset > 0` means the
+    /// sink already replayed the on-disk prefix to seed its hashes
+    /// and the decoder must come up at the same LZSS-output
+    /// position — the matching `resume_decoder_state` blob carries
+    /// the dictionary + Huffman + filter-queue state needed to
+    /// produce byte-identical output from the source-byte cursor
+    /// `resume_decoder_state` was captured at.
+    #[allow(clippy::too_many_arguments)]
     fn decompress_entry_to_sink<F>(
         &self,
         idx: u32,
         entry: &FileEntry,
         data_offset: u64,
         data_end: u64,
+        resume_offset: u64,
+        resume_decoder_state: Option<&[u8]>,
         sink: &mut RarSink,
         callback: &mut F,
     ) -> Result<(), RarPipelineError>
@@ -616,8 +788,34 @@ impl<'a> RarPipeline<'a> {
             })
         })?;
 
-        let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(compressed));
-        let mut decoder = RarStreamDecoder::new(src, dict_capacity).map_err(decode_err_to_rar)?;
+        let mut decoder = if let Some(blob) = resume_decoder_state {
+            // §F1 resume: the blob captured the source-byte cursor
+            // it was taken at. We slice the in-memory compressed
+            // bytes from that cursor so the decoder's source picks
+            // up exactly where the prior run paused.
+            let cursor =
+                RarStreamDecoder::source_cursor_from_blob(blob).map_err(decode_err_to_rar)?;
+            if cursor > packed_size {
+                return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: data_offset,
+                    reason: format!(
+                        "RAR5 resume blob source cursor {cursor} exceeds packed_size {packed_size}"
+                    ),
+                }));
+            }
+            let cursor_usz = cursor as usize;
+            let tail = compressed.split_off(cursor_usz);
+            let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(tail));
+            RarStreamDecoder::resume(src, dict_capacity, blob).map_err(decode_err_to_rar)?
+        } else {
+            // Fresh-or-restart-from-zero: the §E1 path. The sink
+            // is at byte 0 (the caller forced `effective_resume_offset
+            // = 0` when no blob is available), so the LZSS layer
+            // also starts from a clean slate.
+            debug_assert_eq!(resume_offset, 0);
+            let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(compressed));
+            RarStreamDecoder::new(src, dict_capacity).map_err(decode_err_to_rar)?
+        };
 
         let mut staging: Vec<u8> = Vec::with_capacity(64 * 1024);
         loop {
@@ -627,9 +825,11 @@ impl<'a> RarPipeline<'a> {
             if !staging.is_empty() {
                 sink.write_entry(&staging).map_err(RarPipelineError::Sink)?;
                 staging.clear();
-                callback(&RarPipelineEvent::InEntryProgress {
+                let blob = decoder.decoder_state();
+                callback(&RarPipelineEvent::InEntryProgressCompressed {
                     index: idx,
                     bytes_written: sink.current_entry_offset(),
+                    decoder_state: blob,
                 })
                 .map_err(RarPipelineError::Aborted)?;
             }

@@ -273,6 +273,11 @@ pub struct LzssDecoder {
     /// RD (repeat-distance length code) Huffman, persisted
     /// across blocks.
     rd: Option<HuffTable>,
+    /// Most recently parsed code-length array (concatenated
+    /// LD + DD + LDD + RD). `Some(...)` after the first block
+    /// with `is_table_present`; retained so §F1 resume can
+    /// rebuild every Huffman from a single 430-byte payload.
+    last_table_lengths: Option<Box<[u8; HUFF_TABLE_SIZE]>>,
 }
 
 impl LzssDecoder {
@@ -294,6 +299,7 @@ impl LzssDecoder {
             dd: None,
             ldd: None,
             rd: None,
+            last_table_lengths: None,
         })
     }
 
@@ -395,7 +401,18 @@ impl LzssDecoder {
         let meta = build_meta_huffman(&meta_lengths)?;
         let mut combined = [0u8; HUFF_TABLE_SIZE];
         decode_main_table_lengths(reader, &meta, &mut combined)?;
+        self.install_tables_from_lengths(&combined)?;
+        Ok(())
+    }
 
+    /// Build all four sub-Huffmans from a 430-byte combined
+    /// code-length array and retain the lengths so §F1 resume
+    /// can re-emit them. Used by both [`Self::parse_tables`]
+    /// and the [`super::stream::RarStreamDecoder`] resume path.
+    pub(super) fn install_tables_from_lengths(
+        &mut self,
+        combined: &[u8; HUFF_TABLE_SIZE],
+    ) -> Result<(), LzssError> {
         let split_dd = HUFF_NC;
         let split_ldd = split_dd + HUFF_DC;
         let split_rd = split_ldd + HUFF_LDC;
@@ -428,7 +445,16 @@ impl LzssDecoder {
                 source,
             }
         })?);
+        self.last_table_lengths = Some(Box::new(*combined));
         Ok(())
+    }
+
+    /// Read access to the most-recently parsed combined
+    /// code-length array, for §F1 resume snapshot. `None` until
+    /// the first block with `is_table_present` is decoded.
+    #[must_use]
+    pub(super) fn table_lengths(&self) -> Option<&[u8; HUFF_TABLE_SIZE]> {
+        self.last_table_lengths.as_deref()
     }
 
     /// Borrow the pending-filter list. The upper layer applies
@@ -478,6 +504,23 @@ impl LzssDecoder {
     #[must_use]
     pub fn dist_cache(&self) -> &DistCache {
         &self.dist_cache
+    }
+
+    /// Mutable borrow on the recent-distance cache. Used by §F1
+    /// resume to restore the LRU state from a snapshot blob.
+    pub(super) fn dist_cache_mut(&mut self) -> &mut DistCache {
+        &mut self.dist_cache
+    }
+
+    /// Set [`Self::output_pos`] directly. Reserved for §F1
+    /// resume.
+    pub(super) fn set_output_pos(&mut self, output_pos: u64) {
+        self.output_pos = output_pos;
+    }
+
+    /// Set [`Self::last_len`] directly. Reserved for §F1 resume.
+    pub(super) fn set_last_len(&mut self, last_len: u32) {
+        self.last_len = last_len;
     }
 }
 

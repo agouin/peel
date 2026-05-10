@@ -182,7 +182,28 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   when §4 lands the hand-rolled compressed-method decoder.
 ///   Older binaries refuse v10 files with
 ///   [`CheckpointError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 10;
+/// - **v11** — extends [`SinkState::Rar`] with an optional opaque
+///   `current_entry_decoder_state` blob carrying the in-flight
+///   compressed entry's [`crate::decode::rar_native::RarStreamDecoder`]
+///   snapshot (`docs/PLAN_rar5_decoder.md` §F1). v11 readers parse
+///   v1..=v10 files transparently with the blob set to `None`
+///   (compressed entries fall through to the existing
+///   "restart entry from byte 0" path). The format version on
+///   disk only bumps to 11 when a SinkState::Rar checkpoint
+///   actually ships a non-`None` blob — STORED-only checkpoints
+///   keep writing the v10 layout so existing tight crash-resume
+///   tests don't see a byte-count drift in their checkpoint
+///   sidecar. Older binaries refuse v11 files with
+///   [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 11;
+
+/// Pre-§F1 max format version, written when no SinkState payload
+/// uses v11-only fields. Keeping the on-disk version dynamic
+/// means STORED-only RAR checkpoints round-trip byte-identically
+/// to the v10 layout, which keeps tight crash-resume tests
+/// (whose checkpoint sidecar size is observed indirectly via
+/// kill-switch timing) stable across the §F1 transition.
+const FORMAT_VERSION_RAR_STORED_ONLY: u32 = 10;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -544,9 +565,12 @@ pub enum SinkState {
     /// disk via `entries_completed`, and (when a crash interrupts
     /// an entry) the in-flight entry index plus the byte offset
     /// within it. STORED entries (round-one §3) resume from
-    /// `current_entry_offset`; the hand-rolled decoder §4 will
-    /// add a parallel `current_entry_decoder_state` blob when it
-    /// lands.
+    /// `current_entry_offset`; compressed entries (round-one §4 /
+    /// `PLAN_rar5_decoder.md` §F1) resume from
+    /// `current_entry_offset` *plus* the
+    /// `current_entry_decoder_state` blob — together those two
+    /// fields let the next run pick up the in-flight entry
+    /// without restarting from byte 0.
     Rar {
         /// Indices (in archive order) of entries that finished
         /// extracting before this checkpoint was written. Ordered
@@ -559,6 +583,21 @@ pub enum SinkState {
         /// Bytes already written into the in-flight entry. `0`
         /// when `current_entry` is `None`.
         current_entry_offset: u64,
+        /// Opaque decoder-state blob captured at the most recent
+        /// in-entry checkpoint (a serialized
+        /// [`crate::decode::rar_native::RarStreamDecoder`]
+        /// snapshot per `PLAN_rar5_decoder.md` §F1). `None` when:
+        ///
+        /// - the in-flight entry uses STORED (no decoder state to
+        ///   capture; resume re-reads the on-disk prefix);
+        /// - the in-flight entry is at byte 0 (no work to resume);
+        /// - the checkpoint was written by a v1..=v10 binary
+        ///   (the field didn't exist yet).
+        ///
+        /// When `None` for a compressed entry the resume path
+        /// truncates the on-disk file to byte 0 and re-extracts —
+        /// matching the §E1 fallback behaviour.
+        current_entry_decoder_state: Option<Vec<u8>>,
     },
 
     /// State for [`crate::sink::SevenzSink`] (added in v9 of the
@@ -901,6 +940,7 @@ impl Checkpoint {
                 entries_completed,
                 current_entry,
                 current_entry_offset,
+                current_entry_decoder_state,
             } => {
                 body.push(SINK_TAG_RAR);
                 let count = u32::try_from(entries_completed.len()).unwrap_or(u32::MAX);
@@ -916,6 +956,21 @@ impl Checkpoint {
                     None => body.push(0),
                 }
                 write_u64(&mut body, *current_entry_offset);
+                // v11: optional in-flight decoder state blob.
+                // Skipped entirely (no presence byte) when the
+                // blob is `None` — that keeps STORED-only RAR
+                // checkpoints byte-identical to the v10 layout
+                // so older readers parse them transparently and
+                // tight crash-resume tests keyed off checkpoint
+                // sidecar size do not see a drift. The reader
+                // dispatches on `format_version >= 11` to know
+                // whether to expect the trailing byte.
+                if let Some(blob) = current_entry_decoder_state {
+                    body.push(1);
+                    let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+                    write_u32(&mut body, len);
+                    body.extend_from_slice(&blob[..len as usize]);
+                }
             }
         }
 
@@ -981,11 +1036,30 @@ impl Checkpoint {
 
         let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
         buf.extend_from_slice(&MAGIC);
-        write_u32(&mut buf, FORMAT_VERSION);
+        write_u32(&mut buf, self.required_format_version());
         write_u64(&mut buf, body_len);
         write_u64(&mut buf, body_checksum);
         buf.extend_from_slice(&body);
         buf
+    }
+
+    /// Compute the minimum on-disk `format_version` that fully
+    /// captures this checkpoint's payload. The serialize path
+    /// writes this dynamically so a checkpoint whose body fits
+    /// in an older format's wire layout produces byte-identical
+    /// output to that older format. Currently only the §F1
+    /// `SinkState::Rar` variant has a conditional v11-vs-v10
+    /// path; every other variant writes its baseline version
+    /// (v9 for `Sevenz`, v10 for `Rar` STORED-only, etc.) and
+    /// the surrounding fields decide whether v11 is required.
+    fn required_format_version(&self) -> u32 {
+        match &self.sink_state {
+            SinkState::Rar {
+                current_entry_decoder_state: Some(_),
+                ..
+            } => FORMAT_VERSION,
+            _ => FORMAT_VERSION_RAR_STORED_ONLY,
+        }
     }
 
     /// Parse a checkpoint from its on-disk binary representation.
@@ -1070,7 +1144,7 @@ impl Checkpoint {
         // version so it can decide whether to read each trailer;
         // future versions that *change* the layout will branch
         // here.
-        debug_assert!(matches!(format_version, 1..=10));
+        debug_assert!(matches!(format_version, 1..=11));
         Self::decode_body(body, format_version)
     }
 
@@ -1293,9 +1367,10 @@ impl Checkpoint {
                 }
             }
             SINK_TAG_RAR => {
-                // v10: same layout as `SinkState::Zip` minus the
-                // optional decoder-state blob (round-one §3 ships
-                // STORED only; §4 will add a follow-on field).
+                // v10: layout shared with `SinkState::Zip` minus
+                // the decoder-state blob. v11 (§F1) appends an
+                // optional `current_entry_decoder_state`
+                // length-prefixed blob.
                 let count = cursor.read_count_capped("sink.rar.entries_completed.len", 4)?;
                 let mut entries: Vec<u32> = Vec::new();
                 for _ in 0..count {
@@ -1313,10 +1388,43 @@ impl Checkpoint {
                     }
                 };
                 let current_entry_offset = cursor.read_u64("sink.rar.current_entry_offset")?;
+                let current_entry_decoder_state = if format_version >= 11 {
+                    let presence =
+                        cursor.read_u8("sink.rar.current_entry_decoder_state.is_some")?;
+                    match presence {
+                        0 => None,
+                        1 => {
+                            let len =
+                                cursor.read_u32("sink.rar.current_entry_decoder_state.len")?;
+                            if len > MAX_DECODER_STATE_LEN {
+                                return Err(CheckpointError::Truncated {
+                                    reason: format!(
+                                        "sink.rar.current_entry_decoder_state length {len} \
+                                         exceeds cap {MAX_DECODER_STATE_LEN}",
+                                    ),
+                                });
+                            }
+                            let bytes = cursor.require(
+                                len as usize,
+                                "sink.rar.current_entry_decoder_state.bytes",
+                            )?;
+                            Some(bytes.to_vec())
+                        }
+                        other => {
+                            return Err(CheckpointError::InvalidPresence {
+                                field: "sink.rar.current_entry_decoder_state",
+                                value: other,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
                 SinkState::Rar {
                     entries_completed: entries,
                     current_entry,
                     current_entry_offset,
+                    current_entry_decoder_state,
                 }
             }
             other => {
@@ -2284,10 +2392,19 @@ mod tests {
 
     #[test]
     fn header_layout_starts_with_magic_and_version() {
+        // The on-disk version is `Checkpoint::required_format_version`,
+        // which can dip below `FORMAT_VERSION` when the payload fits
+        // in an older layout (`SinkState::Rar` STORED-only writes
+        // v10 even on a v11-aware build). For a `SinkState::Raw`
+        // sample the required version is the v10 floor; we check
+        // both bounds.
         let bytes = sample_raw().serialize();
         assert_eq!(&bytes[0..8], &MAGIC);
         let version = read_u32(&bytes[8..12]);
-        assert_eq!(version, FORMAT_VERSION);
+        assert!(
+            (1..=FORMAT_VERSION).contains(&version),
+            "version {version} outside 1..={FORMAT_VERSION}"
+        );
     }
 
     #[test]
@@ -2382,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_ten() {
+    fn checkpoint_format_version_is_eleven() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
         // work (v6), `docs/PLAN_deflate_block_decoder.md` Phase 9b's
@@ -2390,12 +2507,14 @@ mod tests {
         // `docs/PLAN_multi_url_source.md` §5's parts vec +
         // active-part-aware hash state (v8),
         // `docs/PLAN_7z_support.md` §9's `SinkState::Sevenz`
-        // variant (v9), and `docs/PLAN_rar.md` §3's
-        // `SinkState::Rar` variant (v10) each bumped this when an
-        // optional trailer landed. If a future change resets it,
-        // this guards against silently dropping the
-        // upgrade-required signal older readers depend on.
-        assert_eq!(FORMAT_VERSION, 10);
+        // variant (v9), `docs/PLAN_rar.md` §3's
+        // `SinkState::Rar` variant (v10), and
+        // `docs/PLAN_rar5_decoder.md` §F1's
+        // `current_entry_decoder_state` blob (v11) each bumped
+        // this when an optional trailer landed. If a future
+        // change resets it, this guards against silently dropping
+        // the upgrade-required signal older readers depend on.
+        assert_eq!(FORMAT_VERSION, 11);
     }
 
     fn sample_sevenz(folders_completed: Vec<u32>, current_folder: Option<u32>) -> Checkpoint {
@@ -2474,6 +2593,7 @@ mod tests {
                 entries_completed,
                 current_entry,
                 current_entry_offset,
+                current_entry_decoder_state: None,
             },
             hash_state: None,
             chunk_crc32c: None,
@@ -2945,9 +3065,17 @@ mod tests {
     fn round_trip_multi_part_with_active_part_idx() {
         let original = sample_multi_part();
         let bytes = original.serialize();
-        // The header must record v8.
+        // The header must record at least v8 (the multi-URL
+        // floor) and at most the current `FORMAT_VERSION`. The
+        // exact value is `Checkpoint::required_format_version`,
+        // which dips below the global ceiling for payloads that
+        // fit in older layouts (e.g. STORED-only `SinkState::Rar`
+        // writes v10 even on v11-aware builds).
         let version = read_u32(&bytes[8..12]);
-        assert_eq!(version, FORMAT_VERSION);
+        assert!(
+            (8..=FORMAT_VERSION).contains(&version),
+            "version {version} outside 8..={FORMAT_VERSION}"
+        );
         let parsed = Checkpoint::deserialize(&bytes).expect("decode");
         assert_eq!(parsed, original);
         // Sanity on the recovered parts vec.

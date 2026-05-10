@@ -42,11 +42,25 @@
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 
-use super::dict::DictError;
-use super::filters::{apply as apply_filter, Filter};
+use super::bootstrap::HUFF_TABLE_SIZE;
+use super::dict::{Dict, DictError};
+use super::dist_cache::DistCache;
+use super::filters::{apply as apply_filter, Filter, FilterType};
 use super::lzss::{LzssDecoder, LzssError};
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
 use crate::types::ByteOffset;
+
+/// Magic bytes identifying a [`RarStreamDecoder`] resume blob.
+/// Stamped at offset 0 so a stray cross-decoder blob (e.g. an lz4
+/// or xz snapshot) can't be mis-routed into the RAR resume path.
+const SNAPSHOT_MAGIC: [u8; 4] = *b"RR5S";
+
+/// Wire version of the snapshot format. Bumped whenever the layout
+/// changes; the RAR5 decoder's entry-resume contract permits
+/// silent rejection of future-version blobs (the resume falls
+/// back to byte-0 restart, which still produces byte-identical
+/// output).
+const SNAPSHOT_VERSION: u32 = 1;
 
 /// Hard cap on the per-block bitstream we'll buffer. Any block
 /// claiming a larger `block_size` is treated as malformed input —
@@ -459,10 +473,32 @@ impl StreamingDecoder for RarStreamDecoder {
         // Identical contract to every other in-tree decoder: the
         // run-local `src_consumed` is bytes pulled in *this* run;
         // the global high-water mark = start_offset + src_consumed.
-        // Resume support for mid-entry RAR5 lands in §F1 (this
-        // setter is a no-op for fresh runs since src_consumed = 0,
-        // and §F1 will seed both fields from the saved blob).
+        // Resume seeds this from the saved blob via [`Self::resume`];
+        // fresh runs leave it at 0.
         self.src_start_offset = offset;
+    }
+
+    fn decoder_state_into(&self, out: &mut Vec<u8>) -> bool {
+        // Only return a snapshot when one is actually useful: at
+        // least one block must have been decoded (so the Huffman
+        // tables exist), and the entry must not have already
+        // EOF'd (no point checkpointing a finished entry).
+        if self.eof_emitted || self.lzss.table_lengths().is_none() {
+            return false;
+        }
+        self.serialize_into(out);
+        true
+    }
+
+    fn decoder_state_size_hint(&self) -> usize {
+        // Header + fixed fields + table lengths + dict snapshot +
+        // staging + filters. The `dict.live_bytes` term dominates
+        // for entries with multi-MiB dictionaries; the rest is a
+        // few hundred bytes.
+        let dict_live = self.lzss.dict().live_bytes() as usize;
+        let staging = self.staging.len();
+        let filters = self.filters.len() * 16;
+        SNAPSHOT_FIXED_HEADER_LEN + HUFF_TABLE_SIZE + dict_live + staging + filters + 64
     }
 }
 
@@ -482,13 +518,372 @@ fn map_lzss_err(e: LzssError) -> DecodeError {
 }
 
 /// Translate a [`DictError`] into a [`DecodeError::Construct`].
-/// Unused by the run-time decode path (the LZSS dispatcher has
-/// its own typed forwarding for distance / underflow errors); kept
-/// here so §F1's resume factory can reuse it without a duplicate
-/// adapter.
-#[allow(dead_code)]
-pub(crate) fn map_dict_err(e: DictError) -> DecodeError {
+/// Used by the §F1 resume factory when the on-wire dict capacity
+/// disagrees with the saved blob.
+fn map_dict_err(e: DictError) -> DecodeError {
     DecodeError::Construct(std::io::Error::other(e.to_string()))
+}
+
+/// Bytes consumed by the fixed (non-array) header / state fields
+/// of a snapshot, used by [`RarStreamDecoder::decoder_state_size_hint`].
+/// Doesn't include variable-length sections (table lengths, dict
+/// snapshot, staging, filters); those are added at hint time.
+const SNAPSHOT_FIXED_HEADER_LEN: usize = 4 // magic
+    + 4 // version
+    + 8 // src_consumed
+    + 8 // src_start_offset
+    + 8 // staging_start_pos
+    + 4 // staging_len
+    + 1 // last_block_seen
+    + 1 // eof_emitted
+    + 1 // last_frame_end presence
+    + 8 // last_frame_end value
+    + 4 // filter_count
+    + 4 // dict_capacity
+    + 8 // dict_total_written
+    + 4 // dict_snapshot_len
+    + (4 * 4) // dist_cache slots
+    + 4 // last_len
+    + 8 // output_pos
+    + 1; // table_lengths presence
+
+/// Filter-type wire tag. Mirrors libarchive's `FILTER_*`
+/// constants but is private to the snapshot format because the
+/// RAR5 spec leaves type code numbering authoritative on the
+/// wire and we don't want a future rename of [`FilterType`] to
+/// silently invalidate older blobs.
+const FILTER_TAG_DELTA: u8 = 0;
+const FILTER_TAG_E8: u8 = 1;
+const FILTER_TAG_E8E9: u8 = 2;
+const FILTER_TAG_ARM: u8 = 3;
+
+impl RarStreamDecoder {
+    /// Serialize the decoder's state into `out`, exactly the
+    /// shape [`Self::resume`] consumes. Stable across patch
+    /// releases per `PLAN_rar5_decoder.md` §F1's checkpoint
+    /// compatibility contract.
+    fn serialize_into(&self, out: &mut Vec<u8>) {
+        out.reserve(self.decoder_state_size_hint());
+        out.extend_from_slice(&SNAPSHOT_MAGIC);
+        write_u32_le(out, SNAPSHOT_VERSION);
+        write_u64_le(out, self.src_consumed);
+        write_u64_le(out, self.src_start_offset);
+        write_u64_le(out, self.staging_start_pos);
+        // staging
+        let staging_len = u32::try_from(self.staging.len()).unwrap_or(u32::MAX);
+        write_u32_le(out, staging_len);
+        out.extend_from_slice(&self.staging[..staging_len as usize]);
+        // flags
+        out.push(u8::from(self.last_block_seen));
+        out.push(u8::from(self.eof_emitted));
+        match self.last_frame_end {
+            Some(v) => {
+                out.push(1);
+                write_u64_le(out, v);
+            }
+            None => {
+                out.push(0);
+                write_u64_le(out, 0);
+            }
+        }
+        // filters
+        let filter_count = u32::try_from(self.filters.len()).unwrap_or(u32::MAX);
+        write_u32_le(out, filter_count);
+        for f in self.filters.iter().take(filter_count as usize) {
+            let (tag, channels) = match f.kind {
+                FilterType::Delta { channels } => (FILTER_TAG_DELTA, channels),
+                FilterType::E8 => (FILTER_TAG_E8, 0),
+                FilterType::E8e9 => (FILTER_TAG_E8E9, 0),
+                FilterType::Arm => (FILTER_TAG_ARM, 0),
+            };
+            out.push(tag);
+            out.push(channels);
+            write_u64_le(out, f.block_start);
+            write_u32_le(out, f.block_length);
+        }
+        // LZSS state
+        let dict = self.lzss.dict();
+        let dict_capacity = u32::try_from(dict.capacity()).unwrap_or(u32::MAX);
+        write_u32_le(out, dict_capacity);
+        write_u64_le(out, dict.total_written());
+        let dict_snapshot_start = out.len();
+        // Reserve placeholder for snapshot length, then append.
+        write_u32_le(out, 0);
+        let snapshot_bytes_start = out.len();
+        dict.snapshot_into(out);
+        let written = out.len() - snapshot_bytes_start;
+        let written_u32 = u32::try_from(written).unwrap_or(u32::MAX);
+        let len_bytes = written_u32.to_le_bytes();
+        out[dict_snapshot_start..dict_snapshot_start + 4].copy_from_slice(&len_bytes);
+
+        let dc = self.lzss.dist_cache().slots();
+        for slot in dc {
+            write_u32_le(out, slot);
+        }
+        write_u32_le(out, self.lzss.last_len());
+        write_u64_le(out, self.lzss.output_pos());
+        match self.lzss.table_lengths() {
+            Some(lengths) => {
+                out.push(1);
+                out.extend_from_slice(lengths.as_slice());
+            }
+            None => out.push(0),
+        }
+    }
+
+    /// Inspect a snapshot blob and return the source-byte cursor
+    /// it was captured at. Lets the caller slice an in-memory
+    /// compressed buffer to construct a `Read` source positioned
+    /// at the same point as the prior run before invoking
+    /// [`Self::resume`].
+    ///
+    /// # Errors
+    ///
+    /// - [`DecodeError::Construct`] when the magic / version
+    ///   header is wrong, or the blob is too short to even hold
+    ///   the cursor field.
+    pub fn source_cursor_from_blob(blob: &[u8]) -> Result<u64, DecodeError> {
+        if blob.len() < 4 + 4 + 8 {
+            return Err(blob_construct_err(format!(
+                "snapshot too short for header: got {} bytes",
+                blob.len()
+            )));
+        }
+        if blob[..4] != SNAPSHOT_MAGIC {
+            return Err(blob_construct_err(format!(
+                "snapshot magic mismatch: got {:?}, expected {:?}",
+                &blob[..4],
+                SNAPSHOT_MAGIC
+            )));
+        }
+        let version = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
+        if version != SNAPSHOT_VERSION {
+            return Err(blob_construct_err(format!(
+                "snapshot version mismatch: got {version}, expected {SNAPSHOT_VERSION}"
+            )));
+        }
+        let src_consumed = u64::from_le_bytes([
+            blob[8], blob[9], blob[10], blob[11], blob[12], blob[13], blob[14], blob[15],
+        ]);
+        Ok(src_consumed)
+    }
+
+    /// Construct a decoder seeded from the saved snapshot. `src`
+    /// must deliver bytes starting at the source-byte cursor
+    /// recorded in the blob (caller slices via
+    /// [`Self::source_cursor_from_blob`]).
+    ///
+    /// # Errors
+    ///
+    /// - [`DecodeError::Construct`] for any structural issue with
+    ///   the blob (truncation, magic / version mismatch, dict
+    ///   capacity or filter parameters out of range).
+    pub fn resume(
+        src: Box<dyn Read + Send>,
+        dict_capacity: usize,
+        blob: &[u8],
+    ) -> Result<Self, DecodeError> {
+        let mut cur = SnapshotCursor::new(blob);
+        cur.expect_magic()?;
+        cur.expect_version()?;
+
+        let src_consumed = cur.read_u64("src_consumed")?;
+        let src_start_offset = cur.read_u64("src_start_offset")?;
+        let staging_start_pos = cur.read_u64("staging_start_pos")?;
+
+        let staging_len = cur.read_u32("staging_len")? as usize;
+        let staging = cur.read_slice(staging_len, "staging")?.to_vec();
+
+        let last_block_seen = cur.read_u8("last_block_seen")? != 0;
+        let eof_emitted = cur.read_u8("eof_emitted")? != 0;
+        let last_frame_end_present = cur.read_u8("last_frame_end_present")?;
+        let last_frame_end_value = cur.read_u64("last_frame_end_value")?;
+        let last_frame_end = if last_frame_end_present == 0 {
+            None
+        } else {
+            Some(last_frame_end_value)
+        };
+
+        let filter_count = cur.read_u32("filter_count")? as usize;
+        let mut filters = VecDeque::with_capacity(filter_count);
+        for i in 0..filter_count {
+            let tag = cur.read_u8("filter.tag")?;
+            let channels = cur.read_u8("filter.channels")?;
+            let block_start = cur.read_u64("filter.block_start")?;
+            let block_length = cur.read_u32("filter.block_length")?;
+            let kind = match tag {
+                FILTER_TAG_DELTA => FilterType::Delta { channels },
+                FILTER_TAG_E8 => FilterType::E8,
+                FILTER_TAG_E8E9 => FilterType::E8e9,
+                FILTER_TAG_ARM => FilterType::Arm,
+                other => {
+                    return Err(blob_construct_err(format!(
+                        "snapshot filter[{i}] tag {other} not in 0..=3"
+                    )));
+                }
+            };
+            filters.push_back(Filter {
+                kind,
+                block_start,
+                block_length,
+            });
+        }
+
+        let saved_dict_capacity = cur.read_u32("dict_capacity")? as usize;
+        if saved_dict_capacity != dict_capacity {
+            return Err(blob_construct_err(format!(
+                "snapshot dict_capacity {saved_dict_capacity} \
+                 disagrees with file-header capacity {dict_capacity}"
+            )));
+        }
+        let dict_total_written = cur.read_u64("dict_total_written")?;
+        let dict_snapshot_len = cur.read_u32("dict_snapshot_len")? as usize;
+        let dict_snapshot = cur.read_slice(dict_snapshot_len, "dict_snapshot")?;
+
+        let mut dict = Dict::new(dict_capacity).map_err(map_dict_err)?;
+        dict.restore_from_snapshot(dict_snapshot, dict_total_written)
+            .map_err(map_dict_err)?;
+
+        let mut dc_slots = [0u32; 4];
+        for slot in &mut dc_slots {
+            *slot = cur.read_u32("dist_cache.slot")?;
+        }
+        let dist_cache = DistCache::from_slots(dc_slots);
+
+        let last_len = cur.read_u32("last_len")?;
+        let output_pos = cur.read_u64("output_pos")?;
+
+        let table_lengths_present = cur.read_u8("table_lengths_present")?;
+        let table_lengths = if table_lengths_present == 0 {
+            None
+        } else {
+            let bytes = cur.read_slice(HUFF_TABLE_SIZE, "table_lengths")?;
+            let mut arr = [0u8; HUFF_TABLE_SIZE];
+            arr.copy_from_slice(bytes);
+            Some(arr)
+        };
+
+        if !cur.is_drained() {
+            return Err(blob_construct_err(format!(
+                "snapshot has {} trailing bytes after the last field",
+                cur.remaining()
+            )));
+        }
+
+        let mut lzss = LzssDecoder::new(dict_capacity).map_err(map_dict_err)?;
+        // Plug the restored dict + dist_cache + bookkeeping
+        // counters in directly; the LzssDecoder built fresh has
+        // them at defaults.
+        *lzss.dict_mut() = dict;
+        *lzss.dist_cache_mut() = dist_cache;
+        lzss.set_last_len(last_len);
+        lzss.set_output_pos(output_pos);
+        if let Some(arr) = table_lengths {
+            lzss.install_tables_from_lengths(&arr).map_err(|e| {
+                DecodeError::Construct(std::io::Error::other(format!(
+                    "snapshot Huffman table rebuild: {e}"
+                )))
+            })?;
+        }
+
+        Ok(Self {
+            src: Some(src),
+            src_consumed,
+            src_start_offset,
+            lzss,
+            staging,
+            staging_start_pos,
+            filters,
+            last_block_seen,
+            last_frame_end,
+            eof_emitted,
+        })
+    }
+}
+
+/// Tiny LE-cursor over a snapshot blob with field-name diagnostics.
+/// Used only by [`RarStreamDecoder::resume`]; lives in this file so
+/// the snapshot format stays a single-module concern.
+struct SnapshotCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SnapshotCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+
+    fn is_drained(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+
+    fn read_slice<'b>(&'b mut self, n: usize, name: &str) -> Result<&'b [u8], DecodeError> {
+        if self.remaining() < n {
+            return Err(blob_construct_err(format!(
+                "snapshot field '{name}': need {n} bytes, have {}",
+                self.remaining()
+            )));
+        }
+        let out = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(out)
+    }
+
+    fn expect_magic(&mut self) -> Result<(), DecodeError> {
+        let bytes = self.read_slice(4, "magic")?;
+        if bytes != SNAPSHOT_MAGIC {
+            return Err(blob_construct_err(format!(
+                "snapshot magic mismatch: got {bytes:?}, expected {SNAPSHOT_MAGIC:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn expect_version(&mut self) -> Result<(), DecodeError> {
+        let v = self.read_u32("version")?;
+        if v != SNAPSHOT_VERSION {
+            return Err(blob_construct_err(format!(
+                "snapshot version mismatch: got {v}, expected {SNAPSHOT_VERSION}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_u8(&mut self, name: &str) -> Result<u8, DecodeError> {
+        let bytes = self.read_slice(1, name)?;
+        Ok(bytes[0])
+    }
+
+    fn read_u32(&mut self, name: &str) -> Result<u32, DecodeError> {
+        let bytes = self.read_slice(4, name)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self, name: &str) -> Result<u64, DecodeError> {
+        let bytes = self.read_slice(8, name)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+}
+
+fn blob_construct_err(msg: String) -> DecodeError {
+    DecodeError::Construct(std::io::Error::other(format!(
+        "RAR5 stream decoder snapshot: {msg}"
+    )))
+}
+
+fn write_u32_le(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn write_u64_le(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
 }
 
 #[cfg(test)]
