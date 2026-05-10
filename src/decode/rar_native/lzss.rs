@@ -797,14 +797,25 @@ mod tests {
         assert_eq!(dec.take_pending_filters().len(), 0);
     }
 
+    /// Recompute libarchive's prologue checksum
+    /// (`0x5A ^ flags ^ size[0] ^ size[1] ^ size[2]`) over the
+    /// supplied size bytes. Mirrors
+    /// `block_header::block_prologue_checksum`; we recompute it
+    /// inline to avoid leaking the helper out of its module.
+    fn build_prologue_cksum(flags: u8, size_bytes: &[u8]) -> u8 {
+        let xor = size_bytes.iter().fold(0u8, |a, &b| a ^ b);
+        0x5A ^ flags ^ xor
+    }
+
     #[test]
     fn decode_block_rejects_truncated_block_buffer() {
         // A valid 2-byte prologue with byte_count = 1 says the
         // block is 0xFF bytes long, but we only supply the
         // 3-byte header.
         let flags: u8 = 0b1100_0111; // is_last_block + is_table_present + bit_size=7, byte_count_minus_1=0
-        let cksum = flags ^ 0x5A;
-        let block = [flags, cksum, 0xFF];
+        let size = [0xFFu8];
+        let cksum = build_prologue_cksum(flags, &size);
+        let block = [flags, cksum, size[0]];
         let mut dec = LzssDecoder::new(64).expect("dict OK");
         let mut out = Vec::new();
         let err = dec
@@ -818,8 +829,9 @@ mod tests {
         // block_size = 0 violates the header invariant. The
         // dispatcher catches it before any bitstream work.
         let flags: u8 = 0b0000_0000; // is_last_block=0, is_table_present=0, bit_size=0, byte_count_minus_1=0
-        let cksum = flags ^ 0x5A;
-        let block = [flags, cksum, 0x00];
+        let size = [0x00u8];
+        let cksum = build_prologue_cksum(flags, &size);
+        let block = [flags, cksum, size[0]];
         let mut dec = LzssDecoder::new(64).expect("dict OK");
         let mut out = Vec::new();
         let err = dec
@@ -835,11 +847,12 @@ mod tests {
         // the dispatcher gets to the table check before reading
         // anything from the bitstream.
         let flags: u8 = 0b0000_0000;
-        let cksum = flags ^ 0x5A;
+        let size = [0x01u8];
+        let cksum = build_prologue_cksum(flags, &size);
         // block_size = 1 (LE byte after prologue), bitstream =
         // 1 byte of all zeros (won't be read because tables
         // missing).
-        let block = [flags, cksum, 0x01, 0x00];
+        let block = [flags, cksum, size[0], 0x00];
         let mut dec = LzssDecoder::new(64).expect("dict OK");
         let mut out = Vec::new();
         let err = dec

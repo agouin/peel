@@ -138,13 +138,11 @@ pub fn walk_archive(buf: &[u8]) -> Result<ArchiveSummary, RarError> {
                 let packed_size = header.data_size.unwrap_or(0);
                 let data_offset = (cursor as u64) + header.total_header_bytes as u64;
                 let method = file.compression.method();
-                if method != 0 {
+                if method > 5 {
                     return Err(RarError::UnsupportedFeature {
                         feature: format!(
-                            "compression method {method} (RAR5 standard \
-                             algorithm) — round-one ships STORED only; the \
-                             hand-rolled decoder lands in §4 \
-                             (PLAN_rar5_decoder.md)"
+                            "compression method {method} (reserved by RAR5 \
+                             spec for future use)"
                         ),
                     });
                 }

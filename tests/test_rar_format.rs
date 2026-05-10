@@ -150,15 +150,17 @@ fn walk_truncated_archive_surfaces_specific_error() {
 }
 
 #[test]
-fn walk_archive_with_compressed_entry_rejects_with_method_label() {
+fn walk_archive_lists_compressed_entry_with_method_metadata() {
     use peel::rar::format::{file_flags, hdr_flags};
     use support::rar_fixtures::{
         build_end_of_archive, build_generic_header, build_main_header, encode_vint,
     };
 
-    // Build a file header with compression method = 1 (RAR5 standard
-    // "fastest"); §3 ships STORED only, so the walker must surface
-    // a precise UnsupportedFeature naming the method.
+    // After §E1 of `PLAN_rar5_decoder.md`, the walker no longer
+    // rejects standard-algorithm entries — listing surfaces them
+    // intact and the §3 pipeline dispatches through the
+    // hand-rolled decoder. The walker still rejects reserved
+    // method codes (6, 7) because they're undefined by the spec.
     let mut fields = Vec::new();
     fields.extend_from_slice(&encode_vint(0)); // file flags
     fields.extend_from_slice(&encode_vint(0)); // unpacked size
@@ -177,11 +179,47 @@ fn walk_archive_with_compressed_entry_rejects_with_method_label() {
     archive.extend_from_slice(&build_generic_header(2, 0, &fields, &[], None));
     archive.extend_from_slice(&build_end_of_archive());
 
-    let err = walk_archive(&archive).expect_err("compressed entry should fail");
+    let summary = walk_archive(&archive).expect("compressed listing succeeds");
+    assert_eq!(summary.entries.len(), 1);
+    assert_eq!(summary.entries[0].header.compression.method(), 1);
+    assert_eq!(summary.entries[0].header.name, "q");
+}
+
+#[test]
+fn walk_archive_rejects_reserved_compression_method() {
+    use peel::rar::format::{file_flags, hdr_flags};
+    use support::rar_fixtures::{
+        build_end_of_archive, build_generic_header, build_main_header, encode_vint,
+    };
+
+    // Methods 6 and 7 are reserved by the RAR5 spec and never
+    // produced by current encoders. The walker rejects them so
+    // future RARs that mis-set the field surface as a precise
+    // diagnostic rather than getting fed to the hand-rolled
+    // decoder.
+    let mut fields = Vec::new();
+    fields.extend_from_slice(&encode_vint(0));
+    fields.extend_from_slice(&encode_vint(0));
+    fields.extend_from_slice(&encode_vint(0));
+    let comp_info: u64 = 6u64 << 7; // method = 6 (reserved)
+    fields.extend_from_slice(&encode_vint(comp_info));
+    fields.extend_from_slice(&encode_vint(1));
+    fields.extend_from_slice(&encode_vint(1));
+    fields.push(b'r');
+    let _ = file_flags::DIRECTORY;
+    let _ = hdr_flags::DATA_AREA;
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&peel::rar::SIGNATURE_MAGIC);
+    archive.extend_from_slice(&build_main_header(0, None));
+    archive.extend_from_slice(&build_generic_header(2, 0, &fields, &[], None));
+    archive.extend_from_slice(&build_end_of_archive());
+
+    let err = walk_archive(&archive).expect_err("reserved method should fail");
     match err {
         RarError::UnsupportedFeature { feature } => {
             assert!(
-                feature.contains("method 1") && feature.contains("STORED"),
+                feature.contains("method 6") && feature.contains("reserved"),
                 "got {feature}"
             );
         }

@@ -61,6 +61,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::bitmap::ChunkBitmap;
+use crate::decode::rar_native::dict::MAX_DICT_BYTES;
+use crate::decode::rar_native::RarStreamDecoder;
+use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
 use crate::download::scheduler::{DownloadStats, SchedulerError};
 use crate::download::sparse_file::{SparseFile, SparseFileError};
 use crate::punch::{align_down, align_up, PunchError, PunchHole};
@@ -334,13 +337,14 @@ impl<'a> RarPipeline<'a> {
                     let file =
                         parse_file_header(&header, local_buf).map_err(RarPipelineError::Rar)?;
                     let method = file.compression.method();
-                    if method != 0 {
+                    if method > 5 {
+                        // 6 / 7 are reserved by the format spec; rejecting
+                        // here surfaces a precise diagnostic rather than
+                        // letting the decoder failure mode leak.
                         return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
                             feature: format!(
-                                "compression method {method} (RAR5 standard \
-                                 algorithm) — round-one ships STORED only; \
-                                 the hand-rolled decoder lands in §4 \
-                                 (PLAN_rar5_decoder.md)"
+                                "compression method {method} (reserved by \
+                                 RAR5 spec for future use)"
                             ),
                         }));
                     }
@@ -468,7 +472,16 @@ impl<'a> RarPipeline<'a> {
         }
         self.wait_for_range(data_offset, data_end)?;
 
-        let begin_outcome = if resume_offset > 0 {
+        // Compressed entries (method >= 1) cannot resume mid-entry
+        // until §F1 of `PLAN_rar5_decoder.md` lands the serialized
+        // decoder snapshot. Round-one §E1 falls back to a fresh
+        // begin (truncating the on-disk prefix and re-extracting
+        // from byte 0) so resume still produces byte-identical
+        // output, just at the cost of redoing the entry's decode.
+        let method = entry.header.compression.method();
+        let effective_resume_offset = if method == 0 { resume_offset } else { 0 };
+
+        let begin_outcome = if effective_resume_offset > 0 {
             sink.begin_entry_resume(
                 idx,
                 &entry.header.name,
@@ -476,7 +489,7 @@ impl<'a> RarPipeline<'a> {
                 entry.header.unpacked_size,
                 entry.header.crc32,
                 None, // BLAKE2sp from extra-record subtypes lands in a follow-on
-                resume_offset,
+                effective_resume_offset,
             )
         } else {
             sink.begin_entry(
@@ -510,33 +523,35 @@ impl<'a> RarPipeline<'a> {
             return Ok((0, punched));
         }
 
-        // Stream the entry's data bytes from the sparse file into
-        // the sink. STORED is a passthrough so packed_size ==
-        // unpacked_size; we copy directly. Resume picks up at the
-        // sink's `resume_offset` without re-reading the prefix
-        // from the source — the sink already replayed the on-disk
-        // file to seed its running hashes.
-        let copy_start = data_offset.saturating_add(resume_offset);
-        let mut cursor_in_entry = copy_start;
-        let mut buf = vec![0u8; 64 * 1024];
-        while cursor_in_entry < data_end {
-            let want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
-            self.sparse
-                .read_exact_at(ByteOffset::new(cursor_in_entry), &mut buf[..want])
-                .map_err(RarPipelineError::Sparse)?;
-            sink.write_entry(&buf[..want])
-                .map_err(RarPipelineError::Sink)?;
-            cursor_in_entry = cursor_in_entry.saturating_add(want as u64);
-            if let Some(p) = self.progress_state {
-                p.set_bytes_decoded_input(cursor_in_entry);
+        if method == 0 {
+            // Stream the entry's data bytes from the sparse file
+            // into the sink. STORED is a passthrough so
+            // packed_size == unpacked_size; we copy directly.
+            // Resume picks up at the sink's `resume_offset` without
+            // re-reading the prefix from the source — the sink
+            // already replayed the on-disk file to seed its hashes.
+            let copy_start = data_offset.saturating_add(effective_resume_offset);
+            let mut cursor_in_entry = copy_start;
+            let mut buf = vec![0u8; 64 * 1024];
+            while cursor_in_entry < data_end {
+                let want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
+                self.sparse
+                    .read_exact_at(ByteOffset::new(cursor_in_entry), &mut buf[..want])
+                    .map_err(RarPipelineError::Sparse)?;
+                sink.write_entry(&buf[..want])
+                    .map_err(RarPipelineError::Sink)?;
+                cursor_in_entry = cursor_in_entry.saturating_add(want as u64);
+                if let Some(p) = self.progress_state {
+                    p.set_bytes_decoded_input(cursor_in_entry);
+                }
+                callback(&RarPipelineEvent::InEntryProgress {
+                    index: idx,
+                    bytes_written: sink.current_entry_offset(),
+                })
+                .map_err(RarPipelineError::Aborted)?;
             }
-            // Emit a mid-entry progress event after each chunk so
-            // the coordinator can throttle a checkpoint.
-            callback(&RarPipelineEvent::InEntryProgress {
-                index: idx,
-                bytes_written: sink.current_entry_offset(),
-            })
-            .map_err(RarPipelineError::Aborted)?;
+        } else {
+            self.decompress_entry_to_sink(idx, entry, data_offset, data_end, sink, callback)?;
         }
 
         let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;
@@ -551,6 +566,84 @@ impl<'a> RarPipeline<'a> {
         .map_err(RarPipelineError::Aborted)?;
 
         Ok((entry.header.unpacked_size, punched))
+    }
+
+    /// Standard-RAR5 (`compression.method() >= 1`) dispatch: build
+    /// a [`RarStreamDecoder`] over the entry's compressed bytes
+    /// and drive it until clean EOF. Decoded bytes flow through a
+    /// staging buffer into the sink so the in-flight resume
+    /// bookkeeping (`current_entry_offset`) stays the
+    /// post-decompression byte count the §3 sink was built for.
+    ///
+    /// Round-one §E1 buffers the entry's full compressed
+    /// `packed_size` into memory before constructing the decoder
+    /// (mirrors the zip / 7z pipelines' compressed-entry path).
+    /// The cost is bounded by the file header's `packed_size`;
+    /// `O.RAR.STREAMING_DECOMPRESS` will lift this to a
+    /// chunk-by-chunk reader once the decoder has stabilised
+    /// against a real corpus.
+    fn decompress_entry_to_sink<F>(
+        &self,
+        idx: u32,
+        entry: &FileEntry,
+        data_offset: u64,
+        data_end: u64,
+        sink: &mut RarSink,
+        callback: &mut F,
+    ) -> Result<(), RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let packed_size = data_end.saturating_sub(data_offset);
+        let mut compressed = vec![
+            0u8;
+            usize::try_from(packed_size).map_err(|_| {
+                RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: data_offset,
+                    reason: format!("packed_size {packed_size} exceeds usize on this platform"),
+                })
+            })?
+        ];
+        if !compressed.is_empty() {
+            self.sparse
+                .read_exact_at(ByteOffset::new(data_offset), &mut compressed)
+                .map_err(RarPipelineError::Sparse)?;
+        }
+
+        let dict_capacity = dict_capacity_for(&entry.header.compression).map_err(|e| {
+            RarPipelineError::Rar(RarError::UnsupportedFeature {
+                feature: format!("RAR5 dictionary size: {e}"),
+            })
+        })?;
+
+        let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(compressed));
+        let mut decoder = RarStreamDecoder::new(src, dict_capacity).map_err(decode_err_to_rar)?;
+
+        let mut staging: Vec<u8> = Vec::with_capacity(64 * 1024);
+        loop {
+            let status = decoder
+                .decode_step(&mut staging)
+                .map_err(decode_err_to_rar)?;
+            if !staging.is_empty() {
+                sink.write_entry(&staging).map_err(RarPipelineError::Sink)?;
+                staging.clear();
+                callback(&RarPipelineEvent::InEntryProgress {
+                    index: idx,
+                    bytes_written: sink.current_entry_offset(),
+                })
+                .map_err(RarPipelineError::Aborted)?;
+            }
+            if matches!(status, DecodeStatus::Eof) {
+                break;
+            }
+        }
+        // Decoder consumed every compressed byte; nudge the
+        // progress meter so the scheduler's max_disk_buffer
+        // throttle treats the entry's source range as released.
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(data_end);
+        }
+        Ok(())
     }
 
     /// Ensure the chunks covering `[start, start + initial_window)`
@@ -664,5 +757,61 @@ impl<'a> RarPipeline<'a> {
             .punch(self.sparse_fd, ByteOffset::new(aligned_start), len)
             .map_err(RarPipelineError::Punch)?;
         Ok(len)
+    }
+}
+
+/// Translate an entry's `CompressionInfo` into the LZSS
+/// dictionary capacity (in bytes). The wire selector encodes
+/// `dict_size_bytes = 128 KiB << selector`; we cap at
+/// [`MAX_DICT_BYTES`] (256 MiB — the round-one cap from
+/// `PLAN_rar5_decoder.md` §B1) and surface a precise diagnostic
+/// for selectors that overflow.
+fn dict_capacity_for(compression: &crate::rar::format::CompressionInfo) -> Result<usize, String> {
+    let selector = compression.dict_size_selector();
+    if selector > 14 {
+        return Err(format!(
+            "selector {selector} exceeds RAR5 spec maximum (14)"
+        ));
+    }
+    let bytes = (128u64 * 1024)
+        .checked_shl(
+            u32::try_from(selector)
+                .map_err(|_| format!("selector {selector} does not fit in u32"))?,
+        )
+        .ok_or_else(|| format!("selector {selector} overflows the u64 dict size"))?;
+    let usz = usize::try_from(bytes)
+        .map_err(|_| format!("dict size {bytes} bytes exceeds usize on this platform"))?;
+    if usz > MAX_DICT_BYTES {
+        return Err(format!(
+            "dict size {usz} bytes exceeds round-one cap of {MAX_DICT_BYTES} bytes \
+             (selector {selector})"
+        ));
+    }
+    Ok(usz)
+}
+
+/// Translate a [`DecodeError`] from the hand-rolled RAR5 decoder
+/// into a [`RarPipelineError`]. Read / format errors fold into
+/// the pipeline's `Rar` arm wrapping a synthetic
+/// [`RarError::CorruptHeader`]; sink-side write errors funnel
+/// through `Sink` (the streaming decoder writes into our staging
+/// `Vec<u8>` whose `write_all` is infallible, so this branch is
+/// only reached on a programming error and is mapped defensively).
+fn decode_err_to_rar(e: DecodeError) -> RarPipelineError {
+    match e {
+        DecodeError::Read { source, .. }
+        | DecodeError::Construct(source)
+        | DecodeError::Write(source) => RarPipelineError::Rar(RarError::CorruptHeader {
+            archive_offset: 0,
+            reason: format!("RAR5 stream decoder: {source}"),
+        }),
+        DecodeError::ResumeMismatch { expected, actual } => {
+            RarPipelineError::Rar(RarError::CorruptHeader {
+                archive_offset: 0,
+                reason: format!(
+                    "RAR5 stream decoder resume seam mismatch: expected {expected}, got {actual}"
+                ),
+            })
+        }
     }
 }

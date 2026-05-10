@@ -24,15 +24,28 @@
 //!                                 fact that compressed data
 //!                                 doesn't necessarily end on a
 //!                                 byte boundary.
-//!  bits 5..3  byte_count_minus_1 (0..7) — `block_size_bytes - 1`,
+//!  bits 5..3  byte_count_minus_1 (0..2) — `block_size_bytes - 1`,
 //!                                 so the actual byte_count is
-//!                                 `((flags >> 3) & 7) + 1`.
+//!                                 `((flags >> 3) & 7) + 1` and
+//!                                 lives in `1..=3`. Wire values
+//!                                 of 3..=7 surface as
+//!                                 [`BlockHeaderError::UnsupportedByteCount`]
+//!                                 — libarchive's reference
+//!                                 decoder caps the field at 3
+//!                                 and `rar a` never emits more.
 //!  bit  6     is_last_block      — terminate the block-walk
 //!                                 after this block.
 //!  bit  7     is_table_present   — whether this block carries
 //!                                 fresh Huffman tables (otherwise
 //!                                 reuses the previous block's).
 //! ```
+//!
+//! The checksum is `0x5A ^ flags ^ size[0] ^ size[1] ^ size[2]`,
+//! where `size[0..3]` is the LE block-size field zero-padded to
+//! 3 bytes. Libarchive folds every byte of the size into the
+//! checksum even when `byte_count < 3` — the upper-byte XOR is
+//! identity against the implicit zero, so the formula is
+//! `calc = 0x5A ^ flags ^ (block_size_bytes XORed)`.
 
 use thiserror::Error;
 
@@ -52,9 +65,11 @@ pub enum BlockHeaderError {
         buf_len: usize,
     },
 
-    /// The xor-checksum of `block_flags_u8` did not match the
-    /// `block_cksum` byte that followed it. RAR5's prologue
-    /// stamps a self-cksum to catch single-byte corruption.
+    /// The xor-checksum of the prologue did not match the
+    /// stamped `block_cksum` byte. The checksum covers
+    /// `flags + the LE block-size bytes` per libarchive's
+    /// `parse_block_header` formula
+    /// (`0x5A ^ flags ^ size[0] ^ size[1] ^ size[2]`).
     #[error(
         "RAR5 block header checksum mismatch: flags = {flags:#04x}, \
          expected_cksum = {expected:#04x}, got_cksum = {got:#04x}"
@@ -62,9 +77,23 @@ pub enum BlockHeaderError {
     BadChecksum {
         /// `block_flags_u8`.
         flags: u8,
-        /// `flags ^ 0x5A` (libarchive's `block_cksum` formula).
+        /// Computed checksum (`0x5A ^ flags ^ size_xor`).
         expected: u8,
         /// `block_cksum` byte from the wire.
+        got: u8,
+    },
+
+    /// The wire `byte_count_minus_1` field is 3..=7 (i.e.,
+    /// `byte_count > 3`). Libarchive's reference decoder only
+    /// supports 1..=3 size bytes; rejecting larger values
+    /// surfaces malformed / future-format input as a precise
+    /// diagnostic instead of a checksum mismatch.
+    #[error(
+        "RAR5 block header byte_count {got} out of supported range 1..=3 \
+         (libarchive caps at 3)"
+    )]
+    UnsupportedByteCount {
+        /// The decoded `byte_count` value (`1..=8`).
         got: u8,
     },
 }
@@ -117,19 +146,14 @@ pub fn parse_block_header(buf: &[u8]) -> Result<BlockHeader, BlockHeaderError> {
     }
     let flags = buf[0];
     let got_cksum = buf[1];
-    let expected_cksum = block_flags_checksum(flags);
-    if got_cksum != expected_cksum {
-        return Err(BlockHeaderError::BadChecksum {
-            flags,
-            expected: expected_cksum,
-            got: got_cksum,
-        });
-    }
 
     let bit_size = flags & 0b0000_0111;
     let byte_count = ((flags >> 3) & 0b0000_0111) + 1;
     let is_last_block = (flags & 0b0100_0000) != 0;
     let is_table_present = (flags & 0b1000_0000) != 0;
+    if byte_count > 3 {
+        return Err(BlockHeaderError::UnsupportedByteCount { got: byte_count });
+    }
 
     let header_bytes = 2 + usize::from(byte_count);
     if buf.len() < header_bytes {
@@ -138,10 +162,22 @@ pub fn parse_block_header(buf: &[u8]) -> Result<BlockHeader, BlockHeaderError> {
             buf_len: buf.len(),
         });
     }
-    // LE block-size: `byte_count` bytes starting at offset 2.
+    // LE block-size: `byte_count` bytes starting at offset 2. The
+    // checksum folds these into `flags ^ 0x5A` per libarchive's
+    // `parse_block_header` formula.
     let mut block_size: u64 = 0;
+    let mut size_xor: u8 = 0;
     for (i, &b) in buf[2..header_bytes].iter().enumerate() {
         block_size |= u64::from(b) << (i * 8);
+        size_xor ^= b;
+    }
+    let expected_cksum = block_prologue_checksum(flags, size_xor);
+    if got_cksum != expected_cksum {
+        return Err(BlockHeaderError::BadChecksum {
+            flags,
+            expected: expected_cksum,
+            got: got_cksum,
+        });
     }
     Ok(BlockHeader {
         bit_size,
@@ -153,12 +189,15 @@ pub fn parse_block_header(buf: &[u8]) -> Result<BlockHeader, BlockHeaderError> {
     })
 }
 
-/// Recompute the block-flags checksum byte. libarchive's
-/// `parse_block_header` validates `block_cksum == flags ^ 0x5A`;
-/// the constant comes from the RAR5 reference decoder.
+/// Recompute the block-prologue checksum. Libarchive's
+/// `parse_block_header` validates
+/// `block_cksum == 0x5A ^ flags ^ size[0] ^ size[1] ^ size[2]`;
+/// the upper size bytes XOR-fold to identity when `byte_count < 3`,
+/// so the caller passes an `xor` that already covers all bytes
+/// it actually read.
 #[must_use]
-fn block_flags_checksum(flags: u8) -> u8 {
-    flags ^ 0x5A
+fn block_prologue_checksum(flags: u8, size_xor: u8) -> u8 {
+    0x5A ^ flags ^ size_xor
 }
 
 #[cfg(test)]
@@ -186,10 +225,14 @@ mod tests {
         f
     }
 
+    fn xor_all(bytes: &[u8]) -> u8 {
+        bytes.iter().fold(0u8, |acc, &b| acc ^ b)
+    }
+
     fn build_prologue(flags: u8, block_size_bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + block_size_bytes.len());
         out.push(flags);
-        out.push(block_flags_checksum(flags));
+        out.push(block_prologue_checksum(flags, xor_all(block_size_bytes)));
         out.extend_from_slice(block_size_bytes);
         out
     }
@@ -239,18 +282,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_byte_count_8_max() {
-        // byte_count = 8 → 8 LE bytes for block_size.
-        let flags = build_flags(7, 8, true, true);
-        let mut size_bytes = [0u8; 8];
-        size_bytes[0] = 0x01;
-        size_bytes[7] = 0x80;
+    fn parses_byte_count_3_max() {
+        // libarchive caps `byte_count` at 3 size bytes; we mirror
+        // that limit. Verify the max-supported case round-trips.
+        let flags = build_flags(7, 3, true, true);
+        let size_bytes = [0xEFu8, 0xCD, 0xAB];
         let buf = build_prologue(flags, &size_bytes);
         let hdr = parse_block_header(&buf).unwrap();
-        assert_eq!(hdr.byte_count, 8);
+        assert_eq!(hdr.byte_count, 3);
         assert_eq!(hdr.bit_size, 7);
-        assert_eq!(hdr.block_size, 0x8000_0000_0000_0001);
-        assert_eq!(hdr.header_bytes, 10);
+        assert_eq!(hdr.block_size, 0x00AB_CDEF);
+        assert_eq!(hdr.header_bytes, 5);
     }
 
     #[test]
@@ -267,10 +309,10 @@ mod tests {
 
     #[test]
     fn rejects_truncated_size_field() {
-        // byte_count = 4 expects 4 size bytes; supply 2.
-        let flags = build_flags(0, 4, false, false);
-        let mut buf = vec![flags, block_flags_checksum(flags)];
-        buf.extend_from_slice(&[0x10, 0x20]); // only 2 bytes
+        // byte_count = 3 expects 3 size bytes; supply 1.
+        let flags = build_flags(0, 3, false, false);
+        let mut buf = vec![flags, block_prologue_checksum(flags, 0x10)];
+        buf.extend_from_slice(&[0x10]); // only 1 byte
         let err = parse_block_header(&buf).unwrap_err();
         assert!(matches!(err, BlockHeaderError::Truncated { needed: 2, .. }));
     }
@@ -280,7 +322,7 @@ mod tests {
         let flags = build_flags(0, 1, false, false);
         let buf = vec![
             flags,
-            block_flags_checksum(flags) ^ 0x01, // corrupt checksum
+            block_prologue_checksum(flags, 0x01) ^ 0x01, // corrupt checksum
             0x01,
         ];
         let err = parse_block_header(&buf).unwrap_err();
@@ -298,17 +340,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_byte_count_above_three() {
+        // Wire `byte_count_minus_1 = 3` → byte_count = 4.
+        // libarchive's `parse_block_header` caps at 3 size bytes;
+        // we surface the rejection precisely.
+        let flags: u8 = 0b0001_1000; // byte_count_minus_1 = 3 (bits 5..3)
+        let buf = vec![flags, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let err = parse_block_header(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockHeaderError::UnsupportedByteCount { got: 4 }
+        ));
+    }
+
+    #[test]
     fn checksum_formula_matches_libarchive() {
-        // libarchive: cksum = flags ^ 0x5A.
+        // libarchive: cksum = 0x5A ^ flags ^ size[0] ^ size[1] ^ size[2].
         for flags in 0u8..=255u8 {
-            assert_eq!(block_flags_checksum(flags), flags ^ 0x5A);
+            for s0 in [0u8, 0x18, 0xCD, 0xFF] {
+                for s1 in [0u8, 0x10, 0xAA] {
+                    let xor = s0 ^ s1;
+                    assert_eq!(
+                        block_prologue_checksum(flags, xor),
+                        0x5A ^ flags ^ xor,
+                        "flags={flags:#04x} s0={s0:#04x} s1={s1:#04x}",
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn matches_libarchive_solid_archive_prologue() {
+        // Bytes lifted verbatim from `testfile.rar5.solid.rar`'s
+        // first block prologue (offset 0x3E in the archive). flags
+        // = 0xC6 (bit_size=6, byte_count=1, is_last=true,
+        // is_table_present=true), block_size byte = 0x18 (24).
+        // libarchive's expected checksum is
+        // `0x5A ^ 0xC6 ^ 0x18 = 0x84` — proves the §E1 fix
+        // covers the "first byte of size XOR'd into the cksum" arm.
+        let buf = [0xC6, 0x84, 0x18];
+        let hdr = parse_block_header(&buf).expect("solid prologue parses");
+        assert_eq!(hdr.bit_size, 6);
+        assert_eq!(hdr.byte_count, 1);
+        assert!(hdr.is_last_block);
+        assert!(hdr.is_table_present);
+        assert_eq!(hdr.block_size, 0x18);
     }
 
     #[test]
     fn round_trips_every_bit_size_and_byte_count_combination() {
         for bit_size in 0u8..=7 {
-            for byte_count in 1u8..=8 {
+            for byte_count in 1u8..=3 {
                 for is_last in [false, true] {
                     for has_table in [false, true] {
                         let flags = build_flags(bit_size, byte_count, is_last, has_table);

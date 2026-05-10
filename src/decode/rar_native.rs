@@ -22,11 +22,12 @@
 //! - **Phase F** — mid-entry serialize/deserialize for resume.
 //! - **Phase G** — throughput.
 //!
-//! Each phase ends with a runnable demo per the plan; the module
-//! re-export surface (below) is empty until Phase E lands the
-//! decoder. Earlier phases publish their primitives as `pub mod`
-//! children for tests to exercise but keep the runtime API
-//! private until the integration phase wires them together.
+//! Each phase ends with a runnable demo per the plan; the
+//! [`stream::RarStreamDecoder`] integration landed in §E1 and is
+//! the runtime API the §3 RAR pipeline dispatches to for
+//! `compression method != 0` entries. Phase A–C primitives stay
+//! exposed as `pub mod` children for tests to exercise and for
+//! §F1 resume to seed.
 //!
 //! # Build flag
 //!
@@ -44,3 +45,6 @@ pub mod filters;
 pub mod huffman;
 pub mod length;
 pub mod lzss;
+pub mod stream;
+
+pub use stream::RarStreamDecoder;
