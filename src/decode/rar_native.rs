@@ -43,3 +43,4 @@ pub mod distance;
 pub mod filters;
 pub mod huffman;
 pub mod length;
+pub mod lzss;
