@@ -1,10 +1,12 @@
 ## Plan: legacy RAR (RAR3 / RAR4) archive support
 
-> **Status: drafted 2026-05-10, not yet started.** This plan resolves
-> follow-on `O.RAR4` from `docs/PLAN_rar.md`. It is a sibling sub-plan
-> to `docs/PLAN_rar5_decoder.md` — additive to `docs/PLAN_rar.md`, not
-> a supersession. None of §A1+ may begin until §0 below is resolved
-> by the project owner.
+> **Status: drafted 2026-05-10, partially landed.** §0 resolved
+> 2026-05-10. **§A1 landed (commit 6c96328).** **§A2a landed (commit
+> 38ff665)** — signature dispatch + sibling archive walker. §A2b
+> (pipeline integration) is the next checkpoint. This plan resolves
+> follow-on `O.RAR4` from `docs/PLAN_rar.md`. It is a sibling
+> sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
+> `docs/PLAN_rar.md`, not a supersession.
 >
 > **Sequencing.** `PLAN_rar.md` §1–§4 plus `PLAN_rar5_decoder.md`
 > Phases A–E must be on `main` first. The hand-rolled RAR5 decoder
@@ -217,7 +219,7 @@ into without modification.
 
 ## Phase A — Format layer
 
-### §A1. Legacy header parser
+### §A1. Legacy header parser ✅ (commit 6c96328)
 
 **What**: hand-rolled parser for the legacy fixed-layout headers,
 sibling of [src/rar/format.rs](src/rar/format.rs). Lives at
@@ -255,27 +257,70 @@ extract).
 
 ### §A2. Pipeline dispatch
 
-**What**: signature dispatch in `crate::rar::archive::walk_archive`
-plus the streaming-decoder factory. Existing 7-byte detector already
-sets `UnsupportedFormatVersion`; replace with a real branch.
+Split into two sub-steps during implementation: §A2a lands the
+structural pieces in isolation; §A2b ports the (~1 kLOC) RAR5
+pipeline. Splitting keeps each diff reviewable.
 
-Lives in [src/rar.rs](src/rar.rs) and [src/rar/archive.rs](src/rar/archive.rs).
+#### §A2a. Signature dispatch + legacy walker ✅ (commit 38ff665)
+
+**What landed**: top-level [`SignatureKind`](../src/rar.rs)
+enum + `detect_signature` in `crate::rar`, and
+`crate::rar::legacy::archive::{walk_archive, LegacyArchiveSummary,
+LegacyFileEntry}` mirroring the RAR5 walker. The walker enforces
+`§0` rejections at parse time (multi-volume, encryption,
+pre-2.9 `unp_ver`) and skips comments / AV / sub-blocks /
+recovery records silently.
+
+13 unit tests cover dispatcher truncation/garbage paths and walker
+happy-path / multi-entry / ordering / unknown-block cases.
+
+**Deliberately not in scope of §A2a**:
+
+- The existing `crate::rar::format::parse_signature` still rejects
+  the legacy magic with `UnsupportedFormatVersion`. The RAR5
+  pipeline (`crate::download::rar_pipeline`) still calls that
+  function. Net effect: legacy archives still fail with the
+  pre-existing diagnostic when `peel` actually runs against one.
+  §A2b unblocks that.
+- No streaming-decoder factory changes — `streaming_factory_placeholder`
+  is unaffected, RAR5 callers see no semantic change.
+
+#### §A2b. Pipeline integration (next)
+
+**What**: refactor `crate::download::rar_pipeline` to dispatch on
+`SignatureKind` and route legacy archives through a sibling walker
++ STORED extraction path. Per §0.2 the serial-solid driver and the
+sparse-file/punch/checkpoint plumbing are shared; the format
+delta is in the walker, the per-entry sink expectations
+(BLAKE2sp vs. CRC-32-only), and the `SinkState::Rar` checkpoint
+shape.
 
 **Sketch**.
 
-1. `parse_signature` returns an enum `{ Rar5, RarLegacy }` instead
-   of bool-or-error. The caller dispatches.
-2. `crate::download::rar_pipeline` learns a `LegacyArchiveWalker`
-   alternative; per §0.2 they share the solid-mode driver.
-3. `streaming_factory_placeholder` registration unchanged — both
-   paths still reach the pipeline, never the streaming decoder
-   loop.
+1. Replace the pipeline's `parse_signature` call with
+   `crate::rar::detect_signature`. Add a `SignatureKind`-keyed
+   branch.
+2. Generalise `crate::sink::rar::RarSink` so per-entry hashes are
+   driven by what the file header actually carries (RAR5: BLAKE2sp +
+   optional CRC-32; legacy: CRC-32 only — no BLAKE2sp slot in
+   FILE_HEAD). The cleanest factoring is an `EntryHashSpec` enum
+   the walker hands the sink at `begin_entry` time.
+3. Reject `method != 0x30` (i.e. anything other than STORED) at
+   the legacy dispatch site with `RarError::UnsupportedFeature`
+   naming the method byte. `m=0` STORED extraction works
+   end-to-end via the existing copy-from-sparse-file path.
+4. `Checkpoint::format_version` bumps; `SinkState::Rar` grows a
+   discriminator so a resumed legacy extraction does not get
+   handed to the RAR5 walker. `PLAN_rar.md` §3 reserved this
+   slot.
 
-**Tests**: integration test extracting a known STORED legacy
-archive end-to-end.
+**Tests**: integration test extracting a curated STORED legacy
+archive end-to-end via the mock server. Crash-test parity
+(kill mid-entry) for STORED legacy.
 
 **Demo**: `peel http://mock/legacy_stored.rar` produces correct
-contents.
+contents. The `--format rar` override goes through the legacy
+walker when the bytes start with the legacy magic.
 
 ---
 
