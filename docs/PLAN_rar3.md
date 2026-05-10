@@ -1,16 +1,21 @@
 ## Plan: legacy RAR (RAR3 / RAR4) archive support
 
-> **Status: drafted 2026-05-10, Phase A landed, Phase B in
-> progress.** §0 resolved 2026-05-10. **§A1 (6c96328) + §A2a
-> (38ff665) + §A2b (cc60bf8)** complete: STORED-method legacy
-> archives extract end-to-end. **§B0 (e730509)** lands the PPMd-II
-> range coder under `src/decode/ppmd2/` — round-tripped against a
-> test-only sister encoder across uniform / skewed / adaptive-binary
-> distributions. **§B1 (62bc41c)** lands the PPMd-II suballocator
-> alongside it: 38 freelist size classes, two-direction unit region,
-> GlueCount-driven coalescing. §B2 (context tree + decode loop) is
-> the bulk of Phase B. This plan resolves follow-on `O.RAR4` from
-> `docs/PLAN_rar.md`. It is a sibling sub-plan to
+> **Status: drafted 2026-05-10, Phase A landed, Phase B landed
+> (modulo §B3 differential fixtures).** §0 resolved 2026-05-10.
+> **§A1 (6c96328) + §A2a (38ff665) + §A2b (cc60bf8)** complete:
+> STORED-method legacy archives extract end-to-end. **§B0 (e730509)**
+> lands the PPMd-II range coder under `src/decode/ppmd2/` —
+> round-tripped against a test-only sister encoder across uniform /
+> skewed / adaptive-binary distributions. **§B1 (62bc41c)** lands
+> the PPMd-II suballocator alongside it: 38 freelist size classes,
+> two-direction unit region, GlueCount-driven coalescing.
+> **§B2a (c5119cc) + §B2b (f3a73b6) + §B2c (f3d1226)** land the
+> model: context tree, decode loop, update path, sister encoder,
+> and 21 round-trip / edge-case tests across the full order range
+> (2..=64), session restart, and small-arena exhaustion. §B3
+> (differential cross-check against unrar-produced fixtures) is the
+> next milestone in Phase B. This plan resolves follow-on `O.RAR4`
+> from `docs/PLAN_rar.md`. It is a sibling sub-plan to
 > `docs/PLAN_rar5_decoder.md` — additive to `docs/PLAN_rar.md`, not
 > a supersession.
 >
@@ -336,10 +341,11 @@ through it, the legacy crash-resume scenario will land alongside
 
 ## Phase B — PPMd-II
 
-> **Phase B sub-phasing** (resolved during §B0 implementation): the
-> original "§B1. PPMd-II model" item turned out to be too coarse —
-> the model decomposes into three weakly-coupled layers that should
-> land separately so each one's acceptance criteria are real.
+> **Phase B sub-phasing** (resolved during §B0 implementation,
+> further refined during §B2 implementation): the original
+> "§B1. PPMd-II model" item turned out to be too coarse — the model
+> decomposes into weakly-coupled layers that should land separately
+> so each one's acceptance criteria are real.
 >
 > - **§B0** ✅ (commit e730509) — range coder. Bit-level entropy
 >   primitive. Self-contained, round-trippable against a sister
@@ -348,10 +354,17 @@ through it, the legacy crash-resume scenario will land alongside
 >   allocator the PPMd model uses for its variable-order context
 >   tree. 12-byte units, 38 freelist size classes, GlueCount-driven
 >   compaction.
-> - **§B2** (next) — context tree + symbol-decode loop. Bulk of
->   the algorithm; consumes both §B0 and §B1.
-> - **§B3** — differential cross-check against `unrar`-produced
->   fixtures.
+> - **§B2** — context tree + symbol-decode loop. Bulk of the
+>   algorithm; consumes both §B0 and §B1. Further sub-split into
+>   §B2a (model foundation, init/restart, SEE table seeding),
+>   §B2b (decode loop, update_model, create_successors, rescale,
+>   sister encoder, round-trip tests), and §B2c (edge-case stress).
+> - **§B2a** ✅ (commit c5119cc) — model foundation + alloc.rs
+>   split fix.
+> - **§B2b** ✅ (commit f3a73b6) — decode loop + update model.
+> - **§B2c** ✅ (commit f3d1226) — edge-case stress.
+> - **§B3** (next) — differential cross-check against `unrar`-
+>   produced fixtures.
 
 ### §B1. PPMd-II suballocator ✅ (commit 62bc41c)
 
@@ -406,31 +419,98 @@ total** (was 1447 at §B0).
 **Demo**: `cargo test decode::ppmd2::alloc` passes; the allocator
 round-trips arbitrary alloc / free / shrink / glue sequences.
 
-### §B2. PPMd-II context tree + symbol-decode loop
+### §B2. PPMd-II context tree + symbol-decode loop ✅ (commits c5119cc + f3a73b6 + f3d1226)
 
-**What**: hand-rolled PPMd-II model. Lives alongside §B0 + §B1
-under `src/decode/ppmd2/`. Consumes the range coder
-([`range_dec`](../src/decode/ppmd2/range_dec.rs)) and the
-suballocator ([`alloc`](../src/decode/ppmd2/alloc.rs)) landed in
-§B0 + §B1.
+**What landed**: hand-rolled PPMd-II model at
+[src/decode/ppmd2/model.rs](../src/decode/ppmd2/model.rs).
+Faithful port of libarchive `archive_ppmd7.c` (itself a public-
+domain redistribution of the LZMA SDK Ppmd7). Sits on top of §B0's
+range coder and §B1's suballocator without modifying either's
+public surface (one `pub(super)` visibility bump on `Ref::new`).
 
-**Sketch**.
+**Public surface** (consumed by §C / pipeline integration):
 
-1. Context tree + suffix links. Order-N modelling with escape
-   probabilities.
-2. State-machine decode loop: `decode_symbol(ctx) -> u8`.
-3. Initialisation parameters: order, sub-allocator size, restart
-   policy. Legacy RAR sets all three at the start of each
-   `m=4`/`m=5` block.
-4. Text-region API on the suballocator — per-byte writes the
-   model uses to track the order-N context history. The shape
-   stays open until the model is in scope (see §B1 "what turned
-   out NOT to need").
+- `Model::new(arena_bytes, max_order) -> Result<Model, ModelError>`
+  / `Model::restart()` — construct and reset.
+- `Model::decode_symbol(&mut RangeDecoder<'_>) -> Result<u8, DecodeError>`
+  — decode one byte; mutates model state via internal
+  `update_model` / `update1` / `update1_0` / `update2` / `update_bin`.
+- `Model::allocator()` / `Model::max_order()` — read-only accessors
+  for integration code.
+- `ModelError` (`BadOrder`, `ArenaTooSmall`, `ArenaTooLarge`, `Alloc`).
+- `DecodeError` (`Range`, `EndMarker`, `Malformed`).
+- `MIN_ORDER = 2`, `MAX_ORDER = 64`, `MIN_MEM_SIZE = 2048`,
+  `MAX_MEM_SIZE ≈ 4 GiB - 36`.
 
-**Reference.** libarchive's `archive_read_support_format_rar.c`
-PPMd code, plus Shkarin's original PPMd-II paper. `7zip`'s
-`Ppmd7Dec.c` / `Ppmd7.c` are closely related and are the cleaner
-read.
+The model is range-coder-variant-agnostic — it calls
+`RangeDecoder::get_threshold` + `decode` exclusively, never the
+`decode_bit` shortcut. Binary contexts go through the n-ary path
+with `total = PPMD_BIN_SCALE (= 1 << 14)`, mirroring libarchive's
+`Range_DecodeBit_RAR`. Swapping in a RAR-variant range coder
+(needed by the real legacy pipeline, deferred to Phase C) reuses
+the same model verbatim.
+
+**What turned out NOT to need** (vs. the original sketch):
+
+- **No new text-region API on `Allocator` for §B2c.** §B2a added
+  the four-method text-region surface (`write_text_byte` /
+  `dec_text` / `read_byte` / `text` / `units_start`) that the
+  model layer needed. The "shape stays open" note from §B1 resolved
+  cleanly — per-byte writes, no buffering, boundary check is the
+  model's responsibility after each `write_text_byte`.
+- **No separate `State` / `Context` typed wrappers.** The on-disk
+  layouts live as byte offsets the typed accessors
+  (`ctx_num_stats`, `state_symbol`, etc.) read and write through.
+  Adding a typed wrapper layer would have meant either a parallel
+  representation (cache invalidation hazard) or `Ref<State>`-style
+  phantom-typed offsets (no real safety win on `u32` offsets).
+- **No RAR-variant range coder yet.** The 7z range coder from §B0
+  is correct for the model's round-trip tests (encoder and decoder
+  use the same arithmetic). The RAR variant is needed for actual
+  legacy RAR archive bytes and lands with §C2 / pipeline integration.
+
+**What §B2 had to fix from §B1**:
+
+- **alloc.rs initial unit/text split was inverted.** §B1 carved
+  1/8 of the arena into the unit region and 7/8 into text; the
+  canonical LZMA SDK Ppmd7 layout is 7/8 unit / 1/8 text. With
+  the inverted ratio, the model's initial 129-unit allocation
+  (root context + 128-unit state array) would have failed on any
+  arena below ~16 KiB even though `PPMD7_MIN_MEM_SIZE` is 2 KiB.
+  §B2a fixed it and added regression tests.
+
+**Tests**: 33 unit + round-trip + edge-case tests across §B2a/b/c.
+
+- §B2a (12 tests): `Model::new` rejection paths, `restart()`
+  invariants, root-context layout, BinSumm / See / DummySee
+  table seeding.
+- §B2b (9 tests): single-byte, repeated-byte (binary path),
+  alternating (swap + rescale), short / long ASCII at orders 4
+  and 8, LCG pseudorandom 1 KiB, 256-symbol permutation, all-zero
+  run, MIN_MEM_SIZE / MIN_ORDER corner.
+- §B2c (12 tests): every supported order (2..=64), two-session
+  restart, 32 KiB long stream, internal-restart-on-small-arena
+  (the load-bearing exhaustion case), cyclic 256-byte permutation,
+  MAX_ORDER on compressible input, decoder-side init-time and
+  mid-stream truncation surfacing typed `DecodeError::Range`,
+  accessor smoke tests.
+
+**1507 lib tests pass total** (was 1470 at §B1, +37 from §B2 net of
+the 16 alloc tests added in §B2a that test the text-region API and
+the canonical 7/8 split).
+
+**Demo**: `cargo test decode::ppmd2` runs all 69 module tests in
+≈0.25 s debug / ≈0.04 s release. `cargo test --release
+--all-features` clean. The model end-to-end round-trips arbitrary
+byte streams through the encode → decode pipeline.
+
+**Reference.** libarchive's `archive_ppmd7.c` / `archive_ppmd7_private.h`
+(BSD-2-Clause, in turn redistributing Igor Pavlov's public-domain
+LZMA SDK Ppmd7 code, in turn based on Dmitry Shkarin's PPMd var.H).
+The libarchive distribution was the porting source-of-truth
+because (a) it's the cleanest BSD-2-Clause form of the algorithm,
+and (b) it ships both the 7z and RAR range-coder variants behind
+one decode_symbol — useful when the RAR variant lands in Phase C.
 
 ### §B3. Differential cross-check
 
