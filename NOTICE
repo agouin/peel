@@ -1,0 +1,60 @@
+peel — streaming, resumable, space-efficient extraction of
+compressed archives downloaded over HTTP.
+
+Copyright (c) 2026 Andrew Gouin
+
+Licensed under either of:
+  - Apache License, Version 2.0 (LICENSE-APACHE), or
+  - MIT license (LICENSE-MIT)
+at your option.
+
+================================================================
+Third-party algorithm references
+================================================================
+
+The hand-rolled RAR5 decoder under `src/decode/rar_native/`
+(see `docs/PLAN_rar5_decoder.md`) is a clean-room
+reimplementation in Rust. The algorithm constants and
+structural understanding (meta-Huffman repeat codes, main
+alphabet sizes, length / distance base tables, filter type
+IDs, PPMd-II model parameters) were extracted from the
+RAR5 decoder shipped in libarchive
+(`libarchive/archive_read_support_format_rar5.c`), authored
+by Grzegorz Antoniak and licensed under the BSD 2-Clause
+license:
+
+    Copyright (c) 2018 Grzegorz Antoniak (http://antoniak.org)
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or
+    without modification, are permitted provided that the
+    following conditions are met:
+
+    1. Redistributions of source code must retain the above
+       copyright notice, this list of conditions and the
+       following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above
+       copyright notice, this list of conditions and the
+       following disclaimer in the documentation and/or other
+       materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY
+    EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+    TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+    THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+    GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+    BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+    OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+The `peel` Rust source under `src/decode/rar_native/` is
+original code; libarchive's source is referenced in
+module-level comments at the call sites where its constants
+informed the implementation. No libarchive code is
+distributed with `peel` or linked into the runtime binary.
