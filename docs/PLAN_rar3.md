@@ -25,7 +25,7 @@
 > exclusively) — fixtures come from the CC0 corpus at
 > [`ssokolow/rar-test-files`](https://github.com/ssokolow/rar-test-files)
 > with the bundled `unrar` as the reference-decoder side.
-> **§C1a (this commit)** lands the MSB-first bitstream reader at
+> **§C1a (e96f842)** landed the MSB-first bitstream reader at
 > [`src/decode/rar_legacy/bits.rs`](../src/decode/rar_legacy/bits.rs),
 > sibling of [`crate::decode::rar_native::bits`]; 17 unit tests
 > cover zero-bit reads, byte-spanning reads, 32-bit reads, peek vs.
@@ -33,7 +33,18 @@
 > block boundaries (the load-bearing libarchive-equivalent path),
 > a 60-group random round trip, and legacy-realistic 15-bit
 > Huffman / 18-bit distance-extra-bits widths at byte-boundary-
-> crossing offsets.
+> crossing offsets. **§C1b (this commit)** lands the canonical
+> Huffman builder at
+> [`src/decode/rar_legacy/huffman.rs`](../src/decode/rar_legacy/huffman.rs)
+> (15-bit max code, flat-lookup table sized `1 << max_len`, same
+> shape as the `rar_native::huffman` sibling) plus the per-block
+> bootstrap at
+> [`src/decode/rar_legacy/bootstrap.rs`](../src/decode/rar_legacy/bootstrap.rs)
+> (the 20-entry precode parser, the 404-entry main-length parser
+> with the delta-from-previous-block trick and the libarchive
+> repeat-last / zero-run opcode set, and the four-sub-tree
+> extractor). 24 unit tests across the two modules; lib-test
+> count now 1549.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -642,10 +653,13 @@ reproducible if a future bug needs the same level of triage.
 > demo / passing tests:
 >
 > - **§C0** ✅ (fadba5b) — sub-phasing + scaffolding.
-> - **§C1a** ✅ (this commit) — bitstream reader (MSB-first, with
+> - **§C1a** ✅ (e96f842) — bitstream reader (MSB-first, with
 >   `align_to_byte` for block-start alignment per libarchive's
 >   `rar_br_consume_unaligned_bits`).
-> - **§C1b** — canonical Huffman builder + 4-tree code-length parser.
+> - **§C1b** ✅ (this commit) — canonical Huffman builder
+>   (`HuffmanCode`, flat-lookup table, 15-bit max) + per-block
+>   bootstrap (20-entry precode → 404 main-table lengths → four
+>   sub-trees of size 299 / 60 / 17 / 28).
 > - **§C1c** — block header / block-type discriminator / "tables
 >   present" flag.
 > - **§C1d** — sliding-window dictionary (4 MiB max, 4-deep
@@ -854,6 +868,102 @@ total** (was 1508 at §C0, +17 from §C1a).
 
 **Demo**: `cargo test --features rar decode::rar_legacy::bits`
 runs all 17 tests in <50 ms debug / <10 ms release.
+
+#### §C1b. Canonical Huffman + per-block bootstrap ✅ (this commit)
+
+**What landed**:
+
+1. [`src/decode/rar_legacy/huffman.rs`](../src/decode/rar_legacy/huffman.rs)
+   — `HuffmanCode` builder + decoder. Same shape as the
+   `rar_native::huffman` sibling: MSB-first canonical codes
+   stored as a flat lookup table sized `1 << max_len`, queried
+   via [`super::bits::BitReader::peek_bits`] + `consume_bits`.
+   15-bit max code length (libarchive's `MAX_SYMBOL_LENGTH`);
+   worst-case table 128 KiB per code, 512 KiB for the four-tree
+   block, negligible against the 4 MiB sliding-window dictionary
+   §C1d will land.
+2. [`src/decode/rar_legacy/bootstrap.rs`](../src/decode/rar_legacy/bootstrap.rs)
+   — the three layers libarchive's `parse_codes` interleaves:
+   `read_precode_lengths` (20 × 4-bit literals with the `0xF` +
+   zerocount escape), `read_main_lengths` (404 entries decoded
+   via the precode with delta-mod-16 + repeat-last + zero-run
+   opcodes), and `build_main_tables` (slice the 404-entry buffer
+   into the four canonical sub-trees: `main` 299, `offset` 60,
+   `low_offset` 17, `length` 28).
+
+**Public surface** (consumed by §C1c onwards):
+
+- `huffman::HuffmanCode` + `HuffmanCode::build(&[u8]) -> Result<…>`
+  + `HuffmanCode::decode(&mut BitReader) -> Result<u16, …>` +
+  `HuffmanCode::bits()` + `HuffmanCode::is_populated()`.
+- `huffman::HuffmanError` (`CodeLengthTooLarge`, `OverSubscribed`,
+  `MissingPrefix`, `Underrun`).
+- `bootstrap::{MAIN_CODE_SIZE, OFFSET_CODE_SIZE, LOW_OFFSET_CODE_SIZE,
+  LENGTH_CODE_SIZE, MAIN_TABLE_TOTAL, PRECODE_SIZE}` — the libarchive-
+  matching constants.
+- `bootstrap::MainTables { main, offset, low_offset, length }`.
+- `bootstrap::read_precode_lengths(reader) -> Result<[u8; 20], …>`.
+- `bootstrap::read_main_lengths(reader, precode, &mut [u8; 404])
+  -> Result<(), …>`. Note: the caller owns the per-entry buffer
+  across blocks and decides whether to memset-to-zero (when
+  `keep_old_tables` is false) or retain the previous block's
+  values (when true). This matches libarchive's lengthtable
+  semantics and is what enables the delta-from-previous-block
+  encoding.
+- `bootstrap::build_main_tables(&[u8; 404]) -> Result<MainTables, …>`.
+- `bootstrap::BootstrapError` (`Underrun`, `HuffmanBuild`,
+  `RepeatLastAtStart`, `InvalidPrecodeSymbol`).
+
+**What turned out NOT to need** (vs. the §C0 sketch):
+
+- **No fallback decode tree.** Libarchive's `huffman_code` mixes
+  a flat lookup table (sized `min(max_len, 10)`) with a tree
+  walked when codes exceed the table size. The rar_native
+  sibling uses a single flat-lookup table at `max_len` width and
+  pays the 128 KiB / code worst case for simpler / faster decode.
+  §C1b inherits that posture; the worst case fits in L2 and is
+  ~4 × what rar_native pays in a single block. §G may revisit if
+  profiling shows it matters.
+- **No precode "fast path" for libarchive's `Range_DecodeBit_RAR`
+  variant.** That's the RAR-variant range coder §C1f lands; the
+  bootstrap's precode goes through the same canonical Huffman
+  primitive as the main code.
+- **No explicit Kraft-equality enforcement.** A canonical code
+  with `Σ 2^(-len) < 1` is *under-subscribed* — some prefixes
+  don't map to any symbol — but that's not malformed per se
+  (libarchive accepts them). The decoder surfaces
+  `HuffmanError::MissingPrefix` when an under-subscribed alphabet
+  is hit at decode time; the builder only rejects over-
+  subscription, where the canonical-code accumulator overflows
+  `1 << max_len`.
+
+**Tests**: 24 unit tests across the two new files.
+
+- `huffman.rs` (10 tests): empty alphabet, single-symbol
+  alphabet, two-symbol equal-length codes, a six-symbol
+  hand-checked canonical round trip, over-subscription
+  rejection, code-length-too-large rejection, under-subscription
+  decode-time `MissingPrefix`, mid-symbol underrun surfacing,
+  200-symbol mixed-length-alphabet LCG-shuffled round trip, and
+  the max-code-length-15 alphabet building cleanly.
+- `bootstrap.rs` (14 tests): twenty literal precode lengths
+  round-trip, `0xF` + zerocount-0 literal-15 path, `0xF` +
+  zerocount-5 zero-run path, end-of-buffer truncation of an
+  oversized zero run, precode-side underrun, delta-mod-16 update
+  semantics across 404 entries, opcode-16 small repeat-last,
+  opcodes-18/19 zero-runs, opcode-16 + opcode-17 at index 0
+  errors, the delta `(15 + 1) & 15 = 0` wrap, `build_main_tables`
+  slicing into four canonical codes with mixed populated /
+  empty sub-trees, `build_main_tables` surfacing
+  `HuffmanError::OverSubscribed` through the wrapped error type,
+  and an end-to-end "encode precode + main stream → decode
+  precode + main stream → build sub-tables" round trip.
+
+**1549 lib tests pass total** (was 1525 at §C1a, +24 from §C1b).
+
+**Demo**: `cargo test --features rar decode::rar_legacy` runs
+all 41 rar_legacy module tests (17 from §C1a + 24 from §C1b) in
+<10 ms release.
 
 ---
 

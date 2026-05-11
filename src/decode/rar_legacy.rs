@@ -18,9 +18,12 @@
 //! - **§C1a** ✅ — [`bits`]: MSB-first bitstream reader with
 //!   byte-alignment for block boundaries (libarchive's
 //!   `rar_br_consume_unaligned_bits` equivalent).
-//! - **§C1b** — `huffman` + `bootstrap`: canonical Huffman builder
-//!   and 4-tree code-length parser (literals 299, distances 60,
-//!   lower-distance bits 17, repeats 28).
+//! - **§C1b** ✅ — [`huffman`] + [`bootstrap`]: canonical Huffman
+//!   builder (15-bit max, flat-lookup table) and per-block
+//!   bootstrap (20-entry precode → 404-entry main length table →
+//!   four canonical sub-trees for `MAIN_CODE_SIZE` = 299,
+//!   `OFFSET_CODE_SIZE` = 60, `LOW_OFFSET_CODE_SIZE` = 17,
+//!   `LENGTH_CODE_SIZE` = 28).
 //! - **§C1c** — `block_header`: block-type discriminator and
 //!   "tables present" / "use previous block's tables" flag.
 //! - **§C1d** — `dict`: 4 MiB sliding-window dictionary with a
@@ -59,3 +62,5 @@
 //! not compile this module.
 
 pub mod bits;
+pub mod bootstrap;
+pub mod huffman;
