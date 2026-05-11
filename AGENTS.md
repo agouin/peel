@@ -88,6 +88,29 @@ Do:
 - `cargo test` must pass on every commit. `cargo test --release` and any
   `--ignored` long-running tests must pass before merging a plan section.
 
+## RAR source policy
+
+The RAR3 and RAR5 decoders are clean-room implementations. `peel`
+is licensed `MIT OR Apache-2.0`; the unRAR license is non-OSI and
+GPL-incompatible, so even reading the `unrar` source would
+contaminate the derivation. This is a hard rule, not an "ask first"
+rule.
+
+- **Do not read, copy, paraphrase, or port from RARLAB's `unrar`** —
+  source, comments, identifiers, table contents, magic constants.
+  Don't open the tree.
+- `libarchive`'s RAR readers (LGPL-2.1, OSI) **may** be referenced
+  as an external spec when the wire format requires one — read,
+  not vendored or linked. Cite the file/section in your commit
+  message or the relevant `PLAN_rar*.md` plan when you do.
+- Test fixtures are produced with a license-purchased copy of
+  RARLAB's `rar` encoder. The `unrar` binary is a benchmark
+  comparator only, never an implementation reference.
+
+This rule binds all future RAR work — new phases, follow-ons,
+optimisation passes, bug fixes. If you find yourself wishing you
+could check `unrar` for "the right answer," stop and ask the human.
+
 ## Communicating with the human
 
 - When you finish a task, summarize: what you did, what you tested, what

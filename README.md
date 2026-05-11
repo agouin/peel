@@ -386,6 +386,25 @@ one folder at a time — a `kill -9` mid-folder restarts that folder
 from the start of its packed range; per-coder intra-folder resume,
 BCJ filters, AES, and multi-volume archives are queued.
 
+## RAR provenance
+
+`peel`'s RAR3 and RAR5 decoders are clean-room implementations.
+RARLAB's `unrar` source has not been consulted at any point.
+`libarchive`'s RAR readers (LGPL-2.1, OSI-licensed) are referenced
+as an external spec where the RAR wire format requires one — read,
+not vendored or linked.
+
+Test fixtures are produced with a license-purchased copy of
+RARLAB's `rar` encoder. The `unrar` binary is not linked,
+vendored, or used as an implementation reference; it appears in
+the RAR benchmark grid as a third-party point of comparison only.
+
+`peel` is licensed `MIT OR Apache-2.0`. The unRAR license is
+non-OSI and GPL-incompatible, so a clean-room derivation is the
+only way to ship a RAR decoder without inheriting that constraint.
+All future RAR work in this repo must continue the same practice —
+see [`AGENTS.md`](AGENTS.md).
+
 ## For contributors and AI agents
 
 Start with [`CLAUDE.md`](CLAUDE.md) (or [`AGENTS.md`](AGENTS.md) — both
