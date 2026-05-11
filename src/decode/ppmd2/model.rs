@@ -568,6 +568,20 @@ impl Model {
         &self.alloc
     }
 
+    /// Seed the model's `init_esc` (escape-probability) value.
+    ///
+    /// Called by the legacy RAR PPMd-entry path (§C1g) after a
+    /// restart-mode block prologue parses an explicit init-escape
+    /// byte (`ppmd_flags & 0x40`). When the prologue's flag is
+    /// cleared, libarchive's `parse_codes` uses `2` as the
+    /// default; the caller mirrors that. `init_esc` participates
+    /// in `update_model`'s SummFreq seeding, so setting it before
+    /// any `decode_symbol` call is what plumbs the prologue's
+    /// hint into model state.
+    pub fn set_init_esc(&mut self, value: u32) {
+        self.init_esc = value;
+    }
+
     // ── Internal byte-level accessors ────────────────────────────
 
     fn write_context_root_init(&mut self, ctx: Ref, stats: Ref) {

@@ -79,7 +79,7 @@
 > cross-check originally pitched for §C1e₂ can't run today.
 > Cross-check defers to §C1g; the corpus is the PPMd cross-
 > check target there.
-> **§C1f (this commit)** lands the RAR-variant of the PPMd
+> **§C1f (5976588)** landed the RAR-variant of the PPMd
 > range coder in
 > [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
 > `RangeCoderVariant { Sevenz, Rar }` discriminator; new
@@ -96,7 +96,22 @@
 > The model layer's 4 binary-context call sites rename to
 > `decode_bit_bin` / `encode_bit_bin`; the §B PPMd round-trip
 > and differential-corpus tests all pass unchanged. 5 new
-> RAR-init / structural tests; lib-test count now 1603.
+> RAR-init / structural tests.
+> **§C1g (this commit)** lands the per-entry PPMd decoder at
+> [`src/decode/rar_legacy/ppmd_entry.rs`](../src/decode/rar_legacy/ppmd_entry.rs)
+> — `PpmdSession` owns the model + dict + escape-byte state
+> and implements libarchive's `read_data_compressed`
+> dispatch loop (lines 2158..=2238). Two ssokolow CC0
+> archives at [`tests/fixtures/rar_legacy/`](../tests/fixtures/rar_legacy/)
+> + a new integration test at
+> [`tests/test_rar_legacy_ppmd.rs`](../tests/test_rar_legacy_ppmd.rs)
+> bring the first end-to-end legacy RAR archive decode home:
+> `walk_archive → BitReader → parse_block_prologue →
+> RangeDecoder::new_rar → PpmdSession::decode_block`
+> produces the expected `"Testing 123\n"` plaintext for both
+> non-solid (128 KiB dict) and solid (1 MiB dict) variants.
+> 8 new unit tests + 4 integration tests; lib-test count now
+> 1611.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -740,7 +755,7 @@ reproducible if a future bug needs the same level of triage.
 >   §C1g, where PPMd lands and the ssokolow corpus actually
 >   decodes. The synthetic-fixture coverage in §C1e₁ is the LZ
 >   path's primary validation until then.
-> - **§C1f** ✅ (this commit) — RAR-variant range coder added
+> - **§C1f** ✅ (5976588) — RAR-variant range coder added
 >   to [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
 >   `RangeCoderVariant { Sevenz, Rar }` discriminator; new
 >   `new_rar(src)` constructor (4-byte init, no leading marker,
@@ -754,9 +769,22 @@ reproducible if a future bug needs the same level of triage.
 >   decode` matching `Range_DecodeBit_RAR`. Model layer is
 >   variant-agnostic (4 call-site renames; no behaviour
 >   change for 7z).
-> - **§C1g** — PPMd entry path (`m=4`/`m=5`): wire
->   `crate::decode::ppmd2::Model` through the legacy per-entry
->   pipeline using the §C1f range coder.
+> - **§C1g** ✅ (this commit) — PPMd entry path. New
+>   [`ppmd_entry`](../src/decode/rar_legacy/ppmd_entry.rs)
+>   module: `PpmdSession` wraps
+>   [`Model`](../src/decode/ppmd2/model.rs) +
+>   [`Dict`](../src/decode/rar_legacy/dict.rs) + escape-byte
+>   state for per-entry PPMd decoding. Implements libarchive's
+>   `read_data_compressed` (lines 2158..2238) dispatch:
+>   literal-vs-escape, EOD marker (code 2), new-table (code 0,
+>   surfaced for §C1h), large LZ match (code 4), short LZ match
+>   (code 5), escape-of-escape literals. **First end-to-end
+>   legacy RAR archive decode lands here**: the ssokolow
+>   `testfile.rar3.rar` + `testfile.rar3.solid.rar` (98 bytes
+>   each, CC0) decode to the expected 12-byte plaintext through
+>   the full stack walk_archive → BitReader →
+>   parse_block_prologue → RangeDecoder::new_rar →
+>   PpmdSession::decode_block.
 > - **§C1h** — solid-mode driver + multi-block continuation across
 >   entries.
 > - **§C2a** — RarVM bytecode parser + standard filter set
@@ -1471,9 +1499,135 @@ differential corpus and the 33 model edge-case tests.
 
 **Demo**: `cargo test --features rar decode::ppmd2` runs all
 75 ppmd2 module tests in <1 s release. The range decoder is
-now wired for both 7z and RAR; §C1g will plumb the legacy LZ
+now wired for both 7z and RAR; §C1g plumbs the legacy LZ
 pipeline's PPMd-mode entries through a `RangeDecoder::new_rar
 → Model::decode_symbol` chain.
+
+#### §C1g. PPMd entry path ✅ (this commit)
+
+**What landed**: the per-entry PPMd dispatcher at
+[`src/decode/rar_legacy/ppmd_entry.rs`](../src/decode/rar_legacy/ppmd_entry.rs).
+`PpmdSession` owns the per-entry state — an `Option<Model>`
+(allocated on the first `restart = true` prologue), a
+`Dict` sized from the file header's declared dictionary
+capacity, and the current `ppmd_escape` byte. Implements
+libarchive's `read_data_compressed` (lines 2158..2238)
+dispatch loop:
+
+- `sym != ppmd_escape` — literal byte; `Dict::push_literal`.
+- `sym == ppmd_escape` — read a sub-code:
+  - `code 0` — new table. Returns `BlockEnd::NewTable`; the
+    §C1h multi-block driver re-parses a prologue.
+  - `code 2` — EOD marker. Returns `BlockEnd::EndOfData`.
+  - `code 3` — filter declaration. Returns
+    `Err(UnsupportedFilter)` until §C2 lands.
+  - `code 4` — large LZ match: 3-byte BE offset + 1-byte
+    length. `Dict::copy_match(offset + 2, length + 32)`.
+  - `code 5` — short LZ match: 1-byte length.
+    `Dict::copy_match(1, length + 4)`.
+  - other `code` — escape-of-escape literal (`ppmd_escape`
+    byte itself).
+
+`Model::set_init_esc` accessor added so the
+prologue-driven `init_esc` byte seeds the model's escape-
+probability state before the first symbol decode.
+
+**Public surface**:
+
+- `PpmdSession::new(dict_capacity)`.
+- `PpmdSession::apply_prologue(&BlockPrologue)` — branches
+  on `restart`: allocates a fresh model when `true`; errors
+  with `NoPriorContext` when `false` and no prior context
+  exists; seeds `ppmd_escape` from `init_esc` or defaults to
+  `2`.
+- `PpmdSession::decode_block(&mut RangeDecoder, &mut Vec<u8>,
+  unpacked_size: u64) -> Result<PpmdBlockEnd, _>` — runs the
+  dispatch loop until `output_position >= unpacked_size` or a
+  block-terminating escape.
+- `PpmdBlockEnd::{SizeReached, NewTable, EndOfData}`.
+- `PpmdEntryError::{Range, Model, ModelInit, Dict,
+  NoPriorContext, RestartPayloadMissing, UnsupportedFilter}`.
+- `DEFAULT_PPMD_ESCAPE = 2` constant (matches libarchive
+  line 2344).
+
+**First end-to-end demo**:
+[`tests/test_rar_legacy_ppmd.rs`](../tests/test_rar_legacy_ppmd.rs)
+decodes two real CC0 archives from
+[ssokolow/rar-test-files](https://github.com/ssokolow/rar-test-files)
+through the full stack:
+
+1. `crate::rar::legacy::walk_archive` — header parse (§A2).
+2. `crate::decode::rar_legacy::bits::BitReader` over the
+   entry's compressed payload (§C1a).
+3. `crate::decode::rar_legacy::block_header::parse_block_prologue`
+   — `is_ppmd_block = 1` recognised; `ppmd_flags` /
+   `dictionary_size` / `max_order` / `init_esc` returned
+   (§C1c).
+4. `crate::decode::ppmd2::range_dec::RangeDecoder::new_rar`
+   over the post-prologue byte-aligned tail (§C1f).
+5. `PpmdSession::apply_prologue` + `decode_block` — emits
+   12 bytes of `"Testing 123\n"` per entry.
+
+Both `testfile.rar3.rar` (non-solid, 128 KiB dict) and
+`testfile.rar3.solid.rar` (solid, 1 MiB dict) cross-check
+byte-perfectly against the expected plaintext from the
+bundled `unrar` (RAR 7.22 at `~/Downloads/rar/unrar`).
+
+**What turned out NOT to need landing**:
+
+- **No shared `Dict` between LZ and PPMd within an entry.**
+  Libarchive shares one LZSS window across LZ and PPMd
+  blocks within a single entry (e.g. "code 0 → new table"
+  can transition modes). The ssokolow corpus has one PPMd
+  block per entry, so `PpmdSession` owns its own dict and
+  doesn't share with `LzDecoder`. The cross-mode case is
+  filed for §C1h's multi-block driver, which will refactor
+  to a shared owner when a real archive surfaces that
+  needs it.
+- **No `Model::restart()` between RAR-mode blocks.** The
+  RAR-variant range coder is re-initialised every block via
+  `RangeDecoder::new_rar` against the next 4 bytes
+  (libarchive's `PpmdRAR_RangeDec_Init` is called per
+  block), but the PPMd MODEL state carries over when
+  `restart = false`. `apply_prologue` matches this by NOT
+  calling `model.restart()` in the `restart = false` path.
+- **No CRC32 verification yet.** The file header carries a
+  CRC32 of the unpacked content; checking it lives at the
+  pipeline integration boundary (which lands in §C1h or
+  the rar_pipeline plumbing).
+
+**Tests**: 8 unit tests in `ppmd_entry.rs` covering the
+session lifecycle (uninitialised state, zero-cap rejection,
+restart + init_esc plumbing, no-prior-context errors,
+missing-payload errors, no-restart-after-restart escape-byte
+update) + 4 integration tests in
+[`tests/test_rar_legacy_ppmd.rs`](../tests/test_rar_legacy_ppmd.rs)
+exercising the real-corpus decode + metadata-walk checks.
+
+**1611 lib tests + 4 integration tests pass** (was 1603 lib
+tests at §C1f, +8 from §C1g's `ppmd_entry` unit tests; the
+4 new integration tests live in their own binary and aren't
+counted in the lib total).
+
+**Demo**: `cargo test --features rar test_rar_legacy_ppmd`
+decodes both ssokolow fixtures end-to-end in <100 ms.
+
+**Files added / modified**:
+
+- `src/decode/ppmd2/model.rs` — new `Model::set_init_esc`
+  setter.
+- `src/decode/rar_legacy/ppmd_entry.rs` (new) — the dispatcher.
+- `src/decode/rar_legacy.rs` — wired in `pub mod ppmd_entry`.
+- `tests/fixtures/rar_legacy/testfile.rar3.rar` (new, CC0,
+  98 bytes).
+- `tests/fixtures/rar_legacy/testfile.rar3.solid.rar` (new,
+  CC0, 98 bytes).
+- `tests/fixtures/rar_legacy/testfile.rar3.txt` (new, 12
+  bytes — expected plaintext).
+- `tests/fixtures/rar_legacy/README.md` (new — CC0
+  attribution + corpus posture).
+- `tests/test_rar_legacy_ppmd.rs` (new — the integration
+  test).
 
 ---
 

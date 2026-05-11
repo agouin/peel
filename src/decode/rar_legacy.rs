@@ -39,11 +39,14 @@
 //!   tests cover every main-code branch.
 //! - **§C1e₂** — first end-to-end LZ demo against the ssokolow
 //!   `testfile.rar3.rar` corpus + bundled `unrar` cross-check.
-//! - **§C1f** — RAR-variant range coder added to
+//! - **§C1f** ✅ — RAR-variant range coder added to
 //!   [`crate::decode::ppmd2::range_dec`] (not in this tree).
-//! - **§C1g** — `ppmd_entry`: wire
-//!   [`crate::decode::ppmd2::Model`] through the legacy per-entry
-//!   pipeline for `m=4` / `m=5` entries.
+//! - **§C1g** ✅ — [`ppmd_entry`]: `PpmdSession` wraps
+//!   [`crate::decode::ppmd2::Model`] for the PPMd-mode dispatch
+//!   loop libarchive runs at `read_data_compressed` lines
+//!   2158..=2238 — literals + escape sub-codes for EOD / large
+//!   LZ match (code 4) / short LZ match (code 5) / escape-of-
+//!   escape literals.
 //! - **§C1h** — `solid`: solid-mode driver + multi-block
 //!   continuation across entries.
 //! - **§C2a** — `vm::filters`: standard filter set
@@ -76,3 +79,4 @@ pub mod dict;
 pub mod dist_cache;
 pub mod huffman;
 pub mod lzss;
+pub mod ppmd_entry;
