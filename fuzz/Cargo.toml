@@ -23,7 +23,16 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-peel-rs = { path = ".." }
+peel-rs = { path = "..", features = ["rar"] }
+
+# Pass-through so `cargo clippy --features rar --all-targets` at
+# the workspace root reaches the fuzz crate without erroring on
+# the missing feature. The fuzz crate's `peel-rs` dep already
+# carries `features = ["rar"]`, so the pass-through is a no-op
+# at build time; this just keeps the workspace-level invocations
+# happy.
+[features]
+rar = []
 
 # Detach from any future workspace in the parent directory so the
 # fuzz crate keeps its own Cargo.lock and dependency graph.
@@ -65,6 +74,13 @@ bench = false
 [[bin]]
 name = "tar_sink"
 path = "fuzz_targets/tar_sink.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_legacy_filter"
+path = "fuzz_targets/rar_legacy_filter.rs"
 test = false
 doc = false
 bench = false

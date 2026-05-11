@@ -106,7 +106,7 @@
 > single-entry archives decode to `"Testing 123\n"` through
 > `walk_archive → BitReader → parse_block_prologue →
 > RangeDecoder::new_rar → PpmdSession::decode_block`.
-> **§C1h (this commit)** lands the per-entry front-door at
+> **§C1h (f9db3a9)** lands the per-entry front-door at
 > [`src/decode/rar_legacy/entry.rs`](../src/decode/rar_legacy/entry.rs):
 > `decode_entry(archive_bytes, &LegacyFileEntry) -> Vec<u8>`
 > wraps STORED / LZ / PPMd dispatch behind one function, with
@@ -117,6 +117,53 @@
 > against the bundled `unrar`'s extraction. 3 new lib-test
 > entries + 2 new integration tests; lib-test count now 1614,
 > integration-test count now 6.
+> **§C2a (prior commit)** landed the RarVM filter-declaration
+> parser + standard filter set at
+> [`src/decode/rar_legacy/vm/`](../src/decode/rar_legacy/vm.rs).
+> Three submodules: `vm::membits` (memory-only MSB-first bit
+> reader + `next_rarvm_number` codec), `vm::parse`
+> (`read_filter_declaration_bytes` + `FilterStack` + `Program`
+> + `parse_filter_declaration` for the eight flag bits
+> + XOR-checksum + optional static-data section, mirroring
+> libarchive's `parse_filter` at lines 3258..3397), and
+> `vm::standard` (DELTA / E8 / E8E9 / RGB / AUDIO recognition
+> via libarchive's `crc32 | length << 32` fingerprint shortcut
+> + native executors mirroring `execute_filter_*`).
+> **§C2b + §C2c (this commit)** finishes Phase C: live filter-
+> pipeline wiring through
+> [`entry::decode_entry`](../src/decode/rar_legacy/entry.rs)
+> via the new
+> [`vm::dispatch`](../src/decode/rar_legacy/vm/dispatch.rs)
+> submodule, multi-block LZ decode (both `BlockEnd::NextBlock`
+> and `BlockEnd::EntryDone` treated as "block done; re-parse
+> if `output.len() < unpacked_size`"), and `FilterStack`'s
+> `pending` queue draining at entry end. The §C2b corpus is
+> four self-encoded LZ-only filter fixtures at
+> `tests/fixtures/rar_legacy/filter_*.rar` — encoded against
+> `rar 3.93` (Linux x86_64, RARLAB public release) under
+> Docker `linux/amd64` with `-mcT-` (disable PPMd) and
+> `-mcX+` (force one standard filter); all four decode
+> byte-identical to `rar 7.22`'s reference extraction.
+> Audio-executor off-by-one bug found + fixed during
+> integration: libarchive's `count++ & 0x1F` post-increment
+> fires the weight update on samples 0/32/64/…; our initial
+> pre-increment off-by-one fired on 32/64/… and the audio
+> fixture drifted progressively through the adaptive
+> predictor. §C2c adds a parser+dispatcher fuzz target at
+> [`fuzz/fuzz_targets/rar_legacy_filter.rs`](../fuzz/fuzz_targets/rar_legacy_filter.rs).
+> The custom-bytecode VM interpreter (the original §C2b
+> sketch's "interpreter for archive-supplied bytecode")
+> moves to a post-MVP follow-on §C2-extension, gated on a
+> clean-room reference becoming available — unrar is
+> off-limits per `AGENTS.md`, and libarchive doesn't ship
+> one (stops at the fingerprint shortcut). Lib-test count
+> grows from 1657 to 1662; integration-test files grow from
+> 1 to 2 (six PPMd tests + five filter tests = 11 `rar_legacy`
+> integration tests). The fifth filter fixture
+> (`filter_multi`) exercises a three-filter declaration
+> shape with register-mask, block-start bias, and
+> program-cache reuse — none of which the single-filter
+> fixtures hit.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -798,13 +845,94 @@ reproducible if a future bug needs the same level of triage.
 >   decodes both entries byte-perfectly. Solid-mode (cross-
 >   entry state) + multi-block-within-entry are surfaced as
 >   precise errors today; the corpus doesn't exercise them.
-> - **§C2a** — RarVM bytecode parser + standard filter set
->   (e8/e9/itanium/rgb/audio/delta) via the `VM_STANDARD_FILTERS`
->   shortcut encoding.
-> - **§C2b** — VM interpreter for archive-supplied bytecode with
->   strict per-reference bounds-checking (no UB / abort on
->   malformed programs).
-> - **§C2c** — fuzz harness + custom-filter differential corpus.
+> - **§C2a** ✅ (this commit) — RarVM filter-declaration parser
+>   + standard filter set
+>   ([`vm`](../src/decode/rar_legacy/vm.rs)). Three submodules:
+>   [`vm::membits`](../src/decode/rar_legacy/vm/membits.rs)
+>   (memory-only MSB-first bit reader + `next_rarvm_number`
+>   2-bit-tag width codec, libarchive lines 3596..3622);
+>   [`vm::parse`](../src/decode/rar_legacy/vm/parse.rs)
+>   (`read_filter_declaration_bytes` for the on-wire (flags +
+>   length-extension + bytecode) triple, mirroring libarchive's
+>   `read_filter` at lines 3641..3688; `FilterStack` + `Program`
+>   types holding the per-declaration program cache; and
+>   `parse_filter_declaration` for the bytecode-internal
+>   parameter parse mirroring libarchive's `parse_filter` at
+>   lines 3258..3397, including XOR-checksum validation, optional
+>   static-data section, and the register-mask / global-data flag
+>   bits);
+>   [`vm::standard`](../src/decode/rar_legacy/vm/standard.rs)
+>   (the five WinRAR standard filter programs — DELTA / E8 /
+>   E8E9 / RGB / AUDIO — recognised by libarchive's
+>   `crc32(bytecode) | (length << 32)` fingerprint shortcut at
+>   lines 3876..3891, plus native executors mirroring
+>   `execute_filter_*` at lines 3690..3870). Note: §C0's
+>   sub-phasing block mentioned "itanium" — that's an RAR5-era
+>   standard filter handled by
+>   [`rar_native::filters`](../src/decode/rar_native/filters.rs);
+>   the five WinRAR RAR3 standard filters are
+>   DELTA / E8 / E8E9 / RGB / AUDIO per libarchive's
+>   `execute_filter` switch.
+> - **§C2b** ✅ (this commit) — live filter-pipeline wiring
+>   through
+>   [`entry::decode_entry`](../src/decode/rar_legacy/entry.rs)
+>   for the four standard filter kinds the corpus exercises
+>   (DELTA / E8 / RGB / AUDIO).
+>   [`vm::dispatch`](../src/decode/rar_legacy/vm/dispatch.rs):
+>   `apply_pending_filters_in_place(stack, buffer)` walks the
+>   FIFO pending queue, copies each filter's
+>   `[block_start, block_start + block_length)` slice through
+>   the matching native executor, and writes the filtered bytes
+>   back over the LZ output in place. Custom (non-standard)
+>   bytecode surfaces `DispatchError::UnsupportedCustomFilter`
+>   with the program's CRC fingerprint + length —
+>   `docs/PLAN_rar3.md` §C2-extension owns the future VM
+>   interpreter for that path, gated on a clean-room reference
+>   becoming available.
+>   [`entry::decode_lz_entry`](../src/decode/rar_legacy/entry.rs)
+>   moved from "single-block, no filter" to
+>   "multi-block + filter-decl handling":
+>   `BlockEnd::NextBlock` and `BlockEnd::EntryDone` are now
+>   both treated as "this block done; re-parse the next
+>   prologue and continue if `output.len() < unpacked_size`"
+>   (matching libarchive's `start_new_table`-and-`parse_codes`
+>   pattern); `BlockEnd::FilterDecl` reads the inline
+>   declaration off the bit stream and queues it on the
+>   filter stack, continuing the same block. Filter
+>   application runs at entry end. Corpus: four self-encoded
+>   pure-LZ archives at `tests/fixtures/rar_legacy/filter_*.rar`
+>   (one per standard filter type, see the fixtures README for
+>   the `rar 3.93 -m5 -mcT- -mcX+` recipe under Docker
+>   `linux/amd64`). All four decode byte-identical to
+>   `rar 7.22`'s reference extraction.
+>   Audio-filter bug found + fixed: libarchive's
+>   `state.count++ & 0x1F` is post-increment, so the weight
+>   update fires at samples 0/32/64/…; our initial pre-
+>   increment off-by-one fired at 32/64/… and the audio
+>   fixture drifted progressively through the predictor's
+>   adaptive weights. Fixed at
+>   [`vm/standard.rs:audio fire-flag`](../src/decode/rar_legacy/vm/standard.rs).
+> - **§C2c** ✅ (this commit) — fuzz harness for the §C2a
+>   parser + §C2b dispatcher at
+>   [`fuzz/fuzz_targets/rar_legacy_filter.rs`](../fuzz/fuzz_targets/rar_legacy_filter.rs).
+>   Two selector branches: pure parse (drive the wire-side
+>   reader + parse-side bytecode decoder over fuzzer-supplied
+>   bytes) and parse+dispatch (also run the standard-filter
+>   executors over a capped 4 KiB output buffer, exercising
+>   the dispatcher's `BlockBeyondOutput` /
+>   `UnsupportedCustomFilter` / executor-parameter-validation
+>   branches). Approved per
+>   `docs/ENGINEERING_STANDARDS.md` §5.2 ("Fuzz tests"); the
+>   `rar_legacy_filter` target is the third format-parser fuzz
+>   target alongside `zip_format` and `tar_sink`.
+>   Custom-bytecode VM interpreter (the original §C2b
+>   sketch's "interpreter for archive-supplied bytecode")
+>   moves to a post-§C2 follow-on, **§C2-extension**: gated
+>   on a clean-room reference becoming available (unrar is
+>   off-limits per `AGENTS.md`; libarchive's RAR3
+>   implementation doesn't ship one — it stops at the
+>   fingerprint-match shortcut). Today's dispatcher rejects
+>   custom bytecode with a precise error.
 
 ### §C0. Sub-phasing + module scaffolding ✅ (this commit)
 
@@ -1776,6 +1904,349 @@ plus at least three real-world archives that ship custom filter
 programs is committed alongside §C2c; the §C0 corpus decision
 above sources these from RARLAB public test sets if the ssokolow
 files don't include filter-using archives.
+
+#### §C2a. Filter-declaration parser + standard filter set ✅ (this commit)
+
+**What landed**: the [`vm`](../src/decode/rar_legacy/vm.rs)
+sub-module tree under `src/decode/rar_legacy/`. Three submodules
+mirroring the layout libarchive's
+`archive_read_support_format_rar.c` carries out:
+
+1. [`vm::membits`](../src/decode/rar_legacy/vm/membits.rs) —
+   memory-only MSB-first bit reader (`MemBitReader`) over a
+   borrowed byte slice with soft-fail underrun (sticky `at_eof`
+   flag; reads past end-of-buffer return 0 rather than erroring,
+   matching libarchive's `membr_bits` at line 3617). The
+   `next_rarvm_number` codec at libarchive lines 3596..3614
+   decodes the 2-bit-tag width-encoded integer the bytecode-
+   internal stream uses for register values, block start
+   offsets, block lengths, program lengths, and global-data
+   lengths.
+2. [`vm::parse`](../src/decode/rar_legacy/vm/parse.rs) —
+   `read_filter_declaration_bytes` reads the on-wire
+   `(flags, length-extension, bytecode)` triple straight off the
+   outer [`bits::BitReader`](../src/decode/rar_legacy/bits.rs)
+   (libarchive's `read_filter` at lines 3641..3688), with
+   precise underrun / zero-length / over-cap diagnostics.
+   `FilterStack` + `Program` + `ProgramClassification` types
+   hold the per-archive program cache (libarchive's
+   `struct rar_filters`'s `progs` linked list +
+   `lastfilternum`, minus the pending-invocation queue and
+   `filterstart` that §C2b will add). `parse_filter_declaration`
+   interprets the bytecode payload against the stack
+   (libarchive's `parse_filter` at lines 3258..3397), handles
+   the eight flag bits (program-cache index, block-start +258
+   bias, explicit block length, register-mask + overrides,
+   embedded program bytecode with XOR-checksum validation +
+   optional static-data section, global-data section), and
+   returns a `FilterDeclaration` for §C2b's dispatcher.
+3. [`vm::standard`](../src/decode/rar_legacy/vm/standard.rs) —
+   the five WinRAR standard filter programs
+   (DELTA / E8 / E8E9 / RGB / AUDIO) recognised by libarchive's
+   `crc32(bytecode) | (length << 32)` fingerprint shortcut
+   (libarchive's `execute_filter` switch at lines 3876..3891).
+   The five fingerprint constants are taken verbatim from
+   libarchive; the native executors (`execute_delta`,
+   `execute_e8`, `execute_rgb`, `execute_audio`) mirror
+   `execute_filter_*` at lines 3690..3870, with explicit
+   parameter bounds checks (zero-channel rejection, E8 block-
+   too-short, RGB stride/byte-offset/block-length bounds, buffer
+   length agreement). The CRC-32/ISO-HDLC implementation is
+   local (1 KiB const table) to keep `rar_legacy` self-contained
+   per §C0's sibling-module posture; there's an existing
+   `crc32` at
+   [`xz_liblzma::stream`](../src/decode/xz_liblzma/stream.rs)
+   but the duplication preserves the format-tree boundary.
+
+**Reuse-vs-fork note (carried forward from §C0)**: the standard
+filter set has a near-cousin in
+[`rar_native::filters`](../src/decode/rar_native/filters.rs)
+(DELTA / E8 / E8E9 / ARM for RAR5). The two formats share
+algorithm names but the per-format math differs — DELTA in RAR3
+writes to a separate destination buffer where RAR5 deinterleaves
+in place; RAR3's E8 uses
+`address < 0 ? address + filesize : address - currpos` where
+RAR5 uses a sign-flip predicate; RAR3 ships RGB / AUDIO that
+RAR5 doesn't, and RAR5 ships ARM that RAR3 doesn't. Sharing
+code would just hide the divergence; the modules stay sibling
+forks.
+
+**Corpus note**: §C2a does **not** wire the parser through
+[`entry::decode_entry`](../src/decode/rar_legacy/entry.rs).
+The §C1e₂ corpus inspection established that every entry in the
+ssokolow round-one corpus is PPMd-mode (`is_ppmd_block = 1`),
+and the bundled `rar 7.22` no longer creates legacy archives.
+Filter-using fixtures therefore have to be sourced separately,
+and lighting the wire on the live decode path before we have one
+to round-trip against would be untestable. §C2b sources a
+filter-using corpus first (likely from RARLAB's public test
+archives, per §C0's corpus strategy), then lands both the live
+LZ → VM → filtered-output dispatcher and the custom-bytecode
+interpreter at once. §C2a's deliverable is the parser surface
+(testable in isolation) plus the standard-filter executors
+(round-trip-testable with synthetic input).
+
+**§C2a deliberately is NOT**:
+
+- No live wiring through `entry::decode_entry`. The LZ
+  dispatcher still returns `BlockEnd::FilterDecl` and the entry
+  layer still surfaces `LegacyEntryError::UnsupportedFilter` —
+  one variant pinned by the single-`UnsupportedFilter` test in
+  [`entry.rs`](../src/decode/rar_legacy/entry.rs).
+- No VM bytecode interpreter for custom programs. §C2b. The
+  parser correctly classifies a non-standard program as
+  `ProgramClassification::Custom`, but invoking such a program
+  has no implementation yet.
+- No pending-filter queue / filterstart tracking on
+  `FilterStack`. §C2b's deliverable, since both are dispatcher
+  state.
+
+**Tests**: 43 new unit tests across
+[`vm/membits.rs`](../src/decode/rar_legacy/vm/membits.rs) (12 —
+bit-read MSB-first across byte boundaries, full 32-bit reads,
+`new_at` offset, soft-fail underrun stickiness,
+`next_rarvm_number` tag-0/1/2/3 cases, tag-1 negative-bias path,
+tag-1 large branch, underrun propagation),
+[`vm/parse.rs`](../src/decode/rar_legacy/vm/parse.rs) (11 —
+wire-side `read_filter_declaration_bytes` for the 3-byte / 1-byte
+/ 2-byte length-extension cases, zero-length rejection,
+bitstream-underrun propagation, parse-side full new-program
+happy path, XOR mismatch, program-length zero, program-index
+past cache, num=0 cache clear, last-filter-num reuse path,
++258 block-start bias), and
+[`vm/standard.rs`](../src/decode/rar_legacy/vm/standard.rs) (20 —
+CRC-32 known vectors, fingerprint packing, recognition for each
+of the five known + unknown fingerprints, DELTA single- /
+multi-channel round-trips, all four executors' rejection paths
+for zero channels / buffer-length mismatch / E8-too-short /
+RGB-bad-params, E8 + E8E9 absolute-to-relative rewrite,
+post-rewrite payload skip, RGB / AUDIO zero-source identity).
+All 43 pass; full suite stays at 1657 green
+(`cargo test --features rar --lib`).
+
+**Demo**: `cargo test --features rar --lib decode::rar_legacy::vm`
+runs the 43-test vm sub-suite. `cargo clippy --features rar
+--all-targets -- -D warnings` is clean. The next sub-phase
+(§C2b) extends `FilterStack` with the pending-invocation queue
++ `filterstart`, lands the VM interpreter for custom bytecode,
+and wires the live dispatcher through `entry::decode_entry`.
+
+#### §C2b. Live filter-pipeline wiring + standard filter dispatch ✅ (this commit)
+
+**What landed**:
+
+1. [`vm::dispatch`](../src/decode/rar_legacy/vm/dispatch.rs) —
+   new submodule.
+   `apply_pending_filters_in_place(stack, buffer)` walks the
+   filter stack's FIFO pending queue, copies each filter's
+   `[block_start, block_start + block_length)` slice from the
+   LZ output buffer through the matching native executor in
+   [`vm::standard`](../src/decode/rar_legacy/vm/standard.rs),
+   and writes filtered bytes back over the slice. For DELTA /
+   RGB / AUDIO (which libarchive's `execute_filter_*` runs
+   into a separate destination half of VM memory), we allocate
+   a transient `Vec<u8>` per filter; for E8 / E8E9 (in-place
+   transforms) we pass the buffer slice directly. `DispatchError`
+   covers `BlockBeyondOutput` (range past `buffer.len()`),
+   `UnsupportedCustomFilter` (program isn't one of the five
+   standard fingerprints), and `Executor(FilterExecError)`
+   (parameter validation: zero channels, E8 block-too-short,
+   RGB bad params).
+2. [`vm::parse::FilterStack`](../src/decode/rar_legacy/vm/parse.rs)
+   gained a `pending: Vec<FilterDeclaration>` field;
+   `parse_filter_declaration` now both returns the decoded
+   `FilterDeclaration` *and* pushes a clone onto
+   `stack.pending`, matching libarchive's `parse_filter` queue
+   append at lines 3388..3394. `FilterStack::clear` also drains
+   the pending queue alongside the program cache.
+3. [`entry::decode_lz_entry`](../src/decode/rar_legacy/entry.rs)
+   re-shaped from "single-block, no filter" to
+   "multi-block + filter-decl driver":
+   - `BlockEnd::EntryDone` and `BlockEnd::NextBlock` are now
+     treated identically as "block done; if `output.len() <
+     unpacked_size`, re-parse the next prologue and continue".
+     This matches libarchive's `start_new_table`-and-
+     `parse_codes` pattern (lines 2918..2935) where the
+     bit-after-symbol-256 only controls *when* the next
+     prologue's tables get loaded.
+   - `BlockEnd::FilterDecl` calls
+     [`read_filter_declaration_bytes`](../src/decode/rar_legacy/vm/parse.rs)
+     to consume the flags + length-extension + bytecode payload
+     off the same LZ bit stream, then
+     [`parse_filter_declaration`](../src/decode/rar_legacy/vm/parse.rs)
+     to enqueue the invocation. The LZ block continues with the
+     next symbol after the inline payload.
+   - At entry end, `apply_pending_filters_in_place` runs every
+     queued filter against the LZ output before truncating to
+     `unpacked_size`.
+   - `BlockEnd::EntryDone` / `NextBlock` landing on a PPMd
+     prologue still surfaces `CrossModeNotSupported` (the
+     hybrid LZ-decl + PPMd-data shape that `rar 3.93 -m5`
+     emits when PPMd is enabled is documented in the fixtures
+     README and deferred — the §C2b corpus avoids it via
+     `-mcT-`).
+4. New error variants: `LegacyEntryError::FilterParse` (wraps
+   `VmParseError`) and `LegacyEntryError::FilterDispatch`
+   (wraps `DispatchError`). The old `UnsupportedFilter`
+   variant + its single test in
+   [`entry.rs`](../src/decode/rar_legacy/entry.rs) are removed
+   — they're unreachable now that the dispatcher handles every
+   filter declaration the corpus produces.
+
+**Audio-executor bug found + fixed**: integration testing
+caught a drift in [`vm/standard.rs`'s
+`execute_audio`](../src/decode/rar_legacy/vm/standard.rs).
+libarchive's
+`if (!(state.count++ & 0x1F))` (line 3846) is **post-
+increment**: the check evaluates `count & 0x1F` *before*
+bumping, so the weight-update path fires on samples
+0 / 32 / 64 / … within each channel. Our initial pre-
+increment shape fired on 32 / 64 / 96 / … and the audio
+filter's adaptive weights diverged progressively across the
+sample stream. Fixed by capturing `let fire = state.count &
+0x1F == 0` before the `state.count += 1` bump.
+
+**Corpus**: four pure-LZ + single-filter fixtures committed
+to [`tests/fixtures/rar_legacy/filter_*.rar`](../tests/fixtures/rar_legacy/),
+each paired with the synthetic input the encoder consumed
+(`filter_*.bin`):
+
+- `filter_e8.rar` (264 B) + `filter_e8.bin` (512 B) — E8
+  filter, synthetic PE/x86 binary with `0xE8`/`0xE9`
+  instructions.
+- `filter_rgb.rar` (405 B) + `filter_rgb.bin` (270 B) — RGB
+  filter, 12×6 24-bpp BMP with per-channel gradient.
+- `filter_audio.rar` (885 B) + `filter_audio.bin` (556 B) —
+  AUDIO filter, 128-sample stereo PCM sine wave.
+- `filter_delta.rar` (153 B) + `filter_delta.bin` (512 B) —
+  DELTA filter, 32 records × 4 LE-u32 fields.
+- `filter_multi.rar` (397 B) + `filter_multi.bin` (4096 B) —
+  synthetic 4 KiB PE/x86 binary that the encoder's auto-mode
+  heuristic splits into **three filter declarations** in a
+  single LZ block: E8 (new program 0, `flags=0xA6`, len 256
+  @ start 0), DELTA (new program 1, `flags=0xB6` with
+  register-mask, len 3584 @ start 256), and an E8 reuse of
+  program 0 (`flags=0xC2`, `+258` block-start bias,
+  implicit-len from `old_filter_length`). Exercises FIFO
+  drain across multiple filters, the `flags & 0x10`
+  register-mask path, the `flags & 0x40` block-start bias
+  path, and the `!(flags & 0x20)` implicit-length /
+  program-cache reuse path — none of which the
+  single-filter fixtures hit. `rar 3.93` and `rar 5.0.0`
+  emit byte-identical archives for this input at the same
+  switches.
+
+The encode recipe (Docker `linux/amd64` + `rar 3.93` +
+`-m5 -mcT- -mcX+`) is documented in
+[`tests/fixtures/rar_legacy/README.md`](../tests/fixtures/rar_legacy/README.md).
+`rar 3.93` is the last RARLAB public release whose Linux
+x86_64 binary is still readily available; later 4.x / 5.x /
+6.x versions also support `-ma3` (RAR3 format) but `rar 3.93`
+suffices for round-one coverage. The fifth WinRAR standard
+filter (E8E9 — same algorithm as E8 plus matching `0xE9`)
+isn't exercised in the live corpus because `rar 3.93`'s
+encoder picks pure-E8 for x86 inputs; the `execute_e8`
+executor takes an `e9_also: bool` parameter and the
+E8E9 codepath is covered by the synthetic unit tests in
+[`vm/standard.rs`](../src/decode/rar_legacy/vm/standard.rs).
+
+**What §C2b deliberately is NOT**:
+
+- No VM interpreter for archive-supplied (non-standard)
+  bytecode. The §C2-extension follow-on (see below) owns
+  that, gated on a clean-room reference becoming available.
+  libarchive's RAR3 implementation stops at the
+  fingerprint-match shortcut and rejects custom programs
+  with `"No support for RAR VM program filter"`; our
+  `UnsupportedCustomFilter` dispatch error mirrors that.
+- No PPMd / LZ cross-mode within an entry. The hybrid shape
+  `rar 3.93 -m5` produces (LZ block declaring filter +
+  PPMd block carrying data) requires a shared dict between
+  the two decoders. Deferred to §G.
+
+**Tests**: 5 new integration tests at
+[`tests/test_rar_legacy_filters.rs`](../tests/test_rar_legacy_filters.rs):
+one per single-filter fixture (E8 / RGB / AUDIO / DELTA) plus
+the multi-filter fixture above; each `decode_entry`'s the
+corresponding fixture and asserts byte-identical output.
+5 new lib-test entries in `vm/dispatch.rs` (range-check
+rejection, custom-bytecode rejection, in-place E8,
+separate-buffer DELTA, multi-filter FIFO drain). Full
+lib-test count grows from 1657 to 1662; integration-test
+files grow from 1 to 2; integration test count for
+`rar_legacy` grows from 6 to 11.
+
+**Demo**: `cargo test --features rar --test test_rar_legacy_filters`
+runs the 4 filter-corpus tests against the four standard-
+filter executors, all green. `cargo clippy --features rar
+--all-targets -- -D warnings` is clean.
+
+#### §C2c. Parser fuzz harness ✅ (this commit)
+
+**What landed**: new fuzz target at
+[`fuzz/fuzz_targets/rar_legacy_filter.rs`](../fuzz/fuzz_targets/rar_legacy_filter.rs).
+Two selector branches:
+
+1. **Pure parse** — drive
+   [`read_filter_declaration_bytes`](../src/decode/rar_legacy/vm/parse.rs)
+   on fuzzer-supplied bytes; on success, push the result
+   through
+   [`parse_filter_declaration`](../src/decode/rar_legacy/vm/parse.rs)
+   against a fresh `FilterStack`. Exercises the bit reader's
+   underrun handling, the bytecode `next_rarvm_number`
+   decoder, the XOR-checksum check, and every flag-bit branch
+   of the parser.
+2. **Parse + dispatch** — also runs
+   [`apply_pending_filters_in_place`](../src/decode/rar_legacy/vm/dispatch.rs)
+   over a capped 4 KiB output buffer. Exercises the
+   dispatcher's range-check, the standard-filter-vs-custom
+   classification, and the native executors' parameter
+   validation (zero channels, RGB bad params, E8 too short).
+
+Invariant: **no panics, no out-of-bounds accesses**. Every
+malformed declaration must surface a typed error or be
+silently skipped. `[[bin]]` entry added to
+[`fuzz/Cargo.toml`](../fuzz/Cargo.toml); the `rar` feature
+is now enabled on the fuzz crate's `peel-rs` dep so the
+target compiles. Approved per
+`docs/ENGINEERING_STANDARDS.md` §5.2; this is the third
+format-parser fuzz target alongside `zip_format` and
+`tar_sink`.
+
+**Demo**: `cd fuzz && cargo check --bin rar_legacy_filter`
+builds the target. A 5-minute fuzz run is the standing
+acceptance criterion (`cargo +nightly fuzz run
+rar_legacy_filter -- -max_total_time=300`) — left to the
+maintainer to invoke ad-hoc per `AGENTS.md` §Fuzzing.
+
+#### §C2-extension. Custom-bytecode VM interpreter (post-MVP follow-on)
+
+**Why deferred**: the original §C2b sketch called for a full
+VM interpreter for archive-supplied (non-standard) bytecode.
+Implementing one cleanly requires a reference for the
+RarVM's opcode set + instruction-encoding wire format; the
+two reference sources available are:
+
+- **unrar** — off-limits per `AGENTS.md` §Approved
+  References. The RarVM opcode tables in `rarvm.cpp` are
+  the canonical source.
+- **libarchive** — only ships the fingerprint-match
+  shortcut (line 3878..3891 of
+  `archive_read_support_format_rar.c`), not a generic
+  interpreter. Custom bytecode hits `"No support for RAR VM
+  program filter"` at line 3889.
+
+In practice the standard-filter shortcut handles every
+archive WinRAR's encoder produces (libarchive ships
+production decoders on this basis), so the missing
+interpreter only matters for adversarial archives or
+unusual encoder configurations. Today the §C2b dispatcher
+rejects custom bytecode with `UnsupportedCustomFilter`
+carrying the program's CRC fingerprint + length, matching
+libarchive's posture exactly. The §C2-extension follow-on
+lands when a clean-room reference becomes available; until
+then the §C2c fuzz target validates that custom-bytecode
+rejection is panic-free.
 
 ---
 

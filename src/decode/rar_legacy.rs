@@ -53,12 +53,46 @@
 //!   parse. Surfaces precise errors for the multi-block-within-
 //!   entry / cross-mode / solid-mode cases the round-one
 //!   corpus doesn't exercise (filed as follow-ons).
-//! - **§C2a** — `vm::filters`: standard filter set
-//!   (e8/e9/itanium/rgb/audio/delta) via the `VM_STANDARD_FILTERS`
-//!   shortcut encoding.
-//! - **§C2b** — `vm::interp`: archive-supplied bytecode interpreter
-//!   with strict per-reference bounds checking.
-//! - **§C2c** — fuzz harness + custom-filter differential corpus.
+//! - **§C2a** ✅ — [`vm`]: filter-declaration parser
+//!   ([`vm::parse`]) + WinRAR standard filter set
+//!   ([`vm::standard`]) for DELTA / E8 / E8E9 / RGB / AUDIO
+//!   recognised by libarchive's `crc32(bytecode) | (length <<
+//!   32)` fingerprint shortcut. Memory-only MSB-first bit
+//!   reader + `next_rarvm_number` codec at [`vm::membits`].
+//!   Note: §C2a's round-one listing in `docs/PLAN_rar3.md`
+//!   mentioned "itanium" — that's an RAR5-era standard filter
+//!   (covered by [`crate::decode::rar_native::filters`]); the
+//!   five WinRAR RAR3 standard filters are
+//!   DELTA / E8 / E8E9 / RGB / AUDIO per libarchive's
+//!   `execute_filter` switch.
+//! - **§C2b** ✅ — [`vm::dispatch`]: live filter-pipeline
+//!   wiring through [`entry::decode_entry`] for the four
+//!   standard filter types the corpus exercises (DELTA / E8 /
+//!   RGB / AUDIO; E8E9's executor is shared with E8 via an
+//!   `e9_also: bool` flag and covered by unit tests).
+//!   `apply_pending_filters_in_place(stack, buffer)` runs each
+//!   queued filter in FIFO order, transforming the LZ output
+//!   buffer in place. Custom-bytecode programs surface
+//!   `DispatchError::UnsupportedCustomFilter` with the
+//!   program's CRC fingerprint + length — matching
+//!   libarchive's `"No support for RAR VM program filter"`
+//!   posture. [`entry::decode_lz_entry`] extended to handle
+//!   multi-block LZ entries (`BlockEnd::EntryDone` and
+//!   `BlockEnd::NextBlock` both re-parse the next prologue if
+//!   `output.len() < unpacked_size`).
+//! - **§C2c** ✅ — parser fuzz harness at
+//!   `fuzz/fuzz_targets/rar_legacy_filter.rs`. Drives the
+//!   wire-side reader + parse-side bytecode decoder over
+//!   random bytes (selector 0) and the full
+//!   parse + dispatch path over a capped 4 KiB output buffer
+//!   (selector 1). Invariant: no panics, no out-of-bounds
+//!   accesses.
+//! - **§C2-extension** (post-MVP follow-on) — VM interpreter
+//!   for archive-supplied custom bytecode. Gated on a
+//!   clean-room reference becoming available; unrar is
+//!   off-limits per `AGENTS.md`, and libarchive doesn't ship
+//!   one (stops at the fingerprint shortcut). Today's
+//!   dispatcher rejects custom bytecode with a precise error.
 //!
 //! # Reuse-vs-fork posture
 //!
@@ -85,3 +119,4 @@ pub mod entry;
 pub mod huffman;
 pub mod lzss;
 pub mod ppmd_entry;
+pub mod vm;

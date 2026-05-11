@@ -59,6 +59,10 @@ use super::bootstrap::MAIN_TABLE_TOTAL;
 use super::dict::DictError;
 use super::lzss::{BlockEnd, LzDecoder, LzError};
 use super::ppmd_entry::{PpmdBlockEnd, PpmdEntryError, PpmdSession};
+use super::vm::{
+    apply_pending_filters_in_place, parse_filter_declaration, read_filter_declaration_bytes,
+    DispatchError, FilterStack, VmParseError,
+};
 
 /// Errors produced by [`decode_entry`].
 #[derive(Debug, Error)]
@@ -165,12 +169,20 @@ pub enum LegacyEntryError {
         expected: u64,
     },
 
-    /// LZ-mode block dispatcher returned [`BlockEnd::FilterDecl`]
-    /// — the entry contains an archive-supplied filter
-    /// program. §C2's RarVM lands that path; surface a
-    /// precise error today.
-    #[error("legacy RAR entry: filter declaration (LZ symbol 257) is unsupported until §C2 lands")]
-    UnsupportedFilter,
+    /// Filter declaration parse failed mid-LZ-block (malformed
+    /// bytecode, register-mask underrun, etc.). Wraps the
+    /// underlying [`VmParseError`] so the caller preserves the
+    /// precise diagnostic.
+    #[error("legacy RAR entry: filter declaration parse failed")]
+    FilterParse(#[from] VmParseError),
+
+    /// Filter dispatch failed at entry end. Wraps the underlying
+    /// [`DispatchError`] — either the filter's block range
+    /// exceeded the LZ output buffer, the program isn't one of
+    /// the five WinRAR standard filters, or the native executor
+    /// rejected the parameters.
+    #[error("legacy RAR entry: filter dispatch failed")]
+    FilterDispatch(#[from] DispatchError),
 }
 
 /// Decode one entry's compressed payload from a legacy RAR
@@ -256,8 +268,15 @@ fn decode_compressed_entry(
                 &mut output,
             )?;
         }
-        BlockPrologue::Lz { ref tables, .. } => {
-            decode_lz_entry(&mut br, tables, dict_capacity, unpacked_size, &mut output)?;
+        BlockPrologue::Lz { tables, .. } => {
+            decode_lz_entry(
+                &mut br,
+                tables,
+                &mut lengths,
+                dict_capacity,
+                unpacked_size,
+                &mut output,
+            )?;
         }
     }
 
@@ -308,31 +327,98 @@ fn decode_ppmd_entry(
 
 fn decode_lz_entry(
     br: &mut BitReader<'_>,
-    tables: &super::bootstrap::MainTables,
+    initial_tables: super::bootstrap::MainTables,
+    lengths: &mut [u8; MAIN_TABLE_TOTAL],
     dict_capacity: usize,
     unpacked_size: u64,
     output: &mut Vec<u8>,
 ) -> Result<(), LegacyEntryError> {
     let mut decoder = LzDecoder::new(dict_capacity)?;
-    let outcome = decoder.decode_block(br, tables, output)?;
-    match outcome {
-        BlockEnd::EntryDone => {
-            // The LZ dispatcher may emit a small overshoot
-            // past unpacked_size on the last match (matches
-            // can be up to ~260 bytes). Truncate to the
-            // header-declared size; libarchive does the same.
-            output.truncate(unpacked_size as usize);
-            if (output.len() as u64) < unpacked_size {
-                return Err(LegacyEntryError::SizeShortfall {
-                    got: output.len() as u64,
-                    expected: unpacked_size,
-                });
-            }
-            Ok(())
+    let mut tables = initial_tables;
+    let mut stack = FilterStack::new();
+    // Belt-and-braces upper bound on the per-entry block /
+    // filter-decl iteration count: the encoder won't reasonably
+    // exceed `unpacked_size * 4` declarations per entry (one
+    // per byte at the upper limit), and capping is cheap
+    // insurance against a malformed archive triggering an
+    // infinite loop here.
+    let iter_cap = unpacked_size.saturating_mul(4).saturating_add(64);
+    let mut iterations: u64 = 0;
+    loop {
+        iterations = iterations.saturating_add(1);
+        if iterations > iter_cap {
+            return Err(LegacyEntryError::SizeShortfall {
+                got: output.len() as u64,
+                expected: unpacked_size,
+            });
         }
-        BlockEnd::NextBlock => Err(LegacyEntryError::MultiBlockNotSupported),
-        BlockEnd::FilterDecl => Err(LegacyEntryError::UnsupportedFilter),
+        let outcome = decoder.decode_block(br, &tables, output)?;
+        match outcome {
+            BlockEnd::EntryDone | BlockEnd::NextBlock => {
+                // libarchive treats both terminators as "this
+                // block is done; the entry continues if
+                // `offset < unp_size`". The bit-after-256
+                // (`new_file`) only controls *when* libarchive
+                // calls `parse_codes` for the next block —
+                // both branches re-parse new tables before
+                // emitting more LZ data. We mirror the same
+                // behaviour: stop on size, else re-parse and
+                // continue.
+                if (output.len() as u64) >= unpacked_size {
+                    break;
+                }
+                let prologue = parse_block_prologue(br, lengths)?;
+                tables = match prologue {
+                    BlockPrologue::Lz {
+                        tables: next_tables,
+                        ..
+                    } => next_tables,
+                    BlockPrologue::Ppmd { .. } => {
+                        // Cross-mode (LZ → PPMd) within an entry
+                        // requires a shared dict. Surface a
+                        // precise error so the caller can route
+                        // accordingly. The filter corpus avoids
+                        // this case via `-mcT-`.
+                        return Err(LegacyEntryError::CrossModeNotSupported);
+                    }
+                };
+            }
+            BlockEnd::FilterDecl => {
+                // Pull the filter declaration off the same LZ
+                // bit stream and queue it for post-decode
+                // application. The LZ block continues with the
+                // next symbol after the inline-byte payload —
+                // re-enter `decode_block` on the same decoder /
+                // reader / tables; libarchive does the same
+                // (the symbol 257 branch in `read_data_compressed`
+                // just falls through to the next loop iteration).
+                let raw = read_filter_declaration_bytes(br)?;
+                parse_filter_declaration(&mut stack, &raw, output.len() as u64)?;
+            }
+        }
     }
+
+    // Apply every pending filter against the LZ output buffer
+    // in place. Each filter's `[block_start, block_start +
+    // block_length)` range is transformed to the emit-stream
+    // bytes the consumer would have received from libarchive's
+    // sink. Filters apply in declaration order; same-range
+    // chains pipeline through the buffer (later filters see
+    // earlier filters' outputs).
+    apply_pending_filters_in_place(&mut stack, output)?;
+
+    // Truncate to `unpacked_size` — the LZ dispatcher may have
+    // emitted a small overshoot on the last match (matches can
+    // be up to ~260 bytes); libarchive clips at `offset >=
+    // unp_size` likewise.
+    output.truncate(unpacked_size as usize);
+    if (output.len() as u64) < unpacked_size {
+        return Err(LegacyEntryError::SizeShortfall {
+            got: output.len() as u64,
+            expected: unpacked_size,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
