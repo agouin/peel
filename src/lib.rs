@@ -101,6 +101,7 @@ pub mod checkpoint;
 pub mod cli;
 #[cfg(unix)]
 pub mod coordinator;
+pub mod crypto;
 pub mod decode;
 #[cfg(unix)]
 pub mod download;

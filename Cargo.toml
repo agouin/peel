@@ -143,6 +143,14 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # for `cargo test` and does not affect release binaries. Cargo unions
 # features between dev and runtime for test builds.
 hyper = { version = "1", default-features = false, features = ["server"] }
+# Dev-only reference implementations used by `src/crypto/` tests and
+# `tests/test_crypto_diff.rs` to cross-check the hand-rolled SHA-1,
+# HMAC, and PBKDF2 against battle-tested upstreams
+# (`docs/PLAN_archive_encryption.md` §2). Same precedent as `sha2`
+# and `blake2` above: the runtime binary does not link these.
+sha1 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
 [profile.release]
 debug = "line-tables-only"
