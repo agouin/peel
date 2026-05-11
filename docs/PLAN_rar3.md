@@ -1,7 +1,7 @@
 ## Plan: legacy RAR (RAR3 / RAR4) archive support
 
-> **Status: drafted 2026-05-10, Phase A landed, Phase B landed
-> (modulo §B3 differential fixtures).** §0 resolved 2026-05-10.
+> **Status: drafted 2026-05-10, Phase A landed, Phase B landed.**
+> §0 resolved 2026-05-10.
 > **§A1 (6c96328) + §A2a (38ff665) + §A2b (cc60bf8)** complete:
 > STORED-method legacy archives extract end-to-end. **§B0 (e730509)**
 > lands the PPMd-II range coder under `src/decode/ppmd2/` —
@@ -12,12 +12,12 @@
 > **§B2a (c5119cc) + §B2b (f3a73b6) + §B2c (f3d1226)** land the
 > model: context tree, decode loop, update path, sister encoder,
 > and 21 round-trip / edge-case tests across the full order range
-> (2..=64), session restart, and small-arena exhaustion. §B3
-> (differential cross-check against unrar-produced fixtures) is the
-> next milestone in Phase B. This plan resolves follow-on `O.RAR4`
-> from `docs/PLAN_rar.md`. It is a sibling sub-plan to
-> `docs/PLAN_rar5_decoder.md` — additive to `docs/PLAN_rar.md`, not
-> a supersession.
+> (2..=64), session restart, and small-arena exhaustion. **§B3
+> (this commit)** lands 50 differential reference vectors from
+> 7z-PPMd output and the two model-layer fixes that corpus surfaced.
+> This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
+> is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
+> `docs/PLAN_rar.md`, not a supersession.
 >
 > **Sequencing.** `PLAN_rar.md` §1–§4 plus `PLAN_rar5_decoder.md`
 > Phases A–E must be on `main` first. The hand-rolled RAR5 decoder
@@ -363,8 +363,11 @@ through it, the legacy crash-resume scenario will land alongside
 >   split fix.
 > - **§B2b** ✅ (commit f3a73b6) — decode loop + update model.
 > - **§B2c** ✅ (commit f3d1226) — edge-case stress.
-> - **§B3** (next) — differential cross-check against `unrar`-
->   produced fixtures.
+> - **§B3** ✅ (this commit) — 50 differential reference vectors
+>   sourced from 7z-PPMd output, two model-layer fixes the corpus
+>   surfaced, and a regen script that pins the encoder's actual
+>   `mem_size_bytes` so the decoder shares the encoder's restart
+>   schedule.
 
 ### §B1. PPMd-II suballocator ✅ (commit 62bc41c)
 
@@ -512,13 +515,101 @@ because (a) it's the cleanest BSD-2-Clause form of the algorithm,
 and (b) it ships both the 7z and RAR range-coder variants behind
 one decode_symbol — useful when the RAR variant lands in Phase C.
 
-### §B3. Differential cross-check
+### §B3. Differential cross-check ✅
 
-**What**: encode a small payload with `rar a -m5`, decode with the
-§B2 model, byte-compare. ~50 fixture vectors.
+**What landed**: 50 reference vectors at
+[tests/fixtures/ppmd2/](../tests/fixtures/ppmd2/), each containing a
+plaintext, the PPMd byte stream 7zip produced when encoding it, and
+the encoder's `(order, mem_size_bytes)` tuple. The new
+`differential_7z_tests::corpus_decodes_byte_for_byte` in
+[src/decode/ppmd2/model.rs](../src/decode/ppmd2/model.rs) constructs
+a [`Model`](../src/decode/ppmd2/model.rs) per fixture and asserts
+byte-perfect decode.
 
-**Demo**: `cargo test decode::ppmd2` passes including a corpus of
-~50 reference vectors.
+**Why 7z PPMd, not `rar a -m5`**: the original sketch was no longer
+buildable. Modern `rar 7.x` dropped legacy-archive creation outright
+— there is no `-ma3` switch, no compatible `m<level>` mapping —
+so there is no path to a fresh RAR3-format archive from the
+licensed binary at `~/Downloads/rar/`. The §B2 model also still
+sits on the 7z-variant range coder; the RAR-variant decoder is
+deferred to Phase C. 7z PPMd uses the identical PPMd-II model and
+the 7z-variant range coder this module already targets, so it is
+the cleanest external reference today. When Phase C lands the
+RAR-variant range coder + RAR3 LZ-block parser, a sibling corpus of
+`rar`-produced fixtures is a natural addition.
+
+**Two model bugs the corpus surfaced**:
+
+1. **Binary-context decode used the n-ary path**. The model called
+   `RangeDecoder::get_threshold(BIN_SCALE) + decode(start, size)`
+   for both the bit-0 (hit) and bit-1 (escape) branches of a
+   1-state context. libarchive's `Range_DecodeBit_7z` is **not**
+   equivalent to this on the bit-1 branch: it computes
+   `range -= bound` directly, preserving the low 14 bits of
+   `range`, while the n-ary path computes
+   `range = (range >> 14) * (BIN_SCALE - prob)` and throws them
+   away. The bit streams agree on bit-0 and diverge on every bit-1
+   (escape). The fix adds [`RangeDecoder::decode_bit_ppmd7`](../src/decode/ppmd2/range_dec.rs)
+   plus the matching `RangeEncoder::encode_bit_ppmd7` and wires the
+   model's BIN path through them. The earlier doc note that "the
+   model is range-coder-variant-agnostic" was wrong about the
+   binary primitive — the 7z variant has a dedicated bit method
+   that has to be honoured.
+2. **`init_esc` was indexed with the pre-update probability**.
+   libarchive updates the binary-SEE probability via
+   `PPMD_UPDATE_PROB_1` and then indexes `K_EXP_ESCAPE[*prob >> 10]`
+   with the *post-update* value. The Rust code captured `prob` into
+   a local before the update, then indexed with that stale local —
+   one-bucket-low on most escapes. Drift accumulated through
+   `update_model`'s 1-state→multi-state promotion (which uses
+   `init_esc` to seed the new `SummFreq`) and silently desynced the
+   model.
+
+**Fixture-pipeline fix**: 7zip's command-line parser silently
+overrides `m0=PPMd:mem=<N>m` on the version installed via Homebrew
+(p7zip 17.05) and uses a fixed default — for our requests it
+always emitted `mem_size_bytes = 0x10000` (64 KiB), regardless of
+whether we asked for 1 MiB or 64 MiB. The decoder restarts on
+`text >= units_start`, which is sized off `mem_size_bytes`; if we
+passed the *requested* megabytes to the decoder it would never
+restart while the encoder did, and the model state diverged on any
+stream long enough to grow the text region. Streams short enough to
+fit before the encoder's restart still decoded — which is why the
+five high-order failures clustered on the longest payloads. The fix
+is in regen.py: it now reads the PPMd method properties straight
+out of the 7z archive header (method ID `03 04 01` + length-5
+properties; `bytes[1..5]` are the canonical `mem_size_bytes` as
+LE-u32) and serialises that value into each fixture so the decoder
+shares the encoder's arena. Fixture wire format gained a `u32`
+`mem_bytes` field; the prior `u8 mem_mb` was both insufficient
+(64 KiB doesn't fit a MiB-granularity field) and unreliable.
+
+**What `corpus_decodes_byte_for_byte` covers**:
+
+- 10 payloads × 5 `(order, mem_mb)` configurations = 50 cases.
+- Payloads sweep highly-compressible (zeros, period-27), modestly
+  compressible (ASCII, lorem, English), and high-entropy (LCG
+  pseudorandom). Sizes from 42 B to 16 KiB.
+- Orders 2, 4, 8, 16, 32 (the PPMd7 maximum); mem requests 1 / 4 /
+  16 / 32 / 64 MiB — all of which p7zip 17.05 collapses to 64 KiB
+  in the encoded stream, as recorded.
+
+**Lib-test count**: 1508 passes (was 1507 at §B2c — net +1 for
+`corpus_decodes_byte_for_byte`; the diagnostic scaffolding that
+narrowed down the two bugs was deleted before commit, so no other
+test count changes).
+
+**Demo**: `cargo test --features rar decode::ppmd2` runs all 70
+ppmd2 module tests including the new corpus in <1 s.
+
+**Reference harness**: while triaging the bugs above, a libarchive-
+based standalone decoder was useful for printing observable model
+state at every decoded byte and diff'ing it against our Rust
+trace. That harness lives outside the tree (in `/tmp/refdec/`) and
+is not committed, but its strategy — copy `archive_ppmd7.c`
+verbatim + stub `archive_read_private.h` + small `main.c` that
+parses our fixture format and dumps per-byte state — is
+reproducible if a future bug needs the same level of triage.
 
 ---
 

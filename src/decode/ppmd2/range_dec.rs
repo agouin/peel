@@ -249,6 +249,44 @@ impl<'a> RangeDecoder<'a> {
         self.normalize()?;
         Ok(bit)
     }
+
+    /// PPMd7 binary-context decode: pick `0` (the one-state hit) or
+    /// `1` (escape) against a 14-bit probability scaled by
+    /// [`PPMD_BIN_SCALE`] (= `1 << 14`).
+    ///
+    /// Caller passes `prob` (= the SEE probability), receives the
+    /// decoded bit; the caller is responsible for updating the SEE
+    /// state via `PPMD_UPDATE_PROB_0` / `PPMD_UPDATE_PROB_1` after
+    /// the bit is known.
+    ///
+    /// Why a dedicated method: this mirrors libarchive's
+    /// `Range_DecodeBit_7z`, which is **not** equivalent to
+    /// `get_threshold(PPMD_BIN_SCALE) + decode(start, size)` on the
+    /// `1` (escape) branch. The escape branch's range update reads
+    /// `range -= bound`, preserving the low 14 bits of `range`;
+    /// the n-ary `decode` path reads `range = (range >> 14) * size`,
+    /// discarding them. The bit-stream produced by a 7z PPMd
+    /// encoder calling `Range_EncodeBit_7z` only decodes correctly
+    /// when the decoder pairs it with this method — the n-ary path
+    /// diverges on every binary escape.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeDecoderError::Truncated`] if renormalisation needs a
+    /// byte and the input is exhausted.
+    pub fn decode_bit_ppmd7(&mut self, prob: u32) -> Result<u32, RangeDecoderError> {
+        let bound = (self.range >> 14).wrapping_mul(prob);
+        let bit = if self.code < bound {
+            self.range = bound;
+            0
+        } else {
+            self.code = self.code.wrapping_sub(bound);
+            self.range = self.range.wrapping_sub(bound);
+            1
+        };
+        self.normalize()?;
+        Ok(bit)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -328,6 +366,22 @@ impl RangeEncoder {
             self.low = self.low.wrapping_add(u64::from(bound));
             self.range = self.range.wrapping_sub(bound);
             *prob = (*prob).saturating_sub((u32::from(*prob) >> BIT_MODEL_TOTAL_BITS) as u16);
+        }
+        self.normalize();
+    }
+
+    /// PPMd7 binary-context encode counterpart to
+    /// [`RangeDecoder::decode_bit_ppmd7`]. Mirrors libarchive's
+    /// `Range_EncodeBit_7z`. The probability is the caller's SEE
+    /// state pre-update; the caller applies PPMD_UPDATE_PROB_* after
+    /// the bit is encoded.
+    pub fn encode_bit_ppmd7(&mut self, prob: u32, bit: u32) {
+        let bound = (self.range >> 14).wrapping_mul(prob);
+        if bit == 0 {
+            self.range = bound;
+        } else {
+            self.low = self.low.wrapping_add(u64::from(bound));
+            self.range = self.range.wrapping_sub(bound);
         }
         self.normalize();
     }

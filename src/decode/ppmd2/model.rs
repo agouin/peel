@@ -800,13 +800,20 @@ impl Model {
             }
         } else {
             // ── Binary path ─────────────────────────────────────
+            //
+            // The 7z range coder has a dedicated binary-decode
+            // primitive — `Range_DecodeBit_7z` — that is **not**
+            // equivalent to `get_threshold + decode` on the escape
+            // (bit = 1) branch: it subtracts the bound from `range`
+            // directly rather than recomputing `range = (range >>
+            // 14) * size`, preserving the low 14 bits. Using the
+            // n-ary path here diverges from any 7z-emitted stream on
+            // every binary-context escape. See
+            // [`RangeDecoder::decode_bit_ppmd7`].
             let prob_idx = self.bin_summ_index();
             let prob = u32::from(self.bin_summ[prob_idx]);
-            // Pure binary decode against PPMD_BIN_SCALE — works for
-            // both the 7z and RAR range-coder variants.
-            let value = rc.get_threshold(PPMD_BIN_SCALE)?;
-            if value < prob {
-                rc.decode(0, prob)?;
+            let bit = rc.decode_bit_ppmd7(prob)?;
+            if bit == 0 {
                 self.bin_summ[prob_idx] = ppmd_update_prob_0(prob) as u16;
                 let one_state = Self::ctx_one_state_off(self.min_context);
                 self.found_state = one_state;
@@ -814,9 +821,14 @@ impl Model {
                 self.update_bin();
                 return Ok(symbol);
             }
-            rc.decode(prob, PPMD_BIN_SCALE - prob)?;
-            self.bin_summ[prob_idx] = ppmd_update_prob_1(prob) as u16;
-            self.init_esc = u32::from(K_EXP_ESCAPE[(prob >> 10) as usize]);
+            // INVARIANT: libarchive indexes K_EXP_ESCAPE with the
+            // *updated* probability, not the pre-update one we read
+            // into `prob`. Mismatching this shifts `init_esc` by one
+            // bucket on every escape and silently drifts the
+            // update_model SummFreq path.
+            let new_prob = ppmd_update_prob_1(prob);
+            self.bin_summ[prob_idx] = new_prob as u16;
+            self.init_esc = u32::from(K_EXP_ESCAPE[(new_prob >> 10) as usize]);
             char_mask.fill(0xFF);
             let one_state = Self::ctx_one_state_off(self.min_context);
             char_mask[self.state_symbol(one_state) as usize] = 0;
@@ -1593,21 +1605,25 @@ impl Model {
             rc.encode(sum, summ_freq - sum, summ_freq);
         } else {
             // ── Binary path ─────────────────────────────────────
+            //
+            // See the matching note in `decode_symbol`: the 7z
+            // range coder treats binary contexts with a dedicated
+            // bit primitive that is not equivalent to `encode(start,
+            // size, BIN_SCALE)` on the bit-1 branch.
             let prob_idx = self.bin_summ_index();
             let prob = u32::from(self.bin_summ[prob_idx]);
             let one_state = Self::ctx_one_state_off(self.min_context);
             if self.state_symbol(one_state) == symbol {
-                // bit 0
-                rc.encode(0, prob, PPMD_BIN_SCALE);
+                rc.encode_bit_ppmd7(prob, 0);
                 self.bin_summ[prob_idx] = ppmd_update_prob_0(prob) as u16;
                 self.found_state = one_state;
                 self.update_bin();
                 return;
             }
-            // bit 1
-            rc.encode(prob, PPMD_BIN_SCALE - prob, PPMD_BIN_SCALE);
-            self.bin_summ[prob_idx] = ppmd_update_prob_1(prob) as u16;
-            self.init_esc = u32::from(K_EXP_ESCAPE[(prob >> 10) as usize]);
+            rc.encode_bit_ppmd7(prob, 1);
+            let new_prob = ppmd_update_prob_1(prob);
+            self.bin_summ[prob_idx] = new_prob as u16;
+            self.init_esc = u32::from(K_EXP_ESCAPE[(new_prob >> 10) as usize]);
             char_mask.fill(0xFF);
             char_mask[self.state_symbol(one_state) as usize] = 0;
             self.prev_success = 0;
@@ -2217,4 +2233,132 @@ mod tests {
     // Layout constants are exercised by the file-level
     // `const _: () = { assert!(...); };` block, which fails to
     // compile if any offset drifts. No runtime test is needed.
+}
+
+#[cfg(test)]
+mod differential_7z_tests {
+    //! §B3 — differential cross-check against externally-built PPMd
+    //! reference vectors.
+    //!
+    //! Each fixture under `tests/fixtures/ppmd2/case_*.bin` is a
+    //! `(plaintext, ppmd_stream, order, mem_bytes)` tuple produced by
+    //! 7zip's PPMd encoder. The test decodes the stream through this
+    //! crate's [`Model`] + [`RangeDecoder`] and asserts the output
+    //! matches the recorded plaintext byte-for-byte.
+    //!
+    //! 7z PPMd is Igor Pavlov's PPMd7 (LZMA SDK) variant — the same
+    //! algorithm and range-coder framing this module's decode loop
+    //! targets. `docs/PLAN_rar3.md` §B3 explains why we use 7z here
+    //! rather than `rar a -m5`: modern rar 7.x cannot produce
+    //! RAR3-format archives, and the RAR-variant range coder is
+    //! deferred to Phase C.
+    //!
+    //! See `tests/fixtures/ppmd2/README.md` for the fixture wire
+    //! format and `tests/fixtures/ppmd2/regen.py` for regeneration.
+    use super::*;
+    use crate::decode::ppmd2::range_dec::RangeDecoder;
+
+    const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ppmd2");
+    const MAGIC: &[u8; 4] = b"PPM2";
+
+    struct Fixture {
+        name: String,
+        order: u8,
+        mem_bytes: u32,
+        plaintext: Vec<u8>,
+        ppmd: Vec<u8>,
+    }
+
+    fn parse_fixture(name: String, bytes: &[u8]) -> Fixture {
+        assert!(bytes.len() >= 18, "{name}: fixture truncated (header)");
+        assert_eq!(&bytes[0..4], MAGIC, "{name}: bad magic");
+        let order = bytes[4];
+        // bytes[5] is reserved
+        let mem_bytes = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+        let plaintext_len =
+            u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+        let ppmd_len = u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]) as usize;
+        let body = &bytes[18..];
+        assert_eq!(
+            body.len(),
+            plaintext_len + ppmd_len,
+            "{name}: body length {} != plaintext({}) + ppmd({})",
+            body.len(),
+            plaintext_len,
+            ppmd_len,
+        );
+        let plaintext = body[..plaintext_len].to_vec();
+        let ppmd = body[plaintext_len..].to_vec();
+        Fixture {
+            name,
+            order,
+            mem_bytes,
+            plaintext,
+            ppmd,
+        }
+    }
+
+    fn load_fixtures() -> Vec<Fixture> {
+        let dir = std::path::Path::new(FIXTURE_DIR);
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read_dir({}): {e}", dir.display()))
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("case_") && n.ends_with(".bin"))
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        entries
+            .into_iter()
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let bytes =
+                    std::fs::read(e.path()).unwrap_or_else(|err| panic!("read {name}: {err}"));
+                parse_fixture(name, &bytes)
+            })
+            .collect()
+    }
+
+    fn decode_and_assert(fx: &Fixture) {
+        let arena = fx.mem_bytes as usize;
+        let mut model = Model::new(arena, u32::from(fx.order))
+            .unwrap_or_else(|e| panic!("{}: Model::new failed: {e:?}", fx.name));
+        let mut dec = RangeDecoder::new(&fx.ppmd)
+            .unwrap_or_else(|e| panic!("{}: RangeDecoder::new failed: {e:?}", fx.name));
+        let mut out = Vec::with_capacity(fx.plaintext.len());
+        for i in 0..fx.plaintext.len() {
+            let b = model.decode_symbol(&mut dec).unwrap_or_else(|e| {
+                panic!(
+                    "{}: decode_symbol failed at byte {i} of {}: {e:?}",
+                    fx.name,
+                    fx.plaintext.len(),
+                )
+            });
+            if b != fx.plaintext[i] {
+                panic!(
+                    "{}: byte {i} mismatch: decoded 0x{b:02x}, expected 0x{:02x}",
+                    fx.name, fx.plaintext[i]
+                );
+            }
+            out.push(b);
+        }
+        assert_eq!(out, fx.plaintext, "{}: final output", fx.name);
+    }
+
+    #[test]
+    fn corpus_decodes_byte_for_byte() {
+        let fixtures = load_fixtures();
+        assert!(
+            fixtures.len() >= 50,
+            "expected ≥ 50 fixtures, found {}; regenerate with \
+             tests/fixtures/ppmd2/regen.py",
+            fixtures.len()
+        );
+        for fx in &fixtures {
+            decode_and_assert(fx);
+        }
+    }
 }
