@@ -147,6 +147,8 @@
 
 #![cfg(unix)]
 
+pub mod local;
+
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -805,6 +807,40 @@ pub enum CoordinatorError {
     /// distinct exit code.
     #[error("integrity check failed")]
     Integrity(#[source] crate::hash::IntegrityError),
+
+    /// Local-file extraction was requested but the local-mode
+    /// pipeline is not yet implemented for the current state of
+    /// `docs/PLAN_local_file_extract.md`.
+    ///
+    /// §1 of the plan lands the CLI / dispatch surface; §2 wires
+    /// the open-file → decode → sink pipeline. Until §2 lands the
+    /// local entry point returns this variant so callers get a
+    /// clear error instead of a panic or a misleading "decode
+    /// failed".
+    #[error(
+        "local-file extraction is not yet implemented; \
+         see docs/PLAN_local_file_extract.md §2"
+    )]
+    LocalNotImplemented,
+
+    /// The local-file extractor probed the source filesystem for
+    /// `FALLOC_FL_PUNCH_HOLE` support and the kernel/filesystem
+    /// refused (`docs/PLAN_local_file_extract.md` §2). Destructive
+    /// mode cannot proceed; the user must either pass
+    /// `-k/--keep-archive` to skip punching or move the archive to
+    /// a supporting filesystem (ext4, xfs, btrfs, tmpfs on Linux;
+    /// APFS on macOS).
+    #[error(
+        "the filesystem holding {} does not support FALLOC_FL_PUNCH_HOLE; \
+         peel cannot run in destructive mode here — re-run with \
+         `-k/--keep-archive` to extract without punching, or move the \
+         archive to a supporting filesystem", path.display()
+    )]
+    LocalPunchUnsupported {
+        /// Path of the source archive whose filesystem rejected
+        /// the probe.
+        path: PathBuf,
+    },
 }
 
 /// Run the full pipeline.

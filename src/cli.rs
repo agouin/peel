@@ -8,11 +8,13 @@
 
 #![cfg(unix)]
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 
+use crate::coordinator::local::LocalRunArgs;
 use crate::coordinator::{filename_from_url, CoordinatorConfig, OutputTarget, RunArgs};
 use crate::decode::{DecoderRegistry, FormatShape};
 use crate::download::{
@@ -295,6 +297,21 @@ pub struct Cli {
     /// extracting); compatible with `-k/--keep-archive`.
     #[arg(long = "strict-format", default_value_t = false)]
     pub strict_format: bool,
+
+    /// Skip the destructive-mode confirmation prompt in local-file
+    /// mode (`docs/PLAN_local_file_extract.md` §1).
+    ///
+    /// When the positional argument is a local path peel runs in
+    /// destructive mode by default: the source archive is
+    /// progressively hole-punched as the decoder advances and
+    /// deleted on clean completion. In a TTY the user is prompted
+    /// before this begins; `-y/--yes` bypasses the prompt.
+    /// `-k/--keep-archive` preserves the source archive instead;
+    /// combining `-y` with `-k` is harmless (`-k` wins).
+    ///
+    /// Has no effect for HTTP sources.
+    #[arg(short = 'y', long = "yes", default_value_t = false)]
+    pub yes: bool,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -493,6 +510,93 @@ pub enum CliError {
          while --mirror treats the alternates as copies of the same source"
     )]
     MirrorMultipleUrls,
+
+    /// A positional argument was a relative or absolute path but no
+    /// regular file exists at it (`docs/PLAN_local_file_extract.md`
+    /// §1). Distinct from [`Self::InvalidUrl`]: the input parses as
+    /// neither an HTTP URL nor a path to an existing file, and the
+    /// "does this file exist" check is the friendlier surface.
+    #[error("no such file: {}", path.display())]
+    LocalSourceNotFound {
+        /// The path the user supplied.
+        path: PathBuf,
+    },
+
+    /// A positional argument is a path but it resolves to a
+    /// non-regular file (a directory, a symlink to a directory, a
+    /// socket, etc.). Local mode requires a regular file.
+    #[error("{} is not a regular file (local-mode source must be a regular file)", path.display())]
+    LocalSourceNotRegularFile {
+        /// The path the user supplied.
+        path: PathBuf,
+    },
+
+    /// The positional arguments mix HTTP URLs and local file paths.
+    /// peel rejects the combination at parse time
+    /// (`docs/PLAN_local_file_extract.md` §1): resume semantics for
+    /// a mixed source list are undefined and the UX gain from
+    /// supporting it is nil.
+    #[error(
+        "cannot mix URL and local-file sources in one run \
+         (got both `{url}` and `{path}`)"
+    )]
+    MixedSources {
+        /// One example of an HTTP source from the list.
+        url: String,
+        /// One example of a local-file source from the list.
+        path: PathBuf,
+    },
+
+    /// Multiple local-file positional arguments were given. peel
+    /// supports exactly one local source today; multi-file local
+    /// archives are deferred to the multi-volume plan
+    /// (`docs/PLAN_local_file_extract.md` Out-of-scope).
+    #[error(
+        "local-file mode supports exactly one positional path \
+         (got {count}); split-archive local extraction is not yet \
+         implemented"
+    )]
+    LocalMultiSource {
+        /// How many local paths the user passed.
+        count: usize,
+    },
+
+    /// A flag was passed alongside a local-file source but the flag
+    /// is HTTP-only (`docs/PLAN_local_file_extract.md` §1 step 2).
+    /// All download knobs — `--mirror`, `--sha256`, `--workers`,
+    /// `--chunk-size`, `--max-bandwidth`, `--max-disk-buffer`,
+    /// `--http-version`, `--no-adaptive-chunk-size`,
+    /// `--no-extract`, `--strict-format` — surface this variant.
+    #[error(
+        "flag `{flag}` does not apply to local-file mode \
+         (it controls the HTTP download path)"
+    )]
+    LocalFlagNotApplicable {
+        /// The conflicting flag's user-facing name.
+        flag: &'static str,
+    },
+
+    /// `-k=<PATH>` was given alongside a local source. In local
+    /// mode the archive already lives at the user-supplied
+    /// positional path; the `-k <PATH>` value form is rejected per
+    /// `docs/PLAN_local_file_extract.md` §1 step 3.
+    #[error(
+        "`-k=<PATH>` does not apply to local-file mode \
+         (the archive is already at the positional path; use bare `-k` to preserve it)"
+    )]
+    LocalKeepArchiveWithPath,
+
+    /// Local-file mode would default to destructive extraction but
+    /// stdin is not a TTY and neither `-y` nor `-k` was passed
+    /// (`docs/PLAN_local_file_extract.md` §1 step 4). peel will not
+    /// silently destroy the source archive in a non-interactive
+    /// environment.
+    #[error(
+        "peel destroys the source archive by default in local-file mode \
+         and stdin is not a TTY — re-run with `-y` to confirm destructive \
+         extraction, or `-k` to preserve the source"
+    )]
+    LocalConsentRequired,
 }
 
 /// Compression and archive suffixes stripped when deriving a default
@@ -751,6 +855,238 @@ fn parse_disk_buffer(input: &str) -> Result<Option<u64>, ParseBandwidthError> {
     parse_bandwidth(trimmed).map(Some)
 }
 
+/// Classification of one positional `<source>` argument
+/// (`docs/PLAN_local_file_extract.md` §1 step 1).
+///
+/// HTTP-shaped strings (anything that [`crate::http::Url::parse`]
+/// accepts — `http://...` and `https://...`) take the
+/// [`Self::Http`] arm; anything else is treated as a path and the
+/// existence check decides whether the binary routes to the
+/// local-file extractor or surfaces a "no such file" error before
+/// any work begins.
+#[derive(Debug, Clone)]
+enum SourceClassification {
+    /// HTTP / HTTPS URL — eligible for the existing download path.
+    Http(String),
+    /// Relative or absolute path that exists on disk as a regular
+    /// file. Eligible for the local-file extractor.
+    Local(PathBuf),
+}
+
+/// Classify one positional `<source>` argument
+/// (`docs/PLAN_local_file_extract.md` §1 step 1).
+///
+/// The classifier never does network IO; existence checks on the
+/// path are bare `metadata(2)` calls. Heterogeneous lists
+/// ([`Self::Http`] + [`Self::Local`]) are detected at the
+/// dispatch layer by [`classify_sources`] — this helper is
+/// per-argument.
+fn classify_source(arg: &str) -> Result<SourceClassification, CliError> {
+    match Url::parse(arg) {
+        Ok(_) => Ok(SourceClassification::Http(arg.to_string())),
+        Err(_) => {
+            let path = PathBuf::from(arg);
+            let meta = match path.metadata() {
+                Ok(m) => m,
+                Err(_) => return Err(CliError::LocalSourceNotFound { path }),
+            };
+            if !meta.is_file() {
+                return Err(CliError::LocalSourceNotRegularFile { path });
+            }
+            Ok(SourceClassification::Local(path))
+        }
+    }
+}
+
+/// Top-level entry from [`Cli::into_dispatch`]: a parsed CLI lands
+/// in one of two pipelines depending on what the positional
+/// `<source>` arguments looked like
+/// (`docs/PLAN_local_file_extract.md` §1).
+///
+/// HTTP / HTTPS arguments produce [`Dispatch::Http`], routed via
+/// [`crate::coordinator::run`]. Local file paths produce
+/// [`Dispatch::Local`], routed via
+/// [`crate::coordinator::local::run`]. The two coordinators share
+/// sink / decoder / extractor types but otherwise have no overlap.
+pub enum Dispatch {
+    /// HTTP / HTTPS run. Same shape as today's binary entry.
+    /// Boxed because [`RunArgs`] is several hundred bytes (it
+    /// carries config, client, registry, …) — sizing the bare
+    /// variant skews the enum.
+    Http(Box<RunArgs>),
+    /// Local-file run (`docs/PLAN_local_file_extract.md`). Carries
+    /// a `needs_consent_prompt` flag that the binary observes: when
+    /// `true`, the binary prompts on `/dev/tty` (per §1) before
+    /// invoking the coordinator; when `false`, the run is either
+    /// non-destructive (`-k`) or the user has already consented via
+    /// `-y`.
+    Local {
+        /// Arguments for [`crate::coordinator::local::run`].
+        args: Box<LocalRunArgs>,
+        /// True iff the binary must prompt the user before
+        /// invoking the coordinator. Implies destructive mode and
+        /// a TTY-attached stdin (the non-TTY rule errors at parse
+        /// time; explicit `-y` / `-k` short-circuit the prompt).
+        needs_consent_prompt: bool,
+    },
+}
+
+/// Classify every positional argument and reject heterogeneous /
+/// invalid lists (`docs/PLAN_local_file_extract.md` §1 step 1).
+///
+/// Returns a uniform [`Vec<SourceClassification>`] that callers
+/// can match against in one pass — every element is the same
+/// variant on success.
+fn classify_sources(args: &[String]) -> Result<Vec<SourceClassification>, CliError> {
+    if args.is_empty() {
+        return Err(CliError::NoUrls);
+    }
+    let classified: Vec<SourceClassification> = args
+        .iter()
+        .map(|s| classify_source(s))
+        .collect::<Result<_, _>>()?;
+    // Mixed lists are rejected. We do not have a use case for "two
+    // halves of the same archive, one local one remote"; rejecting
+    // the combination keeps resume semantics unambiguous.
+    let first_http = classified.iter().find_map(|s| match s {
+        SourceClassification::Http(u) => Some(u.clone()),
+        _ => None,
+    });
+    let first_local = classified.iter().find_map(|s| match s {
+        SourceClassification::Local(p) => Some(p.clone()),
+        _ => None,
+    });
+    if let (Some(url), Some(path)) = (first_http, first_local) {
+        return Err(CliError::MixedSources { url, path });
+    }
+    Ok(classified)
+}
+
+/// HTTP-only flags rejected when the positional source is a local
+/// path (`docs/PLAN_local_file_extract.md` §1 step 2).
+///
+/// Returns the user-facing flag name on the first violation so the
+/// error message names the specific knob the user tried to use.
+fn reject_http_only_flags(cli: &Cli) -> Result<(), CliError> {
+    // Order roughly matches the help text so the user sees the
+    // earliest violation reported. Each flag's "was set explicitly"
+    // detection mirrors the §2 sub-rule the `--no-extract` resolver
+    // uses (default-equal values slip through; non-default values
+    // surface the error).
+    if !cli.mirrors.is_empty() {
+        return Err(CliError::LocalFlagNotApplicable { flag: "--mirror" });
+    }
+    if !cli.expected_sha256s.is_empty() {
+        return Err(CliError::LocalFlagNotApplicable { flag: "--sha256" });
+    }
+    if cli.workers != DEFAULT_WORKERS {
+        return Err(CliError::LocalFlagNotApplicable { flag: "--workers" });
+    }
+    if cli.chunk_size != DEFAULT_CHUNK_SIZE {
+        return Err(CliError::LocalFlagNotApplicable {
+            flag: "--chunk-size",
+        });
+    }
+    if cli.no_adaptive_chunk_size {
+        return Err(CliError::LocalFlagNotApplicable {
+            flag: "--no-adaptive-chunk-size",
+        });
+    }
+    if cli.max_bandwidth.is_some() {
+        return Err(CliError::LocalFlagNotApplicable {
+            flag: "--max-bandwidth",
+        });
+    }
+    // `--max-disk-buffer` has a non-empty default; check against
+    // the default literal so a CLI containing the implicit value
+    // does not trip the rejection. `clap::ArgMatches::value_source`
+    // would be tighter but the [`Parser`] derive does not expose
+    // the matches; the literal comparison is good enough.
+    if cli.max_disk_buffer != "1GiB" {
+        return Err(CliError::LocalFlagNotApplicable {
+            flag: "--max-disk-buffer",
+        });
+    }
+    if cli.http_version != HttpVersionArg::default() {
+        return Err(CliError::LocalFlagNotApplicable {
+            flag: "--http-version",
+        });
+    }
+    if cli.no_extract {
+        return Err(CliError::LocalFlagNotApplicable {
+            flag: "--no-extract",
+        });
+    }
+    if cli.strict_format {
+        return Err(CliError::LocalFlagNotApplicable {
+            flag: "--strict-format",
+        });
+    }
+    Ok(())
+}
+
+/// Resolve the user's `-o <PATH>` into an [`OutputTarget`] when the
+/// source is a local file
+/// (`docs/PLAN_local_file_extract.md` §1 step 2).
+///
+/// Mirrors [`build_output_target_explicit`] /
+/// [`build_output_target_unknown_shape`] from the HTTP path: the
+/// shape is decided by `--format` (or the source path's suffix
+/// fall-through), `-o`'s shape hint disambiguates when the source
+/// is opaque, and the explicit-vs-derived branch picks a default
+/// when `-o` is absent.
+fn build_local_output(
+    source: &Path,
+    user_output: Option<PathBuf>,
+    forced_format: Option<&str>,
+    registry: &DecoderRegistry,
+) -> Result<OutputTarget, CliError> {
+    // Shape resolution: `--format` first, then suffix match on the
+    // source filename. We deliberately do *not* peek magic bytes
+    // here — magic detection happens inside the coordinator with
+    // the file already open. Path-shape hints disambiguate when
+    // both lookups miss.
+    let shape: Option<FormatShape> = forced_format
+        .and_then(|name| registry.shape_for_format_name(name))
+        .or_else(|| {
+            source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|name| registry.shape_for_name(name))
+        });
+    match (user_output, shape) {
+        (Some(path), Some(s)) => build_output_target_explicit(path, s),
+        (Some(path), None) => Ok(build_output_target_unknown_shape(path)),
+        (None, Some(FormatShape::Stream)) => {
+            // Stream-shape default: pop a suffix-stripped basename
+            // into CWD. Tar-shape defaults preserve the directory
+            // name; stream defaults strip the compression suffix
+            // exactly as the HTTP path does
+            // (e.g. `foo.zst` → `foo`).
+            let basename = source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or(CliError::NoDefaultOutput)?;
+            let stripped = strip_archive_extensions(basename);
+            if stripped.is_empty() {
+                return Err(CliError::NoDefaultOutput);
+            }
+            Ok(OutputTarget::File(PathBuf::from(stripped)))
+        }
+        (None, Some(FormatShape::Tree) | None) => {
+            let basename = source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or(CliError::NoDefaultOutput)?;
+            let stripped = strip_archive_extensions(basename);
+            if stripped.is_empty() {
+                return Err(CliError::NoDefaultOutput);
+            }
+            Ok(OutputTarget::Dir(PathBuf::from(stripped)))
+        }
+    }
+}
+
 impl Cli {
     /// Convert the parsed CLI into a [`RunArgs`] ready for
     /// [`crate::coordinator::run`].
@@ -967,6 +1303,125 @@ impl Cli {
             progress_state: None,
             kill_switch: None,
             io_backend: None,
+        })
+    }
+
+    /// Classify the positional sources and dispatch to either the
+    /// HTTP coordinator or the local-file extractor
+    /// (`docs/PLAN_local_file_extract.md` §1).
+    ///
+    /// HTTP sources route through [`Self::into_run_args`]; local
+    /// sources go through [`Self::into_local_run_args`]. Mixed
+    /// lists, non-existent paths, and HTTP-only flags paired with
+    /// a local source are rejected at parse time with a typed
+    /// [`CliError`] variant naming the specific problem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::MixedSources`] for heterogeneous source
+    /// lists, [`CliError::LocalSourceNotFound`] /
+    /// [`CliError::LocalSourceNotRegularFile`] when a positional
+    /// argument doesn't parse as a URL and doesn't resolve to a
+    /// regular file, [`CliError::LocalFlagNotApplicable`] when an
+    /// HTTP-only flag is combined with a local source,
+    /// [`CliError::LocalKeepArchiveWithPath`] when `-k=<PATH>` is
+    /// used in local mode, [`CliError::LocalConsentRequired`] when
+    /// destructive local mode is requested in a non-TTY context
+    /// without `-y` / `-k`, or any of the variants
+    /// [`Self::into_run_args`] surfaces.
+    pub fn into_dispatch(self) -> Result<Dispatch, CliError> {
+        // Hard cutover migration error for the removed `-C` flag
+        // — surfaces *before* source classification so a user who
+        // is mixing legacy flags still sees the migration hint
+        // first.
+        if self.output_dir_migration.is_some() {
+            return Err(CliError::OutputDirRemoved);
+        }
+
+        let classified = classify_sources(&self.urls)?;
+        // Disambiguate uniformly. `classify_sources` already
+        // rejected mixed lists, so finding any Local element means
+        // every element is Local.
+        let is_local = classified
+            .iter()
+            .all(|s| matches!(s, SourceClassification::Local(_)));
+
+        if !is_local {
+            return self.into_run_args().map(Box::new).map(Dispatch::Http);
+        }
+
+        // Local-file dispatch. Reject all the HTTP-side knobs
+        // before touching any IO so the error names the specific
+        // flag the user passed instead of failing later with a
+        // misleading "decode failed" message.
+        reject_http_only_flags(&self)?;
+
+        // Exactly one local source for now. Multi-file local
+        // archives are the multi-volume plan's job
+        // (`docs/PLAN_local_file_extract.md` Out-of-scope).
+        if classified.len() != 1 {
+            return Err(CliError::LocalMultiSource {
+                count: classified.len(),
+            });
+        }
+        let source = match &classified[0] {
+            SourceClassification::Local(p) => p.clone(),
+            SourceClassification::Http(_) => unreachable!("filtered above"),
+        };
+
+        // `-k` (bare or with value): in local mode the archive is
+        // already at the user-supplied positional path, so the
+        // `-k=<PATH>` value form is meaningless. Bare `-k` is the
+        // opt-out flag (no destruction, source preserved).
+        let keep_archive = match self.keep_archive.as_deref() {
+            None => false,
+            Some("") => true,
+            Some(_) => return Err(CliError::LocalKeepArchiveWithPath),
+        };
+
+        // Destructive-default consent rule (§1 step 4): when the
+        // run will modify the source and we're not in a TTY,
+        // require explicit consent via `-y` or `-k`.
+        let destructive = !keep_archive;
+        let stdin_is_tty = std::io::stdin().is_terminal();
+        let needs_consent_prompt = if destructive && !self.yes {
+            stdin_is_tty
+        } else {
+            false
+        };
+        if destructive && !self.yes && !stdin_is_tty {
+            return Err(CliError::LocalConsentRequired);
+        }
+
+        let registry = DecoderRegistry::with_defaults();
+        let output = build_local_output(
+            &source,
+            self.output_file,
+            self.forced_format.as_deref(),
+            &registry,
+        )?;
+
+        let args = LocalRunArgs {
+            source,
+            output,
+            forced_format: self.forced_format,
+            force_format_from_magic: self.force_format_from_magic,
+            keep_archive,
+            punch_threshold: self.punch_threshold,
+            checkpoint_min_bytes: self.checkpoint_min_bytes,
+            checkpoint_min_interval: Duration::from_secs_f64(self.checkpoint_min_secs.max(0.0)),
+            workdir: self.workdir,
+            io_backend: self.io_backend.into(),
+            registry,
+            progress: None,
+            progress_state: None,
+            kill_switch: None,
+            io_backend_resolved: None,
+        };
+
+        Ok(Dispatch::Local {
+            args: Box::new(args),
+            needs_consent_prompt,
         })
     }
 }
@@ -2162,5 +2617,231 @@ mod tests {
         let args = cli.into_run_args().expect("run args");
         assert!(args.config.no_extract);
         assert!(args.config.keep_archive.is_none());
+    }
+
+    // ---- PLAN_local_file_extract.md §1: CLI dispatch -----------------
+
+    /// Helper: create a unique temp regular file and return its path.
+    /// Caller is responsible for removing it.
+    fn make_local_fixture(label: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "peel_cli_local_{}_{}_{}.bin",
+            label,
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, b"peel-local-fixture").expect("create local fixture");
+        p
+    }
+
+    #[test]
+    fn classify_source_recognizes_http_url() {
+        let s = classify_source("https://example.com/x.tar.zst").expect("classify");
+        match s {
+            SourceClassification::Http(u) => assert_eq!(u, "https://example.com/x.tar.zst"),
+            SourceClassification::Local(_) => panic!("expected Http"),
+        }
+    }
+
+    #[test]
+    fn classify_source_recognizes_existing_path() {
+        let p = make_local_fixture("classify_existing");
+        let s = classify_source(p.to_str().expect("utf8")).expect("classify");
+        let _ = std::fs::remove_file(&p);
+        assert!(matches!(s, SourceClassification::Local(_)));
+    }
+
+    #[test]
+    fn classify_source_rejects_nonexistent_path() {
+        let err = classify_source("/definitely/not/a/real/peel/path").expect_err("classify");
+        assert!(matches!(err, CliError::LocalSourceNotFound { .. }));
+    }
+
+    #[test]
+    fn classify_source_rejects_directory() {
+        let dir = std::env::temp_dir().join(format!("peel_cli_local_dir_{}", std::process::id(),));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let err = classify_source(dir.to_str().expect("utf8")).expect_err("classify");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(err, CliError::LocalSourceNotRegularFile { .. }));
+    }
+
+    #[test]
+    fn dispatch_single_url_routes_to_http() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.tar.zst", "-o", "/tmp/out/"])
+            .expect("parse");
+        let dispatch = cli.into_dispatch().expect("dispatch");
+        assert!(matches!(dispatch, Dispatch::Http(_)));
+    }
+
+    #[test]
+    fn dispatch_existing_file_with_yes_routes_to_local() {
+        let p = make_local_fixture("dispatch_yes");
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y"]).expect("parse");
+        let dispatch = cli.into_dispatch().expect("dispatch");
+        let _ = std::fs::remove_file(&p);
+        match dispatch {
+            Dispatch::Local {
+                args,
+                needs_consent_prompt,
+            } => {
+                assert!(!needs_consent_prompt, "-y must skip the prompt");
+                assert!(!args.keep_archive, "default mode is destructive");
+            }
+            Dispatch::Http(_) => panic!("expected Local"),
+        }
+    }
+
+    #[test]
+    fn dispatch_existing_file_with_keep_archive_routes_to_local_non_destructive() {
+        let p = make_local_fixture("dispatch_keep");
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-k"]).expect("parse");
+        let dispatch = cli.into_dispatch().expect("dispatch");
+        let _ = std::fs::remove_file(&p);
+        match dispatch {
+            Dispatch::Local {
+                args,
+                needs_consent_prompt,
+            } => {
+                assert!(!needs_consent_prompt, "-k must skip the prompt");
+                assert!(args.keep_archive, "-k must opt out of destructive mode");
+            }
+            Dispatch::Http(_) => panic!("expected Local"),
+        }
+    }
+
+    #[test]
+    fn dispatch_nonexistent_path_errors_clearly() {
+        let cli = Cli::try_parse_from(["peel", "/definitely/not/here.tar.zst"]).expect("parse");
+        let err = cli.into_dispatch().err().expect("must error");
+        assert!(matches!(err, CliError::LocalSourceNotFound { .. }));
+    }
+
+    #[test]
+    fn dispatch_mixing_url_and_path_errors() {
+        let p = make_local_fixture("dispatch_mix");
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/foo.tar.zst",
+            p.to_str().expect("utf8"),
+        ])
+        .expect("parse");
+        let result = cli.into_dispatch();
+        let _ = std::fs::remove_file(&p);
+        let err = result.err().expect("must error");
+        assert!(matches!(err, CliError::MixedSources { .. }));
+    }
+
+    #[test]
+    fn dispatch_local_rejects_http_only_flags() {
+        let p = make_local_fixture("dispatch_workers");
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y", "--workers", "8"])
+            .expect("parse");
+        let result = cli.into_dispatch();
+        let _ = std::fs::remove_file(&p);
+        let err = result.err().expect("must error");
+        assert!(matches!(
+            err,
+            CliError::LocalFlagNotApplicable { flag: "--workers" }
+        ));
+    }
+
+    #[test]
+    fn dispatch_local_rejects_mirror_flag() {
+        let p = make_local_fixture("dispatch_mirror");
+        let cli = Cli::try_parse_from([
+            "peel",
+            p.to_str().expect("utf8"),
+            "-y",
+            "--mirror",
+            "https://m/x",
+        ])
+        .expect("parse");
+        let result = cli.into_dispatch();
+        let _ = std::fs::remove_file(&p);
+        let err = result.err().expect("must error");
+        assert!(matches!(
+            err,
+            CliError::LocalFlagNotApplicable { flag: "--mirror" }
+        ));
+    }
+
+    #[test]
+    fn dispatch_local_rejects_no_extract() {
+        let p = make_local_fixture("dispatch_no_extract");
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y", "--no-extract"])
+            .expect("parse");
+        let result = cli.into_dispatch();
+        let _ = std::fs::remove_file(&p);
+        let err = result.err().expect("must error");
+        assert!(matches!(
+            err,
+            CliError::LocalFlagNotApplicable {
+                flag: "--no-extract"
+            }
+        ));
+    }
+
+    #[test]
+    fn dispatch_local_rejects_keep_archive_with_path() {
+        let p = make_local_fixture("dispatch_kpath");
+        let cli = Cli::try_parse_from([
+            "peel",
+            p.to_str().expect("utf8"),
+            "-k=/tmp/elsewhere.tar.zst",
+        ])
+        .expect("parse");
+        let result = cli.into_dispatch();
+        let _ = std::fs::remove_file(&p);
+        let err = result.err().expect("must error");
+        assert!(matches!(err, CliError::LocalKeepArchiveWithPath));
+    }
+
+    #[test]
+    fn dispatch_local_yes_and_keep_archive_resolves_as_keep() {
+        let p = make_local_fixture("dispatch_yk");
+        let cli =
+            Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y", "-k"]).expect("parse");
+        let dispatch = cli.into_dispatch().expect("dispatch");
+        let _ = std::fs::remove_file(&p);
+        match dispatch {
+            Dispatch::Local {
+                args,
+                needs_consent_prompt,
+            } => {
+                // `-k` wins: not destructive, no prompt needed.
+                assert!(args.keep_archive);
+                assert!(!needs_consent_prompt);
+            }
+            Dispatch::Http(_) => panic!("expected Local"),
+        }
+    }
+
+    #[test]
+    fn dispatch_local_with_format_overrides_shape_resolution() {
+        // The source filename has no recognized suffix; `--format zstd`
+        // (Stream) plus an explicit File-shaped `-o` should land in
+        // `OutputTarget::File`.
+        let p = make_local_fixture("dispatch_format");
+        let cli = Cli::try_parse_from([
+            "peel",
+            p.to_str().expect("utf8"),
+            "-y",
+            "--format",
+            "zstd",
+            "-o",
+            "/tmp/decoded.bin",
+        ])
+        .expect("parse");
+        let dispatch = cli.into_dispatch().expect("dispatch");
+        let _ = std::fs::remove_file(&p);
+        match dispatch {
+            Dispatch::Local { args, .. } => match &args.output {
+                OutputTarget::File(out) => assert_eq!(out, Path::new("/tmp/decoded.bin")),
+                OutputTarget::Dir(_) => panic!("expected File"),
+            },
+            Dispatch::Http(_) => panic!("expected Local"),
+        }
     }
 }

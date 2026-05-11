@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use peel::cli::{http_version_banner, Cli};
+use peel::cli::{http_version_banner, Cli, Dispatch};
+use peel::coordinator::local::{run as run_local, LocalRunArgs};
 use peel::coordinator::{run, CoordinatorError, ProgressEvent, ProgressFn, RunArgs, RunStats};
 use peel::decode::DecoderRegistry;
 use peel::download::{SchedulerError, WorkerError};
@@ -343,9 +344,29 @@ fn main() -> Result<()> {
     // `into_run_args` and `select_backend` (the subscriber is at INFO
     // level there).
     let http_banner = http_version_banner(cli.http_version.into());
-    let mut args = cli
-        .into_run_args()
-        .context("constructing the HTTP client")?;
+    let dispatch = cli.into_dispatch().context("parsing CLI arguments")?;
+
+    // Local-file mode (`docs/PLAN_local_file_extract.md`) skips
+    // every HTTP-side knob — no scheduler retries, no
+    // multi-attempt rebuild, no mirror state. Handle it before
+    // setting up the HTTP-flavored renderer scaffolding.
+    if let Dispatch::Local {
+        args: local_args,
+        needs_consent_prompt,
+    } = dispatch
+    {
+        return run_local_dispatch(
+            *local_args,
+            needs_consent_prompt,
+            stderr_is_tty,
+            &kill_switch,
+            cleanup_done,
+        );
+    }
+    let mut args = match dispatch {
+        Dispatch::Http(args) => *args,
+        Dispatch::Local { .. } => unreachable!("filtered above"),
+    };
 
     // Resolve the IO backend in main (rather than letting
     // `coordinator::run` do it) so we can print the `io_backend=…`
@@ -459,6 +480,167 @@ fn main() -> Result<()> {
     eprintln!(
         "[stats] download chunks={} retries={} mode={:?}",
         stats.download.chunks_completed, stats.download.retries, stats.download.mode,
+    );
+    eprintln!(
+        "[stats] extract bytes_in={} bytes_out={} bytes_punched={} \
+         frames={} checkpoints={}",
+        stats.extraction.bytes_in,
+        stats.extraction.bytes_out,
+        stats.extraction.bytes_punched,
+        stats.extraction.frame_boundaries_observed,
+        stats.extraction.quiescent_checkpoints,
+    );
+    Ok(())
+}
+
+/// Prompt the user on `/dev/tty` for destructive-mode consent in
+/// local-file mode (`docs/PLAN_local_file_extract.md` §1).
+///
+/// Reading from `/dev/tty` directly (rather than `stdin`) means a
+/// piped `stdin` does not silently answer the prompt — the CLI's
+/// non-TTY rule already errors out at parse time when stdin is not
+/// a TTY *and* neither `-y` nor `-k` was passed, but the
+/// belt-and-suspenders `/dev/tty` read makes the interactive UX
+/// robust against unexpected setups (e.g. `xargs peel ...`).
+///
+/// Returns `Ok(true)` when the user typed `y`/`Y`, `Ok(false)` for
+/// anything else (the typical "accidental enter" → abort). An IO
+/// failure on `/dev/tty` (no controlling terminal, etc.) surfaces
+/// as the wrapped error.
+fn prompt_local_destructive_consent(source: &std::path::Path) -> Result<bool> {
+    let ckpt = source.with_file_name({
+        let mut name = source
+            .file_name()
+            .map(std::ffi::OsString::from)
+            .unwrap_or_default();
+        name.push(".peel.ckpt");
+        name
+    });
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("opening /dev/tty for the destructive-mode consent prompt")?;
+    use std::io::{BufRead, BufReader, Write};
+    let banner = format!(
+        "peel will hole-punch {} as extraction proceeds, freeing\n\
+         disk blocks. On successful completion the source will be\n\
+         deleted. On any failure (crash, Ctrl-C, OOM, power loss)\n\
+         the source is left partially destroyed and cannot be\n\
+         re-extracted without a fresh copy — the checkpoint at\n\
+         {} can only resume an interrupted run on the *same*\n\
+         punched file.\n\n\
+         Make a backup if you might need this archive again.\n\n\
+         Continue? [y/N] ",
+        source.display(),
+        ckpt.display(),
+    );
+    tty.write_all(banner.as_bytes())
+        .context("writing the consent prompt to /dev/tty")?;
+    tty.flush().ok();
+    let mut reader = BufReader::new(tty);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("reading the consent prompt response from /dev/tty")?;
+    let trimmed = line.trim();
+    Ok(matches!(trimmed, "y" | "Y" | "yes" | "Yes" | "YES"))
+}
+
+/// Drive the local-file extractor
+/// (`docs/PLAN_local_file_extract.md`). Mirrors the HTTP path's
+/// renderer / IO-backend / kill-switch wiring but skips the
+/// download-side retry loop entirely: a local extraction either
+/// completes or surfaces a clean error.
+///
+/// `needs_consent_prompt` is the bit the dispatch layer set when
+/// the run will be destructive *and* `-y` was not passed *and*
+/// stdin is a TTY. When `true`, we read `/dev/tty` directly so a
+/// piped stdin can't accidentally answer; declining the prompt
+/// exits non-zero with the same exit code as the SIGINT path.
+fn run_local_dispatch(
+    mut args: LocalRunArgs,
+    needs_consent_prompt: bool,
+    stderr_is_tty: bool,
+    kill_switch: &Arc<AtomicBool>,
+    cleanup_done: Arc<AtomicBool>,
+) -> Result<()> {
+    if needs_consent_prompt {
+        match prompt_local_destructive_consent(&args.source) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "[abort] aborted — re-run with `-k/--keep-archive` to preserve the source",
+                );
+                cleanup_done.store(true, Ordering::Release);
+                std::process::exit(1);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    // Resolve the IO backend in `main` so the `io_backend=…`
+    // banner is plain stderr scrollback ABOVE the renderer's
+    // redraw region (mirroring the HTTP path). Local mode passes
+    // workers=1 because there is one logical reader and no
+    // download-worker grid.
+    let (io_backend, io_backend_label) =
+        peel::io_backend::select_backend(args.io_backend, 1).context("resolving the IO backend")?;
+    args.io_backend_resolved = Some(io_backend);
+
+    if stderr_is_tty {
+        eprintln!("{io_backend_label}");
+    }
+
+    let state = ProgressState::new();
+    args.progress_state = Some(Arc::clone(&state));
+    args.progress = Some(make_event_callback(stderr_is_tty));
+    args.kill_switch = Some(Arc::clone(kill_switch));
+
+    let render_handle = if stderr_is_tty {
+        spawn_renderer(
+            Arc::clone(&state),
+            TtyRenderer::new(std::io::stderr()),
+            Duration::from_millis(100),
+        )
+        .context("spawning the TTY progress renderer")?
+    } else {
+        spawn_renderer(
+            Arc::clone(&state),
+            LogRenderer::new(),
+            Duration::from_secs(2),
+        )
+        .context("spawning the log progress renderer")?
+    };
+
+    let result = run_local(args);
+
+    state.mark_done();
+    let _ = render_handle.join();
+    cleanup_done.store(true, Ordering::Release);
+
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(CoordinatorError::Aborted {
+            checkpoints_written,
+        }) => {
+            let sig = FIRST_SIGNAL.load(Ordering::Acquire);
+            eprintln!(
+                "[abort] {} received, exited after {} checkpoints \
+                 (.peel.ckpt left for resume)",
+                signal_name(sig),
+                checkpoints_written,
+            );
+            std::process::exit(128 + sig);
+        }
+        Err(other) => return Err(anyhow::Error::from(other).context("running peel")),
+    };
+
+    eprintln!(
+        "[done] {} bytes extracted in {:.2}s{}",
+        stats.extraction.bytes_out,
+        stats.elapsed.as_secs_f64(),
+        if stats.resumed { " (resumed)" } else { "" },
     );
     eprintln!(
         "[stats] extract bytes_in={} bytes_out={} bytes_punched={} \
