@@ -15,16 +15,25 @@
 > (2..=64), session restart, and small-arena exhaustion. **§B3
 > (2e4648e)** lands 50 differential reference vectors from
 > 7z-PPMd output and the two model-layer fixes that corpus surfaced.
-> **§C0 (this commit)** opens Phase C: the original §C1 / §C2 split
-> is too coarse — same lesson §B taught — so this commit lands the
-> sub-phasing (§C0..§C2c, 12 commits total), scaffolds
+> **§C0 (fadba5b)** opened Phase C: the original §C1 / §C2 split
+> is too coarse — same lesson §B taught — so it landed the
+> sub-phasing (§C0..§C2c, 12 commits total), scaffolded
 > `src/decode/rar_legacy/` behind the existing `rar` Cargo feature,
-> and locks the differential-test corpus strategy. The licensed
+> and locked the differential-test corpus strategy. The licensed
 > RAR 7.22 binary at `~/Downloads/rar/` is decode-only for the
 > legacy format (7.x dropped the `-ma3` switch and emits RAR5
 > exclusively) — fixtures come from the CC0 corpus at
 > [`ssokolow/rar-test-files`](https://github.com/ssokolow/rar-test-files)
 > with the bundled `unrar` as the reference-decoder side.
+> **§C1a (this commit)** lands the MSB-first bitstream reader at
+> [`src/decode/rar_legacy/bits.rs`](../src/decode/rar_legacy/bits.rs),
+> sibling of [`crate::decode::rar_native::bits`]; 17 unit tests
+> cover zero-bit reads, byte-spanning reads, 32-bit reads, peek vs.
+> consume, partial-cursor underrun reporting, byte alignment at
+> block boundaries (the load-bearing libarchive-equivalent path),
+> a 60-group random round trip, and legacy-realistic 15-bit
+> Huffman / 18-bit distance-extra-bits widths at byte-boundary-
+> crossing offsets.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -632,8 +641,10 @@ reproducible if a future bug needs the same level of triage.
 > weakly coupled enough to land separately, each with its own
 > demo / passing tests:
 >
-> - **§C0** ✅ (this commit) — sub-phasing + scaffolding.
-> - **§C1a** — bitstream reader (MSB-first, RAR3 alignment rules).
+> - **§C0** ✅ (fadba5b) — sub-phasing + scaffolding.
+> - **§C1a** ✅ (this commit) — bitstream reader (MSB-first, with
+>   `align_to_byte` for block-start alignment per libarchive's
+>   `rar_br_consume_unaligned_bits`).
 > - **§C1b** — canonical Huffman builder + 4-tree code-length parser.
 > - **§C1c** — block header / block-type discriminator / "tables
 >   present" flag.
@@ -749,10 +760,6 @@ PPMd-bridge / solid-mode pieces in turn per the sub-phasing block
 above. Each sub-section ships with the demo / tests its predecessor
 left a TODO for.
 
-(Specific sub-section bodies land as their sub-phase commits land,
-following the §B pattern — see §B2 in this same file for the
-shape.)
-
 **Notes vs. RAR5** (carried forward from the original §C1 sketch):
 
 - Same MSB-first bitstream convention, but RAR3 aligns to a byte
@@ -762,6 +769,91 @@ shape.)
   lower-distance bits 17, repeats 28) vs. RAR5's three.
 - Distance cache (`oldDist`) is 4-deep, same as RAR5, but RAR3
   pushes / promotes on different symbol numbers.
+
+#### §C1a. Bitstream reader ✅ (this commit)
+
+**What landed**: hand-rolled MSB-first bit reader at
+[`src/decode/rar_legacy/bits.rs`](../src/decode/rar_legacy/bits.rs).
+Sibling of [`crate::decode::rar_native::bits`] per the §C0 reuse-
+vs-fork decision: both formats pack MSB-first, but the two readers
+do not share an implementation so each can evolve against its own
+format. The shape mirrors `rar_native`'s — 64-bit accumulator with
+the next-to-read bit at position 63, `next_byte` cursor over the
+borrowed byte slice, `bits_consumed` counter for diagnostics and
+the §F1 resume snapshot — but the prose, error type, and test
+fixtures are independently considered.
+
+**Public surface** (consumed by §C1b onwards):
+
+- `BitReader::new(data) -> Self`, `BitReader::bits_consumed()`,
+  `bits_remaining()`, `byte_position()`, `is_at_end()`.
+- `peek_bits(n) -> Result<u32, _>` and the matching
+  `consume_bits(n)` — the canonical "decide based on a peek, then
+  commit" pattern Huffman decoders need.
+- `read_bits(n) -> Result<u32, _>` — folded peek+consume for the
+  common single-shot read.
+- `align_to_byte()` — skips to the next byte boundary. Mirrors
+  libarchive's `rar_br_consume_unaligned_bits` macro. RAR3 calls
+  this at the start of every block before reading the
+  `is_ppmd_block` flag (libarchive `archive_read_support_format_rar.c`
+  lines 2314..2317); §C1c's block-header parser is the first
+  in-tree caller.
+- `BitReadError::Underrun { needed, byte_index, bit_off }` —
+  carries the cursor at the moment of underrun so the upper layer
+  can include it in the eventual
+  [`crate::rar::RarError::Truncated`] / `Malformed` message.
+
+**What turned out NOT to need** (vs. the §C0 sketch):
+
+- **No `read_bits_forced` (tail-zero-padding) primitive.** The
+  §C0 plan flagged libarchive's `rar_br_bits_forced` macro as a
+  candidate for the legacy reader — it pads the high bits of the
+  result with zeros when the cache underruns, used at end-of-
+  stream so a Huffman peek that overshoots can still return a
+  prefix. The §C1a posture is "make the caller pre-flight reads
+  via `bits_remaining` and surface underrun explicitly", same as
+  the RAR5 sibling. If §C1b's Huffman decoder turns out to need
+  the forced-padding behaviour for end-of-block lookahead, it
+  lands as a sibling method then. The §C1a tests show the upper
+  layer can already handle end-of-stream cleanly via
+  `is_at_end`.
+- **No streaming-source plumbing.** Same call as §A1 of
+  `PLAN_rar5_decoder.md`: the §3 RAR pipeline materialises an
+  entry's data area in a buffer before invoking the decoder, so
+  the bit reader takes `&[u8]` and never touches IO. Phase G
+  may swap in a chunked-feeding variant for memory-bound entries;
+  it lands as a sibling type, not a refit.
+
+**What §C1a confirmed about the RAR3 bitstream** (resolves the
+§C0-deferred "alignment rules" hedge):
+
+- **MSB-first within each byte**, same as RAR5.
+- **No automatic byte alignment between blocks** — the bitstream
+  is fundamentally continuous. The `align_to_byte` call at block
+  start is *explicit* (libarchive does it via the
+  `rar_br_consume_unaligned_bits` macro before reading the
+  `is_ppmd_block` flag); the reader does not byte-align on its
+  own.
+- **Cache layout differs from libarchive's, semantics don't.**
+  Libarchive's `cache_buffer` keeps the next-to-read bit at
+  position `cache_avail - 1` (bottom-aligned cache, grow upward,
+  consume by decrementing `cache_avail`); our `acc` keeps it at
+  position 63 (top-aligned cache, grow downward, consume by left-
+  shifting). Both materialise the same MSB-first stream; the
+  `align_to_byte` operation drops `bits_consumed % 8 == 0`-aligned
+  bits either way.
+
+**Tests**: 17 unit tests covering zero-bit reads, single-byte
+splits, byte-spanning reads, 32-bit single-shot reads, peek vs.
+consume, partial-cursor underrun reporting, byte alignment at
+block boundaries (the load-bearing libarchive-equivalent test),
+a 60-group random round trip with widths in `1..=31`, and
+legacy-realistic 15-bit Huffman + 18-bit distance-extra-bits
+widths at byte-boundary-crossing offsets. **1525 lib tests pass
+total** (was 1508 at §C0, +17 from §C1a).
+
+**Demo**: `cargo test --features rar decode::rar_legacy::bits`
+runs all 17 tests in <50 ms debug / <10 ms release.
 
 ---
 

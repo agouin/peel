@@ -15,8 +15,9 @@
 //! submodule lands in §C1a):
 //!
 //! - **§C0** ✅ — sub-phasing + this module entry.
-//! - **§C1a** — `bits`: MSB-first bitstream reader with RAR3
-//!   block-boundary alignment rules.
+//! - **§C1a** ✅ — [`bits`]: MSB-first bitstream reader with
+//!   byte-alignment for block boundaries (libarchive's
+//!   `rar_br_consume_unaligned_bits` equivalent).
 //! - **§C1b** — `huffman` + `bootstrap`: canonical Huffman builder
 //!   and 4-tree code-length parser (literals 299, distances 60,
 //!   lower-distance bits 17, repeats 28).
@@ -56,3 +57,5 @@
 //! Same `rar` Cargo feature the rest of the RAR module tree uses —
 //! no new feature surface. The `--no-default-features` build does
 //! not compile this module.
+
+pub mod bits;
