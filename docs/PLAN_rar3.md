@@ -44,7 +44,7 @@
 > with the delta-from-previous-block trick and the libarchive
 > repeat-last / zero-run opcode set, and the four-sub-tree
 > extractor). 24 unit tests across the two modules.
-> **§C1c (this commit)** lands the per-block prologue parser at
+> **§C1c (721ce9c)** landed the per-block prologue parser at
 > [`src/decode/rar_legacy/block_header.rs`](../src/decode/rar_legacy/block_header.rs)
 > — byte-aligns, reads `is_ppmd_block`, then either runs the §C1b
 > chain (LZ mode) or decodes the 7-bit `ppmd_flags` plus its
@@ -53,8 +53,16 @@
 > and retain paths, the four PPMd flag combinations
 > (none / `0x20` / `0x40` / both), max-order remapping above 16,
 > the `max_order == 1` rejection, byte-alignment from an
-> off-aligned cursor, and truncated-prologue underrun. Lib-test
-> count now 1560.
+> off-aligned cursor, and truncated-prologue underrun.
+> **§C1d (this commit)** lands the sliding-window ring buffer at
+> [`src/decode/rar_legacy/dict.rs`](../src/decode/rar_legacy/dict.rs)
+> (4 MiB cap, overlap-by-design `copy_match` for the `length >
+> distance` self-extending RLE-via-LZSS case, `copy_recent_into`
+> for the §C2 filter VM) and the 4-slot LRU at
+> [`src/decode/rar_legacy/dist_cache.rs`](../src/decode/rar_legacy/dist_cache.rs)
+> (push / touch matching libarchive's `oldoffset[]` semantics
+> from `archive_read_support_format_rar.c` lines 3030..3115).
+> 25 unit tests across the two files; lib-test count now 1585.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -670,13 +678,18 @@ reproducible if a future bug needs the same level of triage.
 >   (`HuffmanCode`, flat-lookup table, 15-bit max) + per-block
 >   bootstrap (20-entry precode → 404 main-table lengths → four
 >   sub-trees of size 299 / 60 / 17 / 28).
-> - **§C1c** ✅ (this commit) — block-prologue parser at
+> - **§C1c** ✅ (721ce9c) — block-prologue parser at
 >   [`block_header`](../src/decode/rar_legacy/block_header.rs):
 >   byte-align + `is_ppmd_block` flag + branch into LZ
 >   (`keep_old_tables` + §C1b chain) or PPMd (7-bit ppmd_flags +
 >   conditional dict / init-escape / max-order payload).
-> - **§C1d** — sliding-window dictionary (4 MiB max, 4-deep
->   `oldDist`).
+> - **§C1d** ✅ (this commit) —
+>   [`dict`](../src/decode/rar_legacy/dict.rs) (sliding-window
+>   ring buffer, 4 MiB cap, overlap-by-design `copy_match` +
+>   `copy_recent_into` for the §C2 filter VM) and
+>   [`dist_cache`](../src/decode/rar_legacy/dist_cache.rs)
+>   (4-slot LRU of recent match offsets for symbols 259..=262 /
+>   263..=298).
 > - **§C1e** — LZ block dispatcher (`m=1..m=3`), differential
 >   round-trip against the ssokolow corpus + curated single-entry
 >   m=3 archives.
@@ -1050,6 +1063,86 @@ release. The decoder now reads "what kind of block is this and
 what does it carry" end-to-end from a raw bitstream — the
 remaining §C1d / §C1e plumbing makes the four trees actually
 produce LZ output.
+
+#### §C1d. Sliding-window dictionary + dist-cache LRU ✅ (this commit)
+
+**What landed**: two sibling files at
+[`src/decode/rar_legacy/dict.rs`](../src/decode/rar_legacy/dict.rs)
+and
+[`src/decode/rar_legacy/dist_cache.rs`](../src/decode/rar_legacy/dist_cache.rs)
+— the state §C1e's per-symbol dispatcher mutates as it emits
+output. Both are forks of their `rar_native` counterparts per
+§C0's reuse-vs-fork posture; the RAR3 versions cap the dict at
+4 MiB (libarchive's `DICTIONARY_MAX_SIZE`), carry their own
+error type / wire references / test fixtures, and are free to
+evolve against legacy-only changes without touching `rar_native`.
+
+**Public surface** (consumed by §C1e):
+
+- `dict::Dict::new(capacity) -> Result<Self, DictError>`
+  rejecting zero and over-cap. `capacity()` / `total_written()`
+  / `live_bytes()` accessors.
+- `dict::Dict::push_literal(b, &mut Vec<u8>)` — write to ring
+  and stage to the output sink in one call.
+- `dict::Dict::copy_match(distance, length, &mut Vec<u8>)` —
+  byte-wise back-reference copy that handles `length > distance`
+  overlap (the RLE-via-LZSS trick).
+- `dict::Dict::copy_recent_into(&mut [u8])` — pull the last
+  `out.len()` bytes in stream order without advancing the
+  dictionary; §C2's filter VM is the eventual consumer.
+- `dict::DictError` (`CapacityZero`, `CapacityTooLarge`,
+  `BackReferenceUnderflow`, `DistanceExceedsCapacity`,
+  `RecentWindowOverrun`) — all the failure modes a malformed
+  bitstream can trigger plus the construction-time guards.
+- `dist_cache::DistCache::{new, from_slots, slots, peek, push,
+  touch}` — push for fresh-match symbols (263..=298), touch for
+  cached-distance symbols (259..=262 via `idx = symbol - 259`).
+- `dist_cache::DIST_CACHE_SLOTS = 4` constant.
+
+**What turned out NOT to need** (vs. the §C0 sketch):
+
+- **No `last_offset` / `last_length` fields here.** Symbol 258
+  ("repeat last match") uses the dispatcher's most-recently-
+  emitted `(offset, length)` pair, which lives outside the
+  cache. The §C1e `LzDecoder` owns those as plain fields; the
+  cache stays the pure 4-slot LRU.
+- **No power-of-2 capacity requirement.** Libarchive sizes the
+  buffer at `rar_fls(unp_size) << 1` (power-of-2 up to 4 MiB),
+  but the ring math uses `head + 1; if head == cap { head = 0 }`
+  rather than `mask`-AND, so any positive capacity ≤ 4 MiB
+  works. §C1e's sizing logic will produce power-of-2 capacities
+  to match libarchive; §C1d just trusts the caller.
+- **No live-tail snapshot for §F1 yet.** rar_native's `Dict`
+  has a `snapshot_live_tail` for resume; the legacy `Dict`
+  punts that to §F1's plan-resolution block. PPMd-mode entries
+  also need to serialise the arena, so the snapshot surface is
+  better decided once both consumers are in scope.
+
+**Tests**: 25 unit tests across the two files.
+
+- `dict.rs` (16 tests): zero-capacity / over-cap construction
+  errors, fresh-dict accessors, push-literal round trip,
+  copy_match non-overlap / distance-1 RLE / overlap-by-design,
+  zero-distance error, distance > total_written error,
+  distance > capacity error, the ring wrap when `head` passes
+  capacity, `total_written` persisting across multiple wraps,
+  `copy_recent_into` straight / wrapped / overrun, and the
+  `MAX_DICT_BYTES` (4 MiB) cap constructing cleanly.
+- `dist_cache.rs` (9 tests): zero-construction, push promote /
+  shift / overflow at slot 3, touch(0..=3) covering all four
+  shift patterns, a libarchive-combined push-and-touch sequence
+  modeling `271, 259, 271, 261`, and `from_slots` round trip.
+
+**1585 lib tests pass total** (was 1560 at §C1c, +25 from §C1d).
+
+**Demo**: `cargo test --features rar decode::rar_legacy::dict
+decode::rar_legacy::dist_cache` runs all 25 tests in <10 ms
+release. The decoder now has every primitive §C1e will need to
+emit per-symbol output: the bit reader (§C1a) reads the block,
+the precode + main-length parser (§C1b) builds the four
+Huffman codes, the block-prologue (§C1c) chooses LZ vs PPMd
+and applies the keep-old-tables logic, and §C1d's `Dict` +
+`DistCache` hold the LZ state the dispatcher mutates.
 
 ---
 

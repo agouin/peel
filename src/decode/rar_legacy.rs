@@ -28,8 +28,11 @@
 //!   prologue parser; routes LZ vs. PPMd modes and surfaces the
 //!   `keep_old_tables` flag plus the PPMd dictionary / max-order
 //!   / init-escape payload.
-//! - **§C1d** — `dict`: 4 MiB sliding-window dictionary with a
-//!   4-deep recent-distance cache.
+//! - **§C1d** ✅ — [`dict`] + [`dist_cache`]: sliding-window
+//!   dictionary (4 MiB cap, ring buffer with overlap-by-design
+//!   match copy + recent-window read for the filter VM) plus the
+//!   4-slot LRU of recent match offsets RAR3 keeps for symbols
+//!   `259..=262`.
 //! - **§C1e** — `lzss`: per-block decode dispatcher integrating
 //!   §C1a–d. First end-to-end LZ demo against the ssokolow
 //!   `testfile.rar3.rar` corpus.
@@ -66,4 +69,6 @@
 pub mod bits;
 pub mod block_header;
 pub mod bootstrap;
+pub mod dict;
+pub mod dist_cache;
 pub mod huffman;
