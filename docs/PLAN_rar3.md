@@ -54,7 +54,7 @@
 > (none / `0x20` / `0x40` / both), max-order remapping above 16,
 > the `max_order == 1` rejection, byte-alignment from an
 > off-aligned cursor, and truncated-prologue underrun.
-> **§C1d (this commit)** lands the sliding-window ring buffer at
+> **§C1d (3e159f2)** landed the sliding-window ring buffer at
 > [`src/decode/rar_legacy/dict.rs`](../src/decode/rar_legacy/dict.rs)
 > (4 MiB cap, overlap-by-design `copy_match` for the `length >
 > distance` self-extending RLE-via-LZSS case, `copy_recent_into`
@@ -62,7 +62,17 @@
 > [`src/decode/rar_legacy/dist_cache.rs`](../src/decode/rar_legacy/dist_cache.rs)
 > (push / touch matching libarchive's `oldoffset[]` semantics
 > from `archive_read_support_format_rar.c` lines 3030..3115).
-> 25 unit tests across the two files; lib-test count now 1585.
+> 25 unit tests across the two files.
+> **§C1e₁ (this commit)** lands the per-symbol LZ dispatcher at
+> [`src/decode/rar_legacy/lzss.rs`](../src/decode/rar_legacy/lzss.rs)
+> — wires §C1a–d into `LzDecoder::decode_block`, ports the
+> libarchive `expand` function's symbol dispatch (literals,
+> block-end, filter-decl, repeat-last, cached-distance,
+> short-distance, full-match-small + full-match-large with the
+> low-offset code + repeat sentinel), and exits cleanly on
+> symbol 256 / 257 via a typed `BlockEnd` enum. 13 unit tests
+> with synthetic fixtures covering every dispatch branch;
+> lib-test count now 1598.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -683,16 +693,22 @@ reproducible if a future bug needs the same level of triage.
 >   byte-align + `is_ppmd_block` flag + branch into LZ
 >   (`keep_old_tables` + §C1b chain) or PPMd (7-bit ppmd_flags +
 >   conditional dict / init-escape / max-order payload).
-> - **§C1d** ✅ (this commit) —
+> - **§C1d** ✅ (3e159f2) —
 >   [`dict`](../src/decode/rar_legacy/dict.rs) (sliding-window
 >   ring buffer, 4 MiB cap, overlap-by-design `copy_match` +
 >   `copy_recent_into` for the §C2 filter VM) and
 >   [`dist_cache`](../src/decode/rar_legacy/dist_cache.rs)
 >   (4-slot LRU of recent match offsets for symbols 259..=262 /
 >   263..=298).
-> - **§C1e** — LZ block dispatcher (`m=1..m=3`), differential
->   round-trip against the ssokolow corpus + curated single-entry
->   m=3 archives.
+> - **§C1e₁** ✅ (this commit) — per-symbol LZ dispatcher at
+>   [`lzss`](../src/decode/rar_legacy/lzss.rs). Wires §C1a–d
+>   together into `LzDecoder::decode_block`, with libarchive's
+>   `lengthbases` / `lengthbits` / `offsetbases` / `offsetbits`
+>   / `shortbases` / `shortbits` const tables inlined. Returns
+>   a `BlockEnd::{NextBlock, EntryDone, FilterDecl}` enum so
+>   the upper layer (§C1h / §C2) can decide what to do.
+> - **§C1e₂** — first end-to-end LZ demo against the ssokolow
+>   `testfile.rar3.rar` corpus + bundled `unrar` cross-check.
 > - **§C1f** — RAR-variant range coder added to
 >   [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
 >   Small follow-on to §B0 — the model layer §B2 left "swap in a
@@ -1143,6 +1159,119 @@ the precode + main-length parser (§C1b) builds the four
 Huffman codes, the block-prologue (§C1c) chooses LZ vs PPMd
 and applies the keep-old-tables logic, and §C1d's `Dict` +
 `DistCache` hold the LZ state the dispatcher mutates.
+
+#### §C1e₁. Per-symbol LZ dispatcher ✅ (this commit)
+
+**Sub-split decision** (resolved during §C1e implementation):
+the original §C1 sketch put "LZ block dispatcher (m=1..m=3),
+differential round-trip against the ssokolow corpus + curated
+single-entry m=3 archives" all in one commit. The dispatcher
+itself is large (~370 LOC + ~530 LOC of tests) and worth
+shipping with its own demo (synthetic-fixture tests covering
+every main-code branch). Real-archive cross-check needs a
+fixture-vendor step (commit small CC0 archives from
+ssokolow/rar-test-files into `tests/fixtures/rar_legacy/`)
+plus a streaming-entry driver that knows how to find the
+compressed payload inside a legacy archive — that lives in
+§C1e₂.
+
+**What landed**: per-symbol dispatch at
+[`src/decode/rar_legacy/lzss.rs`](../src/decode/rar_legacy/lzss.rs).
+Port of libarchive's `expand` function (lines 2906..3132 of
+`archive_read_support_format_rar.c`) — the six-branch main-code
+dispatch loop with the six constant tables inlined as Rust
+`const [u32; N]`:
+
+- Symbols `0..=255` — literal byte. `Dict::push_literal`.
+- Symbol `256` — block end. Read 1-bit `new_file` flag; return
+  `BlockEnd::NextBlock` if cleared (another block follows in
+  this entry) or `BlockEnd::EntryDone` if set
+  (libarchive's `start_new_table = 1`).
+- Symbol `257` — filter declaration. Return
+  `BlockEnd::FilterDecl`; §C2 reads the filter program in.
+- Symbol `258` — repeat last `(offset, length)`. Skipped
+  silently if no prior match has been emitted in this entry
+  (libarchive's `if (lastlength == 0) continue`).
+- Symbols `259..=262` — cached-distance: `DistCache::touch`
+  + length-code decode + `Dict::copy_match`.
+- Symbols `263..=270` — short-distance match (fixed length 2):
+  `SHORT_BASES[i] + 1` + `SHORT_BITS[i]` extra bits;
+  `DistCache::push` the new offset.
+- Symbols `271..=298` — full match: length from
+  `LENGTH_BASES[symbol-271] + 3` + extras, offset from the
+  offset code (`OFFSET_BASES` + `OFFSET_BITS`), with the
+  large-distance low-offset code + 15-repeat sentinel path for
+  offset symbols ≥ 10. Distance-above-`0x2000` / -`0x40000`
+  length bumps applied.
+
+**Public surface** (consumed by §C1e₂ / §C1h):
+
+- `LzDecoder::new(dict_capacity) -> Result<Self, DictError>`.
+- `LzDecoder::decode_block(reader, tables, out) ->
+  Result<BlockEnd, LzError>` — runs the dispatcher until a
+  block-terminating symbol.
+- `LzDecoder::output_position() -> u64`,
+  `LzDecoder::dict() -> &Dict` — diagnostic accessors.
+- `BlockEnd { NextBlock, EntryDone, FilterDecl }`.
+- `LzError { Underrun, Huffman, Dict, InvalidSymbol }` — the
+  four classes of malformed-bitstream / dispatcher-error
+  surfaces.
+
+**What turned out NOT to need landing**:
+
+- **No per-symbol step API.** The original sketch considered
+  a `decode_one_symbol` for finer control (e.g. byte-budget
+  enforcement, profiling-friendly tracing). The §C1e₁ posture
+  is "run the tight loop until block end" — the dispatcher's
+  hot path stays inside one function, no per-symbol callout.
+  If §F1's resume needs finer granularity, add it then.
+- **No filter-application logic.** Symbol 257 surfaces as
+  `BlockEnd::FilterDecl` and the dispatcher exits; reading
+  the filter's bytecode + applying the filter is §C2's job.
+  The dispatcher does not advance the bit cursor past the
+  symbol-257 codeword — the next call into §C2's filter
+  reader picks up exactly where §C1e₁ left off.
+- **No special handling of `unp_size` truncation.** Libarchive
+  exits the dispatch loop when `lzss_position(&lzss) >= *end`
+  (i.e. the entry's reported uncompressed size has been
+  emitted). §C1e₁'s caller is responsible for that — the
+  dispatcher just decodes whatever the bitstream tells it
+  until a block-terminating symbol. §C1e₂ wraps this with an
+  output-size guard.
+
+**Tests**: 13 unit tests, all with synthetic in-test fixtures
+(canonical-code helper + MSB-first packer; no real-archive
+bytes yet — those land with §C1e₂).
+
+- Literal run + block-end with new_file=1 → entry done.
+- Block-end with new_file=0 → `NextBlock`.
+- Filter-decl exit.
+- Short-distance symbol 263 (distance 1, length 2).
+- Short-distance symbol 264 (distance 5 from `SHORT_BASES[1]
+  + extras = 0`).
+- Cached-distance symbol 259 touching slot 0 after a prior
+  short-distance push.
+- Repeat-last symbol 258 after an emitted match.
+- Symbol 258 at block start (no prior match) → skipped
+  silently.
+- Full-match symbol 271 small distance, no length bumps.
+- Full-match symbol 271 with offset symbol 26 → distance 8193
+  → `0x2000` length bump applies (len = 3 + 1 = 4).
+- Full-match with low-offset code symbol 16 (repeat
+  sentinel) — exercises the `num_low_offset_repeats = 15`
+  path and the subsequent repeat consumption.
+- Truncated bitstream surfaces typed `Underrun` (via the
+  inner Huffman decode).
+- Malformed back-reference (distance before any literal
+  emitted) surfaces typed `Dict(BackReferenceUnderflow)`.
+
+**1598 lib tests pass total** (was 1585 at §C1d, +13 from
+§C1e₁).
+
+**Demo**: `cargo test --features rar decode::rar_legacy::lzss`
+runs all 13 tests in <10 ms release. The full LZ stack — from
+raw bits to emitted output — now round-trips synthetic
+fixtures cleanly. §C1e₂ adds the real-archive cross-check.
 
 ---
 

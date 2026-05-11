@@ -33,9 +33,12 @@
 //!   match copy + recent-window read for the filter VM) plus the
 //!   4-slot LRU of recent match offsets RAR3 keeps for symbols
 //!   `259..=262`.
-//! - **§C1e** — `lzss`: per-block decode dispatcher integrating
-//!   §C1a–d. First end-to-end LZ demo against the ssokolow
-//!   `testfile.rar3.rar` corpus.
+//! - **§C1e₁** ✅ — [`lzss`]: per-symbol dispatcher
+//!   (`LzDecoder::decode_block`) for one block, with the
+//!   libarchive constant tables inlined. Synthetic-fixture
+//!   tests cover every main-code branch.
+//! - **§C1e₂** — first end-to-end LZ demo against the ssokolow
+//!   `testfile.rar3.rar` corpus + bundled `unrar` cross-check.
 //! - **§C1f** — RAR-variant range coder added to
 //!   [`crate::decode::ppmd2::range_dec`] (not in this tree).
 //! - **§C1g** — `ppmd_entry`: wire
@@ -72,3 +75,4 @@ pub mod bootstrap;
 pub mod dict;
 pub mod dist_cache;
 pub mod huffman;
+pub mod lzss;
