@@ -382,16 +382,16 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     crate::coordinator::verify_output_shape_local(format_shape, &args.output)?;
 
     if let Some(state) = &args.progress_state {
+        // Local-mode progress UX (`docs/PLAN_local_file_extract.md` §4):
+        // feed the renderer through the same `bytes_downloaded` /
+        // `bytes_extracted` channels the HTTP path uses, but skip
+        // every `worker_started` / `worker_finished` / `set_total_workers`
+        // call — local mode has one logical reader and no chunked
+        // download grid to render. The renderer shows "workers 0/0"
+        // (harmless) and an ETA driven by the source-read rate
+        // alone.
         state.set_total_size(total_size);
         state.mark_started();
-        // Local mode has one logical reader and no chunked
-        // download; the renderer's worker grid would be visually
-        // empty. §4 (PLAN_local_file_extract.md) replaces this
-        // with a dedicated single-line shape; for now we register
-        // a single "worker" so the renderer's counters have a
-        // slot to feed and the bytes-decoded counter advances.
-        state.set_total_workers(1);
-        state.worker_started();
     }
 
     // The decoder reads from the file; the puncher punches the
@@ -406,22 +406,32 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
             path: args.source.clone(),
             source,
         })?;
-    let reader: Box<dyn Read + Send> = if prefix.is_empty() {
-        Box::new(decoder_file)
-    } else {
-        // Magic detection consumed `prefix.len()` bytes of the
-        // decoder-side file cursor. We rewind both clones via
-        // their shared inode (the `seek(0)` above re-positions
-        // `source_file`'s offset, but each `File` has its own
-        // offset). Re-seek the decoder clone explicitly so it
-        // reads from byte 0 too.
+    let reader: Box<dyn Read + Send> = {
         let mut f = decoder_file;
+        // Magic detection consumed `prefix.len()` bytes of the
+        // decoder-side file cursor; the post-detection `seek(0)`
+        // on `source_file` only moved that handle since each
+        // [`File`] clone has its own kernel-tracked offset.
+        // Re-seek the decoder clone unconditionally — cheap on a
+        // local file and keeps the with-prefix and no-prefix paths
+        // identical.
+        let _ = prefix;
         f.seek(SeekFrom::Start(0))
             .map_err(|source| CoordinatorError::Io {
                 path: args.source.clone(),
                 source,
             })?;
-        Box::new(f)
+        // Wrap the file in a [`ProgressReader`] when a shared
+        // [`ProgressState`] is attached: each successful read
+        // pumps `add_downloaded` / `set_bytes_decoded_input` so
+        // the renderer's existing percent/ETA math has a signal
+        // to track (`docs/PLAN_local_file_extract.md` §4). No
+        // worker grid is registered, so "workers 0/0" displays
+        // unobtrusively next to the progress bar.
+        match args.progress_state.clone() {
+            Some(state) => Box::new(ProgressReader::new(f, state)),
+            None => Box::new(f),
+        }
     };
 
     let mut decoder = factory(reader).map_err(CoordinatorError::Decode)?;
@@ -487,10 +497,6 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
             )?
         }
     };
-
-    if let Some(state) = &args.progress_state {
-        state.worker_finished();
-    }
 
     // Drop the punching handle (and the decoder's clone) before
     // attempting to delete the source. Holding either across the
@@ -573,6 +579,48 @@ fn coord_err_from_extractor(err: ExtractorError) -> CoordinatorError {
         }
     }
     CoordinatorError::Extractor(err)
+}
+
+/// `Read` adapter that pumps two counters on every successful
+/// read: `add_downloaded` and `set_bytes_decoded_input`. Used by
+/// [`run`] to feed the renderer's percent / ETA math when a
+/// shared [`ProgressState`] is attached
+/// (`docs/PLAN_local_file_extract.md` §4).
+///
+/// The HTTP path feeds those counters from two distinct sources
+/// (the download scheduler updates `bytes_downloaded`, the
+/// decoder's source-read updates `bytes_decoded_input`); local
+/// mode has no scheduler, so both counters track the same value
+/// — the renderer's lookahead-computed-from-the-two
+/// (`bytes_downloaded - bytes_decoded_input`) is always zero,
+/// which is correct (there is nothing on disk *ahead* of the
+/// decoder).
+struct ProgressReader<R: Read> {
+    inner: R,
+    state: Arc<ProgressState>,
+    total_read: u64,
+}
+
+impl<R: Read> ProgressReader<R> {
+    fn new(inner: R, state: Arc<ProgressState>) -> Self {
+        Self {
+            inner,
+            state,
+            total_read: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.total_read = self.total_read.saturating_add(n as u64);
+            self.state.add_downloaded(n as u64);
+            self.state.set_bytes_decoded_input(self.total_read);
+        }
+        Ok(n)
+    }
 }
 
 /// Generic wrapper around [`Extractor::extract`] that maps the

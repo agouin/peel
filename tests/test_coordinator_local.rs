@@ -180,6 +180,46 @@ fn local_forced_format_overrides_filename_suffix() {
 }
 
 #[test]
+fn local_run_pumps_progress_state_counters() {
+    // §4 (PLAN_local_file_extract.md): the shared ProgressState is
+    // fed by the local-mode source-read pump. After a clean run,
+    // `bytes_downloaded` and `bytes_decoded_input` should both
+    // equal the source file size (every byte was read by the
+    // decoder), and `bytes_extracted` should be > 0.
+    use std::sync::Arc;
+    let dir = unique_dir("progress");
+    let source = build_tar_zst(&dir, &[("a.txt", b"alpha-payload-1234567890")]);
+    let archive_size = std::fs::metadata(&source).expect("stat").len();
+    let out = dir.join("out");
+
+    let state = peel::progress::ProgressState::new();
+    let mut args = LocalRunArgs::new(source, OutputTarget::Dir(out));
+    args.keep_archive = true; // so the run doesn't unlink the source mid-test
+    args.progress_state = Some(Arc::clone(&state));
+    local_run(args).expect("local run");
+
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.bytes_downloaded, archive_size,
+        "ProgressReader must pump every source byte into add_downloaded",
+    );
+    assert_eq!(
+        snap.bytes_decoded_input, archive_size,
+        "ProgressReader must pump bytes_decoded_input too",
+    );
+    assert!(
+        snap.bytes_extracted > 0,
+        "extractor must have written some output bytes",
+    );
+    // Local mode does not register workers; the renderer just
+    // displays "workers 0/0".
+    assert_eq!(snap.active_workers, 0);
+    assert_eq!(snap.total_workers, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn local_zip_rejected_with_clear_error() {
     // ZIP / RAR / 7z are random-access formats; local-file mode
     // currently surfaces a `NoDecoder` error pointing the user at
