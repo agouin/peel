@@ -14,7 +14,18 @@ picked PPMd over LZSS for the 12-byte text payload — see the
   same entry, PPMd-mode with 1 MiB dict (`MHD_SOLID` set in
   main header).
 - **`testfile.rar3.txt`** (12 bytes) — expected plaintext
-  for both archives: `"Testing 123\n"`.
+  for both single-entry archives: `"Testing 123\n"`.
+- **`testfile.rar3.cbr`** (381 bytes) — non-solid multi-entry
+  archive (the §A's "Comic Book RAR" convention is just a
+  RAR archive renamed `.cbr`). Two entries:
+  - `testfile.jpg` (220 bytes uncompressed, PPMd, 128 KiB dict).
+  - `testfile.png` (87 bytes uncompressed, PPMd, 128 KiB dict).
+- **`testfile.cbr.jpg`** (220 bytes) — expected unpacked
+  content of the `testfile.jpg` entry inside
+  `testfile.rar3.cbr`. Minimal 2×2 JFIF JPEG.
+- **`testfile.cbr.png`** (87 bytes) — expected unpacked
+  content of the `testfile.png` entry inside
+  `testfile.rar3.cbr`. Minimal 2×2 8-bit colormap PNG.
 
 ## Source + license
 

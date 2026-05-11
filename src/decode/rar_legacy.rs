@@ -47,8 +47,12 @@
 //!   2158..=2238 — literals + escape sub-codes for EOD / large
 //!   LZ match (code 4) / short LZ match (code 5) / escape-of-
 //!   escape literals.
-//! - **§C1h** — `solid`: solid-mode driver + multi-block
-//!   continuation across entries.
+//! - **§C1h** ✅ — [`entry`]: per-entry front-door
+//!   `decode_entry(archive_bytes, &LegacyFileEntry) -> Vec<u8>`
+//!   that dispatches STORED / LZ / PPMd at the first-prologue
+//!   parse. Surfaces precise errors for the multi-block-within-
+//!   entry / cross-mode / solid-mode cases the round-one
+//!   corpus doesn't exercise (filed as follow-ons).
 //! - **§C2a** — `vm::filters`: standard filter set
 //!   (e8/e9/itanium/rgb/audio/delta) via the `VM_STANDARD_FILTERS`
 //!   shortcut encoding.
@@ -77,6 +81,7 @@ pub mod block_header;
 pub mod bootstrap;
 pub mod dict;
 pub mod dist_cache;
+pub mod entry;
 pub mod huffman;
 pub mod lzss;
 pub mod ppmd_entry;

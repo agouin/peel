@@ -97,21 +97,26 @@
 > `decode_bit_bin` / `encode_bit_bin`; the §B PPMd round-trip
 > and differential-corpus tests all pass unchanged. 5 new
 > RAR-init / structural tests.
-> **§C1g (this commit)** lands the per-entry PPMd decoder at
+> **§C1g (863ea77)** landed the per-entry PPMd decoder at
 > [`src/decode/rar_legacy/ppmd_entry.rs`](../src/decode/rar_legacy/ppmd_entry.rs)
 > — `PpmdSession` owns the model + dict + escape-byte state
 > and implements libarchive's `read_data_compressed`
-> dispatch loop (lines 2158..=2238). Two ssokolow CC0
-> archives at [`tests/fixtures/rar_legacy/`](../tests/fixtures/rar_legacy/)
-> + a new integration test at
-> [`tests/test_rar_legacy_ppmd.rs`](../tests/test_rar_legacy_ppmd.rs)
-> bring the first end-to-end legacy RAR archive decode home:
+> dispatch loop (lines 2158..=2238). The first end-to-end
+> legacy RAR archive decode landed alongside: the ssokolow
+> single-entry archives decode to `"Testing 123\n"` through
 > `walk_archive → BitReader → parse_block_prologue →
-> RangeDecoder::new_rar → PpmdSession::decode_block`
-> produces the expected `"Testing 123\n"` plaintext for both
-> non-solid (128 KiB dict) and solid (1 MiB dict) variants.
-> 8 new unit tests + 4 integration tests; lib-test count now
-> 1611.
+> RangeDecoder::new_rar → PpmdSession::decode_block`.
+> **§C1h (this commit)** lands the per-entry front-door at
+> [`src/decode/rar_legacy/entry.rs`](../src/decode/rar_legacy/entry.rs):
+> `decode_entry(archive_bytes, &LegacyFileEntry) -> Vec<u8>`
+> wraps STORED / LZ / PPMd dispatch behind one function, with
+> precise errors for the multi-block-within-entry / cross-
+> mode / solid-mode cases the corpus doesn't exercise. The
+> ssokolow `testfile.rar3.cbr` (multi-entry, 220-byte JPEG +
+> 87-byte PNG, both PPMd) decodes both entries byte-perfectly
+> against the bundled `unrar`'s extraction. 3 new lib-test
+> entries + 2 new integration tests; lib-test count now 1614,
+> integration-test count now 6.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -769,7 +774,7 @@ reproducible if a future bug needs the same level of triage.
 >   decode` matching `Range_DecodeBit_RAR`. Model layer is
 >   variant-agnostic (4 call-site renames; no behaviour
 >   change for 7z).
-> - **§C1g** ✅ (this commit) — PPMd entry path. New
+> - **§C1g** ✅ (863ea77) — PPMd entry path. New
 >   [`ppmd_entry`](../src/decode/rar_legacy/ppmd_entry.rs)
 >   module: `PpmdSession` wraps
 >   [`Model`](../src/decode/ppmd2/model.rs) +
@@ -779,14 +784,20 @@ reproducible if a future bug needs the same level of triage.
 >   literal-vs-escape, EOD marker (code 2), new-table (code 0,
 >   surfaced for §C1h), large LZ match (code 4), short LZ match
 >   (code 5), escape-of-escape literals. **First end-to-end
->   legacy RAR archive decode lands here**: the ssokolow
->   `testfile.rar3.rar` + `testfile.rar3.solid.rar` (98 bytes
->   each, CC0) decode to the expected 12-byte plaintext through
->   the full stack walk_archive → BitReader →
+>   legacy RAR archive decode landed here**: the ssokolow
+>   single-entry archives decode to the expected 12-byte
+>   plaintext through the full stack `walk_archive → BitReader →
 >   parse_block_prologue → RangeDecoder::new_rar →
->   PpmdSession::decode_block.
-> - **§C1h** — solid-mode driver + multi-block continuation across
->   entries.
+>   PpmdSession::decode_block`.
+> - **§C1h** ✅ (this commit) — per-entry front-door
+>   [`entry`](../src/decode/rar_legacy/entry.rs):
+>   `decode_entry(archive_bytes, &LegacyFileEntry) -> Vec<u8>`
+>   wraps STORED / LZ / PPMd dispatch behind one function and
+>   adds multi-entry support. The ssokolow `testfile.rar3.cbr`
+>   (multi-entry: 220-byte JPEG + 87-byte PNG, both PPMd)
+>   decodes both entries byte-perfectly. Solid-mode (cross-
+>   entry state) + multi-block-within-entry are surfaced as
+>   precise errors today; the corpus doesn't exercise them.
 > - **§C2a** — RarVM bytecode parser + standard filter set
 >   (e8/e9/itanium/rgb/audio/delta) via the `VM_STANDARD_FILTERS`
 >   shortcut encoding.
@@ -1503,7 +1514,7 @@ now wired for both 7z and RAR; §C1g plumbs the legacy LZ
 pipeline's PPMd-mode entries through a `RangeDecoder::new_rar
 → Model::decode_symbol` chain.
 
-#### §C1g. PPMd entry path ✅ (this commit)
+#### §C1g. PPMd entry path ✅ (863ea77)
 
 **What landed**: the per-entry PPMd dispatcher at
 [`src/decode/rar_legacy/ppmd_entry.rs`](../src/decode/rar_legacy/ppmd_entry.rs).
@@ -1628,6 +1639,119 @@ decodes both ssokolow fixtures end-to-end in <100 ms.
   attribution + corpus posture).
 - `tests/test_rar_legacy_ppmd.rs` (new — the integration
   test).
+
+#### §C1h. Per-entry front-door + multi-entry decode ✅ (this commit)
+
+**What landed**: per-entry decoder API at
+[`src/decode/rar_legacy/entry.rs`](../src/decode/rar_legacy/entry.rs)
+that wraps STORED / LZ-mode / PPMd-mode dispatch behind one
+function. The §C1g integration test refactors to use it; the
+ssokolow `testfile.rar3.cbr` (multi-entry, both PPMd) gets a
+new cross-check that decodes both `testfile.jpg` (220 B JPEG)
+and `testfile.png` (87 B PNG) byte-perfectly through the
+front-door.
+
+**Public surface**:
+
+- `decode_entry(archive_bytes: &[u8], entry: &LegacyFileEntry)
+  -> Result<Vec<u8>, LegacyEntryError>` — dispatches:
+  - `method == 0x30` (STORED) → byte copy.
+  - `method ∈ 0x31..=0x35` (compressed) → parse the first
+    block prologue; route to `LzDecoder` or `PpmdSession`;
+    decode through one block; truncate to `unpacked_size`.
+  - `method` outside the above → `UnsupportedMethod`.
+- `LegacyEntryError` with 11 variants covering wire-level
+  faults, dispatcher faults, and the explicit
+  "not-yet-supported" cases the corpus doesn't exercise:
+  - `BlockHeader`, `Ppmd`, `Lz`, `Dict`, `Range` — wrapped
+    sub-decoder faults.
+  - `DataAreaOverrun` — `data_offset + packed_size >
+    archive.len()`.
+  - `DirectoryEntry` — directory marker (the file-flags
+    dict-size selector reads as `0b111`).
+  - `UnsupportedMethod { method }` — method byte outside the
+    `0x30..=0x35` range.
+  - `PostPrologueUnaligned` — post-prologue cursor not on a
+    byte boundary (programmer error in §C1c).
+  - `MultiBlockNotSupported` — encoder emits a block
+    continuation (LZ `NextBlock` or PPMd `NewTable`) the
+    round-one corpus doesn't exercise.
+  - `CrossModeNotSupported` — LZ↔PPMd block transition
+    within an entry (needs shared dict; §G follow-on).
+  - `SizeShortfall` — decoded fewer bytes than the header
+    declared.
+  - `UnsupportedFilter` — LZ `BlockEnd::FilterDecl` from the
+    block dispatcher (defers to §C2).
+
+**Multi-entry support**: the §C1g test changed from a hand-
+rolled per-entry decode helper to a generic `decode_all_entries`
+loop using `decode_entry`. The ssokolow cbr — 2 entries, both
+PPMd-mode with 128 KiB dicts — decodes both `testfile.jpg`
+(220 B) and `testfile.png` (87 B) to byte-identical output
+matching the bundled `unrar`'s extraction. The decoder uses
+the per-entry `data_offset` + `packed_size` from the §A2
+walker; non-solid means each entry is independently decodable.
+
+**What turned out NOT to need landing** (vs. the original
+§C1h sketch):
+
+- **No cross-entry shared state for solid archives.** The
+  ssokolow `testfile.rar3.solid.rar` fixture has only one
+  entry, so non-solid logic decodes it correctly. Multi-
+  entry solid archives need cross-entry dict + PPMd-model
+  carry-over, but we don't have such a fixture in the
+  corpus today. Filed as a §G follow-on alongside synthetic
+  LZ-mode archive generation. The walker (§A2) already
+  surfaces the `MHD_SOLID` flag in `LegacyArchiveSummary`,
+  so the integration step is wiring (not new decoder code).
+- **No multi-block-within-entry loop.** The block-end
+  outcomes that surface for continuation (`BlockEnd::NextBlock`
+  / `PpmdBlockEnd::NewTable`) are translated to
+  `LegacyEntryError::MultiBlockNotSupported` rather than
+  parsing a follow-on prologue. The §C1d `Dict` and §C1g
+  `PpmdSession` both carry per-call state correctly, so
+  wiring this is a loop refactor when a multi-block fixture
+  surfaces.
+- **No CRC32 verification.** The file header carries
+  `file_crc32`; comparing it against a running CRC32 over
+  decoded bytes is the natural pipeline-integration step.
+  Today's integration tests assert against expected-byte
+  fixtures, which is a stronger check than CRC32 anyway —
+  CRC32 verification gets added when the `rar_pipeline`
+  plumbing routes through `decode_entry`.
+
+**Tests**: 3 new lib-tests in
+[`src/decode/rar_legacy/entry.rs`](../src/decode/rar_legacy/entry.rs)
+(round-trip via the front-door, data-area-overrun on a
+truncated slice, method-byte rejection) + 2 new
+integration tests in
+[`tests/test_rar_legacy_ppmd.rs`](../tests/test_rar_legacy_ppmd.rs)
+(cbr multi-entry decode + cbr-not-solid metadata check).
+The §C1g integration tests refactor to use `decode_entry`;
+all 6 now go through the same front-door.
+
+**1614 lib tests + 6 integration tests pass** (was 1611 lib +
+4 integration at §C1g; +3 lib + 2 integration from §C1h).
+
+**Demo**: `cargo test --features rar test_rar_legacy_ppmd`
+runs all 6 integration tests (3 single-entry + 1 multi-entry
++ 2 metadata) in <100 ms.
+
+**Files added / modified**:
+
+- `src/decode/rar_legacy/entry.rs` (new) — `decode_entry` +
+  `LegacyEntryError`.
+- `src/decode/rar_legacy.rs` — wired in `pub mod entry`.
+- `tests/fixtures/rar_legacy/testfile.rar3.cbr` (new, CC0,
+  381 bytes — non-solid 2-entry archive).
+- `tests/fixtures/rar_legacy/testfile.cbr.jpg` (new, CC0,
+  220 bytes — expected JPEG output).
+- `tests/fixtures/rar_legacy/testfile.cbr.png` (new, CC0,
+  87 bytes — expected PNG output).
+- `tests/fixtures/rar_legacy/README.md` — extended with the
+  cbr entry.
+- `tests/test_rar_legacy_ppmd.rs` — refactored to use
+  `decode_entry`; +2 new tests for cbr.
 
 ---
 
