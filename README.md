@@ -424,6 +424,62 @@ should fail the build).
 
 `peel --help` for the full list and exact defaults.
 
+### Local-file extraction
+
+Point peel at a path on disk and it skips the HTTP machinery
+entirely — no scheduler, no mirrors, no chunk bitmap — and runs
+the same decoder / sink / extractor stack against the local
+file. Use it when you already have the archive on disk and want
+peel's hand-rolled decoders instead of `tar -I zstd -xf` /
+`unzip` / `7z x`:
+
+```sh
+# Destructive by default: hole-punches the source as the
+# decoder advances; deletes it on clean completion. A TTY
+# user is prompted before this begins; non-TTY runs must
+# pass -y or -k explicitly.
+peel /tmp/dataset.tar.zst -o ./out/
+
+# Skip the prompt non-interactively.
+peel /tmp/dataset.tar.zst -o ./out/ -y
+
+# Preserve the source archive (non-destructive). The same `-k`
+# flag the HTTP path uses; in local mode it always means "keep
+# the existing file untouched."
+peel /tmp/dataset.tar.zst -o ./out/ -k
+```
+
+| Flag | Local-mode behaviour |
+| --- | --- |
+| (default, TTY) | destructive — prompt for confirmation, hole-punch the source, delete on completion |
+| (default, non-TTY) | hard error at parse time; pass `-y` or `-k` |
+| `-y` / `--yes` | bypass the prompt; destructive mode proceeds |
+| `-k` / `--keep-archive` | preserve the source archive; no punching, no deletion |
+| `--format <NAME>` | force a decoder (same semantics as HTTP mode) |
+| `--workdir <DIR>` | place the `.peel.ckpt` sidecar here instead of next to the source |
+| `--io-backend ...` | selects the puncher implementation (`auto` / `blocking` / `mmap`) |
+| `--punch-threshold` | minimum gap between in-loop punch syscalls in destructive mode |
+
+Resume-after-crash is supported in destructive mode: peel writes
+a `.peel.ckpt` next to the source after each quiescent decoder
+boundary, and a `kill -9` mid-run followed by a re-invocation
+with the same arguments converges to the same final output tree
+as a clean single run. `-k` runs are one-pass — no `.peel.ckpt`
+is written, and a kill mid-run just means re-run from scratch
+against the still-intact source.
+
+A few HTTP-only flags are rejected at parse time in local mode
+(`--mirror`, `--sha256`, `--workers`, `--chunk-size`,
+`--no-adaptive-chunk-size`, `--max-bandwidth`, `--max-disk-buffer`,
+`--http-version`, `--no-extract`, `--strict-format`). ZIP / RAR /
+7z local-file extraction is not yet supported in this release —
+the per-format pipelines are tightly coupled to the HTTP-side
+sparse reader today; use the HTTP path or extract those archives
+with their native tools until the local entry points land. Every
+streaming format (`.tar.zst`, `.tar.xz`, `.tar.lz4`, `.tar.gz`,
+raw `.zst` / `.xz` / `.lz4` / `.gz`, plain uncompressed `.tar`)
+works through the local pipeline today.
+
 ## Status
 
 MVP complete (2026-04-29). PLAN_v2 round one — multi-format support,
