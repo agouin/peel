@@ -1,6 +1,6 @@
 ## Plan: legacy RAR (RAR3 / RAR4) archive support
 
-> **Status: drafted 2026-05-10, Phase A landed, Phase B landed.**
+> **Status: drafted 2026-05-10, Phases A + B landed, Phase C started.**
 > §0 resolved 2026-05-10.
 > **§A1 (6c96328) + §A2a (38ff665) + §A2b (cc60bf8)** complete:
 > STORED-method legacy archives extract end-to-end. **§B0 (e730509)**
@@ -13,8 +13,18 @@
 > model: context tree, decode loop, update path, sister encoder,
 > and 21 round-trip / edge-case tests across the full order range
 > (2..=64), session restart, and small-arena exhaustion. **§B3
-> (this commit)** lands 50 differential reference vectors from
+> (2e4648e)** lands 50 differential reference vectors from
 > 7z-PPMd output and the two model-layer fixes that corpus surfaced.
+> **§C0 (this commit)** opens Phase C: the original §C1 / §C2 split
+> is too coarse — same lesson §B taught — so this commit lands the
+> sub-phasing (§C0..§C2c, 12 commits total), scaffolds
+> `src/decode/rar_legacy/` behind the existing `rar` Cargo feature,
+> and locks the differential-test corpus strategy. The licensed
+> RAR 7.22 binary at `~/Downloads/rar/` is decode-only for the
+> legacy format (7.x dropped the `-ma3` switch and emits RAR5
+> exclusively) — fixtures come from the CC0 corpus at
+> [`ssokolow/rar-test-files`](https://github.com/ssokolow/rar-test-files)
+> with the bundled `unrar` as the reference-decoder side.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -615,34 +625,151 @@ reproducible if a future bug needs the same level of triage.
 
 ## Phase C — Legacy LZ + RarVM
 
-### §C1. Sliding window + Huffman tables
+> **Phase C sub-phasing** (resolved in §C0): the original "§C1.
+> Sliding window + Huffman tables" + "§C2. RarVM interpreter" split
+> is too coarse — same lesson §B taught when "§B1. PPMd-II model"
+> decomposed into §B0/§B1/§B2a/§B2b/§B2c/§B3. The pieces below are
+> weakly coupled enough to land separately, each with its own
+> demo / passing tests:
+>
+> - **§C0** ✅ (this commit) — sub-phasing + scaffolding.
+> - **§C1a** — bitstream reader (MSB-first, RAR3 alignment rules).
+> - **§C1b** — canonical Huffman builder + 4-tree code-length parser.
+> - **§C1c** — block header / block-type discriminator / "tables
+>   present" flag.
+> - **§C1d** — sliding-window dictionary (4 MiB max, 4-deep
+>   `oldDist`).
+> - **§C1e** — LZ block dispatcher (`m=1..m=3`), differential
+>   round-trip against the ssokolow corpus + curated single-entry
+>   m=3 archives.
+> - **§C1f** — RAR-variant range coder added to
+>   [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
+>   Small follow-on to §B0 — the model layer §B2 left "swap in a
+>   RAR-variant range coder when the legacy pipeline needs it" as a
+>   note. §C1f cashes that note in.
+> - **§C1g** — PPMd entry path (`m=4`/`m=5`): wire
+>   `crate::decode::ppmd2::Model` through the legacy per-entry
+>   pipeline using the §C1f range coder.
+> - **§C1h** — solid-mode driver + multi-block continuation across
+>   entries.
+> - **§C2a** — RarVM bytecode parser + standard filter set
+>   (e8/e9/itanium/rgb/audio/delta) via the `VM_STANDARD_FILTERS`
+>   shortcut encoding.
+> - **§C2b** — VM interpreter for archive-supplied bytecode with
+>   strict per-reference bounds-checking (no UB / abort on
+>   malformed programs).
+> - **§C2c** — fuzz harness + custom-filter differential corpus.
 
-**What**: bitstream + dictionary + Huffman dispatcher specific to
-legacy 2.9+. Lives at `src/decode/rar_legacy/`.
+### §C0. Sub-phasing + module scaffolding ✅ (this commit)
 
-**Notes vs. RAR5.**
+**What landed**:
 
-- Same bitstream contract — re-use `decode::rar_native::bits` if it
-  is generic enough, otherwise lift it. (Likely a sibling copy:
-  legacy uses MSB-first too but with different alignment rules at
-  block boundaries.)
-- Different code-length tables: 4 trees per block (literals,
-  distances, lower-distance bits, repeat-codes) vs. RAR5's 3.
-- Distance cache (`oldDist`) is 4-deep, same as RAR5.
+1. The Phase C sub-phasing block above, decided during §C0
+   implementation. §C0 itself is the smallest non-trivial Phase C
+   landing — a plan-doc update plus the new module entry — so the
+   sub-phasing for the *rest* of Phase C is the actual deliverable.
+2. New module entry [`src/decode/rar_legacy.rs`](../src/decode/rar_legacy.rs)
+   gated behind the existing `rar` Cargo feature flag (same flag
+   the §A2 archive walker and §B PPMd-II module use; no new
+   feature surface). Sibling of [`src/decode/rar_native`](../src/decode/rar_native)
+   and [`src/decode/ppmd2`](../src/decode/ppmd2). Submodules land
+   one per sub-phase from §C1a onward; the entry file documents
+   the module structure and routes the §0.2 / §A2 dispatch target
+   for legacy compressed methods.
+3. Wired into [`src/decode.rs`](../src/decode.rs) alongside
+   `rar_native` and `ppmd2`, behind the same `cfg(feature = "rar")`
+   gate.
 
-**Tests**: differential against `rar a -m3` archives, ≤ 1 MiB.
+**Reuse-vs-fork decision (locked here)**: legacy primitives live
+as **sibling modules** in `src/decode/rar_legacy/`, not as
+re-exports from `src/decode/rar_native/`. The two formats share
+the same MSB-first bitstream convention and a 4-deep distance
+cache in spirit, but the practical details differ — RAR3's
+bitstream has different block-boundary alignment, RAR3's Huffman
+ships four trees vs. RAR5's three with different max code lengths,
+and RAR3's dictionary is fixed-4-MiB vs. RAR5's variable. Sharing
+code-the-types-don't-fit produces leaky generics and version skew
+between two algorithms that are not actually one algorithm. If
+post-§C2 review surfaces real duplication we want to factor out,
+that factoring lands as a separate clean-up commit.
 
-**Demo**: `cargo test decode::rar_legacy::lzss` passes for at least
-one curated single-entry m=3 archive.
+**Corpus strategy (locked here)**: the §B3 commit recorded that
+modern `rar 7.x` (the bundled `~/Downloads/rar/rar`, RAR 7.22) no
+longer creates legacy archives — the `-ma3` switch was removed in
+the 7.x line and the help text confirms only `-m<0..5>` exists for
+compression level, with no archive-format selector. The licensed
+binary is therefore decode-only for the legacy format. Phase C
+fixtures come from:
+
+1. [`ssokolow/rar-test-files`](https://github.com/ssokolow/rar-test-files)
+   — CC0-licensed minimal RAR3 / CBR archives, 98 B – ~1 KiB each.
+   Suitable for direct commit under
+   [`tests/fixtures/rar_legacy/`](../tests/fixtures/) per §A2's
+   precedent.
+2. The bundled `unrar` (RAR 7.22, license at
+   `~/Downloads/rar/license.txt`) as the reference-decoder side.
+   Same role libarchive played for §B3's bug triage: extract each
+   fixture with `unrar`, capture the expected plaintext, then
+   differential against our decoder's output byte-for-byte.
+3. Self-generated **structural** fixtures (hand-rolled in-test) for
+   §C1a–§C1d unit tests, mirroring how §B0 round-tripped its range
+   coder against a sister encoder before any real-archive bytes
+   appeared.
+
+Real-archive RAR3 generation is left as a `dev` tool task in §C1e:
+if the §C0 corpus shape leaves gaps the ssokolow files don't fill
+(e.g. specific filter combinations, large dictionary edge cases),
+sourcing an older `rar 3.x` / `rar 5.x` Linux binary from RARLAB's
+public archives covers them, but we don't pull that lever before
+§C1e demonstrates it's needed.
+
+**What §C0 deliberately is NOT**:
+
+- No actual decoder code. Submodules under `src/decode/rar_legacy/`
+  land one per sub-phase from §C1a forward.
+- No `StreamingDecoder` factory changes. The pipeline still rejects
+  `unp_ver ∈ [29, 36]` + `method ∈ 1..5` entries at walk time per
+  §A2b until §C1e's dispatcher is in place.
+- No `RangeDecoder` variant addition to `ppmd2/range_dec.rs`. That
+  lands with §C1f, alongside the consumer that exercises it.
+
+**Tests**: `cargo build --features rar` builds clean — the new
+module is wired but exposes no public surface yet. Lib-test
+count unchanged at 1508.
+
+**Demo**: `git ls-files src/decode/rar_legacy*` shows the entry
+file; `cargo test --features rar` is green.
 
 ---
 
-### §C2. RarVM interpreter (with custom-filter support)
+### §C1. Legacy LZ pipeline
 
-**What**: bytecode VM for archive-defined filter programs. Lives
-at `src/decode/rar_legacy/vm.rs`.
+§C1a–§C1h land the bitstream / Huffman / dict / dispatcher /
+PPMd-bridge / solid-mode pieces in turn per the sub-phasing block
+above. Each sub-section ships with the demo / tests its predecessor
+left a TODO for.
 
-**Sketch**.
+(Specific sub-section bodies land as their sub-phase commits land,
+following the §B pattern — see §B2 in this same file for the
+shape.)
+
+**Notes vs. RAR5** (carried forward from the original §C1 sketch):
+
+- Same MSB-first bitstream convention, but RAR3 aligns to a byte
+  boundary at block start and only there; RAR5 has tighter
+  per-meta-tree alignment that doesn't apply.
+- Four Huffman trees per block (literals 299, distances 60,
+  lower-distance bits 17, repeats 28) vs. RAR5's three.
+- Distance cache (`oldDist`) is 4-deep, same as RAR5, but RAR3
+  pushes / promotes on different symbol numbers.
+
+---
+
+### §C2. RarVM (filter pipeline)
+
+§C2a–§C2c land bytecode parser / interpreter / fuzz harness per
+the sub-phasing block above. The original §C2 sketch carries
+forward:
 
 1. Decode the standard filter set (e8/e9/itanium/rgb/audio/delta)
    plus the `VM_STANDARD_FILTERS` shortcuts the encoder uses to
@@ -654,13 +781,11 @@ at `src/decode/rar_legacy/vm.rs`.
    our interpreter must reject out-of-range memory access without
    relying on UB or aborts).
 
-**Tests**: a curated corpus of archives that exercise the standard
-filters plus at least three real-world archives that ship custom
-filter programs (we will need to find and commit these — the
-`rarlab` test suite is a starting point).
-
-**Demo**: `cargo test decode::rar_legacy::vm` passes including
-filter-program differential cases.
+A curated corpus of archives that exercise the standard filters
+plus at least three real-world archives that ship custom filter
+programs is committed alongside §C2c; the §C0 corpus decision
+above sources these from RARLAB public test sets if the ssokolow
+files don't include filter-using archives.
 
 ---
 

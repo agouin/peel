@@ -100,6 +100,15 @@ pub mod rar_native;
 #[cfg(feature = "rar")]
 pub mod ppmd2;
 
+// Hand-rolled legacy RAR (RAR3 / RAR4) decompression pipeline
+// (`docs/PLAN_rar3.md` §C). Sibling of `rar_native` and `ppmd2`;
+// the §A2b pipeline dispatches here on the legacy signature.
+// §C0 scaffolds the module entry; subsequent sub-phases land the
+// bitstream / Huffman / dictionary / LZ block dispatcher / RarVM
+// layers and the PPMd-II bridge for `m=4` / `m=5` entries.
+#[cfg(feature = "rar")]
+pub mod rar_legacy;
+
 /// Status returned by [`StreamingDecoder::decode_step`].
 ///
 /// Does not indicate whether *any* output was produced this step;
