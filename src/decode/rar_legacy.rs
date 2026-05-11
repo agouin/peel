@@ -93,6 +93,14 @@
 //!   off-limits per `AGENTS.md`, and libarchive doesn't ship
 //!   one (stops at the fingerprint shortcut). Today's
 //!   dispatcher rejects custom bytecode with a precise error.
+//! - **§E1** ✅ — [`stream`]: `RarLegacyStreamDecoder`,
+//!   a [`crate::decode::StreamingDecoder`] adapter that
+//!   buffers an entry's `packed_size` compressed bytes from a
+//!   pull-style source, runs the synchronous decoder
+//!   ([`entry::decode_payload`]), and drains the decoded
+//!   output to the sink in bounded chunks. The §A2b pipeline
+//!   dispatches compressed legacy entries through this
+//!   adapter; STORED stays on the fast byte-copy path.
 //!
 //! # Reuse-vs-fork posture
 //!
@@ -119,4 +127,7 @@ pub mod entry;
 pub mod huffman;
 pub mod lzss;
 pub mod ppmd_entry;
+pub mod stream;
 pub mod vm;
+
+pub use stream::RarLegacyStreamDecoder;

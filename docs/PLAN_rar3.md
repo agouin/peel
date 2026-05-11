@@ -2268,26 +2268,77 @@ table layout, different distance encoding, different filter set.
 
 ## Phase E — Integration
 
-### §E1. `StreamingDecoder` wiring + format-mismatch path
+### §E1. `StreamingDecoder` wiring + format-mismatch path ✅ (this commit)
 
-**What**: `RarLegacyStreamDecoder` exposing the
-[`crate::decode::StreamingDecoder`](src/decode.rs) trait. The
-pipeline learns to dispatch on the §A2 enum.
+**What landed**: new
+[`RarLegacyStreamDecoder`](../src/decode/rar_legacy/stream.rs)
+adapter implementing
+[`crate::decode::StreamingDecoder`](../src/decode.rs). The §A2b
+pipeline ([`run_legacy`](../src/download/rar_pipeline.rs)) now
+dispatches compressed entries (`m=1..=5`, on-disk method bytes
+`0x31..=0x35`) through this adapter; STORED entries
+(`method == 0x30`) stay on the existing byte-copy fast path.
 
-**Sketch**.
+**Shape**.
 
-1. Per-entry decoder selects the right inner driver based on
-   `unp_ver` / `method`.
-2. `decode_step(sink)` keeps the bounded-work contract.
-3. `archive::walk_archive` returns `ArchiveSummary` populated for
-   legacy archives the same as RAR5, including solid-mode flag.
+1. Per-entry record (`LegacyEntryRecord` in
+   [`src/download/rar_pipeline.rs`](../src/download/rar_pipeline.rs))
+   carries `method` + `dict_capacity`; the per-entry loop branches
+   on `method == 0x30` to pick STORED vs. the new
+   [`extract_legacy_compressed_entry`](../src/download/rar_pipeline.rs)
+   path.
+2. [`decode_payload`](../src/decode/rar_legacy/entry.rs) is the
+   new public helper inside `entry.rs` that takes the dispatch
+   primitives `(compressed, method, dict_capacity,
+   unpacked_size)` directly so the stream decoder doesn't need
+   to thread a `LegacyFileEntry` through (it operates on bytes
+   pulled from a `Read` source, not on an archive slice).
+3. Round-one buffers the entry's full `packed_size` into memory
+   before constructing the decoder (mirrors the zip / 7z / RAR5
+   §E1 posture). The first
+   [`StreamingDecoder::decode_step`](../src/decode.rs) call
+   pulls the source, runs `decode_payload`, and stages the
+   decoded `Vec<u8>`; subsequent calls drain it to the sink in
+   64 KiB chunks. `decoder_state` returns `None` and
+   `frame_boundary` returns `None` — Phase F (§F1) adds the
+   snapshot blob.
+4. `archive::walk_archive` already returned a populated
+   `LegacyArchiveSummary` with the solid-mode flag from §A2;
+   §E1 carries that flag through the pipeline event stream
+   unchanged.
 
-**Tests**: differential round-trip 100+ legacy archives across the
-`rar3` and `rar4` corpora committed to `tests/fixtures/rar_legacy/`,
-byte-comparing against `unrar`-produced expected outputs.
+**Tests**:
 
-**Demo**: full legacy round-trip against a multi-MB archive
-downloaded via the mock server.
+- Unit tests in
+  [`src/decode/rar_legacy/stream.rs`](../src/decode/rar_legacy/stream.rs)
+  cover the PPMd-mode `testfile.rar3.rar` corpus entry, the
+  LZ + E8 standard-filter `filter_e8.rar` corpus entry, the
+  `bytes_consumed` / `set_source_start_offset` contract, the
+  cap rejections, and the source short-read path.
+- Integration test
+  `round_trip_compressed_legacy_archive_with_e8_filter` in
+  [`tests/test_coordinator_rar3.rs`](../tests/test_coordinator_rar3.rs)
+  drives `filter_e8.rar` end-to-end through the mock-server +
+  ranged-download + sparse-file pipeline and asserts
+  byte-identical output against the curated `.bin` reference.
+- The pre-§E1 `rejects_compressed_legacy_archive_with_specific_diagnostic`
+  test was replaced by two follow-ons: a positive coordinator
+  test exercises the decoder dispatch, and
+  `malformed_compressed_legacy_payload_surfaces_decoder_diagnostic`
+  guards the precise-error contract on malformed payloads
+  (`"legacy RAR decode failed"` surfaces through the
+  CoordinatorError chain). `rejects_legacy_archive_with_unknown_method_byte`
+  keeps walker-level coverage for method bytes outside
+  `0x30..=0x35`.
+- Wider differential round-trip across the full corpus is
+  blocked on building out the corpus itself (the existing
+  fixtures cover the standard-filter set); fold-in lands as
+  follow-on fixture work rather than a §E1 blocker.
+
+**Demo**: `cargo test --features rar
+--test test_coordinator_rar3 round_trip_compressed_legacy_archive_with_e8_filter`
+extracts a compressed legacy archive via the mock-server
+pipeline and byte-compares against the reference plaintext.
 
 ---
 

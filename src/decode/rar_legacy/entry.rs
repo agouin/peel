@@ -231,26 +231,75 @@ pub fn decode_entry(
     match entry.header.method {
         // STORED — direct byte copy. Truncate / pad as the
         // header's unpacked_size dictates; for STORED the two
-        // sizes always match.
+        // sizes always match. Directory markers (LHD_WINDOW set
+        // to 0xE0) have packed_size == 0 so the byte-copy is
+        // simply an empty Vec — no need to consult
+        // dictionary_size() on this branch.
         0x30 => Ok(compressed.to_vec()),
         // Compressed: decide LZ vs PPMd at first-prologue
-        // parse time.
-        0x31..=0x35 => decode_compressed_entry(compressed, entry, unpacked_size),
+        // parse time. dictionary_size() returning None means the
+        // entry is a directory marker (LHD_WINDOW == 0xE0); the
+        // caller should have surfaced that as a flag rather than
+        // calling [`decode_entry`].
+        0x31..=0x35 => {
+            let dict_capacity = entry
+                .header
+                .file_flags
+                .dictionary_size()
+                .ok_or(LegacyEntryError::DirectoryEntry)? as usize;
+            decode_payload(
+                compressed,
+                entry.header.method,
+                dict_capacity,
+                unpacked_size,
+            )
+        }
         method => Err(LegacyEntryError::UnsupportedMethod { method }),
     }
 }
 
-fn decode_compressed_entry(
+/// Decode one entry's compressed payload from its raw bytes.
+///
+/// Sibling of [`decode_entry`] for callers that already own the
+/// `packed_size`-byte slice and the dispatch primitives (method
+/// byte + dictionary capacity + declared `unpacked_size`) directly
+/// — typically the §E1 streaming decoder ([`super::stream`]) which
+/// pulls the payload from a `Read` source rather than slicing it
+/// out of an in-memory archive buffer.
+///
+/// `compressed` must be exactly the entry's packed data area
+/// (`packed_size` bytes). The caller is responsible for upstream
+/// bounds checks; this function does not consult any per-archive
+/// offset. `dict_capacity` is the per-entry sliding-window size
+/// taken from the file header's `LHD_WINDOW` selector (see
+/// [`crate::rar::legacy::format::FileFlags::dictionary_size`]);
+/// directory markers (`LHD_WINDOW == 0xE0`) carry no payload, so
+/// the caller must surface them as a flag rather than invoking
+/// this function. `dict_capacity` is unused on the STORED branch.
+///
+/// # Errors
+///
+/// Any [`LegacyEntryError`] variant — see the type-level docs.
+pub fn decode_payload(
     compressed: &[u8],
-    entry: &LegacyFileEntry,
+    method: u8,
+    dict_capacity: usize,
     unpacked_size: u64,
 ) -> Result<Vec<u8>, LegacyEntryError> {
-    let dict_capacity = entry
-        .header
-        .file_flags
-        .dictionary_size()
-        .ok_or(LegacyEntryError::DirectoryEntry)? as usize;
+    match method {
+        // STORED — direct byte copy.
+        0x30 => Ok(compressed.to_vec()),
+        // Compressed — first-prologue parse decides LZ vs PPMd.
+        0x31..=0x35 => decode_compressed_payload(compressed, dict_capacity, unpacked_size),
+        _ => Err(LegacyEntryError::UnsupportedMethod { method }),
+    }
+}
 
+fn decode_compressed_payload(
+    compressed: &[u8],
+    dict_capacity: usize,
+    unpacked_size: u64,
+) -> Result<Vec<u8>, LegacyEntryError> {
     let mut br = BitReader::new(compressed);
     let mut lengths = [0u8; MAIN_TABLE_TOTAL];
     let mut output = Vec::with_capacity(unpacked_size as usize);

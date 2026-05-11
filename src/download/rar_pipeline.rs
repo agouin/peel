@@ -61,6 +61,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::bitmap::ChunkBitmap;
+use crate::decode::rar_legacy::RarLegacyStreamDecoder;
 use crate::decode::rar_native::dict::MAX_DICT_BYTES;
 use crate::decode::rar_native::RarStreamDecoder;
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
@@ -291,6 +292,16 @@ struct LegacyEntryRecord {
     /// optional high32 when `LHD_LARGE`). For STORED entries this
     /// equals [`Self::unpacked_size`].
     packed_size: u64,
+    /// Compression-method byte from the file header
+    /// (`0x30..=0x35`). `0x30` is STORED — the §A2b fast-path
+    /// extractor handles those; `0x31..=0x35` route through the
+    /// [`RarLegacyStreamDecoder`] (§E1).
+    method: u8,
+    /// Per-entry LZ sliding-window capacity, derived from the
+    /// file header's `LHD_WINDOW` selector. Zero for STORED
+    /// directory markers (where the selector reads as `0b111`);
+    /// the directory branch never consults this field.
+    dict_capacity: usize,
 }
 
 /// Per-entry extraction driver.
@@ -972,18 +983,19 @@ impl<'a> RarPipeline<'a> {
                     }
                     let file = parse_legacy_file_header(&block, local_buf)
                         .map_err(RarPipelineError::Rar)?;
-                    // Round-one §A2b ships STORED only; compressed
-                    // methods surface a precise diagnostic that
-                    // callers / users can correlate with the §B/§C
-                    // sub-plans. The legacy on-disk method byte is
-                    // ASCII '0'..'5' (i.e. 0x30..0x35).
+                    // Round-one §A2b shipped STORED only; §E1 wires
+                    // the §B/§C decoder behind a streaming adapter
+                    // ([`RarLegacyStreamDecoder`]) so compressed
+                    // entries (m=1..=5, on-disk method bytes
+                    // 0x31..=0x35) now extract end-to-end. Method
+                    // bytes outside the supported 0x30..=0x35 range
+                    // still surface a precise diagnostic.
                     const LEGACY_METHOD_STORED: u8 = 0x30;
-                    if file.method != LEGACY_METHOD_STORED {
+                    if !(0x30..=0x35).contains(&file.method) {
                         return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
                             feature: format!(
                                 "legacy RAR compression method 0x{:02x} (m={}, unp_ver={}.{}); \
-                                 round-one (PLAN_rar3.md §A2b) ships STORED-only legacy, \
-                                 PPMd-II + LZ + RarVM land in §B / §C",
+                                 only m=0..=5 (wire bytes 0x30..=0x35) are supported",
                                 file.method,
                                 file.method.wrapping_sub(LEGACY_METHOD_STORED),
                                 file.unp_ver / 10,
@@ -993,6 +1005,15 @@ impl<'a> RarPipeline<'a> {
                     }
                     let data_offset = cursor + u64::from(block.head_size);
                     let packed_size = u64::from(block.add_size.unwrap_or(0));
+                    // Directory markers (LHD_WINDOW == 0xE0) carry
+                    // no payload — `dictionary_size()` returns None
+                    // for them; the per-entry extractor never
+                    // consults `dict_capacity` on that branch.
+                    let dict_capacity = file
+                        .file_flags
+                        .dictionary_size()
+                        .map(|v| v as usize)
+                        .unwrap_or(0);
                     entries.push(LegacyEntryRecord {
                         name: file.name.clone(),
                         is_directory: file.file_flags.is_directory(),
@@ -1000,6 +1021,8 @@ impl<'a> RarPipeline<'a> {
                         expected_crc32: file.file_crc32,
                         data_offset,
                         packed_size,
+                        method: file.method,
+                        dict_capacity,
                     });
                 }
                 BlockType::EndArchive => {
@@ -1058,8 +1081,15 @@ impl<'a> RarPipeline<'a> {
             } else {
                 0
             };
-            let (bytes_written, bytes_punched) =
-                self.extract_legacy_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?;
+            let (bytes_written, bytes_punched) = if entry.method == 0x30 {
+                self.extract_legacy_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?
+            } else {
+                // Compressed: drop any partial-extraction offset.
+                // Round-one (§E1) restarts compressed entries from
+                // byte 0; mid-entry resume lands in §F1 once the
+                // §B/§C decoders ship a snapshot blob.
+                self.extract_legacy_compressed_entry(idx, entry, sink, puncher, &mut callback)?
+            };
             stats.entries_extracted = stats.entries_extracted.saturating_add(1);
             stats.bytes_written = stats.bytes_written.saturating_add(bytes_written);
             stats.bytes_punched = stats.bytes_punched.saturating_add(bytes_punched);
@@ -1174,6 +1204,143 @@ impl<'a> RarPipeline<'a> {
                 bytes_written: sink.current_entry_offset(),
             })
             .map_err(RarPipelineError::Aborted)?;
+        }
+
+        let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;
+
+        let punched = self.punch_range(puncher, data_offset, data_end)?;
+        callback(&RarPipelineEvent::EntryFinished {
+            index: idx,
+            name: entry.name.clone(),
+            bytes_written: entry.unpacked_size,
+            bytes_punched: punched,
+        })
+        .map_err(RarPipelineError::Aborted)?;
+
+        Ok((entry.unpacked_size, punched))
+    }
+
+    /// Compressed-method (`m=1..=5`, on-disk method `0x31..=0x35`)
+    /// per-entry extractor for legacy archives.
+    ///
+    /// Mirrors the structure of [`Self::decompress_entry_to_sink`]
+    /// (the RAR5 compressed path) but uses
+    /// [`RarLegacyStreamDecoder`] (`docs/PLAN_rar3.md` §E1) over the
+    /// in-memory compressed payload. Round-one buffers the entry's
+    /// full `packed_size` before constructing the decoder; Phase G
+    /// (`O.RAR.STREAMING_DECOMPRESS`) lifts this to a chunk-by-
+    /// chunk reader once the §C decoder primitives have stabilised
+    /// against a real corpus.
+    ///
+    /// Always starts from byte 0 of the entry — Phase F (§F1) will
+    /// add the saved-state resume path the RAR5 side already
+    /// implements via `extract_compressed_entry_with_resume`.
+    fn extract_legacy_compressed_entry<F>(
+        &self,
+        idx: u32,
+        entry: &LegacyEntryRecord,
+        sink: &mut RarSink,
+        puncher: &dyn PunchHole,
+        callback: &mut F,
+    ) -> Result<(u64, u64), RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let data_offset = entry.data_offset;
+        let packed_size = entry.packed_size;
+        let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
+            RarPipelineError::Rar(RarError::CorruptHeader {
+                archive_offset: data_offset,
+                reason: "legacy entry data range overflows u64".to_string(),
+            })
+        })?;
+
+        self.cursor.store(data_offset, Ordering::Release);
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(data_offset);
+        }
+        self.wait_for_range(data_offset, data_end)?;
+
+        let begin_outcome = sink
+            .begin_entry(
+                idx,
+                &entry.name,
+                entry.is_directory,
+                entry.unpacked_size,
+                Some(entry.expected_crc32),
+                None, // legacy FILE_HEAD has no BLAKE2sp slot
+            )
+            .map_err(RarPipelineError::Sink)?;
+
+        if matches!(begin_outcome, BeginEntryOutcome::Directory { .. }) {
+            // Directory marker: a compressed-method byte on a
+            // directory entry is unusual but valid (packed_size is
+            // zero either way). Punch defensively and emit the
+            // finished event.
+            let punched = if packed_size > 0 {
+                self.punch_range(puncher, data_offset, data_end)?
+            } else {
+                0
+            };
+            callback(&RarPipelineEvent::EntryFinished {
+                index: idx,
+                name: entry.name.clone(),
+                bytes_written: 0,
+                bytes_punched: punched,
+            })
+            .map_err(RarPipelineError::Aborted)?;
+            return Ok((0, punched));
+        }
+
+        // Buffer the entry's compressed bytes from the sparse file.
+        let mut compressed = vec![
+            0u8;
+            usize::try_from(packed_size).map_err(|_| {
+                RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: data_offset,
+                    reason: format!("packed_size {packed_size} exceeds usize on this platform"),
+                })
+            })?
+        ];
+        if !compressed.is_empty() {
+            self.sparse
+                .read_exact_at(ByteOffset::new(data_offset), &mut compressed)
+                .map_err(RarPipelineError::Sparse)?;
+        }
+
+        let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(compressed));
+        let mut decoder = RarLegacyStreamDecoder::new(
+            src,
+            packed_size,
+            entry.unpacked_size,
+            entry.method,
+            entry.dict_capacity,
+        )
+        .map_err(decode_err_to_rar)?;
+
+        let mut staging: Vec<u8> = Vec::with_capacity(64 * 1024);
+        loop {
+            let status = decoder
+                .decode_step(&mut staging)
+                .map_err(decode_err_to_rar)?;
+            if !staging.is_empty() {
+                sink.write_entry(&staging).map_err(RarPipelineError::Sink)?;
+                staging.clear();
+                // Round-one (§E1) emits no resume blob; Phase F
+                // (§F1) wires one through `decoder_state_into`.
+                callback(&RarPipelineEvent::InEntryProgressCompressed {
+                    index: idx,
+                    bytes_written: sink.current_entry_offset(),
+                    decoder_state: None,
+                })
+                .map_err(RarPipelineError::Aborted)?;
+            }
+            if matches!(status, DecodeStatus::Eof) {
+                break;
+            }
+        }
+        if let Some(p) = self.progress_state {
+            p.set_bytes_decoded_input(data_end);
         }
 
         let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;

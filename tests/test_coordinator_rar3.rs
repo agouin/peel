@@ -2,10 +2,11 @@
 //! through the second-pipeline coordinator.
 //!
 //! Sister to `test_coordinator_rar.rs` but exercises the legacy
-//! signature path landed in `docs/PLAN_rar3.md` §A2b. Round-one
-//! ships STORED-method (`m=0`) extraction end-to-end; compressed
-//! methods surface a precise `UnsupportedFeature` diagnostic and
-//! the decoder generations land in §B / §C.
+//! signature path landed in `docs/PLAN_rar3.md` §A2b and the
+//! compressed-method pipeline wiring landed in §E1. STORED entries
+//! (`m=0`) follow the byte-copy fast path; compressed entries
+//! (`m=1..=5`) route through the `RarLegacyStreamDecoder` adapter
+//! built on the §B (PPMd-II) / §C (LZ + RarVM) decoder primitives.
 
 #![cfg(unix)]
 #![cfg(feature = "rar")]
@@ -240,14 +241,48 @@ fn round_trip_solid_legacy_stored_archive() {
     }
 }
 
+/// Real WinRAR-encoded `filter_e8.rar` (LZ + E8 standard filter).
+const FILTER_E8_RAR: &[u8] = include_bytes!("fixtures/rar_legacy/filter_e8.rar");
+/// Expected decoded contents of `filter_e8.rar`'s sole entry.
+const FILTER_E8_BIN: &[u8] = include_bytes!("fixtures/rar_legacy/filter_e8.bin");
+
 #[test]
-fn rejects_compressed_legacy_archive_with_specific_diagnostic() {
-    // Synthesize a legacy archive whose single FILE_HEAD reports
-    // method 0x33 (m=3, the "normal" RAR3 compression) instead of
-    // STORED. The walker must reject at parse time with a
-    // diagnostic that names the version + method byte; until §B/§C
-    // land, no archive with `m≥1` should slip through to a generic
-    // failure.
+fn round_trip_compressed_legacy_archive_with_e8_filter() {
+    // §E1: a real LZ + E8-filter archive flows through the
+    // compressed-entry pipeline path and produces byte-identical
+    // output. Mock-server, ranged fetches, and the streaming-
+    // decoder buffer-then-drain cadence are all exercised
+    // end-to-end. Validates the §A2 enum-driven dispatch reaches
+    // `extract_legacy_compressed_entry` and that the resulting
+    // sink output matches the reference plaintext captured from
+    // the WinRAR-encoded corpus.
+    let server = MockServer::start(ok_handler(FILTER_E8_RAR.to_vec()));
+    let work = unique_dir("compressed_e8");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+    );
+    let _stats = run(args).expect("extracts cleanly");
+
+    let extracted = read_dir_recursive(&work);
+    assert_eq!(extracted.len(), 1, "expected one entry, got: {extracted:?}");
+    assert_eq!(extracted[0].1, FILTER_E8_BIN);
+}
+
+#[test]
+fn malformed_compressed_legacy_payload_surfaces_decoder_diagnostic() {
+    // §E1 changed the posture on compressed legacy entries — the
+    // pipeline now drives them through the §B/§C decoder rather
+    // than rejecting at the walker. Hand the decoder a malformed
+    // payload (raw placeholder bytes rather than a real LZ/PPMd
+    // bitstream): the decoder's first-prologue parse fails and
+    // the error chain surfaces the legacy-decode diagnostic so a
+    // user can correlate it back to §C without spelunking. This
+    // test guards against silently regressing the dispatch into
+    // a generic IO error.
     let mut buf = Vec::new();
     buf.extend_from_slice(&peel::rar::LEGACY_SIGNATURE_MAGIC);
     buf.extend_from_slice(&build_legacy_main_header(0));
@@ -270,15 +305,61 @@ fn rejects_compressed_legacy_archive_with_specific_diagnostic() {
     buf.extend_from_slice(&build_legacy_endarc_header());
 
     let server = MockServer::start(ok_handler(buf));
-    let work = unique_dir("compressed");
+    let work = unique_dir("compressed_bad");
     let _g = CleanupDir(work.clone());
 
     let args = make_args(&server, OutputTarget::Dir(work), coord_config(64 * 1024));
-    let err = run(args).expect_err("compressed legacy must be rejected");
-    // The outer CoordinatorError variant carries the
-    // RarPipelineError as `#[source]`; thiserror prints only the
-    // top-level "RAR extraction failed" string for `Display`. Walk
-    // the chain to verify the diagnostic at its origin.
+    let err = run(args).expect_err("malformed compressed payload must error");
+    // Walk the error chain because the outer CoordinatorError prints
+    // only its top-level framing under Display.
+    let mut chain_msgs: Vec<String> = Vec::new();
+    let mut cur: Option<&dyn std::error::Error> = Some(&err);
+    while let Some(e) = cur {
+        chain_msgs.push(e.to_string());
+        cur = e.source();
+    }
+    let combined = chain_msgs.join(" / ");
+    assert!(
+        combined.contains("legacy RAR decode failed"),
+        "diagnostic should name the legacy decoder, got chain: {combined}"
+    );
+    assert!(matches!(err, CoordinatorError::Rar(_)), "got {err:?}");
+}
+
+#[test]
+fn rejects_legacy_archive_with_unknown_method_byte() {
+    // Method bytes outside the supported 0x30..=0x35 range remain
+    // rejected at the walker (no decoder can route them). Forge a
+    // FILE_HEAD with method 0x36 (one past the legal range) and
+    // assert the walker surfaces a diagnostic naming the legacy
+    // compression method.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&peel::rar::LEGACY_SIGNATURE_MAGIC);
+    buf.extend_from_slice(&build_legacy_main_header(0));
+
+    let payload = b"unused-payload".to_vec();
+    let pack_size: u32 = payload.len() as u32;
+    let mut body = Vec::new();
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // unp_size_low
+    body.push(3); // host_os = Unix
+    body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // file_crc placeholder
+    body.extend_from_slice(&[0; 4]); // dos_mtime
+    body.push(36); // unp_ver = 3.6 / 4.x
+    body.push(0x36); // method = one past the supported range
+    body.extend_from_slice(&(8u16).to_le_bytes()); // name_size
+    body.extend_from_slice(&[0; 4]); // attr
+    body.extend_from_slice(b"squish.x"); // name
+    let header = build_legacy_block(0x74, 0, &body, Some(pack_size));
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(&payload);
+    buf.extend_from_slice(&build_legacy_endarc_header());
+
+    let server = MockServer::start(ok_handler(buf));
+    let work = unique_dir("unknown_method");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(&server, OutputTarget::Dir(work), coord_config(64 * 1024));
+    let err = run(args).expect_err("unknown method byte must be rejected");
     let mut chain_msgs: Vec<String> = Vec::new();
     let mut cur: Option<&dyn std::error::Error> = Some(&err);
     while let Some(e) = cur {
@@ -290,7 +371,5 @@ fn rejects_compressed_legacy_archive_with_specific_diagnostic() {
         combined.contains("legacy RAR compression method"),
         "diagnostic should name the legacy compression method, got chain: {combined}"
     );
-    // Sanity-check the error type so test breakage points at the
-    // pipeline rather than a coordinator framing change.
     assert!(matches!(err, CoordinatorError::Rar(_)), "got {err:?}");
 }
