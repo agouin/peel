@@ -24,8 +24,10 @@
 //!   four canonical sub-trees for `MAIN_CODE_SIZE` = 299,
 //!   `OFFSET_CODE_SIZE` = 60, `LOW_OFFSET_CODE_SIZE` = 17,
 //!   `LENGTH_CODE_SIZE` = 28).
-//! - **§C1c** — `block_header`: block-type discriminator and
-//!   "tables present" / "use previous block's tables" flag.
+//! - **§C1c** ✅ — [`block_header`]: byte-aligned per-block
+//!   prologue parser; routes LZ vs. PPMd modes and surfaces the
+//!   `keep_old_tables` flag plus the PPMd dictionary / max-order
+//!   / init-escape payload.
 //! - **§C1d** — `dict`: 4 MiB sliding-window dictionary with a
 //!   4-deep recent-distance cache.
 //! - **§C1e** — `lzss`: per-block decode dispatcher integrating
@@ -62,5 +64,6 @@
 //! not compile this module.
 
 pub mod bits;
+pub mod block_header;
 pub mod bootstrap;
 pub mod huffman;

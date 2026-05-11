@@ -33,7 +33,7 @@
 > block boundaries (the load-bearing libarchive-equivalent path),
 > a 60-group random round trip, and legacy-realistic 15-bit
 > Huffman / 18-bit distance-extra-bits widths at byte-boundary-
-> crossing offsets. **§C1b (this commit)** lands the canonical
+> crossing offsets. **§C1b (2be01b6)** landed the canonical
 > Huffman builder at
 > [`src/decode/rar_legacy/huffman.rs`](../src/decode/rar_legacy/huffman.rs)
 > (15-bit max code, flat-lookup table sized `1 << max_len`, same
@@ -43,8 +43,18 @@
 > (the 20-entry precode parser, the 404-entry main-length parser
 > with the delta-from-previous-block trick and the libarchive
 > repeat-last / zero-run opcode set, and the four-sub-tree
-> extractor). 24 unit tests across the two modules; lib-test
-> count now 1549.
+> extractor). 24 unit tests across the two modules.
+> **§C1c (this commit)** lands the per-block prologue parser at
+> [`src/decode/rar_legacy/block_header.rs`](../src/decode/rar_legacy/block_header.rs)
+> — byte-aligns, reads `is_ppmd_block`, then either runs the §C1b
+> chain (LZ mode) or decodes the 7-bit `ppmd_flags` plus its
+> conditional dict / max-order / init-escape payload (PPMd
+> mode). 11 unit tests covering the LZ `keep_old_tables` reset
+> and retain paths, the four PPMd flag combinations
+> (none / `0x20` / `0x40` / both), max-order remapping above 16,
+> the `max_order == 1` rejection, byte-alignment from an
+> off-aligned cursor, and truncated-prologue underrun. Lib-test
+> count now 1560.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -656,12 +666,15 @@ reproducible if a future bug needs the same level of triage.
 > - **§C1a** ✅ (e96f842) — bitstream reader (MSB-first, with
 >   `align_to_byte` for block-start alignment per libarchive's
 >   `rar_br_consume_unaligned_bits`).
-> - **§C1b** ✅ (this commit) — canonical Huffman builder
+> - **§C1b** ✅ (2be01b6) — canonical Huffman builder
 >   (`HuffmanCode`, flat-lookup table, 15-bit max) + per-block
 >   bootstrap (20-entry precode → 404 main-table lengths → four
 >   sub-trees of size 299 / 60 / 17 / 28).
-> - **§C1c** — block header / block-type discriminator / "tables
->   present" flag.
+> - **§C1c** ✅ (this commit) — block-prologue parser at
+>   [`block_header`](../src/decode/rar_legacy/block_header.rs):
+>   byte-align + `is_ppmd_block` flag + branch into LZ
+>   (`keep_old_tables` + §C1b chain) or PPMd (7-bit ppmd_flags +
+>   conditional dict / init-escape / max-order payload).
 > - **§C1d** — sliding-window dictionary (4 MiB max, 4-deep
 >   `oldDist`).
 > - **§C1e** — LZ block dispatcher (`m=1..m=3`), differential
@@ -964,6 +977,79 @@ runs all 17 tests in <50 ms debug / <10 ms release.
 **Demo**: `cargo test --features rar decode::rar_legacy` runs
 all 41 rar_legacy module tests (17 from §C1a + 24 from §C1b) in
 <10 ms release.
+
+#### §C1c. Block-prologue parser ✅ (this commit)
+
+**What landed**:
+[`src/decode/rar_legacy/block_header.rs`](../src/decode/rar_legacy/block_header.rs)
+— the thin parsing wrapper around §C1a + §C1b that decodes one
+block's prologue and surfaces the LZ-vs-PPMd discriminant plus
+each branch's payload. Mirrors libarchive's `parse_codes` head
+(lines 2301..2417 of the reference): byte-align, read 1-bit
+`is_ppmd_block` flag, and then either:
+
+- **LZ** — read 1-bit `keep_old_tables`, conditionally zero the
+  persistent length buffer, and chain into §C1b's three stages.
+  Returns a `BlockPrologue::Lz { tables, kept_old_tables }`.
+- **PPMd** — read 7-bit `ppmd_flags`, conditionally read an
+  8-bit `dict_byte` (gated by `flags & 0x20`) and an 8-bit
+  `init_esc` byte (gated by `flags & 0x40`), and decode the
+  max-order from `(flags & 0x1F) + 1` with the
+  `> 16 → 16 + (raw - 16) * 3` remap. Returns a
+  `BlockPrologue::Ppmd { restart, dictionary_size, max_order,
+  init_esc }`.
+
+**Public surface** (consumed by §C1e and §C1g):
+
+- `BlockPrologue` enum with the two variants above.
+- `BlockHeaderError` (`Underrun`, `Bootstrap`, `PpmdMaxOrderTooSmall`).
+- `parse_block_prologue(&mut BitReader, &mut [u8; 404])
+  -> Result<BlockPrologue, BlockHeaderError>` — the single
+  public entry-point.
+
+**What turned out NOT to need** (vs. the §C0 sketch):
+
+- **No PPMd context allocation.** The original §C0 thinking
+  pictured the prologue parser owning the PPMd init dance.
+  §C1g's caller-owned `PpmdSession` is the cleaner home for
+  context allocation, range-decoder restart, and the
+  "first-block has-no-prior-context" check — keeping the
+  prologue parser pure-parsing means §C1c is testable without
+  pulling in §B's `Model` / `RangeDecoder`. The
+  `Ppmd { restart, dictionary_size, max_order, init_esc }`
+  surface is exactly the state §C1g needs to decide what to do.
+- **No `BlockPrologue::Empty` variant for end-of-entry.** End-
+  of-entry is signalled inside the LZ block dispatcher (a
+  specific main-code symbol exits the block loop, and the
+  pipeline decides whether more blocks follow); the prologue
+  parser is unconditional — every call reads at least the
+  is_ppmd bit and one path's payload.
+
+**Tests**: 11 unit tests at
+[`src/decode/rar_legacy/block_header.rs`](../src/decode/rar_legacy/block_header.rs).
+
+- PPMd: minimal-no-flags, restart with dict + low max-order,
+  restart with high max-order (the `(32 - 16) * 3 + 16 = 64`
+  remap), restart with `max_order == 1` error, init-escape-only
+  flag, and both-flags wire-format order (is_ppmd → flags →
+  dict → init-escape).
+- LZ: `keep_old_tables == 0` zeros a pre-seeded length buffer
+  before applying deltas, `keep_old_tables == 1` preserves the
+  buffer before deltas, and the returned `MainTables` are
+  whatever §C1b builds (an all-zero block yields four empty
+  alphabets, which is fine).
+- Cross-cutting: the prologue byte-aligns from an off-aligned
+  cursor before reading its first bit, and a truncated input
+  surfaces `Underrun` cleanly.
+
+**1560 lib tests pass total** (was 1549 at §C1b, +11 from §C1c).
+
+**Demo**: `cargo test --features rar
+decode::rar_legacy::block_header` runs all 11 tests in <10 ms
+release. The decoder now reads "what kind of block is this and
+what does it carry" end-to-end from a raw bitstream — the
+remaining §C1d / §C1e plumbing makes the four trees actually
+produce LZ output.
 
 ---
 
