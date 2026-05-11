@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use peel::checkpoint::{tmp_path_for, Checkpoint, CheckpointError, SinkState, FORMAT_VERSION};
+use peel::checkpoint::{
+    tmp_path_for, Checkpoint, CheckpointError, RunMode, SinkState, FORMAT_VERSION,
+};
 use peel::types::ByteOffset;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +73,7 @@ fn realistic_tar_checkpoint() -> Checkpoint {
         hash_state: None,
         chunk_crc32c: None,
         decoder_state: None,
+        mode: RunMode::Extract,
     }
 }
 
@@ -315,6 +318,7 @@ fn round_trip_raw_sink_state() {
         hash_state: None,
         chunk_crc32c: None,
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     ckpt.write(&path).expect("write");
 

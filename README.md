@@ -15,7 +15,7 @@ tree never coexist at full size, and a resumed run produces output
 byte-identical to a clean run.
 
 ```
-peel https://example.com/dataset.tar.zst -C ./out
+peel https://example.com/dataset.tar.zst -o ./out/
 ```
 
 ## What you get
@@ -328,11 +328,17 @@ wall-clock numbers you get the full feature set:
 
 ## Usage
 
-```sh
-# Stream a tar archive into a directory
-peel https://example.com/linux-6.x.tar.xz -C ./linux
+> **Migration (2026-05):** `-C/--output-dir` was removed. The single
+> `-o/--output-file` flag now accepts either a file or a directory
+> path; a trailing `/` (or an existing directory at the path) means
+> "directory output." Replace `-C foo/` with `-o foo/`. Passing
+> `-C` produces a hard error pointing at the new flag.
 
-# No -C / -o? Default extract dir is the URL basename with known
+```sh
+# Stream a tar archive into a directory (trailing slash forces dir)
+peel https://example.com/linux-6.x.tar.xz -o ./linux/
+
+# No -o? Default extract dir is the URL basename with known
 # archive/compression suffixes stripped, in the current working
 # directory: this lands the contents in ./linux-6.x
 peel https://example.com/linux-6.x.tar.xz
@@ -340,13 +346,21 @@ peel https://example.com/linux-6.x.tar.xz
 # Bare compressed file → single output file
 peel https://example.com/model.bin.zst -o ./model.bin
 
+# Download-only: parallel ranged GETs (like aria2c) with no
+# extraction. The remote object lands at <basename> verbatim.
+peel https://example.com/big.deb --no-extract
+
+# Extract AND keep the source archive on disk. Sibling-of-`-o` by
+# default; `-k=<path>` for an explicit location.
+peel https://example.com/dataset.tar.zst -o ./out/ -k
+
 # Verify an expected hash, cap bandwidth, fan out across mirrors
 peel https://primary.example.com/dataset.tar.zst \
   --mirror https://eu.mirror.example.com/dataset.tar.zst \
   --mirror https://us.mirror.example.com/dataset.tar.zst \
   --sha256 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad \
   --max-bandwidth 50MB/s \
-  -C ./out
+  -o ./out/
 
 # Multi-part split archive: concatenated parts form one logical
 # stream. Pass each part as a positional URL; --sha256 is repeatable
@@ -360,19 +374,41 @@ peel \
   https://snapshot.arbitrum.io/nova/2026-04-26-7efe0f23/pruned.tar.part0001 \
   --sha256 0a8de6e83fd8ba040fd052fd8d4fd0e009a9736ace5cb32bb2abd4ac6a61725d \
   --sha256 1bcf4d2e9aa01ff5...                                              \
-  -C ./nova-out
+  -o ./nova-out/
 
 # URL has no useful suffix? Pin the decoder.
 peel "https://example.com/download?id=42" --format zstd -o ./out.bin
 
 # A/B against the pre-uring path
-peel https://example.com/dataset.tar.zst --io-backend blocking -C ./out
+peel https://example.com/dataset.tar.zst --io-backend blocking -o ./out/
 ```
+
+### Download modes
+
+peel runs in one of three modes, all selected at the CLI. Format
+detection (suffix → magic) decides the output shape for the
+default mode; `--no-extract` and `-k`/`--keep-archive` are explicit
+mode flags.
+
+| Flag | Download | Extract | Hole-punch source | Source on disk at exit |
+| --- | --- | --- | --- | --- |
+| (default) | yes | yes | yes | deleted |
+| `-k` (bare) | yes | yes | **no** | preserved as sibling of `-o` |
+| `-k=<PATH>` | yes | yes | **no** | preserved at `<PATH>` |
+| `--no-extract` | yes | no | n/a | preserved at `-o` |
+
+If format detection misses, peel warns and runs as `--no-extract`
+by default — the remote object is saved to disk under its URL
+basename. Pass `--strict-format` to make that case a hard error
+instead (useful in CI when an upstream object changing shape
+should fail the build).
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `-C, --output-dir <DIR>` | URL basename, suffixes stripped | Extract a tar/zip archive into `DIR`. When neither `-C` nor `-o` is given, defaults to `$(pwd)/<basename>` with known archive/compression extensions stripped (`abcd.tar.xz` → `./abcd`). Mutually exclusive with `-o`. |
-| `-o, --output-file <FILE>` | — | Stream the decoded bytes verbatim into `FILE`. |
+| `-o, --output-file <PATH>` | URL basename, suffixes stripped | Output path. Directory for tree-shaped formats (tar / zip / 7z / rar / any `.tar.<x>` wrapper); file for stream-shaped formats (raw `.zst`, `.xz`, `.lz4`, `.gz`). A trailing slash forces directory semantics. |
+| `--no-extract` (alias: `--download-only`) | off | Skip extraction; download the source bytes verbatim. |
+| `-k, --keep-archive[=<PATH>]` | off | Extract AND keep the source archive on disk. Bare `-k` places the archive as a sibling of `-o`; `-k=<PATH>` is explicit. |
+| `--strict-format` | off | Treat unrecognized formats as a hard error rather than falling back to download-only. |
 | `--workers <N>` | 8 | Parallel download workers. |
 | `--chunk-size <BYTES>` | 4 MiB | Bitmap unit. With adaptive sizing, dispatch may coalesce several. |
 | `--no-adaptive-chunk-size` | off | Lock dispatch to the bitmap unit. |

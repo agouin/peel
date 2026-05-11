@@ -158,8 +158,8 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
-use crate::checkpoint::{Checkpoint, CheckpointError, SinkState};
-use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, StreamingDecoder};
+use crate::checkpoint::{Checkpoint, CheckpointError, RunMode, SinkState};
+use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, FormatShape, StreamingDecoder};
 use crate::download::sevenz_pipeline::{
     SevenzExtractionStats, SevenzPipeline, SevenzPipelineConfig, SevenzPipelineError,
     SevenzPipelineEvent, SevenzResumeState,
@@ -339,6 +339,34 @@ pub struct CoordinatorConfig {
     /// `--max-disk-buffer <SIZE>` CLI flag (default `1 GiB`,
     /// `none` to disable).
     pub max_disk_buffer: Option<u64>,
+
+    /// Download-only mode (`docs/PLAN_download_modes.md` §2). When
+    /// `true`, the coordinator runs the parallel-ranged-HTTP
+    /// scheduler, fills `<output>.peel.part`, then renames it to
+    /// `<output>` on clean completion. No decoder runs; no holes are
+    /// punched; the `.peel.ckpt` is cleared at the end. Mirrors the
+    /// `--no-extract` / `--download-only` CLI flag.
+    pub no_extract: bool,
+
+    /// Preserve the source archive on disk after extraction
+    /// (`docs/PLAN_download_modes.md` §3). When `Some(path)`, the
+    /// extractor pipeline runs as usual but the puncher is forced
+    /// to no-op (so the archive stays at its full
+    /// `Content-Length`), and the `.peel.part` file is renamed to
+    /// `path` on clean completion instead of being deleted.
+    /// Redundant when [`Self::no_extract`] is set (the `.peel.part`
+    /// is already preserved as the final output); the CLI logs an
+    /// info-level note rather than erroring on that combination.
+    pub keep_archive: Option<PathBuf>,
+
+    /// Treat unrecognized formats as a hard error
+    /// (`docs/PLAN_download_modes.md` §4). When `false` (default),
+    /// a [`CoordinatorError::NoDecoder`] surfaced by format
+    /// detection is downgraded to a warning and the run completes
+    /// as if `--no-extract` had been passed (the `.peel.part` file
+    /// is renamed to a stream-shaped output path derived from the
+    /// URL basename). When `true` the error is rethrown unchanged.
+    pub strict_format: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -362,6 +390,9 @@ impl Default for CoordinatorConfig {
             mirror_urls: Vec::new(),
             max_bandwidth_bps: None,
             max_disk_buffer: Some(DEFAULT_MAX_DISK_BUFFER),
+            no_extract: false,
+            keep_archive: None,
+            strict_format: false,
         }
     }
 }
@@ -699,12 +730,33 @@ pub enum CoordinatorError {
     DownloadPanicked,
 
     /// ZIP archives can only extract into a directory; the user
-    /// passed `--output-file`.
+    /// passed `--output-file` with a file-shaped path.
+    ///
+    /// Superseded by [`Self::OutputShapeMismatch`] for the post-
+    /// detection generic check (`docs/PLAN_download_modes.md` §1);
+    /// retained because the zip / 7z / rar pipelines still emit it
+    /// from their own per-pipeline guards.
     #[error(
         "ZIP archives can only be extracted into a directory; \
-         re-run with `-C <DIR>` instead of `-o <FILE>`"
+         re-run with `-o <DIR>/` (trailing slash) instead of `-o <FILE>`"
     )]
     ZipNeedsDirectory,
+
+    /// The output path's shape and the detected format disagree
+    /// (`docs/PLAN_download_modes.md` §1). Raised after format
+    /// detection completes — covers both URL-suffix conflicts the
+    /// CLI did not catch and magic-detected formats that flip the
+    /// shape away from the user's `-o` path.
+    #[error("{detail}")]
+    OutputShapeMismatch {
+        /// Shape required by the resolved format.
+        shape: FormatShape,
+        /// The user-supplied output path.
+        path: PathBuf,
+        /// Human-readable explanation of the mismatch (includes the
+        /// path and the expected shape).
+        detail: String,
+    },
 
     /// The ZIP pipeline failed.
     #[error("ZIP extraction failed")]
@@ -893,6 +945,27 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         // misleading "source changed" message; this earlier check
         // surfaces the real cause (sidecars out of sync) up front.
         validate_part_file(&ckpt_path, &part_path, info.total_size)?;
+    }
+
+    // `docs/PLAN_download_modes.md` §5: detect mode drift between
+    // the prior run and this one before touching the part-file.
+    // Pre-v12 checkpoints decode as [`RunMode::Extract`]; v12
+    // carries the writer's mode explicitly. A mismatch surfaces as
+    // a typed [`CheckpointError::ModeMismatch`] wrapped in
+    // [`CoordinatorError::Checkpoint`] so the binary can render a
+    // clear "rerun with the matching flag, or delete the .ckpt"
+    // recovery message.
+    if let Some(prior) = prior.as_ref() {
+        let prior_mode = prior.mode;
+        let current_mode = current_run_mode(&config);
+        if prior_mode != current_mode {
+            return Err(CoordinatorError::Checkpoint(
+                CheckpointError::ModeMismatch {
+                    old: prior_mode,
+                    new: current_mode,
+                },
+            ));
+        }
     }
     let resume_plan = build_resume_plan(prior.as_ref(), &info, &url, &config, &output)?;
     let resuming = matches!(resume_plan, ResumePlan::Resume { .. });
@@ -1178,12 +1251,59 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     source,
                 })?;
 
+            // `--no-extract` (`docs/PLAN_download_modes.md` §2):
+            // skip the entire decoder / sink / extractor stack and
+            // just wait for the download thread to finish. The
+            // sparse part-file becomes the final output via a
+            // post-scope rename (see below). Hole-punching is
+            // implicitly disabled (no decoder ⇒ no advancing
+            // cursor); the puncher is never constructed.
+            //
+            // Round-one of §2 emits no checkpoints in this mode
+            // (the existing checkpoint cadence is driven by the
+            // extractor's observer hook, which doesn't run). §5
+            // will add an explicit checkpoint cadence for the
+            // download-only path together with the v12 `mode`
+            // field. Until then, a `kill -9` during a download-only
+            // run discards in-flight progress on resume; a clean
+            // SIGTERM still completes any in-flight chunks before
+            // exiting because the abort flag is honored by the
+            // scheduler.
+            if config.no_extract {
+                dl_handle
+                    .join()
+                    .map_err(|_| CoordinatorError::DownloadPanicked)?;
+                let download_stats = match download_outcome.lock() {
+                    Ok(mut slot) => slot.take(),
+                    Err(_) => None,
+                };
+                let download_stats = match download_stats {
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => return Err(CoordinatorError::Scheduler(e)),
+                    None => DownloadStats::default(),
+                };
+                cancel_guard.disarm();
+                return Ok(ExtractionOutcome {
+                    extraction: ExtractionStats::default(),
+                    download: download_stats,
+                    used_decoder_state: false,
+                    fallback_no_extract_target: None,
+                });
+            }
+
             // Resolve the decoder factory before constructing the
             // reader. Detection may need to wait for chunk 0 to land
             // so the magic-byte sniff has bytes to look at; doing it
             // here keeps the BlockingSparseReader from owning that
             // wait.
-            let factory = select_decoder_factory(
+            //
+            // The returned `FormatShape` is the second line of
+            // shape-validation defence (`docs/PLAN_download_modes.md`
+            // §1): the CLI resolver pre-validates against URL suffix
+            // and `--format`, but a `.bin` URL whose first bytes match
+            // zstd magic flips the shape post-CLI. Verify it now,
+            // before any decoder / sink is constructed.
+            let detection = select_decoder_factory(
                 &registry,
                 &info,
                 &config,
@@ -1192,7 +1312,46 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 &download_done,
                 &download_outcome,
                 kill_switch.as_ref(),
-            )?;
+            );
+            let (format_shape, factory) = match detection {
+                Ok(ok) => ok,
+                Err(CoordinatorError::NoDecoder { filename }) if !config.strict_format => {
+                    // §4 fallback: no decoder registered for this
+                    // source. Warn and run as `--no-extract` — the
+                    // download thread is already producing bytes
+                    // into `.peel.part`; we just need to join it
+                    // and rename the part-file to a stream-shaped
+                    // path on the way out.
+                    tracing::warn!(
+                        "no decoder registered for {filename}; running as --no-extract. \
+                         Pass --no-extract to silence this warning, or --format <name> \
+                         if you know the format. Pass --strict-format to make this a \
+                         hard error instead."
+                    );
+                    dl_handle
+                        .join()
+                        .map_err(|_| CoordinatorError::DownloadPanicked)?;
+                    let download_stats = match download_outcome.lock() {
+                        Ok(mut slot) => slot.take(),
+                        Err(_) => None,
+                    };
+                    let download_stats = match download_stats {
+                        Some(Ok(s)) => s,
+                        Some(Err(e)) => return Err(CoordinatorError::Scheduler(e)),
+                        None => DownloadStats::default(),
+                    };
+                    cancel_guard.disarm();
+                    let fallback_target = fallback_no_extract_path(&info, &output);
+                    return Ok(ExtractionOutcome {
+                        extraction: ExtractionStats::default(),
+                        download: download_stats,
+                        used_decoder_state: false,
+                        fallback_no_extract_target: Some(fallback_target),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+            verify_output_shape(format_shape, &output)?;
 
             // Look up the resolved factory's name to decide which
             // pipeline to drive. ZIP / 7z / RAR archives go through
@@ -1209,7 +1368,18 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             #[cfg(not(feature = "rar"))]
             let is_rar = false;
 
-            let puncher: Box<dyn PunchHole> = make_puncher(&sparse);
+            // §3 (`docs/PLAN_download_modes.md`): when `-k` is set
+            // the user is asking for the source archive on disk, so
+            // no holes are punched. Force a NoopPuncher regardless
+            // of `--io-backend`; the extractor's `punch_threshold`
+            // is also raised to `u64::MAX` (see the run-arg fixup
+            // below) so the extractor never even attempts a punch
+            // syscall.
+            let puncher: Box<dyn PunchHole> = if config.keep_archive.is_some() {
+                Box::new(NoopPuncher::new())
+            } else {
+                make_puncher(&sparse)
+            };
 
             let extraction_stats = if is_zip {
                 let dir = match &output {
@@ -1411,8 +1581,19 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 // writes a durable checkpoint every time the cadence
                 // floor fires.
                 let extractor = {
+                    // §3: with `-k` the puncher is a no-op and any
+                    // punch attempt would be a wasted syscall plus
+                    // the extractor's own per-call accounting.
+                    // Raise the threshold to `u64::MAX` so the
+                    // extractor never reaches the branch in the
+                    // first place.
+                    let effective_punch_threshold = if config.keep_archive.is_some() {
+                        u64::MAX
+                    } else {
+                        config.punch_threshold
+                    };
                     let base = Extractor::new(ExtractorConfig {
-                        punch_threshold: config.punch_threshold,
+                        punch_threshold: effective_punch_threshold,
                         // PLAN_lazy_decoder_state.md Phase 1: throttle
                         // moved from the observer closure into the
                         // extractor's run loop so a throttled step
@@ -1485,6 +1666,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &bitmap,
                             &fingerprints,
                             chunk_size,
+                            current_run_mode(&config),
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
@@ -1505,6 +1687,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             &bitmap,
                             &fingerprints,
                             chunk_size,
+                            current_run_mode(&config),
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
@@ -1590,13 +1773,86 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 extraction: extraction_stats,
                 download: download_stats,
                 used_decoder_state: used_decoder_state_flag.load(Ordering::Relaxed),
+                fallback_no_extract_target: None,
             })
         })?;
 
     // Drop the sparse file so the puncher's borrowed fd is no longer
-    // alive, then delete the sidecars.
+    // alive. Three cleanup paths apply on clean completion:
+    //
+    //   * `--no-extract` (`docs/PLAN_download_modes.md` §2): the
+    //     part file *is* the final output. Rename it into place.
+    //   * `-k`/`--keep-archive` (§3): the extractor wrote its tree
+    //     through the sink, AND the source archive is preserved.
+    //     Rename `.peel.part` to the user-supplied keep-archive
+    //     path (overwriting an existing regular file with a
+    //     `tracing::warn!`).
+    //   * default extract mode: the decompressed output is already
+    //     in the sink; the part file's contents are redundant and
+    //     are deleted.
+    //
+    // In every case the `.peel.ckpt` and its tmp companion are no
+    // longer needed and are cleared.
     drop(sparse);
-    fs::remove_file(&part_path).ok();
+    if let Some(fallback_path) = extraction_outcome.fallback_no_extract_target.as_ref() {
+        // §4: format detection missed and we ran in download-only
+        // fallback. Remove the (legacy default) empty directory
+        // created at the user's `-o` path up-front, then rename
+        // `.peel.part` to the URL-basename-derived fallback path.
+        // If the fallback target happens to coincide with the
+        // pre-created directory, `fs::remove_dir` succeeds on an
+        // empty dir and the rename takes its place.
+        if let OutputTarget::Dir(d) = &output {
+            // `remove_dir` only succeeds on an empty directory; a
+            // non-empty `-o` dir (rare but legal — e.g. the user
+            // pointed at an existing populated dir) is left in
+            // place. The rename target is a sibling, not the same
+            // path, so no collision either way.
+            let _ = fs::remove_dir(d);
+        }
+        fs::rename(&part_path, fallback_path).map_err(|source| CoordinatorError::Io {
+            path: fallback_path.clone(),
+            source,
+        })?;
+    } else if config.no_extract {
+        // INVARIANT: §1's resolver / `--no-extract` shape forcing
+        // guarantees `output` is a [`OutputTarget::File`] here.
+        // Pattern-matching keeps the error path typed if a future
+        // change adds another variant.
+        let final_path = match &output {
+            OutputTarget::File(p) => p.clone(),
+            OutputTarget::Dir(p) => {
+                return Err(CoordinatorError::OutputShapeMismatch {
+                    shape: FormatShape::Stream,
+                    path: p.clone(),
+                    detail: format!(
+                        "--no-extract requires a file output path; {} is a directory",
+                        p.display(),
+                    ),
+                });
+            }
+        };
+        fs::rename(&part_path, &final_path).map_err(|source| CoordinatorError::Io {
+            path: final_path.clone(),
+            source,
+        })?;
+    } else if let Some(keep_path) = config.keep_archive.as_ref() {
+        // §3.2: existing regular file at the target overwrites
+        // with a warning; an existing directory was rejected at
+        // CLI parse time.
+        if keep_path.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            tracing::warn!(
+                "--keep-archive: overwriting existing file at {}",
+                keep_path.display()
+            );
+        }
+        fs::rename(&part_path, keep_path).map_err(|source| CoordinatorError::Io {
+            path: keep_path.clone(),
+            source,
+        })?;
+    } else {
+        fs::remove_file(&part_path).ok();
+    }
     fs::remove_file(&ckpt_path).ok();
     fs::remove_file(crate::checkpoint::tmp_path_for(&ckpt_path)).ok();
 
@@ -1631,6 +1887,16 @@ struct ExtractionOutcome {
     /// Ferried through so [`RunStats::resume_used_decoder_state`]
     /// can be populated.
     used_decoder_state: bool,
+    /// `docs/PLAN_download_modes.md` §4 fallback: when set, format
+    /// detection failed and the run completed as if `--no-extract`
+    /// had been passed. The path is the (URL-basename-derived)
+    /// stream-shaped output target the post-scope cleanup should
+    /// rename `.peel.part` to. Distinct from
+    /// [`CoordinatorConfig::no_extract`] so the cleanup can tell
+    /// "user asked for no-extract" from "we fell back to no-extract"
+    /// — the latter also removes the (legacy default) directory
+    /// that was created up-front.
+    fallback_no_extract_target: Option<PathBuf>,
 }
 
 /// Drop guard that flips an [`AtomicBool`] to `true` on drop unless
@@ -2038,6 +2304,7 @@ fn run_one<S: Sink>(
     bitmap: &ChunkBitmap,
     fingerprints: &ChunkFingerprints,
     chunk_size: u64,
+    current_mode: RunMode,
     progress: Option<&mut ProgressFn>,
     kill_switch: Option<&Arc<AtomicBool>>,
     hasher_for_ckpt: Option<&crate::hash::SharedHasher>,
@@ -2117,6 +2384,7 @@ fn run_one<S: Sink>(
                 hash_state,
                 chunk_crc32c,
                 decoder_state: None,
+                mode: current_mode,
             };
             let prep_time = serialize_prep_start.elapsed();
             let mut decstate_time = Duration::ZERO;
@@ -2414,6 +2682,7 @@ fn run_zip(
                     hash_state: None,
                     chunk_crc32c,
                     decoder_state: None,
+                    mode: current_run_mode(config),
                 };
                 let prep_time = serialize_prep_start.elapsed();
                 let write_timings = ckpt
@@ -2532,6 +2801,7 @@ fn run_zip(
                     // not in the streaming-pipeline-shaped
                     // [`Checkpoint::decoder_state`] field. Phase 9b.
                     decoder_state: None,
+                    mode: current_run_mode(config),
                 };
                 let prep_time = serialize_prep_start.elapsed();
                 let write_timings = ckpt
@@ -2756,6 +3026,7 @@ fn run_rar(
             hash_state: None,
             chunk_crc32c,
             decoder_state: None,
+            mode: current_run_mode(config),
         };
         let prep_time = serialize_prep_start.elapsed();
         let write_timings = ckpt
@@ -3094,6 +3365,7 @@ fn run_sevenz(
                     hash_state: None,
                     chunk_crc32c: None,
                     decoder_state: None,
+                    mode: current_run_mode(config),
                 };
                 ckpt.write_timed(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -4129,9 +4401,9 @@ fn select_decoder_factory(
     download_done: &Arc<AtomicBool>,
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     kill_switch: Option<&Arc<AtomicBool>>,
-) -> Result<DecoderFactory, CoordinatorError> {
+) -> Result<(FormatShape, DecoderFactory), CoordinatorError> {
     if let Some(name) = config.forced_format.as_deref() {
-        return registry.factory_for_format_name(name).ok_or_else(|| {
+        let factory = registry.factory_for_format_name(name).ok_or_else(|| {
             CoordinatorError::UnknownFormatName {
                 name: name.to_string(),
                 available: registry
@@ -4140,12 +4412,23 @@ fn select_decoder_factory(
                     .map(String::from)
                     .collect(),
             }
-        });
+        })?;
+        let shape = registry
+            .shape_for_format_name(name)
+            // INVARIANT: factory_for_format_name returned Some(_) for `name`
+            // above, so shape_for_format_name (same lookup table) cannot miss.
+            .unwrap_or(FormatShape::Tree);
+        return Ok((shape, factory));
     }
 
-    let suffix_factory = registry
-        .factory_for_path(Path::new(info.url.path()))
-        .or_else(|| filename_from_url(&info.url).and_then(|n| registry.factory_for_name(&n)));
+    let suffix_lookup = registry
+        .lookup_by_name(
+            Path::new(info.url.path())
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(""),
+        )
+        .or_else(|| filename_from_url(&info.url).and_then(|n| registry.lookup_by_name(&n)));
 
     // The plan calls for sniffing the first
     // `min(chunk_size, max_magic_window)` bytes — but
@@ -4169,11 +4452,11 @@ fn select_decoder_factory(
             kill_switch,
         )?
     };
-    let magic_factory = registry.factory_for_prefix(&prefix);
+    let magic_lookup = registry.lookup_by_prefix(&prefix);
 
-    match (suffix_factory, magic_factory) {
-        (Some(s), Some(m)) if std::ptr::fn_addr_eq(s, m) => Ok(s),
-        (Some(s), Some(m)) => {
+    match (suffix_lookup, magic_lookup) {
+        (Some((shape, s)), Some((_, m))) if std::ptr::fn_addr_eq(s, m) => Ok((shape, s)),
+        (Some((suffix_shape, s)), Some((magic_shape, m))) => {
             let suffix_name = registry.name_for_factory(s).map(String::from);
             let magic_name = registry.name_for_factory(m).map(String::from);
             if config.force_format_from_magic {
@@ -4189,7 +4472,12 @@ fn select_decoder_factory(
                     magic_name.as_deref().unwrap_or("?"),
                     magic_name.as_deref().unwrap_or("?"),
                 );
-                Ok(m)
+                // Magic wins: shape from magic too. A `.tar.zst` URL
+                // forced to magic (zstd) loses the Tree wrapping
+                // information; the user opted into this with
+                // --force-format-from-magic.
+                let _ = suffix_shape;
+                Ok((magic_shape, m))
             } else {
                 Err(CoordinatorError::FormatMismatch {
                     suffix_format: suffix_name,
@@ -4197,12 +4485,103 @@ fn select_decoder_factory(
                 })
             }
         }
-        (Some(s), None) => Ok(s),
-        (None, Some(m)) => Ok(m),
+        (Some((shape, s)), None) => Ok((shape, s)),
+        (None, Some((shape, m))) => Ok((shape, m)),
         (None, None) => {
             let filename =
                 filename_from_url(&info.url).unwrap_or_else(|| info.url.path().to_string());
             Err(CoordinatorError::NoDecoder { filename })
+        }
+    }
+}
+
+/// Derive the [`RunMode`] for the current run from
+/// [`CoordinatorConfig`] (`docs/PLAN_download_modes.md` §5).
+///
+/// Stamped on every checkpoint the coordinator writes so a
+/// later resume with a different mode surfaces
+/// [`CheckpointError::ModeMismatch`] before it can lose progress.
+fn current_run_mode(config: &CoordinatorConfig) -> RunMode {
+    if config.no_extract {
+        RunMode::NoExtract
+    } else if config.keep_archive.is_some() {
+        RunMode::KeepArchive
+    } else {
+        RunMode::Extract
+    }
+}
+
+/// Derive the on-disk path where the `--no-extract` §4 fallback
+/// should rename `.peel.part` when format detection misses.
+///
+/// The URL basename is used directly (with the `.partNNNN`
+/// multi-URL suffix stripped if present) so the user gets the
+/// remote object under its natural name. The path is placed in the
+/// same directory as the user-supplied `-o` value — siblings of the
+/// (legacy default) directory the unknown-format path created
+/// up-front — so a `peel https://host/foo.bin -o ./out/` invocation
+/// lands the bytes at `./foo.bin` rather than overwriting `./out`.
+fn fallback_no_extract_path(info: &DownloadInfo, output: &OutputTarget) -> PathBuf {
+    let basename = filename_from_url(&info.url).unwrap_or_else(|| info.url.path().to_string());
+    let depart = {
+        // Same conservative `.partNNNN` strip as the CLI helper.
+        let lower = basename.to_ascii_lowercase();
+        match lower.rfind(".part") {
+            Some(idx) => {
+                let tail = &basename[idx + ".part".len()..];
+                if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                    &basename[..idx]
+                } else {
+                    basename.as_str()
+                }
+            }
+            None => basename.as_str(),
+        }
+    };
+    let parent: PathBuf = match output {
+        OutputTarget::File(p) | OutputTarget::Dir(p) => {
+            p.parent().map(PathBuf::from).unwrap_or_else(PathBuf::new)
+        }
+    };
+    parent.join(depart)
+}
+
+/// Verify that the resolved [`FormatShape`] matches the
+/// [`OutputTarget`] variant the user supplied. Surfaces a typed
+/// [`CoordinatorError::OutputShapeMismatch`] before any pipeline
+/// kicks off (`docs/PLAN_download_modes.md` §1 / §6).
+///
+/// The CLI's unified `-o` resolver pre-validates against suffix and
+/// `--format` lookups, but magic detection can still flip the shape
+/// (a `.bin` URL whose first bytes match zstd magic produces Stream
+/// shape regardless of the suffix). This check is the second line of
+/// defence — it runs after magic detection but before extraction
+/// starts.
+fn verify_output_shape(shape: FormatShape, output: &OutputTarget) -> Result<(), CoordinatorError> {
+    match (shape, output) {
+        (FormatShape::Tree, OutputTarget::Dir(_)) => Ok(()),
+        (FormatShape::Stream, OutputTarget::File(_)) => Ok(()),
+        (FormatShape::Tree, OutputTarget::File(path)) => {
+            Err(CoordinatorError::OutputShapeMismatch {
+                shape,
+                path: path.clone(),
+                detail: format!(
+                    "format produces a directory tree but `-o {}` is a file path. \
+                     Pass a directory path (trailing slash optional) instead.",
+                    path.display(),
+                ),
+            })
+        }
+        (FormatShape::Stream, OutputTarget::Dir(path)) => {
+            Err(CoordinatorError::OutputShapeMismatch {
+                shape,
+                path: path.clone(),
+                detail: format!(
+                    "format produces a single file but `-o {}` is a directory path. \
+                     Pass a file path (without trailing slash) instead.",
+                    path.display(),
+                ),
+            })
         }
     }
 }
@@ -4356,6 +4735,7 @@ mod tests {
             hash_state: None,
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         }
     }
 

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use peel::checkpoint::{Checkpoint, SinkState};
+use peel::checkpoint::{Checkpoint, RunMode, SinkState};
 use peel::coordinator::{
     run, CoordinatorConfig, CoordinatorError, OutputTarget, ProgressEvent, ProgressFn, RunArgs,
 };
@@ -118,6 +118,9 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         mirror_urls: Vec::new(),
         max_bandwidth_bps: None,
         max_disk_buffer: None,
+        no_extract: false,
+        keep_archive: None,
+        strict_format: false,
     }
 }
 
@@ -393,6 +396,218 @@ fn happy_path_zst_to_file_round_trips_bytes() {
     // Sidecars cleaned up.
     assert!(!work.join("out.bin.peel.part").exists());
     assert!(!work.join("out.bin.peel.ckpt").exists());
+}
+
+// ---- §2: --no-extract download-only mode ---------------------------
+
+#[test]
+fn no_extract_downloads_raw_bytes_then_renames_into_place() {
+    // `docs/PLAN_download_modes.md` §2 demo: a non-archive remote
+    // object should land on disk byte-identical to a `curl`
+    // download — no decoder runs, the .peel.part rename moves the
+    // assembled bytes into the final path, and the .peel.ckpt is
+    // cleaned up on success.
+    let payload = (0u8..=255).cycle().take(128 * 1024).collect::<Vec<u8>>();
+    let payload_len = payload.len() as u64;
+    let server = MockServer::start(ok_handler(payload.clone(), Some("\"raw-v1\"")));
+
+    let work = unique_dir("no_extract_raw");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("blob.bin");
+
+    let mut config = coord_config_for_test(4096);
+    config.chunk_size = 8 * 1024;
+    config.no_extract = true;
+    let args = make_args(
+        &server,
+        "blob.bin",
+        OutputTarget::File(out_path.clone()),
+        config,
+    );
+
+    let stats = run(args).expect("download-only run");
+    // No extractor ran ⇒ extraction.bytes_out stays at its default.
+    assert_eq!(stats.extraction.bytes_out, 0);
+    assert!(!stats.resumed);
+
+    // The renamed .peel.part is now the final output and matches
+    // the server's bytes exactly.
+    assert_eq!(fs::read(&out_path).expect("read final"), payload);
+    let metadata = fs::metadata(&out_path).expect("stat final");
+    assert_eq!(metadata.len(), payload_len);
+
+    // Sidecars cleaned up.
+    assert!(!work.join("blob.bin.peel.part").exists());
+    assert!(!work.join("blob.bin.peel.ckpt").exists());
+}
+
+/// Build a minimal POSIX-ustar tar containing a single
+/// regular-file entry named `name` with `payload` bytes. Used by
+/// the §3 keep-archive integration test to produce a `.tar.zst`
+/// whose extraction produces a known file at a known path.
+fn simple_tar_with_entry(name: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut header = [0u8; 512];
+    let name_bytes = name.as_bytes();
+    assert!(name_bytes.len() < 100, "test helper supports short names");
+    header[..name_bytes.len()].copy_from_slice(name_bytes);
+    header[100..108].copy_from_slice(b"0000644\0");
+    header[108..116].copy_from_slice(b"0000000\0");
+    header[116..124].copy_from_slice(b"0000000\0");
+    let size_str = format!("{:011o}\0", payload.len());
+    header[124..136].copy_from_slice(size_str.as_bytes());
+    header[136..148].copy_from_slice(b"00000000000\0");
+    header[148..156].copy_from_slice(b"        ");
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let cksum: u32 = header.iter().map(|&b| b as u32).sum();
+    let cksum_str = format!("{:06o}\0 ", cksum);
+    header[148..156].copy_from_slice(cksum_str.as_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    let pad = (512 - (payload.len() % 512)) % 512;
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out.extend(std::iter::repeat_n(0u8, 1024));
+    out
+}
+
+#[test]
+fn cross_mode_resume_no_extract_to_extract_is_rejected() {
+    // `docs/PLAN_download_modes.md` §5: a `.peel.ckpt` written by
+    // a `--no-extract` run must not be silently consumed by a
+    // later run that omits the flag. The coordinator surfaces
+    // `CheckpointError::ModeMismatch` wrapped in
+    // `CoordinatorError::Checkpoint`.
+    use peel::checkpoint::{CheckpointError, PartRecord, RunMode, SinkState};
+    use peel::types::ByteOffset;
+
+    let payload = b"raw bytes, no decoder".repeat(64);
+    let server = MockServer::start(ok_handler(payload.clone(), Some("\"v1\"")));
+
+    let work = unique_dir("cross_mode_reject");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("blob.bin");
+
+    // Drop in a hand-built `--no-extract` checkpoint alongside an
+    // empty part file. Skipping the `.peel.part` validation means
+    // we need its on-disk length to match `total_size`.
+    let total_size = payload.len() as u64;
+    let part_path = work.join("blob.bin.peel.part");
+    let part_file = fs::File::create(&part_path).expect("create part");
+    part_file.set_len(total_size).expect("set_len");
+    drop(part_file);
+
+    let ckpt = Checkpoint {
+        url: format!("{}/blob.bin", server.base_url()),
+        etag: Some("\"v1\"".to_string()),
+        last_modified: None,
+        parts: vec![PartRecord {
+            url: format!("{}/blob.bin", server.base_url()),
+            size: total_size,
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            expected_sha256: None,
+        }],
+        total_size,
+        chunk_size: 4096,
+        decoder_position: ByteOffset::new(0),
+        bitmap_completed: vec![0],
+        created_at: std::time::SystemTime::now(),
+        sink_state: SinkState::Raw { bytes_written: 0 },
+        hash_state: None,
+        chunk_crc32c: None,
+        decoder_state: None,
+        mode: RunMode::NoExtract,
+    };
+    ckpt.write(&work.join("blob.bin.peel.ckpt"))
+        .expect("write ckpt");
+
+    // Now run *without* `--no-extract` against the same output.
+    let args = make_args(
+        &server,
+        "blob.bin",
+        OutputTarget::File(out_path),
+        coord_config_for_test(4096),
+    );
+    let err = run(args).expect_err("cross-mode resume must error");
+    match err {
+        peel::coordinator::CoordinatorError::Checkpoint(CheckpointError::ModeMismatch {
+            old,
+            new,
+        }) => {
+            assert_eq!(old, RunMode::NoExtract);
+            assert_eq!(new, RunMode::Extract);
+        }
+        other => panic!("expected ModeMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn keep_archive_preserves_source_alongside_extracted_output() {
+    // `docs/PLAN_download_modes.md` §3 demo. A `.tar.zst` URL is
+    // extracted to a directory AND the source archive is preserved
+    // at a user-supplied path. The preserved archive's on-disk
+    // footprint equals `Content-Length` (no holes punched).
+    let payload = b"sample-payload-bytes; ".repeat(2048);
+    let tar_body = simple_tar_with_entry("data.bin", &payload);
+    let archive = encode_zstd(&tar_body);
+    let archive_len = archive.len() as u64;
+    let server = MockServer::start(ok_handler(archive.clone(), Some("\"keep-archive-v1\"")));
+
+    let work = unique_dir("keep_archive");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("extracted");
+    let keep_path = work.join("preserved.tar.zst");
+
+    let mut config = coord_config_for_test(4096);
+    config.chunk_size = 16 * 1024;
+    config.keep_archive = Some(keep_path.clone());
+    let args = make_args(
+        &server,
+        "foo.tar.zst",
+        OutputTarget::Dir(out_dir.clone()),
+        config,
+    );
+
+    let _stats = run(args).expect("keep-archive run");
+
+    let extracted = fs::read(out_dir.join("data.bin")).expect("read extracted");
+    assert_eq!(extracted, payload);
+    assert_eq!(fs::read(&keep_path).expect("read archive"), archive);
+    let meta = fs::metadata(&keep_path).expect("stat archive");
+    assert_eq!(meta.len(), archive_len);
+
+    assert!(!work.join("extracted.peel.part").exists());
+    assert!(!work.join("extracted.peel.ckpt").exists());
+}
+
+#[test]
+fn no_extract_skips_format_detection_even_for_archive_suffix() {
+    // The URL ends in `.tar.zst` but `--no-extract` short-circuits
+    // detection — we ship the raw zstd bytes through verbatim and
+    // never invoke the zstd decoder, so a payload of arbitrary
+    // (non-zstd) bytes still completes successfully.
+    let payload = b"not a real archive; just bytes".repeat(2048);
+    let server = MockServer::start(ok_handler(payload.clone(), None));
+
+    let work = unique_dir("no_extract_archive_suffix");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("foo.tar.zst");
+
+    let mut config = coord_config_for_test(4096);
+    config.chunk_size = 16 * 1024;
+    config.no_extract = true;
+    let args = make_args(
+        &server,
+        "foo.tar.zst",
+        OutputTarget::File(out_path.clone()),
+        config,
+    );
+
+    let _stats = run(args).expect("download-only run on .tar.zst URL");
+    assert_eq!(fs::read(&out_path).expect("read final"), payload);
+    assert!(!work.join("foo.tar.zst.peel.part").exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -892,6 +1107,7 @@ fn resume_picks_up_from_existing_checkpoint() {
         hash_state: None,
         chunk_crc32c: None,
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let ckpt_path = work2.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -944,6 +1160,7 @@ fn etag_mismatch_on_resume_aborts_cleanly() {
         hash_state: None,
         chunk_crc32c: None,
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -997,6 +1214,7 @@ fn url_change_on_resume_aborts_cleanly() {
         hash_state: None,
         chunk_crc32c: None,
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -1268,7 +1486,20 @@ fn zip_to_file_output_is_rejected() {
         coord_config_for_test(4096),
     );
     let err = run(args).expect_err("zip + -o must abort");
-    assert!(matches!(err, CoordinatorError::ZipNeedsDirectory));
+    // Since `docs/PLAN_download_modes.md` §1 added the general
+    // post-detection shape check, a file-shaped output against a
+    // tree-shaped format now surfaces as `OutputShapeMismatch`
+    // before the zip pipeline's own `ZipNeedsDirectory` guard fires.
+    // Both indicate the same user error; the new variant is
+    // strictly more precise (it also fires for the tar/zstd/etc.
+    // codecs that previously failed late with a sink-level error).
+    assert!(matches!(
+        err,
+        CoordinatorError::OutputShapeMismatch {
+            shape: peel::decode::FormatShape::Tree,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -1880,6 +2111,7 @@ fn sha256_added_on_resume_without_saved_state_errors() {
         hash_state: None,
         chunk_crc32c: None,
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -1942,6 +2174,7 @@ fn sha256_dropped_on_resume_with_saved_state_errors() {
         }),
         chunk_crc32c: None,
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -2054,6 +2287,7 @@ fn source_drift_on_resume_is_caught_by_probe() {
         hash_state: None,
         chunk_crc32c: Some(crcs),
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let part_path = work.join("out.bin.peel.part");
     let ckpt_path = work.join("out.bin.peel.ckpt");
@@ -2175,6 +2409,7 @@ fn cursor_chunk_audit_rejects_corrupted_part_file_on_resume() {
         hash_state: None,
         chunk_crc32c: Some(crcs),
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let part_path = work.join("out.bin.peel.part");
     let ckpt_path = work.join("out.bin.peel.ckpt");
@@ -2291,6 +2526,7 @@ fn cursor_chunk_audit_skips_when_cursor_is_mid_chunk() {
         hash_state: None,
         chunk_crc32c: Some(crcs),
         decoder_state: None,
+        mode: RunMode::Extract,
     };
     let part_path = work.join("out.bin.peel.part");
     let ckpt_path = work.join("out.bin.peel.ckpt");
@@ -2405,22 +2641,71 @@ fn worker_probe_detects_source_drift() {
 // ---- no decoder for filename ----------------------------------------
 
 #[test]
-fn unrecognized_suffix_returns_no_decoder() {
+fn unrecognized_suffix_with_strict_format_returns_no_decoder() {
+    // `docs/PLAN_download_modes.md` §4: with `strict_format=true`
+    // the historical behaviour is preserved — an unrecognized
+    // suffix surfaces `CoordinatorError::NoDecoder`. The default
+    // (without strict-format) now falls through to a download-only
+    // run; see `unrecognized_suffix_falls_back_to_no_extract`.
     let payload = b"no-decoder-here";
     let server = MockServer::start(ok_handler(payload.to_vec(), Some("\"v1\"")));
 
-    let work = unique_dir("no_decoder");
+    let work = unique_dir("no_decoder_strict");
     let _g = CleanupDir(work.clone());
     let out_path = work.join("out.bin");
 
+    let mut config = coord_config_for_test(4096);
+    config.strict_format = true;
     let args = make_args(
         &server,
         "datafile.unknown",
         OutputTarget::File(out_path),
+        config,
+    );
+    let err = run(args).expect_err("strict-format must error");
+    assert!(matches!(err, CoordinatorError::NoDecoder { .. }));
+}
+
+#[test]
+fn unrecognized_suffix_falls_back_to_no_extract() {
+    // `docs/PLAN_download_modes.md` §4 default behaviour: format
+    // detection misses, no `--strict-format`, so the coordinator
+    // warns and runs as `--no-extract`. The output lands at the
+    // URL-basename-derived path (a sibling of the user's `-o`).
+    let payload = b"opaque payload that no decoder claims, ".repeat(256);
+    let server = MockServer::start(ok_handler(payload.clone(), Some("\"v1\"")));
+
+    let work = unique_dir("no_decoder_fallback");
+    let _g = CleanupDir(work.clone());
+    // Pass `-o <dir>/` so the coordinator creates the empty
+    // directory up-front; the §4 fallback should clean it up and
+    // place the bytes at the URL-derived sibling path.
+    let dir_out = work.join("out");
+
+    let args = make_args(
+        &server,
+        "opaque.bin",
+        OutputTarget::Dir(dir_out.clone()),
         coord_config_for_test(4096),
     );
-    let err = run(args).expect_err("must error");
-    assert!(matches!(err, CoordinatorError::NoDecoder { .. }));
+    let _stats = run(args).expect("fallback should succeed");
+
+    // The expected fallback target: sibling of the `-o` dir, named
+    // after the URL basename.
+    let expected = work.join("opaque.bin");
+    assert!(
+        expected.exists(),
+        "fallback file not at {}",
+        expected.display()
+    );
+    assert_eq!(fs::read(&expected).expect("read fallback"), payload);
+    // The pre-created empty directory is removed by the cleanup
+    // pass.
+    assert!(
+        !dir_out.exists(),
+        "stale empty dir at {}",
+        dir_out.display()
+    );
 }
 
 // ---- disk-buffer throttle: forward-progress under tight caps ----------

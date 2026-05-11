@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use peel::coordinator::{run, CoordinatorConfig, CoordinatorError, OutputTarget, RunArgs};
-use peel::decode::{DecodeError, DecodeStatus, DecoderRegistry, MagicSignature, StreamingDecoder};
+use peel::decode::{
+    DecodeError, DecodeStatus, DecoderRegistry, FormatShape, MagicSignature, StreamingDecoder,
+};
 use peel::download::RetryConfig;
 use peel::http::{Client, ClientConfig};
 use peel::types::ByteOffset;
@@ -102,6 +104,9 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         mirror_urls: Vec::new(),
         max_bandwidth_bps: None,
         max_disk_buffer: None,
+        no_extract: false,
+        keep_archive: None,
+        strict_format: false,
     }
 }
 
@@ -211,7 +216,8 @@ fn registry_with_gzip_stub() -> DecoderRegistry {
     let mut r = DecoderRegistry::with_defaults();
     r.register_format(
         "gzip",
-        &[".gz"],
+        FormatShape::Stream,
+        &[(".gz", FormatShape::Stream)],
         &[MagicSignature {
             offset: 0,
             bytes: &[0x1F, 0x8B],
@@ -418,22 +424,25 @@ fn detection_forced_format_unknown_name_errors_cleanly() {
 // ---- no decoder at all when neither suffix nor magic match ------------
 
 #[test]
-fn detection_no_signal_returns_no_decoder() {
-    // Use a body that is not a valid zstd or gzip stream and a URL
-    // suffix that nothing handles. Both paths must miss; the
-    // coordinator must surface NoDecoder, not FormatMismatch.
+fn detection_no_signal_with_strict_format_returns_no_decoder() {
+    // `docs/PLAN_download_modes.md` §4: with `strict_format=true`
+    // the historical behaviour holds — both lookups miss, the
+    // coordinator surfaces `NoDecoder` rather than falling through
+    // to download-only mode.
     let body = vec![0u8; 1024];
     let server = MockServer::start(ok_handler(body, Some("\"v-nope\"")));
 
-    let work = unique_dir("no_decoder");
+    let work = unique_dir("no_decoder_strict");
     let _g = CleanupDir(work.clone());
     let out_path = work.join("out.bin");
 
+    let mut config = coord_config_for_test(4096);
+    config.strict_format = true;
     let args = make_args(
         &server,
         "datafile.unknown",
         OutputTarget::File(out_path),
-        coord_config_for_test(4096),
+        config,
         registry_with_gzip_stub(),
     );
     let err = run(args).expect_err("must error");

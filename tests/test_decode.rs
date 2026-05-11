@@ -8,7 +8,7 @@
 
 use std::io::{Cursor, Read, Write};
 
-use peel::decode::{DecodeError, DecodeStatus, DecoderRegistry, StreamingDecoder};
+use peel::decode::{DecodeError, DecodeStatus, DecoderRegistry, FormatShape, StreamingDecoder};
 use peel::types::ByteOffset;
 
 /// A two-frame zstd stream that the registered `.zst` factory should
@@ -94,7 +94,7 @@ fn registry_longest_suffix_takes_precedence_over_shorter() {
     }
 
     let mut registry = DecoderRegistry::with_defaults();
-    registry.register(".tar.zst", marker_factory);
+    registry.register(".tar.zst", FormatShape::Tree, marker_factory);
 
     // .tar.zst should pick the marker.
     let tar_factory = registry

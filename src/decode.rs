@@ -343,6 +343,34 @@ pub type DecoderFactory =
 pub type DecoderResumeFactory =
     fn(Box<dyn Read + Send>, &[u8], u64) -> Result<Box<dyn StreamingDecoder>, DecodeError>;
 
+/// Shape of the output a format produces, used by the CLI's unified
+/// `-o` resolver (`docs/PLAN_download_modes.md` §1) to validate a
+/// user-supplied output path against the format dictated by either
+/// the URL suffix or the magic bytes.
+///
+/// - [`FormatShape::Tree`]: the decoded stream is a directory tree
+///   (tar, zip, 7z, rar, or any compressed wrapper around tar —
+///   `.tar.zst`, `.tar.xz`, etc.). The CLI requires `-o` to resolve
+///   to a directory.
+/// - [`FormatShape::Stream`]: the decoded stream is a single byte
+///   stream with no archive layer (raw `.zst`, `.xz`, `.lz4`, `.gz`).
+///   The CLI requires `-o` to resolve to a file.
+///
+/// Shape is attached **per suffix entry** so the same factory can
+/// serve both shapes: `.zst` registers as Stream and `.tar.zst` as
+/// Tree, both pointing at the same zstd factory. For magic
+/// detection — which sees only the format-level prefix and cannot
+/// peek through a compression layer to a tar header — the registered
+/// magic carries the format's default shape (Stream for compression
+/// codecs, Tree for tar / zip / 7z / rar).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FormatShape {
+    /// Decoded stream produces a directory tree.
+    Tree,
+    /// Decoded stream produces a single byte stream.
+    Stream,
+}
+
 /// A fixed byte sequence at a known offset that uniquely identifies a
 /// compressed-archive format.
 ///
@@ -393,17 +421,31 @@ impl MagicSignature {
 /// portion of the path / on the format name.
 #[derive(Default, Clone)]
 pub struct DecoderRegistry {
-    /// Each entry is `(lowercased_suffix, factory)`. Order is the
-    /// insertion order; lookup linearly searches for the longest match.
-    /// At plan-§6 scale (a handful of suffixes), the linear scan is
-    /// faster than any lookup structure that requires hashing.
-    suffix_entries: Vec<(String, DecoderFactory)>,
-    /// Each entry is `(magic_signature, factory)`. Same linear-scan
-    /// rationale as `suffix_entries`.
-    magic_entries: Vec<(MagicSignature, DecoderFactory)>,
-    /// Each entry is `(lowercased_name, factory)`. Used by the
-    /// `--format <name>` CLI override path.
-    name_entries: Vec<(String, DecoderFactory)>,
+    /// Each entry is `(lowercased_suffix, shape, factory)`. Order is
+    /// the insertion order; lookup linearly searches for the longest
+    /// match. At plan-§6 scale (a handful of suffixes), the linear
+    /// scan is faster than any lookup structure that requires hashing.
+    /// `shape` is the [`FormatShape`] dictated by the suffix — the
+    /// same factory may register under two suffixes with different
+    /// shapes (e.g. zstd's `.zst` → Stream and `.tar.zst` → Tree);
+    /// shape lookup follows the same longest-match-wins rule as
+    /// factory lookup so `.tar.zst` shadows `.zst`.
+    suffix_entries: Vec<(String, FormatShape, DecoderFactory)>,
+    /// Each entry is `(magic_signature, shape, factory)`. Same
+    /// linear-scan rationale as `suffix_entries`. `shape` is the
+    /// format's default — magic detection sees only the outer
+    /// compression layer and cannot peek through to a tar header, so
+    /// compression codecs register their magic as
+    /// [`FormatShape::Stream`] while archive containers (tar, zip,
+    /// 7z, rar) register theirs as [`FormatShape::Tree`].
+    magic_entries: Vec<(MagicSignature, FormatShape, DecoderFactory)>,
+    /// Each entry is `(lowercased_name, default_shape, factory)`.
+    /// Used by the `--format <name>` CLI override path. `default_shape`
+    /// is the shape implied when the user passes only a format name
+    /// and no path-shape hint; the resolver may still let a
+    /// trailing-slash `-o` path override this for codecs whose
+    /// factory works in either shape.
+    name_entries: Vec<(String, FormatShape, DecoderFactory)>,
     /// Optional resume-factory companion to `name_entries`. Only
     /// populated for formats whose
     /// [`StreamingDecoder::decoder_state`] returns `Some(...)`
@@ -450,9 +492,22 @@ impl DecoderRegistry {
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
+        // Compression codecs default to FormatShape::Stream — their
+        // magic identifies the codec, not whether the decoded bytes
+        // happen to be tar. The `.tar.<x>` suffix entries are
+        // registered as FormatShape::Tree so the unified-`-o`
+        // resolver (`docs/PLAN_download_modes.md` §1) demands a
+        // directory output for those URLs without needing to peek
+        // through the codec.
         r.register_format(
             "zstd",
-            &[".zst", ".zstd"],
+            FormatShape::Stream,
+            &[
+                (".zst", FormatShape::Stream),
+                (".zstd", FormatShape::Stream),
+                (".tar.zst", FormatShape::Tree),
+                (".tar.zstd", FormatShape::Tree),
+            ],
             &[MagicSignature {
                 offset: 0,
                 bytes: &[0x28, 0xB5, 0x2F, 0xFD],
@@ -461,7 +516,8 @@ impl DecoderRegistry {
         );
         r.register_format(
             "tar",
-            &[".tar"],
+            FormatShape::Tree,
+            &[(".tar", FormatShape::Tree)],
             &[
                 MagicSignature {
                     offset: 257,
@@ -476,7 +532,8 @@ impl DecoderRegistry {
         );
         r.register_format(
             "xz",
-            &[".xz", ".tar.xz"],
+            FormatShape::Stream,
+            &[(".xz", FormatShape::Stream), (".tar.xz", FormatShape::Tree)],
             &[MagicSignature {
                 offset: 0,
                 bytes: &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00],
@@ -485,7 +542,11 @@ impl DecoderRegistry {
         );
         r.register_format(
             "lz4",
-            &[".lz4", ".tar.lz4"],
+            FormatShape::Stream,
+            &[
+                (".lz4", FormatShape::Stream),
+                (".tar.lz4", FormatShape::Tree),
+            ],
             &[MagicSignature {
                 offset: 0,
                 bytes: &[0x04, 0x22, 0x4D, 0x18],
@@ -513,7 +574,8 @@ impl DecoderRegistry {
         r.register_resume_factory("gzip", gzip::resume_factory);
         r.register_format(
             "gzip",
-            &[".gz", ".tar.gz"],
+            FormatShape::Stream,
+            &[(".gz", FormatShape::Stream), (".tar.gz", FormatShape::Tree)],
             &[MagicSignature {
                 offset: 0,
                 bytes: &[0x1F, 0x8B],
@@ -538,7 +600,8 @@ impl DecoderRegistry {
         // suffix or `--format zip`.
         r.register_format(
             crate::zip::FORMAT_NAME,
-            &[".zip"],
+            FormatShape::Tree,
+            &[(".zip", FormatShape::Tree)],
             &[
                 MagicSignature {
                     offset: 0,
@@ -562,7 +625,8 @@ impl DecoderRegistry {
         // themselves).
         r.register_format(
             crate::sevenz::FORMAT_NAME,
-            &[".7z", ".tar.7z"],
+            FormatShape::Tree,
+            &[(".7z", FormatShape::Tree), (".tar.7z", FormatShape::Tree)],
             &[MagicSignature {
                 offset: 0,
                 bytes: &crate::sevenz::SIGNATURE_MAGIC,
@@ -598,7 +662,8 @@ impl DecoderRegistry {
         }];
         r.register_format(
             crate::rar::FORMAT_NAME,
-            &[".rar"],
+            FormatShape::Tree,
+            &[(".rar", FormatShape::Tree)],
             rar_magics,
             crate::rar::streaming_factory_placeholder,
         );
@@ -606,66 +671,95 @@ impl DecoderRegistry {
     }
 
     /// Register `factory` to handle paths whose lowercased file name
-    /// ends in `suffix`.
+    /// ends in `suffix`, with `shape` describing whether the suffix
+    /// implies a tree-bearing or stream-shaped output.
     ///
-    /// Re-registering the same suffix replaces the prior factory.
-    pub fn register(&mut self, suffix: &str, factory: DecoderFactory) {
+    /// Re-registering the same suffix replaces the prior factory and
+    /// shape.
+    pub fn register(&mut self, suffix: &str, shape: FormatShape, factory: DecoderFactory) {
         let key = suffix.to_ascii_lowercase();
-        if let Some(slot) = self.suffix_entries.iter_mut().find(|(s, _)| *s == key) {
-            slot.1 = factory;
+        if let Some(slot) = self.suffix_entries.iter_mut().find(|(s, _, _)| *s == key) {
+            slot.1 = shape;
+            slot.2 = factory;
         } else {
-            self.suffix_entries.push((key, factory));
+            self.suffix_entries.push((key, shape, factory));
         }
     }
 
     /// Register `factory` to handle sources whose first bytes match
-    /// `magic`.
+    /// `magic`, with `shape` describing the format's default output
+    /// shape (Stream for compression codecs, Tree for archive
+    /// containers).
     ///
     /// Re-registering the same magic (same offset and same bytes)
-    /// replaces the prior factory.
-    pub fn register_magic(&mut self, magic: MagicSignature, factory: DecoderFactory) {
+    /// replaces the prior factory and shape.
+    pub fn register_magic(
+        &mut self,
+        magic: MagicSignature,
+        shape: FormatShape,
+        factory: DecoderFactory,
+    ) {
         if let Some(slot) = self
             .magic_entries
             .iter_mut()
-            .find(|(m, _)| m.offset == magic.offset && m.bytes == magic.bytes)
+            .find(|(m, _, _)| m.offset == magic.offset && m.bytes == magic.bytes)
         {
-            slot.1 = factory;
+            slot.1 = shape;
+            slot.2 = factory;
         } else {
-            self.magic_entries.push((magic, factory));
+            self.magic_entries.push((magic, shape, factory));
         }
     }
 
     /// Register `factory` under a human-readable format `name` for
-    /// `--format <name>` lookups.
+    /// `--format <name>` lookups, with `default_shape` describing the
+    /// shape implied when the user passes only a format name.
     ///
     /// Re-registering the same name (case-insensitively) replaces the
-    /// prior factory.
-    pub fn register_name(&mut self, name: &str, factory: DecoderFactory) {
+    /// prior factory and shape.
+    pub fn register_name(
+        &mut self,
+        name: &str,
+        default_shape: FormatShape,
+        factory: DecoderFactory,
+    ) {
         let key = name.to_ascii_lowercase();
-        if let Some(slot) = self.name_entries.iter_mut().find(|(n, _)| *n == key) {
-            slot.1 = factory;
+        if let Some(slot) = self.name_entries.iter_mut().find(|(n, _, _)| *n == key) {
+            slot.1 = default_shape;
+            slot.2 = factory;
         } else {
-            self.name_entries.push((key, factory));
+            self.name_entries.push((key, default_shape, factory));
         }
     }
 
     /// Convenience: register `factory` against a format name, a list
-    /// of suffixes, and a list of magic signatures in one call. Each
-    /// individual registration follows the same replacement semantics
-    /// as the targeted single-purpose method.
+    /// of `(suffix, shape)` entries, and a list of magic signatures
+    /// in one call.
+    ///
+    /// `name_shape` is the format's default shape (used by the
+    /// `--format <name>` override). Each suffix carries its own
+    /// shape — the same factory can handle both shapes (e.g. zstd
+    /// registers `.zst` as [`FormatShape::Stream`] and `.tar.zst` as
+    /// [`FormatShape::Tree`]). All registered magics inherit
+    /// `name_shape` because magic detection cannot distinguish a tar
+    /// wrapper from a bare stream.
+    ///
+    /// Each individual registration follows the same replacement
+    /// semantics as the targeted single-purpose method.
     pub fn register_format(
         &mut self,
         name: &str,
-        suffixes: &[&str],
+        name_shape: FormatShape,
+        suffixes: &[(&str, FormatShape)],
         magics: &[MagicSignature],
         factory: DecoderFactory,
     ) {
-        self.register_name(name, factory);
-        for s in suffixes {
-            self.register(s, factory);
+        self.register_name(name, name_shape, factory);
+        for (s, shape) in suffixes {
+            self.register(s, *shape, factory);
         }
         for m in magics {
-            self.register_magic(*m, factory);
+            self.register_magic(*m, name_shape, factory);
         }
     }
 
@@ -717,12 +811,37 @@ impl DecoderRegistry {
     /// `name` is matched against suffixes case-insensitively.
     #[must_use]
     pub fn factory_for_name(&self, name: &str) -> Option<DecoderFactory> {
+        self.suffix_match(name).map(|(_, _, factory)| factory)
+    }
+
+    /// Return the longest-matching `(shape, factory)` pair for the
+    /// given file name, or `None` if no suffix matches.
+    ///
+    /// `name` is matched against suffixes case-insensitively. Shape
+    /// is taken from the same longest-match entry so a `.tar.zst`
+    /// lookup yields [`FormatShape::Tree`] while a `.zst` lookup
+    /// yields [`FormatShape::Stream`] even though both resolve to
+    /// the zstd factory.
+    #[must_use]
+    pub fn lookup_by_name(&self, name: &str) -> Option<(FormatShape, DecoderFactory)> {
+        self.suffix_match(name)
+            .map(|(_, shape, factory)| (shape, factory))
+    }
+
+    fn suffix_match(&self, name: &str) -> Option<(&str, FormatShape, DecoderFactory)> {
         let lower = name.to_ascii_lowercase();
         self.suffix_entries
             .iter()
-            .filter(|(suffix, _)| lower.ends_with(suffix.as_str()))
-            .max_by_key(|(suffix, _)| suffix.len())
-            .map(|(_, factory)| *factory)
+            .filter(|(suffix, _, _)| lower.ends_with(suffix.as_str()))
+            .max_by_key(|(suffix, _, _)| suffix.len())
+            .map(|(suffix, shape, factory)| (suffix.as_str(), *shape, *factory))
+    }
+
+    /// Return the [`FormatShape`] dictated by the longest-matching
+    /// suffix for `name`, if any.
+    #[must_use]
+    pub fn shape_for_name(&self, name: &str) -> Option<FormatShape> {
+        self.suffix_match(name).map(|(_, shape, _)| shape)
     }
 
     /// Return the longest-matching factory for `prefix`, if any of the
@@ -733,11 +852,23 @@ impl DecoderRegistry {
     /// rule as suffix lookup, in spirit).
     #[must_use]
     pub fn factory_for_prefix(&self, prefix: &[u8]) -> Option<DecoderFactory> {
+        self.magic_match(prefix).map(|(_, _, factory)| factory)
+    }
+
+    /// Return the longest-matching `(shape, factory)` pair for
+    /// `prefix`, or `None` if no registered magic matches.
+    #[must_use]
+    pub fn lookup_by_prefix(&self, prefix: &[u8]) -> Option<(FormatShape, DecoderFactory)> {
+        self.magic_match(prefix)
+            .map(|(_, shape, factory)| (shape, factory))
+    }
+
+    fn magic_match(&self, prefix: &[u8]) -> Option<(&MagicSignature, FormatShape, DecoderFactory)> {
         self.magic_entries
             .iter()
-            .filter(|(magic, _)| magic.matches(prefix))
-            .max_by_key(|(magic, _)| magic.bytes.len())
-            .map(|(_, factory)| *factory)
+            .filter(|(magic, _, _)| magic.matches(prefix))
+            .max_by_key(|(magic, _, _)| magic.bytes.len())
+            .map(|(magic, shape, factory)| (magic, *shape, *factory))
     }
 
     /// Return the factory registered against the given format `name`,
@@ -750,8 +881,22 @@ impl DecoderRegistry {
         let lower = name.to_ascii_lowercase();
         self.name_entries
             .iter()
-            .find(|(n, _)| n == &lower)
-            .map(|(_, factory)| *factory)
+            .find(|(n, _, _)| n == &lower)
+            .map(|(_, _, factory)| *factory)
+    }
+
+    /// Return the default [`FormatShape`] for the given format
+    /// `name`, case-insensitively, if any.
+    ///
+    /// Used by the `--format <name>` CLI override path to validate a
+    /// user-supplied `-o` against the chosen format's default shape.
+    #[must_use]
+    pub fn shape_for_format_name(&self, name: &str) -> Option<FormatShape> {
+        let lower = name.to_ascii_lowercase();
+        self.name_entries
+            .iter()
+            .find(|(n, _, _)| n == &lower)
+            .map(|(_, shape, _)| *shape)
     }
 
     /// Largest prefix window any registered magic requires.
@@ -763,7 +908,7 @@ impl DecoderRegistry {
     pub fn max_magic_window(&self) -> usize {
         self.magic_entries
             .iter()
-            .map(|(m, _)| m.window_required())
+            .map(|(m, _, _)| m.window_required())
             .max()
             .unwrap_or(0)
     }
@@ -772,7 +917,10 @@ impl DecoderRegistry {
     /// by error messages that want to suggest valid `--format` values.
     #[must_use]
     pub fn format_names(&self) -> Vec<&str> {
-        self.name_entries.iter().map(|(n, _)| n.as_str()).collect()
+        self.name_entries
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect()
     }
 
     /// Reverse-lookup: the registered name (if any) for a given
@@ -782,8 +930,8 @@ impl DecoderRegistry {
     pub fn name_for_factory(&self, factory: DecoderFactory) -> Option<&str> {
         self.name_entries
             .iter()
-            .find(|(_, f)| std::ptr::fn_addr_eq(*f, factory))
-            .map(|(n, _)| n.as_str())
+            .find(|(_, _, f)| std::ptr::fn_addr_eq(*f, factory))
+            .map(|(n, _, _)| n.as_str())
     }
 
     /// Number of registered suffixes.
@@ -872,8 +1020,8 @@ mod tests {
     #[test]
     fn registry_re_registering_replaces_factory() {
         let mut r = DecoderRegistry::new();
-        r.register(".bin", stub_factory);
-        r.register(".bin", other_factory);
+        r.register(".bin", FormatShape::Stream, stub_factory);
+        r.register(".bin", FormatShape::Stream, other_factory);
         assert_eq!(r.len(), 1);
         // We can't compare fn pointers reliably across compilation
         // units, but we can call through and confirm a factory exists.
@@ -884,8 +1032,8 @@ mod tests {
     #[test]
     fn registry_longest_suffix_wins() {
         let mut r = DecoderRegistry::new();
-        r.register(".zst", stub_factory);
-        r.register(".tar.zst", other_factory);
+        r.register(".zst", FormatShape::Stream, stub_factory);
+        r.register(".tar.zst", FormatShape::Tree, other_factory);
 
         // We rely on fn-pointer identity within the same crate, which
         // is well-defined for non-generic free functions.
@@ -895,6 +1043,9 @@ mod tests {
             .expect("matches .tar.zst");
         assert!(std::ptr::fn_addr_eq(zst, stub_factory as DecoderFactory));
         assert!(std::ptr::fn_addr_eq(tar, other_factory as DecoderFactory));
+        // Shape lookup uses the same longest-match rule.
+        assert_eq!(r.shape_for_name("plain.zst"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_name("bundle.tar.zst"), Some(FormatShape::Tree));
     }
 
     #[test]
@@ -970,6 +1121,7 @@ mod tests {
                 offset: 0,
                 bytes: &[0xAA, 0xBB],
             },
+            FormatShape::Stream,
             stub_factory,
         );
         r.register_magic(
@@ -977,6 +1129,7 @@ mod tests {
                 offset: 0,
                 bytes: &[0xAA, 0xBB, 0xCC, 0xDD],
             },
+            FormatShape::Stream,
             other_factory,
         );
 
@@ -1003,8 +1156,8 @@ mod tests {
             bytes: &[0x01, 0x02, 0x03],
         };
         let mut r = DecoderRegistry::new();
-        r.register_magic(magic, stub_factory);
-        r.register_magic(magic, other_factory);
+        r.register_magic(magic, FormatShape::Stream, stub_factory);
+        r.register_magic(magic, FormatShape::Stream, other_factory);
         let chosen = r
             .factory_for_prefix(&[0x01, 0x02, 0x03, 0x04])
             .expect("registered");
@@ -1024,6 +1177,7 @@ mod tests {
                 offset: 0,
                 bytes: &[0xAA; 4],
             },
+            FormatShape::Stream,
             stub_factory,
         );
         assert_eq!(r.max_magic_window(), 4);
@@ -1032,6 +1186,7 @@ mod tests {
                 offset: 257,
                 bytes: b"ustar\0",
             },
+            FormatShape::Tree,
             other_factory,
         );
         assert_eq!(r.max_magic_window(), 263);
@@ -1048,7 +1203,8 @@ mod tests {
         let mut r = DecoderRegistry::new();
         r.register_format(
             "stub",
-            &[".stub", ".s2"],
+            FormatShape::Stream,
+            &[(".stub", FormatShape::Stream), (".s2", FormatShape::Stream)],
             &[MagicSignature {
                 offset: 0,
                 bytes: &[0xDE, 0xAD],
@@ -1060,6 +1216,51 @@ mod tests {
         assert!(r.factory_for_name("a.stub").is_some());
         assert!(r.factory_for_name("a.s2").is_some());
         assert!(r.factory_for_prefix(&[0xDE, 0xAD, 0x00]).is_some());
+        // Shape lookup mirrors the per-entry shape passed at registration.
+        assert_eq!(r.shape_for_name("a.stub"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_format_name("stub"), Some(FormatShape::Stream));
+    }
+
+    #[test]
+    fn registry_with_defaults_assigns_shape_per_suffix() {
+        // The same compression factory registers under both a
+        // stream-shaped suffix (e.g. `.zst`) and a tree-shaped wrapper
+        // suffix (e.g. `.tar.zst`); shape lookup respects the
+        // longest-match-wins rule even when the factory is identical.
+        let r = DecoderRegistry::with_defaults();
+        assert_eq!(r.shape_for_name("foo.zst"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_name("foo.tar.zst"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.xz"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_name("foo.tar.xz"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.gz"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_name("foo.tar.gz"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.lz4"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_name("foo.tar.lz4"), Some(FormatShape::Tree));
+        // Archive containers register as Tree at every suffix.
+        assert_eq!(r.shape_for_name("foo.tar"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.zip"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.7z"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.rar"), Some(FormatShape::Tree));
+        // Unknown suffix → no shape.
+        assert_eq!(r.shape_for_name("foo.bin"), None);
+    }
+
+    #[test]
+    fn registry_with_defaults_format_name_shape_defaults() {
+        // `--format <name>` looks up the format's default shape; the
+        // resolver pairs it with the user's -o path to validate.
+        let r = DecoderRegistry::with_defaults();
+        assert_eq!(r.shape_for_format_name("zstd"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_format_name("xz"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_format_name("lz4"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_format_name("gzip"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_format_name("tar"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_format_name("zip"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_format_name("7z"), Some(FormatShape::Tree));
+        // Case-insensitive.
+        assert_eq!(r.shape_for_format_name("ZSTD"), Some(FormatShape::Stream));
+        // Unknown name → None.
+        assert_eq!(r.shape_for_format_name("bzip2"), None);
     }
 
     #[test]

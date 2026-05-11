@@ -66,7 +66,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use peel::checkpoint::{Checkpoint, PartRecord, SinkState};
+//! use peel::checkpoint::{Checkpoint, PartRecord, RunMode, SinkState};
 //! use peel::types::ByteOffset;
 //!
 //! let url: String = "https://example.com/dataset.tar.zst".into();
@@ -95,6 +95,7 @@
 //!     hash_state: None,
 //!     chunk_crc32c: None,
 //!     decoder_state: None,
+//!     mode: RunMode::Extract,
 //! };
 //! ckpt.write(std::path::Path::new("/tmp/peel-demo.ckpt"))?;
 //! # Ok::<(), peel::checkpoint::CheckpointError>(())
@@ -195,7 +196,15 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   tests don't see a byte-count drift in their checkpoint
 ///   sidecar. Older binaries refuse v11 files with
 ///   [`CheckpointError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 11;
+///
+/// **v12** — adds the [`Checkpoint::mode`] field
+/// (`docs/PLAN_download_modes.md` §5) so resume can detect drift
+/// between runs that pass different mode flags (e.g. a prior
+/// `--no-extract` checkpoint paired with a later run that omits
+/// the flag). Forward-compat: v11 and earlier read as
+/// [`RunMode::Extract`]; v12 writes only fire when `mode !=
+/// Extract` (the byte-identical lower bound).
+pub const FORMAT_VERSION: u32 = 12;
 
 /// Pre-§F1 max format version, written when no SinkState payload
 /// uses v11-only fields. Keeping the on-disk version dynamic
@@ -204,6 +213,13 @@ pub const FORMAT_VERSION: u32 = 11;
 /// (whose checkpoint sidecar size is observed indirectly via
 /// kill-switch timing) stable across the §F1 transition.
 const FORMAT_VERSION_RAR_STORED_ONLY: u32 = 10;
+
+/// `docs/PLAN_download_modes.md` §5: format version the writer
+/// upgrades to when [`Checkpoint::mode`] is anything other than
+/// [`RunMode::Extract`]. Default-mode runs keep writing the
+/// pre-§5 layout (v10 / v11 depending on the SinkState payload)
+/// so byte-identical regression checks pass.
+const FORMAT_VERSION_RUN_MODE: u32 = 12;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -221,6 +237,76 @@ const SINK_TAG_ZIP: u8 = 2;
 /// Tag for [`SinkState::Rar`] in the on-disk format. Added in v10
 /// of the format (`docs/PLAN_rar.md` §3).
 const SINK_TAG_RAR: u8 = 4;
+
+/// `docs/PLAN_download_modes.md` §5: which top-level mode a
+/// checkpoint was written by, persisted in v12 so resume can
+/// detect a user changing flags between runs and refuse to silently
+/// "forget" extractor or download-only progress.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum RunMode {
+    /// Default extract pipeline: download → decode → extract →
+    /// hole-punch → delete source on success. Writers default to
+    /// this value, and readers of pre-v12 checkpoints synthesize
+    /// it.
+    #[default]
+    Extract,
+    /// Download-only mode: scheduler fills `.peel.part`, no
+    /// decoder runs, the part-file is renamed to the final output
+    /// path on completion (`docs/PLAN_download_modes.md` §2).
+    NoExtract,
+    /// Extract-and-preserve mode: decoder runs and the puncher is
+    /// forced to no-op so the source archive stays at its full
+    /// `Content-Length`. On completion the `.peel.part` is renamed
+    /// to a user-supplied keep-archive path
+    /// (`docs/PLAN_download_modes.md` §3).
+    KeepArchive,
+}
+
+/// Run-mode tag for [`RunMode::Extract`] in the on-disk format
+/// (`docs/PLAN_download_modes.md` §5). Implicit for pre-v12
+/// checkpoints — the deserializer synthesizes the value.
+const RUN_MODE_TAG_EXTRACT: u8 = 0;
+/// Run-mode tag for [`RunMode::NoExtract`].
+const RUN_MODE_TAG_NO_EXTRACT: u8 = 1;
+/// Run-mode tag for [`RunMode::KeepArchive`].
+const RUN_MODE_TAG_KEEP_ARCHIVE: u8 = 2;
+
+impl std::fmt::Display for RunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl RunMode {
+    /// Stable human-readable label used in [`CheckpointError::ModeMismatch`]
+    /// messages and in `tracing` output. Mirrors the flag the user
+    /// would type on the CLI for each mode.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunMode::Extract => "extract",
+            RunMode::NoExtract => "--no-extract",
+            RunMode::KeepArchive => "--keep-archive",
+        }
+    }
+
+    fn to_tag(self) -> u8 {
+        match self {
+            RunMode::Extract => RUN_MODE_TAG_EXTRACT,
+            RunMode::NoExtract => RUN_MODE_TAG_NO_EXTRACT,
+            RunMode::KeepArchive => RUN_MODE_TAG_KEEP_ARCHIVE,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            RUN_MODE_TAG_EXTRACT => Some(RunMode::Extract),
+            RUN_MODE_TAG_NO_EXTRACT => Some(RunMode::NoExtract),
+            RUN_MODE_TAG_KEEP_ARCHIVE => Some(RunMode::KeepArchive),
+            _ => None,
+        }
+    }
+}
 
 /// Maximum length of the v5 [`Checkpoint::decoder_state`] blob.
 ///
@@ -352,6 +438,22 @@ pub enum CheckpointError {
         field: &'static str,
         /// The byte we observed.
         value: u8,
+    },
+
+    /// `docs/PLAN_download_modes.md` §5: the on-disk checkpoint
+    /// declares a [`RunMode`] that disagrees with the current run's
+    /// mode. Resume would silently lose progress (or attempt the
+    /// wrong cleanup), so the resume path surfaces this as a hard
+    /// error.
+    #[error(
+        "checkpoint was written by mode `{old}` but current run uses mode `{new}`; \
+         re-run with the matching flag or delete the .peel.ckpt file to start over"
+    )]
+    ModeMismatch {
+        /// The mode recorded in the on-disk checkpoint.
+        old: RunMode,
+        /// The mode the current invocation is running under.
+        new: RunMode,
     },
 
     /// The file declares a `body_length` that exceeds the configured
@@ -758,6 +860,12 @@ pub struct Checkpoint {
     /// the [`MAX_DECODER_STATE_LEN`] length cap on decode. Added in
     /// checkpoint format v5; older readers see `None`.
     pub decoder_state: Option<Vec<u8>>,
+    /// `docs/PLAN_download_modes.md` §5: which top-level mode this
+    /// checkpoint was written by. Added in checkpoint format v12;
+    /// pre-v12 readers synthesize [`RunMode::Extract`]. Resume
+    /// surfaces [`CheckpointError::ModeMismatch`] when the prior
+    /// mode and the current run's mode disagree.
+    pub mode: RunMode,
 }
 
 /// Maximum body length [`Checkpoint::deserialize`] will trust before
@@ -1038,6 +1146,16 @@ impl Checkpoint {
             body.push(0);
         }
 
+        // v12 (`docs/PLAN_download_modes.md` §5): the `mode` tag is
+        // written only when the run is in a non-default mode. The
+        // `required_format_version` rule below upgrades the on-disk
+        // version in lockstep so older readers cleanly reject the
+        // bumped checkpoint instead of misparsing the trailing
+        // tag.
+        if self.mode != RunMode::Extract {
+            body.push(self.mode.to_tag());
+        }
+
         let body_len = body.len() as u64;
         let body_checksum = fnv1a64(&body);
 
@@ -1060,13 +1178,30 @@ impl Checkpoint {
     /// (v9 for `Sevenz`, v10 for `Rar` STORED-only, etc.) and
     /// the surrounding fields decide whether v11 is required.
     fn required_format_version(&self) -> u32 {
-        match &self.sink_state {
+        // The §F1 SinkState::Rar-with-decoder-state path used to be
+        // the high-water mark (FORMAT_VERSION = 11). §5's RunMode
+        // bump moved FORMAT_VERSION to 12, so the literal here
+        // names v11 explicitly to keep the lower bound stable
+        // (byte-identical writes for the default-mode RAR path).
+        const FORMAT_VERSION_RAR_F1: u32 = 11;
+        // v12 (`docs/PLAN_download_modes.md` §5): a non-default
+        // `mode` forces v12. Take the max of v12 and the
+        // sink-state-dictated version so a `KeepArchive` run with
+        // a `SinkState::Rar` carrying decoder-state still writes a
+        // single coherent header.
+        let mode_version = if self.mode == RunMode::Extract {
+            0
+        } else {
+            FORMAT_VERSION_RUN_MODE
+        };
+        let sink_version = match &self.sink_state {
             SinkState::Rar {
                 current_entry_decoder_state: Some(_),
                 ..
-            } => FORMAT_VERSION,
+            } => FORMAT_VERSION_RAR_F1,
             _ => FORMAT_VERSION_RAR_STORED_ONLY,
-        }
+        };
+        mode_version.max(sink_version)
     }
 
     /// Parse a checkpoint from its on-disk binary representation.
@@ -1151,7 +1286,7 @@ impl Checkpoint {
         // version so it can decide whether to read each trailer;
         // future versions that *change* the layout will branch
         // here.
-        debug_assert!(matches!(format_version, 1..=11));
+        debug_assert!(matches!(format_version, 1..=FORMAT_VERSION));
         Self::decode_body(body, format_version)
     }
 
@@ -1529,6 +1664,21 @@ impl Checkpoint {
             None
         };
 
+        // v12 (`docs/PLAN_download_modes.md` §5): one trailing tag
+        // byte that names the [`RunMode`] this checkpoint was
+        // written under. v11-and-earlier readers synthesize
+        // [`RunMode::Extract`] — every pre-v12 checkpoint was
+        // written by the default extract pipeline. The tag is
+        // optional even at v12, because the writer omits it
+        // entirely when the mode is `Extract` (the byte-identical
+        // lower-bound path).
+        let mode = if format_version >= FORMAT_VERSION_RUN_MODE && cursor.remaining() > 0 {
+            let tag = cursor.read_u8("mode.tag")?;
+            RunMode::from_tag(tag).ok_or(CheckpointError::InvalidEnumTag { field: "mode", tag })?
+        } else {
+            RunMode::Extract
+        };
+
         if cursor.remaining() != 0 {
             return Err(CheckpointError::Truncated {
                 reason: format!(
@@ -1569,6 +1719,7 @@ impl Checkpoint {
             hash_state,
             chunk_crc32c,
             decoder_state,
+            mode,
         })
     }
 
@@ -2307,6 +2458,7 @@ mod tests {
             hash_state: None,
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         }
     }
 
@@ -2342,6 +2494,7 @@ mod tests {
             hash_state: None,
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         }
     }
 
@@ -2392,6 +2545,7 @@ mod tests {
             }),
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         }
     }
 
@@ -2471,6 +2625,7 @@ mod tests {
             hash_state: None,
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         }
     }
 
@@ -2506,7 +2661,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_eleven() {
+    fn checkpoint_format_version_is_twelve() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
         // work (v6), `docs/PLAN_deflate_block_decoder.md` Phase 9b's
@@ -2515,13 +2670,103 @@ mod tests {
         // active-part-aware hash state (v8),
         // `docs/PLAN_7z_support.md` §9's `SinkState::Sevenz`
         // variant (v9), `docs/PLAN_rar.md` §3's
-        // `SinkState::Rar` variant (v10), and
+        // `SinkState::Rar` variant (v10),
         // `docs/PLAN_rar5_decoder.md` §F1's
-        // `current_entry_decoder_state` blob (v11) each bumped
-        // this when an optional trailer landed. If a future
-        // change resets it, this guards against silently dropping
-        // the upgrade-required signal older readers depend on.
-        assert_eq!(FORMAT_VERSION, 11);
+        // `current_entry_decoder_state` blob (v11), and
+        // `docs/PLAN_download_modes.md` §5's [`RunMode`] tag
+        // (v12) each bumped this when an optional trailer landed.
+        // If a future change resets it, this guards against
+        // silently dropping the upgrade-required signal older
+        // readers depend on.
+        assert_eq!(FORMAT_VERSION, 12);
+    }
+
+    // ---- §5: RunMode round-trip + forward-compat -----------------------
+
+    /// Build a minimal raw-sink checkpoint with the given mode for
+    /// the v12 round-trip / forward-compat tests below.
+    fn sample_mode_checkpoint(mode: RunMode) -> Checkpoint {
+        Checkpoint {
+            url: "https://example.com/blob.bin".to_string(),
+            etag: Some("\"v12-mode\"".to_string()),
+            last_modified: None,
+            parts: vec![PartRecord {
+                url: "https://example.com/blob.bin".to_string(),
+                size: 4096,
+                etag: Some("\"v12-mode\"".to_string()),
+                last_modified: None,
+                expected_sha256: None,
+            }],
+            total_size: 4096,
+            chunk_size: 1024,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![0xFF; 1],
+            created_at: UNIX_EPOCH + Duration::new(1_700_000_000, 0),
+            sink_state: SinkState::Raw { bytes_written: 0 },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode,
+        }
+    }
+
+    #[test]
+    fn round_trip_run_mode_no_extract() {
+        let ckpt = sample_mode_checkpoint(RunMode::NoExtract);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        assert_eq!(parsed.mode, RunMode::NoExtract);
+    }
+
+    #[test]
+    fn round_trip_run_mode_keep_archive() {
+        let ckpt = sample_mode_checkpoint(RunMode::KeepArchive);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        assert_eq!(parsed.mode, RunMode::KeepArchive);
+    }
+
+    #[test]
+    fn default_mode_writes_pre_v12_format_byte_identical() {
+        // Byte-identical guarantee: a default-mode (Extract) Raw
+        // checkpoint must serialize to the pre-§5 v10 layout so
+        // unrelated regression tests that observe the on-disk
+        // size (or compare bytes) stay stable across the bump.
+        let ckpt = sample_mode_checkpoint(RunMode::Extract);
+        let bytes = ckpt.serialize();
+        // The header records the declared version. Default-mode +
+        // Raw sink ⇒ v10 (no later layout extension required).
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_RAR_STORED_ONLY,
+            "Extract-mode checkpoint should write v{FORMAT_VERSION_RAR_STORED_ONLY}, got v{format_version}",
+        );
+    }
+
+    #[test]
+    fn non_default_mode_bumps_format_version_to_twelve() {
+        for mode in [RunMode::NoExtract, RunMode::KeepArchive] {
+            let ckpt = sample_mode_checkpoint(mode);
+            let bytes = ckpt.serialize();
+            let format_version = read_u32(&bytes[8..12]);
+            assert_eq!(
+                format_version, FORMAT_VERSION,
+                "{mode:?} mode should write v{FORMAT_VERSION}, got v{format_version}",
+            );
+        }
+    }
+
+    #[test]
+    fn pre_v12_checkpoints_decode_as_extract_mode() {
+        // Forward-compat: take a v12 Extract checkpoint (which
+        // writes the v10 layout byte-identically) and confirm the
+        // deserializer synthesizes `mode: Extract` for it. The
+        // serialized bytes are equivalent to what a pre-v12 writer
+        // would have produced.
+        let ckpt = sample_mode_checkpoint(RunMode::Extract);
+        let bytes = ckpt.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.mode, RunMode::Extract);
     }
 
     fn sample_sevenz(folders_completed: Vec<u32>, current_folder: Option<u32>) -> Checkpoint {
@@ -2548,6 +2793,7 @@ mod tests {
             hash_state: None,
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         }
     }
 
@@ -2605,6 +2851,7 @@ mod tests {
             hash_state: None,
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         }
     }
 
@@ -3229,6 +3476,7 @@ mod tests {
             hash_state: None,
             chunk_crc32c: None,
             decoder_state: None,
+            mode: RunMode::Extract,
         };
         let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
         assert_eq!(parsed, ckpt);
@@ -3744,6 +3992,7 @@ mod tests {
                 hash_state,
                 chunk_crc32c,
                 decoder_state,
+                mode: RunMode::Extract,
             };
             let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
             assert_eq!(parsed, ckpt);
