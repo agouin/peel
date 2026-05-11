@@ -138,8 +138,7 @@ pub fn ensure_rar5_stored(entries: &[(String, Vec<u8>)], size_bytes: usize) -> V
     if let Ok(bytes) = fs::read(&path) {
         return bytes;
     }
-    fs::create_dir_all(path.parent().expect("fixture dir parent"))
-        .expect("mkdir fixture dir");
+    fs::create_dir_all(path.parent().expect("fixture dir parent")).expect("mkdir fixture dir");
 
     let staging = tempdir_under("rar5_stage", size_bytes);
     stage_entries(&staging, entries);
@@ -178,8 +177,7 @@ pub fn ensure_rar3_stored(entries: &[(String, Vec<u8>)], size_bytes: usize) -> V
     if let Ok(bytes) = fs::read(&path) {
         return bytes;
     }
-    fs::create_dir_all(path.parent().expect("fixture dir parent"))
-        .expect("mkdir fixture dir");
+    fs::create_dir_all(path.parent().expect("fixture dir parent")).expect("mkdir fixture dir");
 
     let staging = tempdir_under("rar3_stage", size_bytes);
     stage_entries(&staging, entries);
@@ -205,10 +203,7 @@ tar -xzf /rar.tgz
         .arg("-v")
         .arg(format!("{}:/work", staging.display()))
         .arg("-v")
-        .arg(format!(
-            "{}:/rar.tgz:ro",
-            rarlinux_5_tarball().display()
-        ))
+        .arg(format!("{}:/rar.tgz:ro", rarlinux_5_tarball().display()))
         .arg("-w")
         .arg("/work")
         .arg("debian:bookworm-slim")
@@ -234,9 +229,7 @@ fn tempdir_under(label: &str, size_bytes: usize) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "peel-{label}-{size_bytes}-{pid}-{nanos}"
-    ));
+    let dir = std::env::temp_dir().join(format!("peel-{label}-{size_bytes}-{pid}-{nanos}"));
     fs::create_dir_all(&dir).expect("mkdir tempdir_under");
     dir
 }

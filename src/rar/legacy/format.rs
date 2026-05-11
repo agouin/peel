@@ -1131,7 +1131,8 @@ mod tests {
         // decorative. The registered RAR encoder tags `-m0` entries
         // `unp_ver = 20` for backward compatibility with pre-2.9
         // readers, and we accept those.
-        let body = build_file_head_body(0, 0, 0, 0, 20 /* 2.0 */, STORED_METHOD, 0, b"old.bin");
+        let body =
+            build_file_head_body(0, 0, 0, 0, 20 /* 2.0 */, STORED_METHOD, 0, b"old.bin");
         let bytes = build_block(block_codes::FILE, 0, &body, Some(0));
         let block = parse_generic_header(&bytes, 0).expect("parses");
         let file = parse_file_header(&block, &bytes).expect("STORED is decode-version-agnostic");
