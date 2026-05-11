@@ -58,6 +58,10 @@ use peel::http::{Client, ClientConfig};
 mod support;
 
 use support::mock_server::{MockRequest, MockResponse, MockServer};
+#[cfg(feature = "rar")]
+use support::rar_bench_fixtures::{
+    ensure_rar3_stored, ensure_rar5_stored, rar3_encoder_present, rar5_encoder_present, unrar_path,
+};
 use support::sevenz_fixtures::build_copy_sevenz;
 use support::tar_fixtures::build_simple_archive;
 use support::zip_fixtures::{build_zip, ZipEntrySpec};
@@ -2150,6 +2154,67 @@ fn bench_throttled_download_then_extract_grid() {
                     )
                 },
             );
+        }
+
+        // ---- rar5 + rar3 (STORED) --------------------------------------
+        // Same shape as zip / 7z: `unrar` requires a seekable file, so
+        // the only fair baseline is `curl -O && unrar x && rm`. Peel
+        // streams RAR end-to-end (headers + data interleaved in stream
+        // order) — the highlight this grid quantifies. Encoder output
+        // comes from the real `rar` binaries (`tests/support/
+        // rar_bench_fixtures.rs`) so the third-party `unrar` baseline
+        // is decoding genuine RAR wire bytes, not a peel-built dialect.
+        #[cfg(feature = "rar")]
+        {
+            if let Some(unrar) = unrar_path() {
+                if rar5_encoder_present() {
+                    let body = ensure_rar5_stored(&entries, rate.payload_bytes);
+                    let unrar = unrar.clone();
+                    run_throttled_dnx_case(
+                        rate,
+                        mib,
+                        "rar5",
+                        "curl+unrar",
+                        &body,
+                        &entries,
+                        "bundle.rar",
+                        move |file, dir| {
+                            // -inul: suppress all output. -y: yes to
+                            // prompts. Trailing slash on the dest is
+                            // required for `unrar x`.
+                            format!(
+                                r#"curl -sS --limit-rate {limit} -o {file} "$URL" && {unrar} x -inul -y {file} {dir}/ && rm {file}"#,
+                                limit = rate.bytes_per_sec,
+                                file = shell_quote(file),
+                                dir = shell_quote(dir),
+                                unrar = unrar,
+                            )
+                        },
+                    );
+                }
+                if rar3_encoder_present() {
+                    let body = ensure_rar3_stored(&entries, rate.payload_bytes);
+                    let unrar = unrar.clone();
+                    run_throttled_dnx_case(
+                        rate,
+                        mib,
+                        "rar3",
+                        "curl+unrar",
+                        &body,
+                        &entries,
+                        "bundle.rar",
+                        move |file, dir| {
+                            format!(
+                                r#"curl -sS --limit-rate {limit} -o {file} "$URL" && {unrar} x -inul -y {file} {dir}/ && rm {file}"#,
+                                limit = rate.bytes_per_sec,
+                                file = shell_quote(file),
+                                dir = shell_quote(dir),
+                                unrar = unrar,
+                            )
+                        },
+                    );
+                }
+            }
         }
     }
 }

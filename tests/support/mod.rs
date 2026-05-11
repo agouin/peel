@@ -14,6 +14,11 @@ pub mod mock_server;
 // feature is on (`docs/PLAN_rar.md` §0.5).
 #[cfg(feature = "rar")]
 pub mod rar_fixtures;
+// On-demand fixture cache for the streaming bench grid. Lives behind
+// the same `rar` Cargo feature: nothing here references rar internals
+// directly, but the only consumer is the rar bench rows.
+#[cfg(feature = "rar")]
+pub mod rar_bench_fixtures;
 pub mod sevenz_fixtures;
 pub mod tar_fixtures;
 pub mod zip_fixtures;

@@ -66,6 +66,12 @@ pub const MIN_SUPPORTED_UNP_VER: u8 = 29;
 /// handled by the sibling RAR5 path.
 pub const MAX_SUPPORTED_UNP_VER: u8 = 36;
 
+/// Method byte for STORED entries — direct byte copy, no
+/// compression. `unp_size == pack_size` and the decoder is a plain
+/// `memcpy` from packed to unpacked, so the `unp_ver` version gate
+/// does not apply.
+pub const STORED_METHOD: u8 = 0x30;
+
 /// Length of the fixed base-block header in bytes.
 const BASE_BLOCK_LEN: usize = 7;
 
@@ -656,9 +662,18 @@ pub fn parse_file_header(block: &BaseBlock, buf: &[u8]) -> Result<FileHeader, Ra
     // the sink).
 
     // Reject out-of-range compression versions early so the pipeline
-    // does not plan a download for an entry it cannot decode.
+    // does not plan a download for an entry it cannot decode. The
+    // version gate only applies to compressed methods — STORED
+    // (`method == 0x30`) is a direct byte-copy, so `unp_ver` is
+    // decorative and we accept any value. Real-world archives (and
+    // the registered `rar` encoder when invoked with `-m0`) tag
+    // STORED entries `unp_ver = 20` for backward compatibility with
+    // pre-2.9 readers; rejecting them would refuse perfectly valid
+    // STORED data.
     let name = decode_file_name(name_bytes, file_flags)?;
-    if !(MIN_SUPPORTED_UNP_VER..=MAX_SUPPORTED_UNP_VER).contains(&unp_ver) {
+    if method != STORED_METHOD
+        && !(MIN_SUPPORTED_UNP_VER..=MAX_SUPPORTED_UNP_VER).contains(&unp_ver)
+    {
         return Err(RarError::UnsupportedFeature {
             feature: format!(
                 "legacy RAR compression version {}.{} (unp_ver = {}); round-one supports {}.{}..{}.{} only",
@@ -702,26 +717,35 @@ pub fn parse_file_header(block: &BaseBlock, buf: &[u8]) -> Result<FileHeader, Ra
 /// preferentially. If the encoded form is missing (no `\0`
 /// separator) we fall back to the leading ASCII run.
 fn decode_file_name(buf: &[u8], flags: FileFlags) -> Result<String, RarError> {
-    if !flags.has_unicode_name() {
-        return decode_ascii_name(buf);
-    }
-
-    // Locate the NUL separator. If absent the field is just an
-    // ASCII name with the unicode flag erroneously set; accept it.
-    let nul = match buf.iter().position(|&b| b == 0) {
-        Some(idx) => idx,
-        None => return decode_ascii_name(buf),
+    let raw = if !flags.has_unicode_name() {
+        decode_ascii_name(buf)?
+    } else {
+        // Locate the NUL separator. If absent the field is just an
+        // ASCII name with the unicode flag erroneously set; accept it.
+        let nul = buf.iter().position(|&b| b == 0);
+        match nul {
+            None => decode_ascii_name(buf)?,
+            Some(idx) => {
+                let ascii_form = &buf[..idx];
+                let encoded = &buf[idx + 1..];
+                if encoded.is_empty() {
+                    decode_ascii_name(ascii_form)?
+                } else {
+                    decode_unicode_name(ascii_form, encoded)
+                        .or_else(|_| decode_ascii_name(ascii_form))?
+                }
+            }
+        }
     };
 
-    let ascii_form = &buf[..nul];
-    let encoded = &buf[nul + 1..];
-
-    // Encoded form is empty: fall back to ASCII.
-    if encoded.is_empty() {
-        return decode_ascii_name(ascii_form);
-    }
-
-    decode_unicode_name(ascii_form, encoded).or_else(|_| decode_ascii_name(ascii_form))
+    // RAR3's wire format uses DOS path separators ('\\') even when
+    // the archive was authored on Unix (`host_os = 3`). The
+    // RAR3 technote calls this out and unrar / libarchive both
+    // translate to '/' before handing names to the OS. peel
+    // mirrors that here so the sink layer can split on '/'
+    // unconditionally and nested-directory entries land at the
+    // right on-disk paths.
+    Ok(raw.replace('\\', "/"))
 }
 
 /// Decode an unflagged FILE_HEAD name field. Accepts UTF-8 and
@@ -1082,8 +1106,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_file_header_rejects_old_unp_ver() {
-        let body = build_file_head_body(0, 0, 0, 0, 20 /* 2.0 */, 0x30, 0, b"old.bin");
+    fn parse_file_header_rejects_old_unp_ver_for_compressed_method() {
+        // Compressed method (0x33 = m=3 Normal) with pre-2.9 unp_ver
+        // is rejected — the LZ decoder doesn't support the older
+        // stream layout.
+        let body = build_file_head_body(0, 0, 0, 0, 20 /* 2.0 */, 0x33, 0, b"old.bin");
         let bytes = build_block(block_codes::FILE, 0, &body, Some(0));
         let block = parse_generic_header(&bytes, 0).expect("parses");
         let err = parse_file_header(&block, &bytes).unwrap_err();
@@ -1096,6 +1123,21 @@ mod tests {
             }
             other => panic!("expected UnsupportedFeature, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_file_header_accepts_old_unp_ver_for_stored_method() {
+        // STORED (method 0x30) is a `memcpy` — `unp_ver` is
+        // decorative. The registered RAR encoder tags `-m0` entries
+        // `unp_ver = 20` for backward compatibility with pre-2.9
+        // readers, and we accept those.
+        let body = build_file_head_body(0, 0, 0, 0, 20 /* 2.0 */, STORED_METHOD, 0, b"old.bin");
+        let bytes = build_block(block_codes::FILE, 0, &body, Some(0));
+        let block = parse_generic_header(&bytes, 0).expect("parses");
+        let file = parse_file_header(&block, &bytes).expect("STORED is decode-version-agnostic");
+        assert_eq!(file.name, "old.bin");
+        assert_eq!(file.method, STORED_METHOD);
+        assert_eq!(file.unp_ver, 20);
     }
 
     #[test]

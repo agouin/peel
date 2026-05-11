@@ -1,0 +1,46 @@
+   Compiling peel-rs v0.3.0 (/Users/andrewgouin/pux)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3.36s
+     Running tests/test_bench_streaming.rs (target/release/deps/test_bench_streaming-62043a88f85b5c0a)
+
+running 1 test
+test bench_throttled_download_then_extract_grid ... [dnx]       rate    payload  format         peel   curl+extract   ratio  tools
+[dnx]    10 Mbps     8.0 MiB  tar         7.243s        6.722s   1.08x  curl+tar
+[dnx]    10 Mbps     8.0 MiB  tar.zst     7.204s        6.834s   1.05x  curl+zstd+tar
+[dnx]    10 Mbps     8.0 MiB  tar.xz      6.884s        6.603s   1.04x  curl+xz+tar
+[dnx]    10 Mbps     8.0 MiB  tar.gz      7.474s        6.809s   1.10x  curl+gzip+tar
+[dnx]    10 Mbps     8.0 MiB  tar.lz4     7.463s        7.028s   1.06x  curl+lz4+tar
+[dnx]    10 Mbps     8.0 MiB  zip         7.470s        6.839s   1.09x  curl+unzip
+[dnx]    10 Mbps     8.0 MiB  7z          7.034s        6.770s   1.04x  curl+7z
+[dnx]    10 Mbps     8.0 MiB  rar5        7.261s        6.759s   1.07x  curl+unrar
+[dnx]    10 Mbps     8.0 MiB  rar3        6.839s        6.771s   1.01x  curl+unrar
+[dnx]   100 Mbps    32.0 MiB  tar         2.551s        2.753s   0.93x  curl+tar
+[dnx]   100 Mbps    32.0 MiB  tar.zst     2.553s        2.763s   0.92x  curl+zstd+tar
+[dnx]   100 Mbps    32.0 MiB  tar.xz      2.517s        3.042s   0.83x  curl+xz+tar
+[dnx]   100 Mbps    32.0 MiB  tar.gz      2.558s        2.763s   0.93x  curl+gzip+tar
+[dnx]   100 Mbps    32.0 MiB  tar.lz4     2.555s        2.754s   0.93x  curl+lz4+tar
+[dnx]   100 Mbps    32.0 MiB  zip         2.554s        2.856s   0.89x  curl+unzip
+[dnx]   100 Mbps    32.0 MiB  7z          2.567s        2.758s   0.93x  curl+7z
+[dnx]   100 Mbps    32.0 MiB  rar5        2.625s        2.757s   0.95x  curl+unrar
+[dnx]   100 Mbps    32.0 MiB  rar3        2.841s        2.961s   0.96x  curl+unrar
+[dnx]     1 Gbps   128.0 MiB  tar         0.858s        1.175s   0.73x  curl+tar
+[dnx]     1 Gbps   128.0 MiB  tar.zst     0.859s        1.210s   0.71x  curl+zstd+tar
+[dnx]     1 Gbps   128.0 MiB  tar.xz      2.662s        3.513s   0.76x  curl+xz+tar
+[dnx]     1 Gbps   128.0 MiB  tar.gz      0.862s        1.206s   0.71x  curl+gzip+tar
+[dnx]     1 Gbps   128.0 MiB  tar.lz4     0.864s        1.215s   0.71x  curl+lz4+tar
+[dnx]     1 Gbps   128.0 MiB  zip         0.861s        1.490s   0.58x  curl+unzip
+[dnx]     1 Gbps   128.0 MiB  7z          0.874s        1.181s   0.74x  curl+7z
+[dnx]     1 Gbps   128.0 MiB  rar5        1.057s        1.166s   0.91x  curl+unrar
+[dnx]     1 Gbps   128.0 MiB  rar3        1.861s        1.905s   0.98x  curl+unrar
+[dnx]    10 Gbps   256.0 MiB  tar         0.276s        0.327s   0.84x  curl+tar
+[dnx]    10 Gbps   256.0 MiB  tar.zst     0.215s        0.386s   0.56x  curl+zstd+tar
+[dnx]    10 Gbps   256.0 MiB  tar.xz      5.709s        5.947s   0.96x  curl+xz+tar
+[dnx]    10 Gbps   256.0 MiB  tar.gz      0.235s        0.378s   0.62x  curl+gzip+tar
+[dnx]    10 Gbps   256.0 MiB  tar.lz4     0.232s        0.387s   0.60x  curl+lz4+tar
+[dnx]    10 Gbps   256.0 MiB  zip         0.235s        0.968s   0.24x  curl+unzip
+[dnx]    10 Gbps   256.0 MiB  7z          0.220s        0.301s   0.73x  curl+7z
+[dnx]    10 Gbps   256.0 MiB  rar5        0.702s        0.293s   2.40x  curl+unrar
+[dnx]    10 Gbps   256.0 MiB  rar3        2.345s        1.805s   1.30x  curl+unrar
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 317.16s
+

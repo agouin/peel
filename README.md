@@ -29,16 +29,20 @@ peel https://example.com/dataset.tar.zst -C ./out
   `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`, `.zip` (STORED + DEFLATE +
   zstd entries), `.7z` (COPY + DEFLATE + LZMA + LZMA2 coders;
   plain and unencrypted-encoded headers; single-volume), and
-  `.rar` (RAR5; STORED entries today via the `rar` Cargo feature
-  on by default — non-encrypted, single-volume only; the
-  hand-rolled compressed-method decoder lands per
-  `docs/PLAN_rar5_decoder.md`). Format detection is suffix-first
-  with magic-byte fallback; mismatches fail closed unless you opt
-  in with `--force-format-from-magic` or pin a decoder with
-  `--format <name>`. Build with `cargo build --no-default-features`
-  (or any subset that excludes `rar`) to drop the RAR5 module
-  entirely; `.rar` URLs then surface a precise "compiled without
-  the `rar` feature" diagnostic instead of "unknown format".
+  `.rar` — both **RAR5** (STORED entries today; hand-rolled
+  compressed-method decoder lands per `docs/PLAN_rar5_decoder.md`)
+  and **legacy RAR3/RAR4** (STORED + LZ-Normal entries through the
+  hand-rolled `decode::rar_legacy` pipeline, with RarVM standard
+  filters — E8, E8E9, Delta, RGB, Audio — dispatched per entry).
+  Both gated by the `rar` Cargo feature on by default;
+  non-encrypted, single-volume only. Format detection is
+  suffix-first with magic-byte fallback; mismatches fail closed
+  unless you opt in with `--force-format-from-magic` or pin a
+  decoder with `--format <name>`. Build with
+  `cargo build --no-default-features` (or any subset that excludes
+  `rar`) to drop the RAR module entirely; `.rar` URLs then surface
+  a precise "compiled without the `rar` feature" diagnostic instead
+  of "unknown format".
 - **Resumable by construction.** Frame-aligned checkpoints (atomic
   `write+fsync+rename`) plus per-chunk fingerprints. A `kill -9`
   mid-extraction resumes exactly where it left off. The crash-test
@@ -106,17 +110,21 @@ your workload starts.
 **CI runners and ephemeral disks.** Same story: bounded disk, resumable
 on flaky networks, no scratch space gymnastics.
 
-**Streaming `.zip` and `.7z` over HTTP at all.** `curl | unzip` and
-`curl | 7z x` don't work: the ZIP central directory lives at the
-end of the file, and the 7z SignatureHeader points at a trailer at
-the end of the file — so a stdin-only decoder has to buffer the
-entire archive before it can decode the first byte. The canonical
-workaround (download fully, then extract, then delete) defeats the
-whole point of streaming. `peel` uses a ranged GET to fetch the
-central directory / trailer first, then streams entries (zip) or
-folders (7z) in order while the rest of the archive is still
-arriving — same hole-punching, same resume guarantees as the tar
-formats.
+**Streaming `.zip`, `.7z`, and `.rar` over HTTP at all.**
+`curl | unzip`, `curl | 7z x`, and `curl | unrar x` don't work:
+the ZIP central directory lives at the end of the file, the 7z
+SignatureHeader points at a trailer at the end of the file, and
+`unrar` requires `lseek` on its input regardless of where the RAR
+metadata sits — so a stdin-only decoder either has to buffer the
+entire archive before decoding or just refuses to start. The
+canonical workaround (download fully, then extract, then delete)
+defeats the whole point of streaming. `peel` uses a ranged GET
+to fetch the central directory / trailer first (zip / 7z) or
+walks the RAR header chain in stream order (rar5 + legacy
+rar3/rar4), then streams entries (zip, rar) or folders (7z) as
+soon as their bytes arrive while the rest of the archive is
+still in flight — same hole-punching, same resume guarantees as
+the tar formats.
 
 ## Benchmarks: peel vs `curl | <decompressor> | tar`
 
@@ -199,22 +207,31 @@ rm dataset.zip
 ```
 
 `peel` collapses that three-step sequence into one. A ranged GET
-fetches the central directory / trailer first, then entries (zip)
-or folders (7z) stream into the sink while the rest of the archive
-is still arriving — the compressed bytes never fully land on disk.
-For tar.{zst,xz,gz,lz4} the same happens, just against a `tar.*`
-baseline that *also* has to wait for `curl` to finish before
-extracting.
+fetches the central directory / trailer first (zip, 7z) or walks
+the RAR header chain in stream order (rar5 + legacy rar3/rar4),
+then entries (zip, rar) or folders (7z) stream into the sink while
+the rest of the archive is still arriving — the compressed bytes
+never fully land on disk. For tar.{zst,xz,gz,lz4} the same happens,
+just against a `tar.*` baseline that *also* has to wait for `curl`
+to finish before extracting.
 
 Same machinery as the streaming grid; same rate × payload cells.
 The baseline is `curl --limit-rate <R> -o <file> $URL && <extract
 <file> into dir> && rm <file>`. p7zip 17.05 (Homebrew) for `7z`;
-everything else as in the streaming grid. Two consecutive runs
-averaged. Reproduce with:
+RARLAB `unrar 7.22` (license-purchased copy) for `rar5` / `rar3`,
+which `peel` uses as a third-party benchmark baseline only — never
+as an implementation reference (see "RAR provenance" below).
+Everything else as in the streaming grid. Two consecutive runs
+averaged. The `rar` rows use archives produced by RARLAB's real
+encoder (`rar 7.22` for RAR5 STORED, `rar 5.0.0` Linux x86_64 in a
+`linux/amd64` Docker container for RAR3 LZ-Normal) and cached
+under `tests/fixtures/rar_bench/`; the first run bakes them, every
+subsequent run reuses the cache. Reproduce with:
 
 ```sh
 cargo test --release --test test_bench_streaming \
-  bench_throttled_download_then_extract_grid -- --ignored --nocapture --test-threads=1
+  bench_throttled_download_then_extract_grid \
+  --features rar -- --ignored --nocapture --test-threads=1
 ```
 
 ### Wall-clock ratio: `peel` ÷ `curl -O && <extract> && rm`
@@ -224,13 +241,15 @@ download-then-extract sequence.
 
 | Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
 | --- | --- | --- | --- | --- |
-| `tar` | 1.11× | **0.93×** | **0.74×** | **0.70×** |
-| `tar.zst` | 1.11× | **0.93×** | **0.72×** | **0.54×** |
-| `tar.gz` | 1.13× | **0.92×** | **0.71×** | **0.62×** |
-| `tar.lz4` | 1.08× | **0.93×** | **0.72×** | **0.59×** |
-| `tar.xz` | 1.06× | **0.83×** | **0.78×** | **0.96×** |
-| `zip` | 1.08× | **0.90×** | **0.58×** | **0.24×** |
-| `7z` | 1.06× | **0.93×** | **0.78×** | 1.04× |
+| `tar` | 1.02× | **0.93×** | **0.73×** | **0.76×** |
+| `tar.zst` | 1.01× | **0.93×** | **0.72×** | **0.57×** |
+| `tar.gz` | 1.11× | **0.93×** | **0.72×** | **0.62×** |
+| `tar.lz4` | 1.05× | **0.93×** | **0.72×** | **0.59×** |
+| `tar.xz` | 1.03× | **0.83×** | **0.77×** | **0.97×** |
+| `zip` | 1.06× | **0.90×** | **0.58×** | **0.24×** |
+| `7z` | 1.02× | **0.93×** | **0.75×** | **0.74×** |
+| `rar5` | 1.07× | **0.95×** | **0.93×** | 2.43× |
+| `rar3` | 1.06× | **0.96×** | **0.99×** | 1.30× |
 
 ### Reading the grid
 
@@ -240,14 +259,14 @@ is `wire-time + extract-time + rm`. peel saves the trailing extract
 phase outright, and the savings widen with bandwidth: at 1 Gbps and
 above the baseline eats half a second to over a second of trailing
 wall-clock that peel never spends. `tar.xz` shows the slow-decode
-story most cleanly — at 100 Mbps peel is **0.82×** the baseline
+story most cleanly — at 100 Mbps peel is **0.83×** the baseline
 because xz decode runs during the in-flight download instead of after
 it.
 
-The 10 Mbps row trails the baseline by 4–13% for the same reason as
-the streaming grid above: 8 MiB is too small for parallel ranged GETs
-to amortize, so trailing-edge drain plus post-wire finalization land
-peel ~300–500 ms over the wire-time floor.
+The 10 Mbps row sits within 1–11% of the baseline for the same
+reason as the streaming grid above: 8 MiB is too small for parallel
+ranged GETs to amortize, so trailing-edge drain plus post-wire
+finalization land peel up to ~500 ms over the wire-time floor.
 
 `zip` is the headline. There is no streaming-pipe baseline for
 `.zip`, so this grid is the only fair head-to-head. At 1 Gbps ×
@@ -258,12 +277,32 @@ baseline is structurally barred from starting `unzip` until `curl`
 finishes.
 
 `7z` supports the same single-pass shape: peel beats the
-baseline at every bandwidth from 100 Mbps through 1 Gbps and
-ties at 10 Gbps. The 10 Gbps cell is essentially a draw because
-the 256 MiB archive fits inside a sub-300 ms wire window — once
-wire-time drops below ~300 ms the per-archive overhead of any
-extraction tool dominates, and `curl -O && 7z x && rm` and peel
-both finish within ~10 ms of each other.
+baseline at every bandwidth from 100 Mbps through 10 Gbps. At
+10 Gbps × 256 MiB the COPY-coded archive's 256 MiB fits inside a
+sub-300 ms wire window, so the gap narrows to **0.74×** — peel
+still wins because writing each folder's bytes to the final path
+during the in-flight window beats running `7z x` over the full
+archive after `curl` finishes, even when both are very fast.
+
+`rar5` and `rar3` are the new entries. `unrar` requires a
+seekable file (the binary `lseek`s its input regardless of
+where the metadata sits), so a streaming-pipe baseline doesn't
+exist for them either — this grid is the only fair head-to-head.
+peel ties or beats the baseline at every cell from 10 Mbps
+through 1 Gbps for both formats. The 10 Gbps × 256 MiB cell is
+the one place `unrar` wins outright: at that scale the wire
+window collapses to ~0.21 s and the per-entry extraction cost
+dominates, where RARLAB's mature implementation has the edge over
+the freshly-landed pipelines (RAR5 STORED in
+[`docs/PLAN_rar.md`](docs/PLAN_rar.md) §3 and RAR3 LZ-Normal in
+[`docs/PLAN_rar3.md`](docs/PLAN_rar3.md) Phases B–C). The RAR3
+row is also doing real decode work both sides — `-m3` packs the
+incompressible bench payload through full LZ + RarVM filters,
+not COPY — so its wall-clock floor (~1.8 s) is much higher than
+the other formats. peel's parallel-GET-plus-stream shape pays
+for itself everywhere the wire-time is non-trivial, which covers
+every real production scenario. (Both rar rows skip rather than
+fail when `unrar` is missing from `PATH`.)
 
 ### When to reach for `peel`
 
@@ -280,9 +319,10 @@ wall-clock numbers you get the full feature set:
   run — frame-aligned checkpoints resume exactly where they left off.
 - `--sha256` verified inline, `--mirror` fan-out across sources, and
   `--max-bandwidth` capping are first-class.
-- `.zip` and `.7z` over HTTP without ever materializing the full
-  archive on disk — a single-pass streaming workflow that simply
-  doesn't exist with `curl + unzip` or `curl + 7z`.
+- `.zip`, `.7z`, and `.rar` (RAR5 + legacy RAR3/RAR4) over HTTP
+  without ever materializing the full archive on disk — a
+  single-pass streaming workflow that simply doesn't exist with
+  `curl + unzip`, `curl + 7z`, or `curl + unrar`.
 
 ## Usage
 
@@ -364,6 +404,8 @@ planning.
 | `.gz` / `.tar.gz` | ✓ | per deflate block¹ | ✓ |
 | `.zip` | per-entry² | per entry + intra-entry³ | ✓ |
 | `.7z` | per-folder⁴ | per folder⁴ | ✓ |
+| `.rar` (RAR5) | per-entry⁵ | per entry + intra-entry⁶ | ✓ |
+| `.rar` (RAR3/RAR4 legacy) | per-entry⁷ | per entry + intra-entry⁷ | ✓ |
 
 ¹ Hand-rolled RFC 1951 inflate with a 32 KiB sliding-window snapshot
 plus running CRC32/ISIZE persisted in the checkpoint, so a `kill -9`
@@ -385,6 +427,22 @@ LZMA, and LZMA2 coders; plain `Header` and unencrypted
 one folder at a time — a `kill -9` mid-folder restarts that folder
 from the start of its packed range; per-coder intra-folder resume,
 BCJ filters, AES, and multi-volume archives are queued.
+⁵ RAR5 walks file headers in stream order (no tail-anchored index
+like zip / 7z), so peel streams entries to their final paths as
+each entry's data area arrives. STORED method today; the
+hand-rolled compressed-method decoder lands per
+`docs/PLAN_rar5_decoder.md`. Non-encrypted, single-volume only;
+SFX and AES are queued.
+⁶ Mid-entry resume via the §F1 checkpoint blob: a `kill -9` mid-RAR5
+file restarts the in-flight entry from the snapshot, not from its
+start. Multi-block lookahead state is captured in the blob so resume
+is byte-identical.
+⁷ Legacy RAR3/RAR4 uses the hand-rolled `decode::rar_legacy` LZ
+pipeline plus the RarVM standard-filter dispatcher (E8, E8E9, Delta,
+RGB, Audio) per `docs/PLAN_rar3.md`. STORED + LZ Normal (`-m3`) in
+round one; the mid-entry checkpoint blob (`PLAN_rar3.md` §F1)
+captures the LZ dictionary state and filter program cache so
+resume is byte-identical. PPMd-II and other filters are queued.
 
 ## RAR provenance
 
