@@ -454,6 +454,40 @@ fn local_keep_archive_ignores_stale_ckpt() {
 }
 
 #[test]
+fn local_keep_archive_writes_no_checkpoint() {
+    // §6 (PLAN_local_file_extract.md): `-k` runs do not write
+    // `.peel.ckpt` — the run is one-pass and a kill mid-run just
+    // means re-run from scratch against the still-intact source.
+    let dir = unique_dir("keep_no_ckpt");
+    let source = build_tar_zst(&dir, &[("a.txt", b"alpha\n")]);
+    let archive_size_before = std::fs::metadata(&source).expect("stat").len();
+    let ckpt_path = {
+        let mut name = source.file_name().unwrap().to_os_string();
+        name.push(".peel.ckpt");
+        source.with_file_name(name)
+    };
+    let out = dir.join("out");
+
+    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
+    args.keep_archive = true;
+    local_run(args).expect("local run");
+
+    // Source preserved at full size, no checkpoint written.
+    assert_eq!(
+        std::fs::metadata(&source).expect("stat after").len(),
+        archive_size_before,
+        "-k must preserve the source archive's size",
+    );
+    assert!(
+        !ckpt_path.exists(),
+        "-k runs must not write `.peel.ckpt` — got one at {}",
+        ckpt_path.display(),
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn local_destructive_kill_mid_run_resumes_to_byte_identical_output() {
     // The load-bearing §5 test: kick off a destructive
     // extraction, flip the kill switch after the first
