@@ -121,6 +121,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
         no_extract: false,
         keep_archive: None,
         strict_format: false,
+        password_source: None,
     }
 }
 

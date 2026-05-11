@@ -24,6 +24,7 @@ use crate::extractor::DEFAULT_PUNCH_THRESHOLD;
 use crate::hash::sha256::{parse_hex_digest, ParseHexDigestError};
 use crate::http::{Client, ClientConfig, HttpVersion, Url, UrlError};
 use crate::io_backend::IoBackendChoice;
+use crate::secret::source::PasswordSource;
 
 /// Parsed CLI for the `peel` binary.
 #[derive(Debug, Parser)]
@@ -297,6 +298,27 @@ pub struct Cli {
     /// extracting); compatible with `-k/--keep-archive`.
     #[arg(long = "strict-format", default_value_t = false)]
     pub strict_format: bool,
+
+    /// Password source for encrypted archives
+    /// (`docs/PLAN_archive_encryption.md` §1).
+    ///
+    /// Accepts one of:
+    ///   * `prompt` — read from `/dev/tty` with echo disabled.
+    ///     Up to 3 attempts on a wrong password before giving up.
+    ///   * `env:NAME` — read from the named environment variable.
+    ///   * `file:PATH` — read the first line of the file. Modes
+    ///     other than `0600` emit a one-shot warning.
+    ///   * `fd:N` — read from file descriptor N (until EOF or
+    ///     newline). Compatible with shell process substitution
+    ///     (`peel … --password-from fd:3 3< <(pass …)`).
+    ///
+    /// peel deliberately does not accept the password on the
+    /// command line — `argv` is visible to every process on the
+    /// host and is the wrong default. Users who really need a
+    /// non-interactive single-step invocation can pipe one through
+    /// `env:`, `file:`, or `fd:`.
+    #[arg(long = "password-from", value_name = "SOURCE")]
+    pub password_from: Option<String>,
 
     /// Skip the destructive-mode confirmation prompt in local-file
     /// mode (`docs/PLAN_local_file_extract.md` §1).
@@ -585,6 +607,11 @@ pub enum CliError {
          (the archive is already at the positional path; use bare `-k` to preserve it)"
     )]
     LocalKeepArchiveWithPath,
+
+    /// `--password-from <SOURCE>` did not parse as a valid source
+    /// (`docs/PLAN_archive_encryption.md` §1).
+    #[error("--password-from value is not a valid password source")]
+    InvalidPasswordSource(#[source] crate::secret::source::PasswordSourceParseError),
 
     /// Local-file mode would default to destructive extraction but
     /// stdin is not a TTY and neither `-y` nor `-k` was passed
@@ -1254,6 +1281,12 @@ impl Cli {
         };
         let max_disk_buffer =
             parse_disk_buffer(&self.max_disk_buffer).map_err(CliError::InvalidDiskBuffer)?;
+        let password_source = self
+            .password_from
+            .as_deref()
+            .map(PasswordSource::parse)
+            .transpose()
+            .map_err(CliError::InvalidPasswordSource)?;
         let http_version: HttpVersion = self.http_version.into();
         // Log the HTTP version selection at startup. Mirrors the
         // `io_backend=...` line that `crate::io_backend::select_backend`
@@ -1296,6 +1329,7 @@ impl Cli {
                 no_extract: self.no_extract,
                 keep_archive,
                 strict_format: self.strict_format,
+                password_source,
             },
             client,
             registry: DecoderRegistry::with_defaults(),
@@ -1400,6 +1434,12 @@ impl Cli {
             self.forced_format.as_deref(),
             &registry,
         )?;
+        let password_source = self
+            .password_from
+            .as_deref()
+            .map(PasswordSource::parse)
+            .transpose()
+            .map_err(CliError::InvalidPasswordSource)?;
 
         let args = LocalRunArgs {
             source,
@@ -1417,6 +1457,7 @@ impl Cli {
             progress_state: None,
             kill_switch: None,
             io_backend_resolved: None,
+            password_source,
         };
 
         Ok(Dispatch::Local {
@@ -1453,6 +1494,77 @@ mod tests {
             OutputTarget::File(p) => assert_eq!(p, PathBuf::from("/tmp/out.bin")),
             OutputTarget::Dir(_) => panic!("expected File for bare .zst"),
         }
+    }
+
+    #[test]
+    fn password_from_absent_yields_none_source() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.tar.zst"]).expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(args.config.password_source.is_none());
+    }
+
+    #[test]
+    fn password_from_prompt_parses_into_config() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.tar.zst",
+            "--password-from",
+            "prompt",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        assert!(matches!(
+            args.config.password_source,
+            Some(PasswordSource::Prompt)
+        ));
+    }
+
+    #[test]
+    fn password_from_env_parses_into_config() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.tar.zst",
+            "--password-from",
+            "env:PEEL_PASSWORD",
+        ])
+        .expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        match args.config.password_source {
+            Some(PasswordSource::Env(name)) => {
+                assert_eq!(name, std::ffi::OsString::from("PEEL_PASSWORD"));
+            }
+            other => panic!("expected Env source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn password_from_invalid_value_errors() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.tar.zst",
+            "--password-from",
+            "stdin",
+        ])
+        .expect("clap accepts the value");
+        let err = cli.into_run_args().err().expect("must error");
+        assert!(matches!(err, CliError::InvalidPasswordSource(_)));
+    }
+
+    #[test]
+    fn no_password_arg_in_help() {
+        // peel deliberately does not accept `--password=<value>` in
+        // argv. The flag is the source-only form. This test
+        // documents that choice: if a `--password` flag is ever
+        // added back, this test fails and forces a re-evaluation
+        // of the threat-model docs in PLAN_archive_encryption.md.
+        let err = Cli::try_parse_from(["peel", "https://example.com/x.tar.zst", "--password", "p"])
+            .expect_err("clap should reject --password");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unexpected")
+                || msg.contains("unrecognized")
+                || msg.contains("--password")
+        );
     }
 
     #[test]

@@ -116,6 +116,7 @@ fn coord_config(chunk_size: u64) -> CoordinatorConfig {
         mirror_urls: Vec::new(),
         max_bandwidth_bps: None,
         max_disk_buffer: None,
+        password_source: None,
         no_extract: false,
         keep_archive: None,
         strict_format: false,

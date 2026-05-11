@@ -115,6 +115,7 @@ pub mod progress;
 #[cfg(unix)]
 pub mod punch;
 pub mod rar;
+pub mod secret;
 pub mod sevenz;
 pub mod sink;
 pub mod types;

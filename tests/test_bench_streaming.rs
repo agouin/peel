@@ -415,6 +415,7 @@ fn coord_config() -> CoordinatorConfig {
         no_extract: false,
         keep_archive: None,
         strict_format: false,
+        password_source: None,
     }
 }
 

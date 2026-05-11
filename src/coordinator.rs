@@ -369,6 +369,21 @@ pub struct CoordinatorConfig {
     /// is renamed to a stream-shaped output path derived from the
     /// URL basename). When `true` the error is rethrown unchanged.
     pub strict_format: bool,
+
+    /// Password source for encrypted archives
+    /// (`docs/PLAN_archive_encryption.md` §1). `None` (the default)
+    /// means peel has no password to offer; encrypted entries
+    /// surface a `PasswordMissing`-style error from the format-
+    /// specific pipeline. `Some(source)` is the parsed
+    /// `--password-from` argument; the format pipeline calls
+    /// [`PasswordSource::load`] when it discovers an encrypted
+    /// entry and re-prompts on
+    /// [`PasswordSource::is_interactive`] sources for up to 3
+    /// attempts (per the plan).
+    ///
+    /// [`PasswordSource::load`]: crate::secret::source::PasswordSource::load
+    /// [`PasswordSource::is_interactive`]: crate::secret::source::PasswordSource::is_interactive
+    pub password_source: Option<crate::secret::source::PasswordSource>,
 }
 
 impl Default for CoordinatorConfig {
@@ -395,6 +410,7 @@ impl Default for CoordinatorConfig {
             no_extract: false,
             keep_archive: None,
             strict_format: false,
+            password_source: None,
         }
     }
 }

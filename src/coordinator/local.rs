@@ -124,6 +124,14 @@ pub struct LocalRunArgs {
     /// scrollback above the TTY renderer; library callers leave
     /// this `None` and we materialize it from [`Self::io_backend`].
     pub io_backend_resolved: Option<Arc<dyn crate::io_backend::IoBackend>>,
+
+    /// Password source for encrypted archives
+    /// (`docs/PLAN_archive_encryption.md` §1). Mirrors
+    /// [`crate::coordinator::CoordinatorConfig::password_source`]
+    /// for the local-mode path; the format-specific pipeline calls
+    /// [`crate::secret::source::PasswordSource::load`] when it
+    /// discovers an encrypted entry.
+    pub password_source: Option<crate::secret::source::PasswordSource>,
 }
 
 impl LocalRunArgs {
@@ -148,6 +156,7 @@ impl LocalRunArgs {
             progress_state: None,
             kill_switch: None,
             io_backend_resolved: None,
+            password_source: None,
         }
     }
 }

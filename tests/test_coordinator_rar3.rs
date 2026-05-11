@@ -92,6 +92,7 @@ fn coord_config(chunk_size: u64) -> CoordinatorConfig {
         no_extract: false,
         keep_archive: None,
         strict_format: false,
+        password_source: None,
     }
 }
 
