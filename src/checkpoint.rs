@@ -584,9 +584,16 @@ pub enum SinkState {
         /// when `current_entry` is `None`.
         current_entry_offset: u64,
         /// Opaque decoder-state blob captured at the most recent
-        /// in-entry checkpoint (a serialized
-        /// [`crate::decode::rar_native::RarStreamDecoder`]
-        /// snapshot per `PLAN_rar5_decoder.md` §F1). `None` when:
+        /// in-entry checkpoint. For RAR5 archives this is a
+        /// serialized
+        /// [`crate::decode::rar_native::RarStreamDecoder`] snapshot
+        /// (`PLAN_rar5_decoder.md` §F1); for legacy (RAR3/RAR4)
+        /// archives it is a serialized
+        /// [`crate::decode::rar_legacy::RarLegacyStreamDecoder`]
+        /// snapshot (`PLAN_rar3.md` §F1). The two formats are
+        /// distinguished by their leading 4-byte magic (`RR5S`
+        /// vs. `RR3S`), so a checkpoint's blob is always routable
+        /// back to the decoder that produced it. `None` when:
         ///
         /// - the in-flight entry uses STORED (no decoder state to
         ///   capture; resume re-reads the on-disk prefix);

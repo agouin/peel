@@ -2344,24 +2344,118 @@ pipeline and byte-compares against the reference plaintext.
 
 ## Phase F — Resume
 
-### §F1. Mid-entry checkpoint blob (legacy)
+### §F1. Mid-entry checkpoint blob (legacy) ✅ (this commit)
 
-**What**: serialisable decoder snapshot for legacy entries. Same
-shape as `PLAN_rar5_decoder.md` §F1, with PPMd-II model state
-serialised in addition to the LZ dict.
+**What landed**: `RarLegacyStreamDecoder` now exposes a
+deterministic snapshot blob so a `kill -9` mid-compressed-entry
+resumes byte-identical. The §E1 buffer-then-stream shape made
+this much smaller than the §F1 plan originally sketched: because
+[`decode_payload`](../src/decode/rar_legacy/entry.rs) is
+deterministic in `(compressed, method, dict_capacity,
+unpacked_size)`, the snapshot only needs to record the per-entry
+header fields plus `decoded_pos` (how many output bytes had been
+emitted at the snapshot moment). On resume,
+[`RarLegacyStreamDecoder::resume`](../src/decode/rar_legacy/stream.rs)
+re-runs the synchronous decode against the same compressed
+payload — yielding the same `decoded` buffer — and skips ahead
+to the saved `decoded_pos` before emitting the suffix.
 
-**Sketch**.
+The sketch's "snapshot the PPMd suballocator" / "replay from the
+previous block" options drop out of consideration entirely: the
+round-one decoder already re-runs end-to-end on every entry, so
+the cheap thing is to reuse that determinism and keep the
+snapshot tiny (49 bytes fixed). When Phase G lifts the
+buffer-then-stream into a block-by-block driver
+(`O.RAR.STREAMING_DECOMPRESS`), §F1's wire layout will need to
+extend — at that point we revisit option (a) vs (b) with real
+performance numbers.
 
-1. PPMd-II model state is *not* trivially serialisable —
-   sub-allocator pointers, context tree. Two options: (a) snapshot
-   the entire allocator arena (large but mechanical), (b) replay
-   from the previous block boundary (small but slow). Probably (a)
-   bounded by a `--max-resume-state` knob.
-2. Bump `Checkpoint::format_version` (next free slot after the
-   RAR5 §F1 bump).
-3. Crash-test parity with `tests/test_coordinator_rar.rs`.
+**Shape**.
 
-**Demo**: crash-resume harness covers compressed legacy entries.
+1. New module-private `SNAPSHOT_MAGIC` (`b"RR3S"`) +
+   `SNAPSHOT_VERSION` (1) tag the blob so a stray RAR5 snapshot
+   (`b"RR5S"`) can't be mis-routed into the legacy resume path.
+2. [`RarLegacyStreamDecoder::serialize_into`](../src/decode/rar_legacy/stream.rs)
+   writes a 49-byte fixed-layout blob: magic + version +
+   `src_start_offset` + `packed_size` + `unpacked_size` + `method` +
+   `dict_capacity` + `decoded_pos`.
+   [`Self::resume`](../src/decode/rar_legacy/stream.rs) is the
+   inverse — it cross-checks every per-entry field against the
+   caller's file-header values and refuses on any disagreement,
+   then drives `buffer_and_decode()` and seeks to the saved
+   `decoded_pos`.
+3. `StreamingDecoder::decoder_state_into` returns `true` only
+   between drain steps (after `buffer_and_decode()` has run and
+   before `eof_emitted` latches); `frame_boundary` becomes
+   `Some(src_start_offset + packed_size)` over the same window.
+   `source_cursor_from_blob` always reports `0` — the resuming
+   decoder needs the full entry payload to rebuild the decoded
+   buffer, not a tail-only slice. The pipeline's
+   `compressed.split_off(0)` slicing handles that as a no-op.
+4. [`Checkpoint::FORMAT_VERSION`](../src/checkpoint.rs) stays at
+   v11. The §E1 RAR5 path already cut the
+   `current_entry_decoder_state` slot in `SinkState::Rar`; the
+   legacy blob just rides the same opaque-byte channel. The §F1
+   plan asked for a fresh format-version bump but the checkpoint
+   layer treats the blob as opaque bytes, and the leading magic
+   already disambiguates legacy vs RAR5 snapshots, so the v11
+   bump suffices for both.
+5. [`extract_legacy_compressed_entry`](../src/download/rar_pipeline.rs)
+   grew `resume_offset` + `resume_decoder_state` parameters and a
+   dispatch on `resume_decoder_state.is_some() && resume_offset
+   > 0` to pick `begin_entry_resume` vs `begin_entry`. The
+   per-entry decoder construction also branches: with a blob it
+   goes through `RarLegacyStreamDecoder::resume`; without one it
+   stays on `RarLegacyStreamDecoder::new`. The `run_legacy`
+   dispatcher mirrors the §F1 RAR5 dispatch shape, including the
+   "blob is only honoured for the current_entry" guard.
+
+**Tests**:
+
+- 19 unit tests in
+  [`src/decode/rar_legacy/stream.rs`](../src/decode/rar_legacy/stream.rs)
+  cover the snapshot/resume contract. The headline test is
+  `synthetic_blob_resume_round_trips_at_every_decoded_pos` which
+  builds a snapshot blob for every `decoded_pos` in
+  `0..filter_e8.bin.len()` (512 boundaries) and verifies the
+  prefix + resumed suffix equals the reference plaintext byte
+  for byte. The unit-test approach side-steps the in-tree
+  fixture limitation: every legacy fixture decodes to ≤4 KiB,
+  which is below the streaming adapter's 64 KiB drain chunk, so
+  the live `decode_step` loop never exposes a mid-drain snapshot
+  through the public `decoder_state` path. Going through a
+  hand-built blob lets us cover the same code paths the live
+  decoder would hit at larger fixture sizes. Companion tests
+  exercise: header-field mismatch rejections (method,
+  `dict_capacity`, `packed_size`, `decoded_pos` past
+  `unpacked_size`), magic / version / truncation diagnostics,
+  the `source_cursor_from_blob` zero contract, and serialize →
+  resume → serialize round-trip lossless-ness.
+- [`tests/test_coordinator_rar3.rs::crash_resume_mid_entry_produces_identical_output`](../tests/test_coordinator_rar3.rs)
+  is the integration-level crash-resume test. It mirrors the
+  RAR5 sibling in
+  [`tests/test_coordinator_rar.rs`](../tests/test_coordinator_rar.rs):
+  a 4 MiB single-entry STORED legacy archive, kill-switch after
+  the first `CheckpointWritten`, resume in a fresh run, expect
+  byte-identical on-disk output. The STORED-entry path doesn't
+  exercise the §F1 snapshot blob (STORED goes through
+  `extract_legacy_entry`, not the compressed path) but it does
+  prove the `entries_completed` / `current_entry_offset`
+  checkpoint machinery still works for legacy archives across
+  the §E1 / §F1 pipeline reshuffle. The compressed-entry sibling
+  is bottlenecked on a curated legacy fixture whose decoded size
+  exceeds the streaming adapter's drain chunk; that's the same
+  Goldilocks-fixture problem flagged in
+  `PLAN_rar5_decoder.md` §F1's postmortem note for the RAR5
+  compressed-entry crash-test.
+
+**Demo**: `cargo test --features rar --lib
+decode::rar_legacy::stream` exercises the snapshot/resume
+contract end-to-end (19 unit tests, exhaustive over every
+`decoded_pos` boundary); `cargo test --features rar --test
+test_coordinator_rar3 crash_resume_mid_entry_produces_identical_output`
+drives the legacy crash-resume through the full coordinator
+pipeline.
 
 ---
 

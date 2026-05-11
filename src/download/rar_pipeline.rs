@@ -1081,14 +1081,31 @@ impl<'a> RarPipeline<'a> {
             } else {
                 0
             };
+            // §F1 dispatch: a compressed legacy entry whose
+            // checkpoint carried a saved decoder-state blob
+            // routes through the resume path. STORED entries
+            // always resume by offset alone (sink prefix-replay
+            // seeds the running hash); compressed entries with
+            // no blob restart from byte 0. Mirror of the RAR5
+            // pipeline's §F1 dispatch shape.
+            let resume_blob: Option<&[u8]> =
+                if Some(idx) == resume.current_entry && entry.method != 0x30 {
+                    resume.current_entry_decoder_state.as_deref()
+                } else {
+                    None
+                };
             let (bytes_written, bytes_punched) = if entry.method == 0x30 {
                 self.extract_legacy_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?
             } else {
-                // Compressed: drop any partial-extraction offset.
-                // Round-one (§E1) restarts compressed entries from
-                // byte 0; mid-entry resume lands in §F1 once the
-                // §B/§C decoders ship a snapshot blob.
-                self.extract_legacy_compressed_entry(idx, entry, sink, puncher, &mut callback)?
+                self.extract_legacy_compressed_entry(
+                    idx,
+                    entry,
+                    resume_offset,
+                    resume_blob,
+                    sink,
+                    puncher,
+                    &mut callback,
+                )?
             };
             stats.entries_extracted = stats.entries_extracted.saturating_add(1);
             stats.bytes_written = stats.bytes_written.saturating_add(bytes_written);
@@ -1232,13 +1249,22 @@ impl<'a> RarPipeline<'a> {
     /// chunk reader once the §C decoder primitives have stabilised
     /// against a real corpus.
     ///
-    /// Always starts from byte 0 of the entry — Phase F (§F1) will
-    /// add the saved-state resume path the RAR5 side already
-    /// implements via `extract_compressed_entry_with_resume`.
+    /// `resume_decoder_state` carries the saved
+    /// [`RarLegacyStreamDecoder`] snapshot blob when this entry was
+    /// in flight at the previous checkpoint (`docs/PLAN_rar3.md`
+    /// §F1). When `Some`, the sink uses `begin_entry_resume` to
+    /// replay the on-disk prefix and seed its running CRC, and
+    /// the decoder is constructed via [`RarLegacyStreamDecoder::resume`]
+    /// so the suffix emitted matches the original run byte-for-byte.
+    /// When `None`, the entry restarts from byte 0 (the §E1
+    /// fallback).
+    #[allow(clippy::too_many_arguments)]
     fn extract_legacy_compressed_entry<F>(
         &self,
         idx: u32,
         entry: &LegacyEntryRecord,
+        resume_offset: u64,
+        resume_decoder_state: Option<&[u8]>,
         sink: &mut RarSink,
         puncher: &dyn PunchHole,
         callback: &mut F,
@@ -1261,8 +1287,25 @@ impl<'a> RarPipeline<'a> {
         }
         self.wait_for_range(data_offset, data_end)?;
 
-        let begin_outcome = sink
-            .begin_entry(
+        // §F1 resume: seed the sink's running CRC from the
+        // already-written on-disk prefix when a decoder-state blob
+        // is available. The blob's `decoded_pos` and the sink's
+        // `resume_offset` agree by construction — they both track
+        // "bytes already emitted to the sink at the moment of the
+        // last checkpoint". Without a blob, restart fresh.
+        let begin_outcome = if resume_decoder_state.is_some() && resume_offset > 0 {
+            sink.begin_entry_resume(
+                idx,
+                &entry.name,
+                entry.is_directory,
+                entry.unpacked_size,
+                Some(entry.expected_crc32),
+                None,
+                resume_offset,
+            )
+            .map_err(RarPipelineError::Sink)?
+        } else {
+            sink.begin_entry(
                 idx,
                 &entry.name,
                 entry.is_directory,
@@ -1270,7 +1313,8 @@ impl<'a> RarPipeline<'a> {
                 Some(entry.expected_crc32),
                 None, // legacy FILE_HEAD has no BLAKE2sp slot
             )
-            .map_err(RarPipelineError::Sink)?;
+            .map_err(RarPipelineError::Sink)?
+        };
 
         if matches!(begin_outcome, BeginEntryOutcome::Directory { .. }) {
             // Directory marker: a compressed-method byte on a
@@ -1308,15 +1352,49 @@ impl<'a> RarPipeline<'a> {
                 .map_err(RarPipelineError::Sparse)?;
         }
 
-        let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(compressed));
-        let mut decoder = RarLegacyStreamDecoder::new(
-            src,
-            packed_size,
-            entry.unpacked_size,
-            entry.method,
-            entry.dict_capacity,
-        )
-        .map_err(decode_err_to_rar)?;
+        let mut decoder = if let Some(blob) = resume_decoder_state {
+            // §F1 resume: the blob carries the snapshot taken at
+            // the previous checkpoint. `source_cursor_from_blob`
+            // is always 0 for the legacy decoder (round-one
+            // re-buffers the full payload to deterministically
+            // re-run [`decode_payload`]), but we honour the
+            // pipeline's standard "slice from cursor" shape for
+            // symmetry with the RAR5 path.
+            let cursor =
+                RarLegacyStreamDecoder::source_cursor_from_blob(blob).map_err(decode_err_to_rar)?;
+            if cursor > packed_size {
+                return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: data_offset,
+                    reason: format!(
+                        "legacy RAR resume blob source cursor {cursor} exceeds \
+                         packed_size {packed_size}"
+                    ),
+                }));
+            }
+            let cursor_usz = cursor as usize;
+            let tail = compressed.split_off(cursor_usz);
+            let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(tail));
+            RarLegacyStreamDecoder::resume(
+                src,
+                packed_size,
+                entry.unpacked_size,
+                entry.method,
+                entry.dict_capacity,
+                blob,
+            )
+            .map_err(decode_err_to_rar)?
+        } else {
+            debug_assert_eq!(resume_offset, 0);
+            let src: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(compressed));
+            RarLegacyStreamDecoder::new(
+                src,
+                packed_size,
+                entry.unpacked_size,
+                entry.method,
+                entry.dict_capacity,
+            )
+            .map_err(decode_err_to_rar)?
+        };
 
         let mut staging: Vec<u8> = Vec::with_capacity(64 * 1024);
         loop {
@@ -1326,12 +1404,11 @@ impl<'a> RarPipeline<'a> {
             if !staging.is_empty() {
                 sink.write_entry(&staging).map_err(RarPipelineError::Sink)?;
                 staging.clear();
-                // Round-one (§E1) emits no resume blob; Phase F
-                // (§F1) wires one through `decoder_state_into`.
+                let blob = decoder.decoder_state();
                 callback(&RarPipelineEvent::InEntryProgressCompressed {
                     index: idx,
                     bytes_written: sink.current_entry_offset(),
-                    decoder_state: None,
+                    decoder_state: blob,
                 })
                 .map_err(RarPipelineError::Aborted)?;
             }

@@ -13,10 +13,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use peel::coordinator::{run, CoordinatorConfig, CoordinatorError, OutputTarget, RunArgs};
+use peel::coordinator::{
+    run, CoordinatorConfig, CoordinatorError, OutputTarget, ProgressEvent, RunArgs,
+};
 use peel::decode::DecoderRegistry;
 use peel::download::RetryConfig;
 use peel::http::{Client, ClientConfig};
@@ -173,6 +176,27 @@ fn make_args(server: &MockServer, output: OutputTarget, config: CoordinatorConfi
     }
 }
 
+fn make_args_with_callbacks(
+    server: &MockServer,
+    output: OutputTarget,
+    config: CoordinatorConfig,
+    kill_switch: Option<Arc<AtomicBool>>,
+    progress: Option<peel::coordinator::ProgressFn>,
+) -> RunArgs {
+    RunArgs {
+        url: format!("{}/dataset.rar", server.base_url()),
+        additional_urls: Vec::new(),
+        output,
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress,
+        progress_state: Some(peel::progress::ProgressState::new()),
+        kill_switch,
+        io_backend: None,
+    }
+}
+
 fn three_file_legacy_stored() -> (Vec<u8>, Vec<LegacyEntrySpec>) {
     let entries = vec![
         LegacyEntrySpec::stored("alpha.txt", b"hello, legacy RAR".to_vec()),
@@ -324,6 +348,76 @@ fn malformed_compressed_legacy_payload_surfaces_decoder_diagnostic() {
         "diagnostic should name the legacy decoder, got chain: {combined}"
     );
     assert!(matches!(err, CoordinatorError::Rar(_)), "got {err:?}");
+}
+
+/// §F1 STORED-entry mid-entry crash-resume: build a 4 MiB
+/// single-entry STORED legacy archive, run the coordinator with
+/// a kill-switch that fires after the first `CheckpointWritten`
+/// event, then resume in a fresh run. The on-disk extraction
+/// must be byte-identical to the clean run. Sister of
+/// `tests/test_coordinator_rar.rs::crash_resume_mid_entry_produces_identical_output`
+/// but for legacy archives — proves the
+/// `entries_completed`/`current_entry_offset` resume machinery
+/// from §A2b still works across the §E1/§F1 pipeline reshuffle.
+///
+/// The compressed-entry sibling is bottlenecked on a curated
+/// legacy fixture whose decoded size exceeds the streaming
+/// adapter's 64 KiB drain chunk; the in-tree fixtures are all
+/// ≤4 KiB so the live `decode_step` loop never exposes a
+/// mid-drain boundary. The §F1 snapshot/resume contract itself
+/// is covered exhaustively by the
+/// `synthetic_blob_resume_round_trips_at_every_decoded_pos`
+/// unit test in
+/// `src/decode/rar_legacy/stream.rs` (every reachable
+/// `decoded_pos` value, byte-by-byte).
+#[test]
+fn crash_resume_mid_entry_produces_identical_output() {
+    let payload: Vec<u8> = (0..4u32 * 1024 * 1024).map(|i| (i * 31) as u8).collect();
+    let entries = vec![LegacyEntrySpec::stored("big.bin", payload.clone())];
+    let body = build_legacy_archive(0, &entries);
+    let server = MockServer::start(ok_handler(body));
+
+    let work = unique_dir("crash_resume");
+    let _g = CleanupDir(work.clone());
+
+    let kill = Arc::new(AtomicBool::new(false));
+    let kill_for_cb = Arc::clone(&kill);
+    let counter = Arc::new(AtomicU64::new(0));
+    let counter_for_cb = Arc::clone(&counter);
+    let progress: peel::coordinator::ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            let n = counter_for_cb.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= 1 {
+                kill_for_cb.store(true, Ordering::Release);
+            }
+        }
+    });
+    let args = make_args_with_callbacks(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+        Some(Arc::clone(&kill)),
+        Some(progress),
+    );
+    match run(args) {
+        Err(CoordinatorError::Aborted { .. }) => {}
+        other => panic!("expected Aborted, got {other:?}"),
+    }
+
+    let args2 = make_args_with_callbacks(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+        None,
+        None,
+    );
+    run(args2).expect("resume run");
+    let on_disk = fs::read(work.join("big.bin")).expect("read big.bin");
+    assert_eq!(on_disk.len(), payload.len());
+    assert_eq!(
+        on_disk, payload,
+        "resumed extraction must be byte-identical"
+    );
 }
 
 #[test]
