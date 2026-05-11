@@ -306,7 +306,103 @@ for itself everywhere the wire-time is non-trivial, which covers
 every real production scenario. (Both rar rows skip rather than
 fail when `unrar` is missing from `PATH`.)
 
-### When to reach for `peel`
+## Benchmarks: peel's decoder vs the reference CLI (local files)
+
+The two grids above bake HTTP cost into both sides — useful for the
+"is the streaming machinery a net win?" question, but the per-format
+ratio gets blurred by the network. This grid strips HTTP out: both
+peel and the reference CLI decode the same fixture from disk, so the
+ratio reflects the decoder kernel (plus, in the cold column, the
+reference CLI's `fork`/`execve`/`dlopen` startup — a real cost the
+user pays every time they type the command).
+
+Same LCG-generated near-incompressible payload as the streaming
+grids. Two raw-payload sizes per format: 10 MiB and 100 MiB, each
+in `cold` (one-shot) and `warm` (one prior run, then time the next)
+variants. Apple M4 Max / macOS 26.3 with the homebrew `zstd 1.5.7`,
+`xz 5.8.3`, `lz4 1.10.0`, and bsdtar 3.5.3 / `gzip` builtins.
+Single-run laptop numbers — replace with the next archived primary-
+host run from `docs/bench-results/`. Reproduce with:
+
+```sh
+cargo test --release --test test_bench_decode_local -- \
+  --ignored --nocapture --test-threads=1
+```
+
+### Wall-clock ratio: `peel` ÷ reference CLI
+
+Lower is better; **bold** = `peel` is faster than the reference CLI.
+
+| Format | 10 MiB · cold | 10 MiB · warm | 100 MiB · cold | 100 MiB · warm |
+| --- | --- | --- | --- | --- |
+| `zstd-raw` | **0.14×** | **0.44×** | **0.62×** | **0.78×** |
+| `tar.zst` | **0.14×** | **0.14×** | **0.30×** | **0.37×** |
+| `xz-raw` | **0.80×** | **0.81×** | **0.90×** | **0.92×** |
+| `tar.xz` | **0.74×** | **0.74×** | **0.90×** | **0.89×** |
+| `gz-raw` | **0.30×** | **0.35×** | 1.58× | 1.25× |
+| `tar.gz` | **0.23×** | **0.31×** | **0.91×** | **0.89×** |
+| `lz4-raw` | **0.08×** | **0.06×** | **0.36×** | **0.23×** |
+| `tar.lz4` | **0.08×** | **0.05×** | **0.17×** | **0.15×** |
+| `tar` | **0.07×** | **0.08×** | **0.30×** | **0.30×** |
+
+Geomean at 100 MiB · warm: **0.52×** across all nine formats.
+
+### Reading the grid
+
+The 10 MiB columns are dominated by per-invocation overhead — the
+reference CLI pays `fork`+`execve`+dynamic-linker resolution +
+`dlopen` of the codec library on every run; peel pays none of that
+because the decoder is in-process. The `cold` column also includes
+peel's one-time table-initialisation cost (LZMA probability tables,
+gzip Huffman preset, zstd state-machine setup); the `warm` column
+shows the decode kernel without that init. This is why every 10 MiB
+row is dramatically under 1× — at that size the comparison is mostly
+"do you pay to start a process or not." Real-world: yes, you do.
+
+The 100 MiB columns are where the per-format decoder story lives.
+`tar.lz4` and plain `tar` lead because the codec work is near-zero
+and peel saves the bash-pipe-plus-fork/exec/dlopen overhead the
+reference pipeline pays per stage. `tar.zst` and `zstd-raw` come
+next: peel's hand-rolled zstd block decoder
+([`PLAN_zstd_throughput.md`](docs/PLAN_zstd_throughput.md)) is
+within striking distance of upstream `zstd`. `tar.xz` and `xz-raw`
+sit closest to parity at ~0.9× — LZMA decode is the compute
+floor, and peel's
+hand-rolled xz decoder
+([`PLAN_xz_liblzma_phase_f.md`](docs/PLAN_xz_liblzma_phase_f.md))
+is essentially matched with `liblzma` in CPU terms.
+
+`gz-raw` at 100 MiB is the outlier — **1.25× warm, peel slower**.
+This is the optimisation queue item the bench was designed to
+surface ([`PLAN_decoder_throughput_vs_cli.md`](docs/PLAN_decoder_throughput_vs_cli.md)
+§5): peel's hand-rolled DEFLATE decoder is single-threaded and
+hasn't had the parallel-member round that
+[`PLAN_gzip_throughput.md`](docs/PLAN_gzip_throughput.md) lays out.
+The tar-wrapped row (`tar.gz`) is at 0.89× because peel reclaims
+the lead via the same skip-the-pipe shape — but the underlying
+decode kernel is the bottleneck, and it's the next thing to look at.
+
+### Why aren't `.zip`, `.7z`, and `.rar` here?
+
+Those formats route through random-access orchestrators in
+[`src/zip/`](src/zip/), [`src/sevenz/`](src/sevenz/), and
+[`src/rar/`](src/rar/), and those pipelines are tightly coupled to
+peel's HTTP-side
+[`BlockingSparseReader`](src/coordinator.rs) source — they expect a
+chunked, range-fetched archive, not a plain `File`. peel's local-
+file coordinator
+([`src/coordinator/local.rs`](src/coordinator/local.rs)) surfaces a
+typed `CoordinatorError::NoDecoder` for those formats today, with a
+"use the HTTP path for now" message. Adding a `File + Seek` entry
+point to each random-access pipeline is its own design — the
+local-file plan
+([`docs/PLAN_local_file_extract.md`](docs/PLAN_local_file_extract.md))
+§2 step 5 notes the discrepancy and defers it. The download-then-extract
+grid above already covers `.zip`, `.7z`, `rar5`, and `rar3` over
+HTTP end-to-end against the same reference binaries, so there's a
+real head-to-head — just not a HTTP-stripped one.
+
+## When to reach for `peel`
 
 `peel` is the right choice in every case the bench grids cover —
 it ties or beats `curl | tool | tar` across the streaming grid,
