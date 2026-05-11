@@ -809,10 +809,16 @@ impl Model {
             // 14) * size`, preserving the low 14 bits. Using the
             // n-ary path here diverges from any 7z-emitted stream on
             // every binary-context escape. See
-            // [`RangeDecoder::decode_bit_ppmd7`].
+            // [`RangeDecoder::decode_bit_bin`]. The range
+            // decoder branches internally on `variant` —
+            // 7z uses the dedicated `Range_DecodeBit_7z` math
+            // described above; RAR uses `get_threshold +
+            // decode(0/prob, prob/BIN_SCALE - prob)` matching
+            // libarchive's `Range_DecodeBit_RAR`. The model
+            // layer stays variant-agnostic.
             let prob_idx = self.bin_summ_index();
             let prob = u32::from(self.bin_summ[prob_idx]);
-            let bit = rc.decode_bit_ppmd7(prob)?;
+            let bit = rc.decode_bit_bin(prob)?;
             if bit == 0 {
                 self.bin_summ[prob_idx] = ppmd_update_prob_0(prob) as u16;
                 let one_state = Self::ctx_one_state_off(self.min_context);
@@ -1614,13 +1620,13 @@ impl Model {
             let prob = u32::from(self.bin_summ[prob_idx]);
             let one_state = Self::ctx_one_state_off(self.min_context);
             if self.state_symbol(one_state) == symbol {
-                rc.encode_bit_ppmd7(prob, 0);
+                rc.encode_bit_bin(prob, 0);
                 self.bin_summ[prob_idx] = ppmd_update_prob_0(prob) as u16;
                 self.found_state = one_state;
                 self.update_bin();
                 return;
             }
-            rc.encode_bit_ppmd7(prob, 1);
+            rc.encode_bit_bin(prob, 1);
             let new_prob = ppmd_update_prob_1(prob);
             self.bin_summ[prob_idx] = new_prob as u16;
             self.init_esc = u32::from(K_EXP_ESCAPE[(new_prob >> 10) as usize]);

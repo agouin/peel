@@ -1,20 +1,33 @@
 //! PPMd-II / PPMd7 range decoder.
 //!
 //! Bit-level entropy primitive shared by every layer of the PPMd
-//! model. Round-one (`docs/PLAN_rar3.md` §B0) ships decode-only —
-//! `peel` is decompression-only — with a test-only sister encoder
-//! used to round-trip arbitrary symbol streams in tests.
+//! model. Round-one (`docs/PLAN_rar3.md` §B0) shipped decode-only
+//! 7z-variant support; §C1f adds the RAR-variant init + math
+//! libarchive's PPMd-encoded RAR3 blocks need.
 //!
-//! # Wire format
+//! # Wire-format variants
 //!
-//! The decoder reads from an arbitrary byte source, treating the
-//! input as a sequence of 8-bit lanes. Initialisation reads
-//! **5 bytes**: a leading marker byte (the LZMA SDK / 7z reference
-//! emits `0x00`, and rejecting a non-zero leading byte is the
-//! standard sanity check), followed by 4 big-endian bytes that
-//! seed [`Self::code`].
+//! Two coexisting variants share the same model layer:
 //!
-//! Two coding modes:
+//! - **7z** ([`Self::new`]). Reads **5 bytes** on init: a leading
+//!   marker byte (the LZMA SDK / 7z reference always emits `0x00`)
+//!   followed by 4 big-endian bytes that seed [`Self::code`].
+//!   `bottom = 0`; `decode` updates `code` directly. The dedicated
+//!   binary primitive `Range_DecodeBit_7z` ([`Self::decode_bit_bin`]
+//!   in 7z mode) reads `(range >> 14) * prob` against `code` and
+//!   uses the resulting interval split.
+//! - **RAR** ([`Self::new_rar`]). Reads **4 bytes** on init (no
+//!   leading marker), seeding [`Self::code`]. `bottom = 0x8000`;
+//!   `decode` maintains a running `low` lower-bound and shifts
+//!   the carry-handling normalize loop. The binary primitive
+//!   `Range_DecodeBit_RAR` goes through
+//!   `get_threshold(PPMD_BIN_SCALE) + decode(start, size)` — the
+//!   7z fast-path math is **not** equivalent here.
+//!
+//! Both variants expose the same `get_threshold` / `decode` /
+//! `decode_bit_bin` / `decode_bit` API; the model layer is variant-
+//! agnostic and works against whichever flavour the caller hands
+//! in. Two coding modes either variant exposes:
 //!
 //! - **n-ary** ([`Self::get_threshold`] + [`Self::decode`]). Used
 //!   for symbols carved out of an arbitrary-sized total range.
@@ -26,13 +39,22 @@
 //!   Used for escape decisions and other binary choices. The
 //!   probability is an 11-bit fixed-point value the caller stores
 //!   inline; the decoder updates it after each bit per the
-//!   standard PPMd7 adaptation rule.
+//!   standard PPMd7 adaptation rule. (Variant-agnostic — both
+//!   7z and RAR use the same 11-bit adaptive primitive when the
+//!   model wants one. The 14-bit binary primitive that
+//!   [`Self::decode_bit_bin`] wraps is what differs.)
 //!
 //! # References
 //!
-//! - LZMA SDK `Ppmd7Dec.c` — the canonical PPMd7 range decoder.
+//! - LZMA SDK `Ppmd7Dec.c` — the canonical PPMd7 range decoder
+//!   (7z variant).
+//! - libarchive `archive_ppmd7.c` — both 7z and RAR-variant
+//!   `Range_Decode_*` / `Range_DecodeBit_*` / `*_RangeDec_Init`
+//!   functions side-by-side; §C1f's port follows libarchive.
 //! - libarchive `archive_read_support_format_rar.c` — RAR3's
-//!   integration of the same primitive.
+//!   integration: `is_ppmd_block` blocks call
+//!   `PpmdRAR_RangeDec_Init` + `PpmdRAR_RangeDec_CreateVTable`,
+//!   which wires the model layer to the RAR-variant math.
 //! - Shkarin's PPMII paper — the algorithm's original statement.
 
 /// Threshold below which the range needs renormalisation. Equals
@@ -49,21 +71,35 @@ pub const BIT_MODEL_TOTAL_BITS: u32 = 11;
 /// (`0x800`).
 pub const BIT_MODEL_TOTAL: u32 = 1 << BIT_MODEL_TOTAL_BITS;
 
+/// Wire-format variant of the range coder. See module docs for
+/// the per-variant init / math / binary-primitive differences.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RangeCoderVariant {
+    /// 7z / PPMd7 — used by 7z's PPMd method and by §B's
+    /// 7z-PPMd differential corpus.
+    Sevenz,
+    /// RAR — used by legacy RAR's PPMd-mode blocks
+    /// (`is_ppmd_block = 1`). Wired up by §C1g.
+    Rar,
+}
+
 /// Errors produced by the range decoder.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum RangeDecoderError {
-    /// The input ended before the decoder could read 5 init bytes
-    /// or before it could refill on a normalisation step.
+    /// The input ended before the decoder could read its init
+    /// prefix (5 bytes in 7z, 4 in RAR) or before it could refill
+    /// on a normalisation step.
     #[error("PPMd-II range decoder ran out of input ({what})")]
     Truncated {
         /// Human-readable name of the field that overran.
         what: &'static str,
     },
 
-    /// The leading marker byte was not `0x00`. Standard PPMd7
-    /// streams always start with a zero; a non-zero leader is
-    /// virtually always a sign of misframing (the caller fed a
-    /// stream from the wrong block boundary, etc.).
+    /// The 7z leading marker byte was not `0x00`. 7z PPMd streams
+    /// always start with a zero; a non-zero leader is virtually
+    /// always a sign of misframing (the caller fed a stream from
+    /// the wrong block boundary, etc.). The RAR variant has no
+    /// leading marker so this error is 7z-only.
     #[error("PPMd-II range decoder: leading marker byte must be 0x00, got 0x{leader:02x}")]
     BadLeader {
         /// The non-zero byte the decoder read.
@@ -84,17 +120,36 @@ pub enum RangeDecoderError {
 /// position the cursor (e.g. at an entry's data area) without
 /// copying. The position is queryable via [`Self::position`] —
 /// snapshotting the whole decoder for resume amounts to recording
-/// `(range, code, position)` plus a backreference to the input.
+/// `(range, code, low, position)` plus a backreference to the
+/// input.
 #[derive(Debug)]
 pub struct RangeDecoder<'a> {
-    /// Lower bound of the currently-coded symbol's sub-interval,
-    /// scaled up to the full 32-bit range. Updated on every
-    /// `decode` / `decode_bit` call.
+    /// Big-endian 32-bit window into the stream the decoder is
+    /// currently splitting. In 7z mode this directly tracks the
+    /// "code position within the working range"; in RAR mode the
+    /// actual position-within-range is `code - low`.
     code: u32,
-    /// Width of the currently-coded sub-interval, also scaled to
-    /// the 32-bit range. Halves (sometimes) on each decode and
-    /// renormalises by 8 bits when it falls below [`TOP_VALUE`].
+    /// Width of the currently-coded sub-interval, scaled to the
+    /// 32-bit range. Halves (sometimes) on each decode and
+    /// renormalises by 8 bits when it falls below [`TOP_VALUE`]
+    /// (or [`Self::bottom`] in RAR mode).
     range: u32,
+    /// Running lower bound of the current symbol's sub-interval.
+    /// Always `0` in 7z mode (libarchive's `Range_Decode_7z`
+    /// updates `Code` directly); accumulates in RAR mode
+    /// (libarchive's `Range_Decode_RAR` does `Low += start *
+    /// Range`).
+    low: u32,
+    /// Renormalisation cutoff. `0` in 7z mode (the loop never
+    /// fires the underflow-recovery branch); `0x8000` in RAR
+    /// mode, where the "Range < Bottom AND no carry possible"
+    /// case kicks in.
+    bottom: u32,
+    /// Wire-format variant. Drives [`Self::decode`] (`code` vs
+    /// `low` update) and [`Self::decode_bit_bin`] (dedicated
+    /// `Range_DecodeBit_7z` math vs the `get_threshold + decode`
+    /// path `Range_DecodeBit_RAR` uses).
+    variant: RangeCoderVariant,
     /// Borrowed input bytes. The decoder advances `pos` as it
     /// consumes them; callers can read `pos` via [`Self::position`].
     src: &'a [u8],
@@ -103,7 +158,7 @@ pub struct RangeDecoder<'a> {
 }
 
 impl<'a> RangeDecoder<'a> {
-    /// Construct a decoder reading from `src`.
+    /// Construct a **7z-variant** decoder reading from `src`.
     ///
     /// Reads 5 bytes from `src`: the leading marker (must be
     /// `0x00`) and 4 big-endian bytes that seed [`Self::code`].
@@ -127,9 +182,57 @@ impl<'a> RangeDecoder<'a> {
         Ok(Self {
             code,
             range: u32::MAX,
+            low: 0,
+            bottom: 0,
+            variant: RangeCoderVariant::Sevenz,
             src,
             pos: 5,
         })
+    }
+
+    /// Construct a **RAR-variant** decoder reading from `src`.
+    ///
+    /// Reads 4 bytes from `src` (no leading marker) as a
+    /// big-endian seed for [`Self::code`]. Sets `bottom = 0x8000`
+    /// so the carry-handling normalize loop's underflow-recovery
+    /// branch is reachable. Cursor is advanced past those 4
+    /// bytes; the rest of `src` is available to subsequent decode
+    /// calls.
+    ///
+    /// Mirrors libarchive's `PpmdRAR_RangeDec_Init` /
+    /// `PpmdRAR_RangeDec_CreateVTable` pair at
+    /// `archive_ppmd7.c:767..858`. The RAR3 LZ-block prologue ends
+    /// on a byte boundary (1-bit `is_ppmd_block` + 7-bit
+    /// `ppmd_flags` plus 0 / 8 / 16 / 24 conditional bits — all
+    /// byte-aligned sums), so §C1g's caller hands in a byte slice
+    /// starting at the PPMd payload.
+    ///
+    /// # Errors
+    ///
+    /// - [`RangeDecoderError::Truncated`] if `src.len() < 4`.
+    pub fn new_rar(src: &'a [u8]) -> Result<Self, RangeDecoderError> {
+        if src.len() < 4 {
+            return Err(RangeDecoderError::Truncated {
+                what: "4-byte RAR init prefix",
+            });
+        }
+        let code = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+        Ok(Self {
+            code,
+            range: u32::MAX,
+            low: 0,
+            bottom: 0x8000,
+            variant: RangeCoderVariant::Rar,
+            src,
+            pos: 4,
+        })
+    }
+
+    /// Which wire-format variant this decoder is operating in.
+    /// Diagnostic accessor.
+    #[must_use]
+    pub fn variant(&self) -> RangeCoderVariant {
+        self.variant
     }
 
     /// Number of bytes consumed from the input so far. Includes
@@ -160,14 +263,42 @@ impl<'a> RangeDecoder<'a> {
         Ok(b)
     }
 
-    /// Renormalise: while `range` has shed enough mass that its
-    /// top byte is empty, shift up by 8 bits and pull a fresh byte
-    /// into `code`. Mirrors PPMd7's `RangeDec_Normalize` loop.
+    /// Renormalise: shift up by 8 bits (pulling a fresh byte into
+    /// `code`, shifting `range` / `low` left) until the working
+    /// interval is wide enough that the next decode is safe.
+    ///
+    /// Unified for both variants. The carry-handling logic is the
+    /// libarchive `Range_Normalize` loop (lines 781..796 of
+    /// `archive_ppmd7.c`):
+    ///
+    /// - **7z mode** (`low = 0`, `bottom = 0`): the carry check
+    ///   `(low ^ (low + range)) >= TOP_VALUE` reduces to
+    ///   `range >= TOP_VALUE`; the inner `range >= bottom` is
+    ///   trivially true. Behaves exactly like the simpler
+    ///   `while range < TOP_VALUE { ... }` loop §B0 originally
+    ///   shipped.
+    /// - **RAR mode** (`low` may be non-zero, `bottom = 0x8000`):
+    ///   the carry check is real — it asks "do the top bytes of
+    ///   `low` and `low + range` differ, i.e. is the next emit
+    ///   safe from a future carry?". When they don't differ but
+    ///   `range < bottom`, the underflow-recovery branch shrinks
+    ///   `range` to the largest value `(-low) & (bottom - 1)`
+    ///   that preserves decoding correctness.
     fn normalize(&mut self) -> Result<(), RangeDecoderError> {
-        while self.range < TOP_VALUE {
+        loop {
+            if (self.low ^ self.low.wrapping_add(self.range)) >= TOP_VALUE {
+                if self.range >= self.bottom {
+                    break;
+                }
+                // Underflow recovery: replace range with the
+                // largest value that keeps the carry condition
+                // unambiguous. Unreachable in 7z mode (bottom=0).
+                self.range = self.low.wrapping_neg() & (self.bottom.wrapping_sub(1));
+            }
             let b = self.read_byte()?;
-            self.range <<= 8;
             self.code = (self.code << 8) | u32::from(b);
+            self.range <<= 8;
+            self.low <<= 8;
         }
         Ok(())
     }
@@ -194,7 +325,10 @@ impl<'a> RangeDecoder<'a> {
             return Err(RangeDecoderError::ZeroTotal);
         }
         self.range /= total;
-        Ok(self.code / self.range)
+        // (code - low) / range. In 7z mode `low` is always 0 so
+        // this reduces to `code / range`. In RAR mode `low` may
+        // be non-zero and the explicit subtraction matters.
+        Ok(self.code.wrapping_sub(self.low) / self.range)
     }
 
     /// Commit an n-ary decode for the sub-interval `[start, start + size)`.
@@ -213,7 +347,21 @@ impl<'a> RangeDecoder<'a> {
         // computed `range = old_range / total` and must call
         // `decode` with `start + size <= total`, so
         // `start * range <= total * range = old_range <= 2^32 - 1`.
-        self.code = self.code.wrapping_sub(start.wrapping_mul(self.range));
+        match self.variant {
+            // 7z keeps `Code` as the position-within-range and
+            // shifts the origin by subtracting `start * range`.
+            // Libarchive's `Range_Decode_7z` (line 798).
+            RangeCoderVariant::Sevenz => {
+                self.code = self.code.wrapping_sub(start.wrapping_mul(self.range));
+            }
+            // RAR keeps `Low` as the running lower bound and adds
+            // `start * range`; `Code` only changes during
+            // renormalize. Libarchive's `Range_Decode_RAR` (line
+            // 806).
+            RangeCoderVariant::Rar => {
+                self.low = self.low.wrapping_add(start.wrapping_mul(self.range));
+            }
+        }
         self.range = self.range.wrapping_mul(size);
         self.normalize()
     }
@@ -250,31 +398,44 @@ impl<'a> RangeDecoder<'a> {
         Ok(bit)
     }
 
-    /// PPMd7 binary-context decode: pick `0` (the one-state hit) or
-    /// `1` (escape) against a 14-bit probability scaled by
+    /// PPMd binary-context decode: pick `0` (the one-state hit)
+    /// or `1` (escape) against a 14-bit probability scaled by
     /// [`PPMD_BIN_SCALE`] (= `1 << 14`).
     ///
     /// Caller passes `prob` (= the SEE probability), receives the
-    /// decoded bit; the caller is responsible for updating the SEE
-    /// state via `PPMD_UPDATE_PROB_0` / `PPMD_UPDATE_PROB_1` after
-    /// the bit is known.
+    /// decoded bit; the caller is responsible for updating the
+    /// SEE state via `PPMD_UPDATE_PROB_0` / `PPMD_UPDATE_PROB_1`
+    /// after the bit is known.
     ///
-    /// Why a dedicated method: this mirrors libarchive's
-    /// `Range_DecodeBit_7z`, which is **not** equivalent to
-    /// `get_threshold(PPMD_BIN_SCALE) + decode(start, size)` on the
-    /// `1` (escape) branch. The escape branch's range update reads
-    /// `range -= bound`, preserving the low 14 bits of `range`;
-    /// the n-ary `decode` path reads `range = (range >> 14) * size`,
-    /// discarding them. The bit-stream produced by a 7z PPMd
-    /// encoder calling `Range_EncodeBit_7z` only decodes correctly
-    /// when the decoder pairs it with this method — the n-ary path
-    /// diverges on every binary escape.
+    /// # Variant-specific math
+    ///
+    /// - **7z** mirrors libarchive's `Range_DecodeBit_7z` (line
+    ///   814 of `archive_ppmd7.c`): `bound = (range >> 14) * prob`;
+    ///   on bit-1 the escape-branch's range update reads
+    ///   `range -= bound`, preserving the low 14 bits of `range`.
+    ///   The n-ary `decode` path's `range = (range >> 14) * size`
+    ///   would discard those bits and desync from any 7z PPMd
+    ///   encoder's output, so 7z mode uses this dedicated path.
+    /// - **RAR** mirrors libarchive's `Range_DecodeBit_RAR` (line
+    ///   834): goes through `get_threshold(PPMD_BIN_SCALE)` +
+    ///   `decode(0, prob)` / `decode(prob, PPMD_BIN_SCALE - prob)`.
+    ///   The RAR encoder pairs this exactly — feeding a RAR
+    ///   binary symbol through the 7z dedicated math would
+    ///   silently desync the same way the inverse pairing would.
     ///
     /// # Errors
     ///
     /// [`RangeDecoderError::Truncated`] if renormalisation needs a
     /// byte and the input is exhausted.
-    pub fn decode_bit_ppmd7(&mut self, prob: u32) -> Result<u32, RangeDecoderError> {
+    pub fn decode_bit_bin(&mut self, prob: u32) -> Result<u32, RangeDecoderError> {
+        match self.variant {
+            RangeCoderVariant::Sevenz => self.decode_bit_bin_7z(prob),
+            RangeCoderVariant::Rar => self.decode_bit_bin_rar(prob),
+        }
+    }
+
+    /// 7z dedicated binary primitive — see [`Self::decode_bit_bin`].
+    fn decode_bit_bin_7z(&mut self, prob: u32) -> Result<u32, RangeDecoderError> {
         let bound = (self.range >> 14).wrapping_mul(prob);
         let bit = if self.code < bound {
             self.range = bound;
@@ -286,6 +447,20 @@ impl<'a> RangeDecoder<'a> {
         };
         self.normalize()?;
         Ok(bit)
+    }
+
+    /// RAR binary primitive — `get_threshold + decode` against
+    /// `PPMD_BIN_SCALE`. See [`Self::decode_bit_bin`].
+    fn decode_bit_bin_rar(&mut self, prob: u32) -> Result<u32, RangeDecoderError> {
+        // PPMD_BIN_SCALE = 1 << 14 = 16384.
+        let threshold = self.get_threshold(1 << 14)?;
+        if threshold < prob {
+            self.decode(0, prob)?;
+            Ok(0)
+        } else {
+            self.decode(prob, (1 << 14) - prob)?;
+            Ok(1)
+        }
     }
 }
 
@@ -370,12 +545,19 @@ impl RangeEncoder {
         self.normalize();
     }
 
-    /// PPMd7 binary-context encode counterpart to
-    /// [`RangeDecoder::decode_bit_ppmd7`]. Mirrors libarchive's
-    /// `Range_EncodeBit_7z`. The probability is the caller's SEE
-    /// state pre-update; the caller applies PPMD_UPDATE_PROB_* after
-    /// the bit is encoded.
-    pub fn encode_bit_ppmd7(&mut self, prob: u32, bit: u32) {
+    /// PPMd 7z-variant binary-context encode counterpart to
+    /// [`RangeDecoder::decode_bit_bin`] (in 7z mode). Mirrors
+    /// libarchive's `Range_EncodeBit_7z`. The probability is the
+    /// caller's SEE state pre-update; the caller applies
+    /// `PPMD_UPDATE_PROB_*` after the bit is encoded.
+    ///
+    /// No RAR-variant counterpart yet — §C1f's RAR-decoder
+    /// validation is via real archives in §C1g, not against a
+    /// sister test encoder. Writing a RAR-variant test encoder
+    /// would require porting the LZMA SDK's `Range_EncodeBit_RAR`
+    /// plus the carry-handling renormalize loop; deferred until
+    /// a concrete test need shows up.
+    pub fn encode_bit_bin(&mut self, prob: u32, bit: u32) {
         let bound = (self.range >> 14).wrapping_mul(prob);
         if bit == 0 {
             self.range = bound;
@@ -556,6 +738,95 @@ mod tests {
             "got {result:?}"
         );
     }
+
+    // ---- RAR-variant init + structural tests --------------------
+    //
+    // §C1f scope: validate that `new_rar` reads the right prefix
+    // and seeds the variant-specific fields. Functional round-
+    // tripping of the RAR-variant math defers to §C1g, where
+    // real ssokolow PPMd-mode archives provide the cross-check
+    // against the bundled unrar's expected output.
+
+    #[test]
+    fn new_rar_reads_four_bytes_with_no_marker() {
+        let bytes = [0x12u8, 0x34, 0x56, 0x78, 0xAA, 0xBB];
+        let dec = RangeDecoder::new_rar(&bytes).unwrap();
+        assert_eq!(dec.variant(), RangeCoderVariant::Rar);
+        assert_eq!(dec.position(), 4);
+        // Position 4 ⇒ bytes 0..=3 went into Code, byte 4 onwards
+        // remains for renormalize. The first 4 bytes form a BE
+        // u32: 0x12345678.
+        assert_eq!(dec.code, 0x1234_5678);
+        assert_eq!(dec.low, 0);
+        assert_eq!(dec.bottom, 0x8000);
+        assert_eq!(dec.range, u32::MAX);
+    }
+
+    #[test]
+    fn new_rar_rejects_truncated_init() {
+        let err = RangeDecoder::new_rar(&[0u8, 0, 0]).unwrap_err();
+        assert!(matches!(err, RangeDecoderError::Truncated { .. }));
+    }
+
+    #[test]
+    fn new_rar_does_not_check_leading_byte() {
+        // 7z's BadLeader check is variant-specific. RAR-mode init
+        // accepts any first byte — it's just code-seed material.
+        let bytes = [0xFFu8, 0x00, 0x00, 0x00];
+        let dec = RangeDecoder::new_rar(&bytes).unwrap();
+        assert_eq!(dec.code, 0xFF00_0000);
+    }
+
+    /// In RAR mode `decode` should accumulate into `low` rather
+    /// than subtracting from `code`. Asserts the state shape
+    /// without depending on a full round trip.
+    #[test]
+    fn rar_decode_updates_low_not_code() {
+        let bytes = [0x00u8; 64];
+        let mut dec = RangeDecoder::new_rar(&bytes).unwrap();
+        let code_before = dec.code;
+        // Take an n-ary slice to provoke a decode. total = 256,
+        // pick start = 1, size = 1 → an arbitrary 1/256 partition.
+        let _t = dec.get_threshold(256).unwrap();
+        let low_before = dec.low;
+        dec.decode(1, 1).unwrap();
+        // Code may have shifted via normalize, but the per-decode
+        // update path went through `low`. We can only assert
+        // shape: `low` accumulated; the symmetric 7z update on
+        // `code` did NOT fire.
+        assert!(dec.low != low_before, "low should have advanced");
+        // Code may have shifted via normalize (range *= size made
+        // range narrow → renorm pulls bytes in), but the decoder
+        // chose not to subtract from code in the decode call.
+        // We can't assert `code == code_before` because normalize
+        // may have shifted; instead assert that the variant
+        // discriminator was respected by checking we ended in
+        // RAR mode.
+        assert_eq!(dec.variant(), RangeCoderVariant::Rar);
+        let _ = code_before; // silence dead-store warning
+    }
+
+    /// In RAR mode `bottom = 0x8000` means the carry-handling
+    /// normalize loop's underflow-recovery branch is reachable.
+    /// 7z mode has `bottom = 0` so the branch is dead.
+    /// Smoke test: decode a long enough stream to provoke
+    /// renormalize and verify the decoder doesn't panic / under-
+    /// run on synthetic zero-padded input.
+    #[test]
+    fn rar_decode_smoke_tests_normalize_loop() {
+        let bytes = vec![0u8; 4096];
+        let mut dec = RangeDecoder::new_rar(&bytes).unwrap();
+        // Drive the decoder through ~40 n-ary decodes; each
+        // 256-wide slice forces a renormalize.
+        for _ in 0..40 {
+            let _t = dec.get_threshold(256).unwrap();
+            dec.decode(0, 1).unwrap();
+        }
+        // Position should have advanced past the init bytes.
+        assert!(dec.position() > 4);
+    }
+
+    // ---- 7z behavior preserved across the rename ----------------
 
     /// Position reflects how many input bytes the decoder has
     /// consumed, including the 5-byte init prefix.

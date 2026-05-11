@@ -72,13 +72,31 @@
 > low-offset code + repeat sentinel), and exits cleanly on
 > symbol 256 / 257 via a typed `BlockEnd` enum. 13 unit tests
 > with synthetic fixtures covering every dispatch branch.
-> **§C1e₂ (this commit, plan-doc only)** records what corpus
+> **§C1e₂ (541c1ee, plan-doc only)** recorded what corpus
 > inspection turned up: every compressed entry in the ssokolow
 > CC0 archives is `is_ppmd_block = 1` (the encoder picked PPMd
 > for the `-m5` short-text payloads), so the LZ-only
 > cross-check originally pitched for §C1e₂ can't run today.
 > Cross-check defers to §C1g; the corpus is the PPMd cross-
 > check target there.
+> **§C1f (this commit)** lands the RAR-variant of the PPMd
+> range coder in
+> [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
+> `RangeCoderVariant { Sevenz, Rar }` discriminator; new
+> `new_rar(src)` constructor reads a 4-byte init prefix with no
+> leading marker (vs 7z's 5-byte `0x00`-prefixed init) and sets
+> `bottom = 0x8000`; `decode` branches between
+> `Code -= start*Range` (7z, libarchive `Range_Decode_7z`) and
+> `Low += start*Range` (RAR, libarchive `Range_Decode_RAR`);
+> `normalize` uses the unified carry-handling loop from
+> libarchive's `Range_Normalize`; `decode_bit_ppmd7` renamed to
+> `decode_bit_bin` with an internal variant branch (7z keeps
+> the `Range_DecodeBit_7z` dedicated math; RAR uses
+> `get_threshold + decode` matching `Range_DecodeBit_RAR`).
+> The model layer's 4 binary-context call sites rename to
+> `decode_bit_bin` / `encode_bit_bin`; the §B PPMd round-trip
+> and differential-corpus tests all pass unchanged. 5 new
+> RAR-init / structural tests; lib-test count now 1603.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -713,8 +731,8 @@ reproducible if a future bug needs the same level of triage.
 >   / `shortbases` / `shortbits` const tables inlined. Returns
 >   a `BlockEnd::{NextBlock, EntryDone, FilterDecl}` enum so
 >   the upper layer (§C1h / §C2) can decide what to do.
-> - **§C1e₂** ✅ (this commit, plan-doc only) — corpus
->   inspection: every compressed entry in
+> - **§C1e₂** ✅ (541c1ee, plan-doc only) — corpus inspection:
+>   every compressed entry in
 >   [ssokolow/rar-test-files](https://github.com/ssokolow/rar-test-files)
 >   starts with `is_ppmd_block = 1` (the encoder picks PPMd
 >   for `-m5` short-text payloads). The real-archive cross-
@@ -722,11 +740,20 @@ reproducible if a future bug needs the same level of triage.
 >   §C1g, where PPMd lands and the ssokolow corpus actually
 >   decodes. The synthetic-fixture coverage in §C1e₁ is the LZ
 >   path's primary validation until then.
-> - **§C1f** — RAR-variant range coder added to
->   [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
->   Small follow-on to §B0 — the model layer §B2 left "swap in a
->   RAR-variant range coder when the legacy pipeline needs it" as a
->   note. §C1f cashes that note in.
+> - **§C1f** ✅ (this commit) — RAR-variant range coder added
+>   to [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
+>   `RangeCoderVariant { Sevenz, Rar }` discriminator; new
+>   `new_rar(src)` constructor (4-byte init, no leading marker,
+>   `bottom = 0x8000`); `decode` branches between
+>   `Code -= start*Range` (7z) and `Low += start*Range` (RAR);
+>   `normalize` uses the unified libarchive carry-handling loop
+>   (the underflow-recovery branch is dead in 7z mode but
+>   reachable in RAR); `decode_bit_ppmd7` renamed to
+>   `decode_bit_bin` with an internal variant branch — 7z keeps
+>   `Range_DecodeBit_7z` math; RAR uses `get_threshold +
+>   decode` matching `Range_DecodeBit_RAR`. Model layer is
+>   variant-agnostic (4 call-site renames; no behaviour
+>   change for 7z).
 > - **§C1g** — PPMd entry path (`m=4`/`m=5`): wire
 >   `crate::decode::ppmd2::Model` through the legacy per-entry
 >   pipeline using the §C1f range coder.
@@ -1336,6 +1363,117 @@ fuzz-seed work — it doesn't add over-and-above value to
 
 **What didn't change**: no source files, no lib test count.
 1598 lib tests still pass; this is a plan-doc-only commit.
+
+#### §C1f. RAR-variant range coder ✅ (this commit)
+
+**What landed**: the RAR variant of the PPMd range coder at
+[`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
+Round-one §B0 landed the 7z variant; §B2 noted "swap in a
+RAR-variant range coder when the legacy pipeline needs it"
+as deferred to Phase C. §C1f cashes that note in.
+
+Mirrors libarchive's `archive_ppmd7.c` (lines 750..862),
+where both variants are implemented side-by-side:
+
+- `Ppmd_RangeDec_Init` — common init that reads 4 BE bytes
+  into `Code`.
+- `Ppmd7z_RangeDec_Init` (7z) — reads one extra byte (the
+  leading marker, must be `0x00`) before calling common init.
+- `PpmdRAR_RangeDec_Init` (RAR) — calls common init, then sets
+  `Bottom = 0x8000`.
+- `Range_Decode_7z` — `Code -= start * Range`.
+- `Range_Decode_RAR` — `Low += start * Range`.
+- `Range_Normalize` — single function, parametrised by
+  `Bottom`. In 7z mode (`Low = 0, Bottom = 0`) the carry check
+  `(Low ^ Low+Range) >= TOP_VALUE` reduces to `Range >=
+  TOP_VALUE`; in RAR mode the carry check is real and the
+  `Range < Bottom` underflow-recovery branch becomes
+  reachable.
+- `Range_DecodeBit_7z` — dedicated `(range >> 14) * prob`
+  binary primitive; the 7z model's binary contexts go
+  through this.
+- `Range_DecodeBit_RAR` — `get_threshold(PPMD_BIN_SCALE) +
+  decode(0, prob)` / `decode(prob, PPMD_BIN_SCALE - prob)`;
+  the n-ary primitive does the work, not a dedicated fast
+  path. The 7z encoder's binary symbol is NOT compatible
+  with the RAR decoder's binary primitive and vice versa.
+
+**Public surface changes**:
+
+- `RangeCoderVariant { Sevenz, Rar }` enum.
+- `RangeDecoder::new_rar(src) -> Result<Self, _>` constructor.
+- `RangeDecoder::variant() -> RangeCoderVariant` accessor.
+- `decode_bit_ppmd7` **renamed** to `decode_bit_bin` (internal
+  variant branch). Same applies to the test-only
+  `RangeEncoder::encode_bit_ppmd7` → `encode_bit_bin`.
+- `RangeDecoder` gains `low: u32` and `bottom: u32` fields
+  (always 0 in 7z mode; `low` accumulates and `bottom =
+  0x8000` in RAR mode).
+- `get_threshold` returns `(code.wrapping_sub(low)) / range`
+  (in 7z mode `low = 0` so this is unchanged).
+- `decode` branches on variant: `code -= start * range` (7z)
+  vs `low += start * range` (RAR).
+- `normalize` adopts the unified libarchive carry-handling
+  loop; the 7z behavior is preserved exactly (the underflow-
+  recovery branch is unreachable when `bottom = 0`).
+
+**Model-layer call-site changes**: `decode_bit_bin` /
+`encode_bit_bin` rename at 3 sites in
+[`src/decode/ppmd2/model.rs`](../src/decode/ppmd2/model.rs)
+(one decode, two encode). No semantic change for the 7z
+variant; the model becomes variant-agnostic — the range
+decoder's internal `variant` field drives the binary-primitive
+dispatch.
+
+**What turned out NOT to need landing**:
+
+- **No RAR-variant test encoder.** §C1f's validation is via
+  init / structural tests and the existing §B 7z round-trip
+  + differential-corpus tests (which still pass unchanged
+  across the rename). Functional cross-check of the RAR-
+  variant decode loop is via real archives in §C1g — the
+  ssokolow corpus's `is_ppmd_block = 1` payloads exercise the
+  RAR-variant math end-to-end. Writing a RAR-variant test
+  encoder (porting LZMA SDK's `Range_EncodeBit_RAR` plus the
+  carry-handling renormalize) is deferred until a concrete
+  test need shows up; the §B PPMd model layer already
+  rigorously exercises every code path on the 7z side, and
+  the variant branch is small enough that real-archive
+  validation in §C1g is the right next checkpoint.
+- **No `decode_bit_ppmd7` compatibility alias.** The rename is
+  hard; the method only existed since §B3 and only had two
+  external callers (in this crate). Clean rename keeps the
+  naming honest about what the primitive does.
+
+**Tests**: 5 new tests at
+[`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs):
+
+- `new_rar_reads_four_bytes_with_no_marker` — init prefix
+  shape; `variant() == Rar`; `bottom == 0x8000`;
+  `code = BE(first 4 bytes)`.
+- `new_rar_rejects_truncated_init` — `src.len() < 4` surfaces
+  `Truncated` (4-byte prefix label).
+- `new_rar_does_not_check_leading_byte` — `BadLeader` is
+  7z-only; RAR accepts any first byte as code-seed material.
+- `rar_decode_updates_low_not_code` — shape test confirming
+  the `decode` variant branch was taken (low advanced).
+- `rar_decode_smoke_tests_normalize_loop` — drives 40 n-ary
+  decodes against zero-padded input, exercising the unified
+  normalize loop without expecting specific values (full
+  functional cross-check defers to §C1g).
+
+The pre-existing §B0 / §B1 / §B2 / §B3 7z tests all pass
+unchanged: 60+ ppmd2 module tests including the 50-vector
+differential corpus and the 33 model edge-case tests.
+
+**1603 lib tests pass total** (was 1598 at §C1e₂, +5 from
+§C1f's RAR-init / structural tests).
+
+**Demo**: `cargo test --features rar decode::ppmd2` runs all
+75 ppmd2 module tests in <1 s release. The range decoder is
+now wired for both 7z and RAR; §C1g will plumb the legacy LZ
+pipeline's PPMd-mode entries through a `RangeDecoder::new_rar
+→ Model::decode_symbol` chain.
 
 ---
 
