@@ -29,11 +29,13 @@ peel https://example.com/dataset.tar.zst -C ./out
   `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`, `.zip` (STORED + DEFLATE +
   zstd entries), `.7z` (COPY + DEFLATE + LZMA + LZMA2 coders;
   plain and unencrypted-encoded headers; single-volume), and
-  `.rar` — both **RAR5** (STORED entries today; hand-rolled
-  compressed-method decoder lands per `docs/PLAN_rar5_decoder.md`)
-  and **legacy RAR3/RAR4** (STORED + LZ-Normal entries through the
-  hand-rolled `decode::rar_legacy` pipeline, with RarVM standard
-  filters — E8, E8E9, Delta, RGB, Audio — dispatched per entry).
+  `.rar` — both **RAR5** (STORED + the standard RAR5 algorithm
+  at compression methods 1..5, end-to-end through the hand-rolled
+  `decode::rar_native` LZSS pipeline plus the RAR-VM standard
+  filters per `docs/PLAN_rar5_decoder.md`) and **legacy
+  RAR3/RAR4** (STORED + LZ-Normal entries through the hand-rolled
+  `decode::rar_legacy` pipeline, with RarVM standard filters —
+  E8, E8E9, Delta, RGB, Audio — dispatched per entry).
   Both gated by the `rar` Cargo feature on by default;
   non-encrypted, single-volume only. Format detection is
   suffix-first with magic-byte fallback; mismatches fail closed
@@ -429,10 +431,12 @@ from the start of its packed range; per-coder intra-folder resume,
 BCJ filters, AES, and multi-volume archives are queued.
 ⁵ RAR5 walks file headers in stream order (no tail-anchored index
 like zip / 7z), so peel streams entries to their final paths as
-each entry's data area arrives. STORED method today; the
-hand-rolled compressed-method decoder lands per
-`docs/PLAN_rar5_decoder.md`. Non-encrypted, single-volume only;
-SFX and AES are queued.
+each entry's data area arrives. STORED method plus the standard
+RAR5 algorithm (compression methods 1..5) both ship via the
+hand-rolled `decode::rar_native` LZSS + RAR-VM filter pipeline
+per `docs/PLAN_rar5_decoder.md`. Non-encrypted, single-volume
+only; SFX, AES, and the rarely-used RAR-VM custom-filter slot
+(`O.RAR.CUSTOMFILTER`) are queued.
 ⁶ Mid-entry resume via the §F1 checkpoint blob: a `kill -9` mid-RAR5
 file restarts the in-flight entry from the snapshot, not from its
 start. Multi-block lookahead state is captured in the blob so resume

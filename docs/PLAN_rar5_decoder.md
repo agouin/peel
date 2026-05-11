@@ -1,16 +1,26 @@
 ## Plan: hand-rolled RAR5 decoder
 
-> **Status: drafted 2026-05-09, not yet started.** This sub-plan is
-> the §4 deliverable for `docs/PLAN_rar.md` after §0.1 resolved
-> against an FFI dependency. The §3 STORED-method pipeline gives
-> `peel` a working RAR5 extractor for the (uncommon) method-0 case;
-> this plan adds the standard RAR5 algorithm (`compression
-> method = 1..5`) and unblocks the "general-purpose RAR5
-> extraction" milestone.
+> **Status: §A1, §A2, §B1, §B2, §C1, §E1, §F1 landed
+> (drafted 2026-05-09, round-one shipped through 2026-05-11).**
+> The `method >= 1` dispatch in
+> [`rar_pipeline::extract_entry`](../src/download/rar_pipeline.rs)
+> now drives [`RarStreamDecoder`](../src/decode/rar_native/stream.rs);
+> the §3 STORED-only rejection has been removed. The mid-entry
+> checkpoint blob (§F1) is wired through `Checkpoint` format v11 and
+> the crash-resume integration test covers compressed entries
+> end-to-end including the multi-block lookahead path (see
+> [`PLAN_rar5_multi_block_decode.md`](PLAN_rar5_multi_block_decode.md),
+> resolved 2026-05-10).
 >
-> **Sequencing.** §1+§2+§3 of `docs/PLAN_rar.md` must be on `main`
-> before §A1 begins — the decoder plugs into the same `RarSink` /
-> `rar_pipeline` surfaces those phases ship.
+> **Open**: §C2 (custom-filter bytecode) — deferred to
+> `O.RAR.CUSTOMFILTER`. §G1 (throughput) — not started; the
+> bench grid in the README currently exercises STORED-method
+> archives only, so the compressed-method hot-path profile that
+> §G1 calls for has not yet been collected.
+>
+> **Sequencing.** §1+§2+§3 of `docs/PLAN_rar.md` were on `main`
+> before §A1 began; the decoder plugs into the same `RarSink` /
+> `rar_pipeline` surfaces those phases shipped.
 
 **Supersedes**: nothing — this is additive to `docs/PLAN_rar.md` §4.
 
