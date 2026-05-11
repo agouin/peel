@@ -63,7 +63,7 @@
 > (push / touch matching libarchive's `oldoffset[]` semantics
 > from `archive_read_support_format_rar.c` lines 3030..3115).
 > 25 unit tests across the two files.
-> **§C1e₁ (this commit)** lands the per-symbol LZ dispatcher at
+> **§C1e₁ (80f2f9c)** landed the per-symbol LZ dispatcher at
 > [`src/decode/rar_legacy/lzss.rs`](../src/decode/rar_legacy/lzss.rs)
 > — wires §C1a–d into `LzDecoder::decode_block`, ports the
 > libarchive `expand` function's symbol dispatch (literals,
@@ -71,8 +71,14 @@
 > short-distance, full-match-small + full-match-large with the
 > low-offset code + repeat sentinel), and exits cleanly on
 > symbol 256 / 257 via a typed `BlockEnd` enum. 13 unit tests
-> with synthetic fixtures covering every dispatch branch;
-> lib-test count now 1598.
+> with synthetic fixtures covering every dispatch branch.
+> **§C1e₂ (this commit, plan-doc only)** records what corpus
+> inspection turned up: every compressed entry in the ssokolow
+> CC0 archives is `is_ppmd_block = 1` (the encoder picked PPMd
+> for the `-m5` short-text payloads), so the LZ-only
+> cross-check originally pitched for §C1e₂ can't run today.
+> Cross-check defers to §C1g; the corpus is the PPMd cross-
+> check target there.
 > This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
 > is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
 > `docs/PLAN_rar.md`, not a supersession.
@@ -700,15 +706,22 @@ reproducible if a future bug needs the same level of triage.
 >   [`dist_cache`](../src/decode/rar_legacy/dist_cache.rs)
 >   (4-slot LRU of recent match offsets for symbols 259..=262 /
 >   263..=298).
-> - **§C1e₁** ✅ (this commit) — per-symbol LZ dispatcher at
+> - **§C1e₁** ✅ (80f2f9c) — per-symbol LZ dispatcher at
 >   [`lzss`](../src/decode/rar_legacy/lzss.rs). Wires §C1a–d
 >   together into `LzDecoder::decode_block`, with libarchive's
 >   `lengthbases` / `lengthbits` / `offsetbases` / `offsetbits`
 >   / `shortbases` / `shortbits` const tables inlined. Returns
 >   a `BlockEnd::{NextBlock, EntryDone, FilterDecl}` enum so
 >   the upper layer (§C1h / §C2) can decide what to do.
-> - **§C1e₂** — first end-to-end LZ demo against the ssokolow
->   `testfile.rar3.rar` corpus + bundled `unrar` cross-check.
+> - **§C1e₂** ✅ (this commit, plan-doc only) — corpus
+>   inspection: every compressed entry in
+>   [ssokolow/rar-test-files](https://github.com/ssokolow/rar-test-files)
+>   starts with `is_ppmd_block = 1` (the encoder picks PPMd
+>   for `-m5` short-text payloads). The real-archive cross-
+>   check therefore can't validate the LZ path; it moves to
+>   §C1g, where PPMd lands and the ssokolow corpus actually
+>   decodes. The synthetic-fixture coverage in §C1e₁ is the LZ
+>   path's primary validation until then.
 > - **§C1f** — RAR-variant range coder added to
 >   [`src/decode/ppmd2/range_dec.rs`](../src/decode/ppmd2/range_dec.rs).
 >   Small follow-on to §B0 — the model layer §B2 left "swap in a
@@ -1271,7 +1284,58 @@ bytes yet — those land with §C1e₂).
 **Demo**: `cargo test --features rar decode::rar_legacy::lzss`
 runs all 13 tests in <10 ms release. The full LZ stack — from
 raw bits to emitted output — now round-trips synthetic
-fixtures cleanly. §C1e₂ adds the real-archive cross-check.
+fixtures cleanly.
+
+#### §C1e₂. Corpus inspection (plan-doc revision) ✅ (this commit)
+
+**What landed**: this sub-section + the routing decision below.
+No code changes; the §C1e₁ dispatcher's synthetic-fixture
+coverage stands as the LZ path's primary validation.
+
+**Finding**. The §C0 plan locked the corpus strategy as "CC0
+archives from [ssokolow/rar-test-files](https://github.com/ssokolow/rar-test-files)
++ bundled `unrar` as reference-decoder side". When §C1e₂
+started, the first step was to inspect each candidate archive
+to confirm which compression path it would exercise. The
+result was uniform: every compressed entry in the ssokolow
+corpus is PPMd, not LZ.
+
+- `testfile.rar3.rar` (98 B) — `testfile.txt` entry's first
+  compressed-data byte is `0xA7 = 0b1010_0111`; first bit
+  (MSB) = 1 = `is_ppmd_block`.
+- `testfile.rar3.solid.rar` (98 B) — same.
+- `testfile.rar3.av.rar` (327 B) — same.
+- `testfile.rar3.rr.rar` (666 B) — same.
+- `testfile.rar3.locked.rar` (98 B) — same.
+- `testfile.rar3.cbr` (381 B) — both `testfile.jpg` and
+  `testfile.png` entries first byte `0xE7 = 0b1110_0111`,
+  bit 1 = `is_ppmd_block`.
+
+This is consistent with the WinRAR encoder's normal behaviour:
+`-m5` (maximum compression) lets it pick PPMd over LZSS for
+short text and already-entropy-rich payloads (the ssokolow
+archives' `testfile.txt` is 12 bytes; `testfile.jpg` is a
+220-byte JPEG; `testfile.png` is 87 bytes of pre-compressed
+PNG).
+
+**Routing decision**. The real-archive cross-check moves to
+§C1g (PPMd entry path). At that point the ssokolow corpus is
+the natural validation target — every entry decodes through
+the PPMd path, and the bundled `unrar` at
+`~/Downloads/rar/unrar` produces the expected plaintext.
+
+§C1e₁'s synthetic-fixture coverage remains the LZ path's
+primary validation until a real LZ-mode RAR3 archive surfaces
+(filed as a §G concern; the corpus shape we can actually
+acquire today is what the encoder chose to emit, and that's
+PPMd). Building a synthetic RAR3-LZ archive in test code
+(precode + main-length encoder + Huffman packer wrapped in
+the archive container) is filed as a candidate for §G's
+fuzz-seed work — it doesn't add over-and-above value to
+§C1e₁'s direct LZ-stack tests today.
+
+**What didn't change**: no source files, no lib test count.
+1598 lib tests still pass; this is a plan-doc-only commit.
 
 ---
 
