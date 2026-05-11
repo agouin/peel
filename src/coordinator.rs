@@ -808,21 +808,6 @@ pub enum CoordinatorError {
     #[error("integrity check failed")]
     Integrity(#[source] crate::hash::IntegrityError),
 
-    /// Local-file extraction was requested but the local-mode
-    /// pipeline is not yet implemented for the current state of
-    /// `docs/PLAN_local_file_extract.md`.
-    ///
-    /// §1 of the plan lands the CLI / dispatch surface; §2 wires
-    /// the open-file → decode → sink pipeline. Until §2 lands the
-    /// local entry point returns this variant so callers get a
-    /// clear error instead of a panic or a misleading "decode
-    /// failed".
-    #[error(
-        "local-file extraction is not yet implemented; \
-         see docs/PLAN_local_file_extract.md §2"
-    )]
-    LocalNotImplemented,
-
     /// The local-file extractor probed the source filesystem for
     /// `FALLOC_FL_PUNCH_HOLE` support and the kernel/filesystem
     /// refused (`docs/PLAN_local_file_extract.md` §2). Destructive
@@ -4620,6 +4605,20 @@ fn verify_output_shape(shape: FormatShape, output: &OutputTarget) -> Result<(), 
             })
         }
     }
+}
+
+/// `pub(crate)` re-export so [`crate::coordinator::local::run`]
+/// can validate the format-vs-output-target pairing using the
+/// same logic as the HTTP path. Local mode runs the check inside
+/// the coordinator (after magic detection, before sink open) for
+/// the same reason the HTTP path does — magic detection can flip
+/// the format shape, and we want the typed error before any sink
+/// IO happens.
+pub(crate) fn verify_output_shape_local(
+    shape: FormatShape,
+    output: &OutputTarget,
+) -> Result<(), CoordinatorError> {
+    verify_output_shape(shape, output)
 }
 
 /// Wait for the chunks covering `[0, min(max_window, total_size))` to
