@@ -74,6 +74,7 @@ fn realistic_tar_checkpoint() -> Checkpoint {
         chunk_crc32c: None,
         decoder_state: None,
         mode: RunMode::Extract,
+        source_mtime: None,
     }
 }
 
@@ -319,6 +320,7 @@ fn round_trip_raw_sink_state() {
         chunk_crc32c: None,
         decoder_state: None,
         mode: RunMode::Extract,
+        source_mtime: None,
     };
     ckpt.write(&path).expect("write");
 

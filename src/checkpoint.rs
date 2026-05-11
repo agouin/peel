@@ -96,6 +96,7 @@
 //!     chunk_crc32c: None,
 //!     decoder_state: None,
 //!     mode: RunMode::Extract,
+//!     source_mtime: None,
 //! };
 //! ckpt.write(std::path::Path::new("/tmp/peel-demo.ckpt"))?;
 //! # Ok::<(), peel::checkpoint::CheckpointError>(())
@@ -204,7 +205,7 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 /// the flag). Forward-compat: v11 and earlier read as
 /// [`RunMode::Extract`]; v12 writes only fire when `mode !=
 /// Extract` (the byte-identical lower bound).
-pub const FORMAT_VERSION: u32 = 12;
+pub const FORMAT_VERSION: u32 = 13;
 
 /// Pre-§F1 max format version, written when no SinkState payload
 /// uses v11-only fields. Keeping the on-disk version dynamic
@@ -220,6 +221,13 @@ const FORMAT_VERSION_RAR_STORED_ONLY: u32 = 10;
 /// pre-§5 layout (v10 / v11 depending on the SinkState payload)
 /// so byte-identical regression checks pass.
 const FORMAT_VERSION_RUN_MODE: u32 = 12;
+
+/// `docs/PLAN_local_file_extract.md` §5: format version the
+/// writer upgrades to when [`Checkpoint::mode`] is
+/// [`RunMode::LocalDestructive`]. Carries the source-file mtime
+/// trailer so the resume path can defend against a same-size
+/// swap of the underlying archive between runs.
+const FORMAT_VERSION_LOCAL_DESTRUCTIVE: u32 = 13;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -260,6 +268,13 @@ pub enum RunMode {
     /// to a user-supplied keep-archive path
     /// (`docs/PLAN_download_modes.md` §3).
     KeepArchive,
+    /// Local-file destructive mode: the user-supplied archive on
+    /// disk is progressively hole-punched as the decoder advances
+    /// and deleted on clean completion
+    /// (`docs/PLAN_local_file_extract.md` §5). Carries a
+    /// `source_mtime` trailer in the on-disk format (v13+) so a
+    /// same-size swap between runs is detected on resume.
+    LocalDestructive,
 }
 
 /// Run-mode tag for [`RunMode::Extract`] in the on-disk format
@@ -270,6 +285,8 @@ const RUN_MODE_TAG_EXTRACT: u8 = 0;
 const RUN_MODE_TAG_NO_EXTRACT: u8 = 1;
 /// Run-mode tag for [`RunMode::KeepArchive`].
 const RUN_MODE_TAG_KEEP_ARCHIVE: u8 = 2;
+/// Run-mode tag for [`RunMode::LocalDestructive`]. Added in v13.
+const RUN_MODE_TAG_LOCAL_DESTRUCTIVE: u8 = 3;
 
 impl std::fmt::Display for RunMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -287,6 +304,7 @@ impl RunMode {
             RunMode::Extract => "extract",
             RunMode::NoExtract => "--no-extract",
             RunMode::KeepArchive => "--keep-archive",
+            RunMode::LocalDestructive => "local-destructive",
         }
     }
 
@@ -295,6 +313,7 @@ impl RunMode {
             RunMode::Extract => RUN_MODE_TAG_EXTRACT,
             RunMode::NoExtract => RUN_MODE_TAG_NO_EXTRACT,
             RunMode::KeepArchive => RUN_MODE_TAG_KEEP_ARCHIVE,
+            RunMode::LocalDestructive => RUN_MODE_TAG_LOCAL_DESTRUCTIVE,
         }
     }
 
@@ -303,6 +322,7 @@ impl RunMode {
             RUN_MODE_TAG_EXTRACT => Some(RunMode::Extract),
             RUN_MODE_TAG_NO_EXTRACT => Some(RunMode::NoExtract),
             RUN_MODE_TAG_KEEP_ARCHIVE => Some(RunMode::KeepArchive),
+            RUN_MODE_TAG_LOCAL_DESTRUCTIVE => Some(RunMode::LocalDestructive),
             _ => None,
         }
     }
@@ -454,6 +474,27 @@ pub enum CheckpointError {
         old: RunMode,
         /// The mode the current invocation is running under.
         new: RunMode,
+    },
+
+    /// `docs/PLAN_local_file_extract.md` §5: the local
+    /// destructive-mode resume path detected drift between the
+    /// checkpoint's view of the source archive and the file
+    /// currently on disk — either the source path moved, its
+    /// length changed, or its `mtime` shifted. Silently
+    /// "resuming" against the wrong bytes would either feed the
+    /// decoder garbage or produce a byte-different output tree;
+    /// surface a hard error and let the user decide.
+    #[error(
+        "local-destructive resume rejected: source archive has changed since the \
+         checkpoint was written ({reason}); either restore the original archive at \
+         {expected_path} or delete the .peel.ckpt to start over (which will leave \
+         the partially-punched source unrecoverable)"
+    )]
+    SourceMismatch {
+        /// The source path the checkpoint expects.
+        expected_path: PathBuf,
+        /// Human-readable summary of the drift.
+        reason: String,
     },
 
     /// The file declares a `body_length` that exceeds the configured
@@ -866,6 +907,18 @@ pub struct Checkpoint {
     /// surfaces [`CheckpointError::ModeMismatch`] when the prior
     /// mode and the current run's mode disagree.
     pub mode: RunMode,
+
+    /// `docs/PLAN_local_file_extract.md` §5: the source archive's
+    /// `mtime` at the moment the checkpoint was written. Populated
+    /// only when [`Self::mode`] is [`RunMode::LocalDestructive`];
+    /// [`None`] for every other mode and for pre-v13 checkpoints
+    /// (the on-disk trailer is omitted entirely on the
+    /// byte-identical fallback path). The resume path compares
+    /// this against the current source's mtime so a same-size
+    /// swap between runs surfaces a typed
+    /// [`CheckpointError::SourceMismatch`] before any decoder
+    /// state restores from a stale blob.
+    pub source_mtime: Option<SystemTime>,
 }
 
 /// Maximum body length [`Checkpoint::deserialize`] will trust before
@@ -1156,6 +1209,24 @@ impl Checkpoint {
             body.push(self.mode.to_tag());
         }
 
+        // v13 (`docs/PLAN_local_file_extract.md` §5): the
+        // `source_mtime` trailer is written only for
+        // [`RunMode::LocalDestructive`]. Layout: a single
+        // presence byte, then (if present) an 8-byte i64
+        // seconds-since-epoch + 4-byte u32 sub-second nanos —
+        // same shape `created_at` uses.
+        if self.mode == RunMode::LocalDestructive {
+            match self.source_mtime {
+                Some(t) => {
+                    body.push(1);
+                    let (secs, nanos) = encode_system_time(t);
+                    write_i64(&mut body, secs);
+                    write_u32(&mut body, nanos);
+                }
+                None => body.push(0),
+            }
+        }
+
         let body_len = body.len() as u64;
         let body_checksum = fnv1a64(&body);
 
@@ -1185,14 +1256,17 @@ impl Checkpoint {
         // (byte-identical writes for the default-mode RAR path).
         const FORMAT_VERSION_RAR_F1: u32 = 11;
         // v12 (`docs/PLAN_download_modes.md` §5): a non-default
-        // `mode` forces v12. Take the max of v12 and the
-        // sink-state-dictated version so a `KeepArchive` run with
-        // a `SinkState::Rar` carrying decoder-state still writes a
-        // single coherent header.
-        let mode_version = if self.mode == RunMode::Extract {
-            0
-        } else {
-            FORMAT_VERSION_RUN_MODE
+        // `mode` forces v12. v13 (`docs/PLAN_local_file_extract.md`
+        // §5): a [`RunMode::LocalDestructive`] run forces v13
+        // because the `source_mtime` trailer requires a reader
+        // that knows to parse it. Take the max of the mode-driven
+        // floor and the sink-state-dictated version so a future
+        // `LocalDestructive` run with a `SinkState::Rar` carrying
+        // a decoder-state blob writes a single coherent header.
+        let mode_version = match self.mode {
+            RunMode::Extract => 0,
+            RunMode::NoExtract | RunMode::KeepArchive => FORMAT_VERSION_RUN_MODE,
+            RunMode::LocalDestructive => FORMAT_VERSION_LOCAL_DESTRUCTIVE,
         };
         let sink_version = match &self.sink_state {
             SinkState::Rar {
@@ -1679,6 +1753,33 @@ impl Checkpoint {
             RunMode::Extract
         };
 
+        // v13 (`docs/PLAN_local_file_extract.md` §5): a
+        // `source_mtime` trailer is written when (and only when)
+        // the mode is [`RunMode::LocalDestructive`]. Read it for
+        // local-destructive checkpoints at v13+; default to
+        // `None` for every other mode / version.
+        let source_mtime = if format_version >= FORMAT_VERSION_LOCAL_DESTRUCTIVE
+            && mode == RunMode::LocalDestructive
+        {
+            let presence = cursor.read_u8("source_mtime.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    let secs = cursor.read_i64("source_mtime.secs")?;
+                    let nanos = cursor.read_u32("source_mtime.nanos")?;
+                    Some(decode_system_time(secs, nanos))
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "source_mtime",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         if cursor.remaining() != 0 {
             return Err(CheckpointError::Truncated {
                 reason: format!(
@@ -1720,6 +1821,7 @@ impl Checkpoint {
             chunk_crc32c,
             decoder_state,
             mode,
+            source_mtime,
         })
     }
 
@@ -2459,6 +2561,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         }
     }
 
@@ -2495,6 +2598,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         }
     }
 
@@ -2546,6 +2650,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         }
     }
 
@@ -2626,6 +2731,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         }
     }
 
@@ -2661,7 +2767,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_twelve() {
+    fn checkpoint_format_version_is_thirteen() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
         // work (v6), `docs/PLAN_deflate_block_decoder.md` Phase 9b's
@@ -2672,13 +2778,15 @@ mod tests {
         // variant (v9), `docs/PLAN_rar.md` §3's
         // `SinkState::Rar` variant (v10),
         // `docs/PLAN_rar5_decoder.md` §F1's
-        // `current_entry_decoder_state` blob (v11), and
-        // `docs/PLAN_download_modes.md` §5's [`RunMode`] tag
-        // (v12) each bumped this when an optional trailer landed.
+        // `current_entry_decoder_state` blob (v11),
+        // `docs/PLAN_download_modes.md` §5's [`RunMode`] tag (v12),
+        // and `docs/PLAN_local_file_extract.md` §5's
+        // [`RunMode::LocalDestructive`] + `source_mtime` trailer
+        // (v13) each bumped this when an optional trailer landed.
         // If a future change resets it, this guards against
         // silently dropping the upgrade-required signal older
         // readers depend on.
-        assert_eq!(FORMAT_VERSION, 12);
+        assert_eq!(FORMAT_VERSION, 13);
     }
 
     // ---- §5: RunMode round-trip + forward-compat -----------------------
@@ -2707,6 +2815,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode,
+            source_mtime: None,
         }
     }
 
@@ -2745,15 +2854,51 @@ mod tests {
 
     #[test]
     fn non_default_mode_bumps_format_version_to_twelve() {
+        // HTTP non-default modes (NoExtract, KeepArchive) still
+        // write v12 byte-identically; only the
+        // [`RunMode::LocalDestructive`] tail (v13) drives the
+        // header past v12.
         for mode in [RunMode::NoExtract, RunMode::KeepArchive] {
             let ckpt = sample_mode_checkpoint(mode);
             let bytes = ckpt.serialize();
             let format_version = read_u32(&bytes[8..12]);
             assert_eq!(
-                format_version, FORMAT_VERSION,
-                "{mode:?} mode should write v{FORMAT_VERSION}, got v{format_version}",
+                format_version, FORMAT_VERSION_RUN_MODE,
+                "{mode:?} mode should write v{FORMAT_VERSION_RUN_MODE}, got v{format_version}",
             );
         }
+    }
+
+    #[test]
+    fn local_destructive_mode_bumps_format_version_to_thirteen() {
+        // §5 (`docs/PLAN_local_file_extract.md`): a
+        // [`RunMode::LocalDestructive`] checkpoint carries the
+        // `source_mtime` trailer and the writer upgrades the
+        // header to v13 so older readers refuse it cleanly.
+        let mut ckpt = sample_mode_checkpoint(RunMode::LocalDestructive);
+        ckpt.source_mtime = Some(UNIX_EPOCH + Duration::new(1_700_000_001, 42));
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_LOCAL_DESTRUCTIVE,
+            "LocalDestructive should write v{FORMAT_VERSION_LOCAL_DESTRUCTIVE}, got v{format_version}",
+        );
+        let parsed = Checkpoint::deserialize(&bytes).expect("round-trip");
+        assert_eq!(parsed.mode, RunMode::LocalDestructive);
+        assert_eq!(parsed.source_mtime, ckpt.source_mtime);
+    }
+
+    #[test]
+    fn local_destructive_without_mtime_round_trips_with_none() {
+        // The presence byte is `0` when source_mtime is None; the
+        // deserializer must recover None and not synthesize an
+        // mtime.
+        let ckpt = sample_mode_checkpoint(RunMode::LocalDestructive);
+        assert_eq!(ckpt.source_mtime, None);
+        let bytes = ckpt.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("round-trip");
+        assert_eq!(parsed.mode, RunMode::LocalDestructive);
+        assert_eq!(parsed.source_mtime, None);
     }
 
     #[test]
@@ -2794,6 +2939,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         }
     }
 
@@ -2852,6 +2998,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         }
     }
 
@@ -3477,6 +3624,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         };
         let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
         assert_eq!(parsed, ckpt);
@@ -3993,6 +4141,7 @@ mod tests {
                 chunk_crc32c,
                 decoder_state,
                 mode: RunMode::Extract,
+                source_mtime: None,
             };
             let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
             assert_eq!(parsed, ckpt);

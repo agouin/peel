@@ -2406,6 +2406,7 @@ fn run_one<S: Sink>(
                 chunk_crc32c,
                 decoder_state: None,
                 mode: current_mode,
+                source_mtime: None,
             };
             let prep_time = serialize_prep_start.elapsed();
             let mut decstate_time = Duration::ZERO;
@@ -2704,6 +2705,7 @@ fn run_zip(
                     chunk_crc32c,
                     decoder_state: None,
                     mode: current_run_mode(config),
+                    source_mtime: None,
                 };
                 let prep_time = serialize_prep_start.elapsed();
                 let write_timings = ckpt
@@ -2823,6 +2825,7 @@ fn run_zip(
                     // [`Checkpoint::decoder_state`] field. Phase 9b.
                     decoder_state: None,
                     mode: current_run_mode(config),
+                    source_mtime: None,
                 };
                 let prep_time = serialize_prep_start.elapsed();
                 let write_timings = ckpt
@@ -3048,6 +3051,7 @@ fn run_rar(
             chunk_crc32c,
             decoder_state: None,
             mode: current_run_mode(config),
+            source_mtime: None,
         };
         let prep_time = serialize_prep_start.elapsed();
         let write_timings = ckpt
@@ -3387,6 +3391,7 @@ fn run_sevenz(
                     chunk_crc32c: None,
                     decoder_state: None,
                     mode: current_run_mode(config),
+                    source_mtime: None,
                 };
                 ckpt.write_timed(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -4771,6 +4776,7 @@ mod tests {
             chunk_crc32c: None,
             decoder_state: None,
             mode: RunMode::Extract,
+            source_mtime: None,
         }
     }
 
