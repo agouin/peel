@@ -137,3 +137,32 @@ chose pure-`E8` for every x86-like input we tried. The
 the `E8E9` codepath is covered by the synthetic-input unit
 tests in
 [`vm/standard.rs`](../../../src/decode/rar_legacy/vm/standard.rs).
+
+## Goldilocks crash-resume fixture (§F1)
+
+- **`large_lz_normal.rar`** (794 bytes) + **`large_lz_normal.bin`**
+  (256 KiB) — single-entry `payload.bin` in legacy (RAR4) format,
+  LZ `-m3` ("Normal"). Decoded size exceeds the streaming
+  adapter's 64 KiB `STREAM_CHUNK_BYTES`, so the live
+  `decode_step` loop takes multiple drain steps and a
+  `coord_config(checkpoint_min_bytes = 1)` run reliably lands a
+  mid-entry `CheckpointWritten` event before the entry
+  finishes. Used by
+  `tests/test_coordinator_rar3.rs::crash_resume_mid_compressed_entry_produces_identical_output`
+  to validate the §F1 snapshot/resume contract end-to-end
+  through the coordinator pipeline.
+
+  The payload is a deterministic, semi-compressible blob
+  (LCG-derived, 64×4 KiB-aligned subblocks) — small enough to
+  embed in-tree, big enough to compress to a non-trivial ratio
+  through the LZ-Normal encoder.
+
+  **Provenance**: encoded with rar 5.0.0 Linux x86_64
+  (`rarlinux-x64-5.0.0.tar.gz` from RARLAB) via Docker
+  `linux/amd64`, invoked as
+  `rar a -ma4 -m3 large_lz_normal.rar payload.bin`. `rar 5.0.0`
+  is the most recent public release that still accepts the
+  `-ma4` switch for legacy (RAR4) output; `rar 7.x` only emits
+  RAR5. The synthetic payload generation script lives in
+  [`docs/fixtures/rar_legacy_large_lz_normal.md`](../../../docs/fixtures/rar_legacy_large_lz_normal.md)
+  for re-encode reproducibility.

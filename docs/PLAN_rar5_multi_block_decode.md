@@ -1,6 +1,18 @@
 # PLAN — RAR5 multi-block decode gap
 
-**Status**: investigated 2026-05-10. **Diagnosed, not yet fixed.**
+**Status**: **resolved 2026-05-10.** Fix landed in
+[`src/decode/rar_native/stream.rs`](../src/decode/rar_native/stream.rs)
++ [`src/decode/rar_native/lzss.rs`](../src/decode/rar_native/lzss.rs)
+via libarchive's lookahead discipline (4 bytes pulled past every
+non-last block's bitstream, replayed as the next block's prologue
+on the following `read_block`). Multi-block compressed entries now
+decode byte-identical against `unrar` reference output across the
+curated probe corpus (`prose-huge`, `rand-text-1m`, `p27-huge`,
+`multi_block_p27`). The deferred §F1 crash-resume slot in
+[`tests/test_coordinator_rar.rs`](../tests/test_coordinator_rar.rs)
+is unblocked. See "Resolution" at the bottom for the fix details
+and headline change vs the original sketch.
+
 **Trigger**: searching for a §F1 "Goldilocks" fixture (a compressed
 RAR5 archive large enough for the coordinator's mid-entry checkpoint
 to fire, simple enough for the round-one decoder to handle).
@@ -174,3 +186,84 @@ deferred crash-resume test: the blocker is decoder coverage, not
 fixture availability. Slot a Phase F2 (or §B2-revisit) sub-section
 into `PLAN_rar5_decoder.md` ahead of §G (throughput) — correctness
 first.
+
+## Resolution (2026-05-10)
+
+Diagnosis stood, fix matched libarchive — **not** the
+`feed_block` / `decode_until_block_drained` API split the original
+sketch proposed. The headline change vs the sketch: the bit cursor
+**does** reset to 0 at every new block (per libarchive's
+`process_block`), so we did not need a bit-position-preserving
+state machine spanning blocks. What we needed was the
+**lookahead window**: libarchive's
+`read_ahead(a, 4 + cur_block_size, &p)` reserves 4 bytes past the
+block's bitstream so the LD-symbol Huffman peek (up to 16 bits)
+doesn't underrun on a symbol whose code straddles the block
+boundary. Those 4 bytes are physically the next block's prologue,
+peeked-as-bit-data by the dispatcher and **also** parsed normally
+as the prologue on the next iteration — they double-duty.
+
+### What landed
+
+1. [`src/decode/rar_native/stream.rs`](../src/decode/rar_native/stream.rs):
+   - New `prepend_buf: Vec<u8>` field on `RarStreamDecoder`.
+   - `read_exact` now drains `prepend_buf` first before pulling
+     from `src`. Bytes pulled into `prepend_buf` are not
+     re-counted in `src_consumed` (they were already counted at
+     pull time).
+   - `read_block` for non-last blocks pulls
+     `BLOCK_LOOKAHEAD_BYTES = 4` after the bitstream and saves
+     them in `prepend_buf` for replay as the next block's
+     prologue. The same bytes are appended to the returned block
+     buffer so the dispatcher's `BitReader` sees them.
+   - The `resume` constructor seeds `prepend_buf: Vec::new()`
+     because §F1 snapshots reseat the decoder at a clean block
+     boundary; no pending lookahead survives a snapshot/restore
+     round-trip.
+2. [`src/decode/rar_native/lzss.rs`](../src/decode/rar_native/lzss.rs):
+   - `decode_block`'s `BitReader` now spans
+     `block[header_bytes..]` (bitstream **plus** any lookahead
+     trailing bytes) instead of slicing exactly to
+     `bitstream_end`. The loop's existing
+     `bits_consumed >= block_bit_budget` exit still uses the
+     bitstream's bit budget, so the dispatcher correctly
+     "leaves" any over-consumed lookahead bits to the next
+     block — where they appear in the replayed prologue.
+
+### Why the API didn't need to change
+
+The fix is wholly internal. Outside the rar_native module —
+the `StreamingDecoder` trait, the `decode_step` contract, the
+§F1 snapshot blob format, the coordinator's per-entry pipeline —
+nothing changed. The `Checkpoint::format_version` did not bump.
+
+### Tests added / activated
+
+- [`tests/test_rar_decoder_resume.rs`](../tests/test_rar_decoder_resume.rs)
+  `multi_block_archive_decodes_byte_identical` — was `#[ignore]`,
+  now active. Exercises `tests/fixtures/rar5/multi_block_p27.rar`
+  (the smallest known 2-block fixture) end-to-end through
+  `RarStreamDecoder` and asserts the 67.5 MB decoded payload is
+  the expected `b'X' * 27 * 2_500_000`.
+- Out-of-tree probe corpus (regenerable via the recipe in §"Repro
+  recipe" above) cross-checked via FNV-1a 64-bit hash against the
+  source; all four fixtures (`prose-huge`, `rand-text-1m`,
+  `p27-huge`, `multi_block_p27`) decode byte-identical:
+
+  | Archive            | Unpacked | Hash (decoded == source) |
+  |--------------------|---------:|:-------------------------|
+  | `prose-huge.rar`   | 180 MB   | `3cdcedf2c85e2225` ✓     |
+  | `rand-text-1m.rar` | 1 MB     | `1a083a31eca0f97e` ✓     |
+  | `p27-huge.rar`     | 108 MB   | (all 'X')           ✓     |
+  | `multi_block_p27`  | 67.5 MB  | (all 'X')           ✓     |
+
+### Filed follow-on
+
+The `crash_resume_mid_compressed_entry_produces_identical_output`
+slot in
+[`tests/test_coordinator_rar.rs`](../tests/test_coordinator_rar.rs)
+is no longer decoder-blocked. Wiring the test against
+`multi_block_p27.rar` (a 2.9 KB compressed, 67.5 MB unpacked
+archive — easily over `coord_config(checkpoint_min_bytes = 1)`'s
+mid-entry threshold) is left as a follow-on commit, separate
+from this fix.

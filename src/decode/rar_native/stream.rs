@@ -648,7 +648,28 @@ impl RarStreamDecoder {
         out.reserve(self.decoder_state_size_hint());
         out.extend_from_slice(&SNAPSHOT_MAGIC);
         write_u32_le(out, SNAPSHOT_VERSION);
-        write_u64_le(out, self.src_consumed);
+        // Subtract any pulled-but-replayed lookahead bytes
+        // ([`Self::prepend_buf`]) from the serialized source
+        // cursor. Those bytes were pulled from `src` (so
+        // `src_consumed` counts them) but never processed by
+        // the LZSS dispatcher — they live in `prepend_buf` for
+        // replay as the next block's prologue. On resume the
+        // pipeline slices `compressed[cursor..]` and the new
+        // decoder starts with an empty `prepend_buf`; rewinding
+        // the cursor by `prepend_buf.len()` means the new src
+        // delivers those lookahead bytes again at the right
+        // moment (now as fresh `src` reads instead of
+        // prepend-buf drains). Byte-equivalent to the original
+        // state and avoids serializing the lookahead bytes
+        // themselves.
+        //
+        // For single-block entries `prepend_buf` is always
+        // empty (the last block never pulls lookahead), so this
+        // is a no-op on the existing single-block test corpus.
+        let logical_src_consumed = self
+            .src_consumed
+            .saturating_sub(self.prepend_buf.len() as u64);
+        write_u64_le(out, logical_src_consumed);
         write_u64_le(out, self.src_start_offset);
         write_u64_le(out, self.staging_start_pos);
         // staging

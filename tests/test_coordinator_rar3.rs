@@ -359,17 +359,8 @@ fn malformed_compressed_legacy_payload_surfaces_decoder_diagnostic() {
 /// but for legacy archives — proves the
 /// `entries_completed`/`current_entry_offset` resume machinery
 /// from §A2b still works across the §E1/§F1 pipeline reshuffle.
-///
-/// The compressed-entry sibling is bottlenecked on a curated
-/// legacy fixture whose decoded size exceeds the streaming
-/// adapter's 64 KiB drain chunk; the in-tree fixtures are all
-/// ≤4 KiB so the live `decode_step` loop never exposes a
-/// mid-drain boundary. The §F1 snapshot/resume contract itself
-/// is covered exhaustively by the
-/// `synthetic_blob_resume_round_trips_at_every_decoded_pos`
-/// unit test in
-/// `src/decode/rar_legacy/stream.rs` (every reachable
-/// `decoded_pos` value, byte-by-byte).
+/// The compressed-entry sibling lives in
+/// [`crash_resume_mid_compressed_entry_produces_identical_output`].
 #[test]
 fn crash_resume_mid_entry_produces_identical_output() {
     let payload: Vec<u8> = (0..4u32 * 1024 * 1024).map(|i| (i * 31) as u8).collect();
@@ -417,6 +408,69 @@ fn crash_resume_mid_entry_produces_identical_output() {
     assert_eq!(
         on_disk, payload,
         "resumed extraction must be byte-identical"
+    );
+}
+
+/// §F1 mid-compressed-entry crash-resume for legacy (RAR3/RAR4)
+/// archives. Drives the Goldilocks fixture
+/// `large_lz_normal.rar` (rar 5.0.0 Linux `-ma4 -m3`, 256 KiB
+/// decoded, ~800 B compressed) through the coordinator. The
+/// decoded payload exceeds the streaming adapter's 64 KiB drain
+/// chunk so the live `decode_step` loop takes multiple drain
+/// steps — `checkpoint_min_bytes = 1` lands a mid-entry
+/// `CheckpointWritten` before EOF, the kill-switch fires, and
+/// the resumed run picks up at the saved `decoded_pos` via the
+/// §F1 snapshot blob. On-disk extraction must be byte-identical
+/// to a clean run.
+#[test]
+fn crash_resume_mid_compressed_entry_produces_identical_output() {
+    let body: Vec<u8> =
+        fs::read("tests/fixtures/rar_legacy/large_lz_normal.rar").expect("fixture present");
+    let expected: Vec<u8> = fs::read("tests/fixtures/rar_legacy/large_lz_normal.bin")
+        .expect("reference plaintext present");
+    let server = MockServer::start(ok_handler(body));
+
+    let work = unique_dir("crash_resume_compressed");
+    let _g = CleanupDir(work.clone());
+
+    let kill = Arc::new(AtomicBool::new(false));
+    let kill_for_cb = Arc::clone(&kill);
+    let counter = Arc::new(AtomicU64::new(0));
+    let counter_for_cb = Arc::clone(&counter);
+    let progress: peel::coordinator::ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            let n = counter_for_cb.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= 1 {
+                kill_for_cb.store(true, Ordering::Release);
+            }
+        }
+    });
+    let args = make_args_with_callbacks(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+        Some(Arc::clone(&kill)),
+        Some(progress),
+    );
+    match run(args) {
+        Err(CoordinatorError::Aborted { .. }) => {}
+        other => panic!("expected Aborted, got {other:?}"),
+    }
+
+    let args2 = make_args_with_callbacks(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+        None,
+        None,
+    );
+    run(args2).expect("resume run");
+
+    let on_disk = fs::read(work.join("payload.bin")).expect("read payload.bin");
+    assert_eq!(on_disk.len(), expected.len(), "size mismatch");
+    assert_eq!(
+        on_disk, expected,
+        "resumed legacy compressed extraction must be byte-identical"
     );
 }
 

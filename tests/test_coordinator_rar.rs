@@ -326,27 +326,79 @@ fn crash_resume_mid_entry_produces_identical_output() {
     );
 }
 
-// `crash_resume_mid_compressed_entry_produces_identical_output` —
-// the §F1 compressed-entry sibling — is deferred behind a
-// concrete decoder bug, not a fixture-availability problem.
-//
-// The round-one `RarStreamDecoder` treats each RAR5 block's
-// bitstream as bit-isolated. RAR5's encoder splits compressed
-// entries above ~2.8 KB packed into multiple blocks and leaves
-// the trailing symbol partially encoded across the block
-// boundary; the decoder under-runs by 2 bits at the seam. A
-// curated minimal repro lives at
-// `tests/fixtures/rar5/multi_block_p27.rar` and is pinned by
-// the `#[ignore]`'d `multi_block_archive_decodes_byte_identical`
-// test in `tests/test_rar_decoder_resume.rs`.
-//
-// Once the multi-block gap closes, this test slot lights up
-// directly — the `multi_block_p27.rar` fixture (67.5 MB unpacked,
-// 2.8 KB compressed) is the Goldilocks the original §F1 plan
-// asked for: large enough that
-// `coord_config(checkpoint_min_bytes = 1)` lands a mid-entry
-// `CheckpointWritten` before the entry finishes.
-//
-// See `docs/PLAN_rar5_multi_block_decode.md` for the full
-// diagnosis + fix sketch and `docs/PLAN_rar5_decoder.md` §F1
-// for the parent plan.
+/// §F1 mid-compressed-entry crash-resume: drive the curated
+/// `multi_block_p27.rar` fixture (2.8 KB compressed, 67.5 MB
+/// decoded — Goldilocks-sized for the tight checkpoint cadence)
+/// through the coordinator. Kill after the first
+/// `CheckpointWritten` event, then resume in a fresh run; the
+/// on-disk extraction must be byte-identical to a clean run.
+///
+/// Unblocked by the multi-block decode fix that landed in
+/// `src/decode/rar_native/{stream,lzss}.rs` per
+/// `docs/PLAN_rar5_multi_block_decode.md`'s "Resolution" note.
+/// Until that fix, the decoder underran the bitstream by 2 bits
+/// at each block seam; the entry never reached EOF and this
+/// test couldn't possibly pass.
+#[test]
+fn crash_resume_mid_compressed_entry_produces_identical_output() {
+    // 67.5 MB decoded — sized large enough that
+    // `checkpoint_min_bytes = 1` lands a mid-entry
+    // `CheckpointWritten` well before EOF, and small enough that
+    // the test finishes in a few seconds on a developer laptop.
+    let body: Vec<u8> =
+        fs::read("tests/fixtures/rar5/multi_block_p27.rar").expect("fixture present");
+    let expected_len: usize = 27 * 2_500_000;
+    let server = MockServer::start(ok_handler(body));
+
+    let work = unique_dir("crash_resume_compressed");
+    let _g = CleanupDir(work.clone());
+
+    let kill = Arc::new(AtomicBool::new(false));
+    let kill_for_cb = Arc::clone(&kill);
+    let counter = Arc::new(AtomicU64::new(0));
+    let counter_for_cb = Arc::clone(&counter);
+    let progress: peel::coordinator::ProgressFn = Box::new(move |event| {
+        if let ProgressEvent::CheckpointWritten { .. } = event {
+            let n = counter_for_cb.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= 1 {
+                kill_for_cb.store(true, Ordering::Release);
+            }
+        }
+    });
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+        Some(Arc::clone(&kill)),
+        Some(progress),
+    );
+    match run(args) {
+        Err(CoordinatorError::Aborted { .. }) => {}
+        other => panic!("expected Aborted, got {other:?}"),
+    }
+
+    let args2 = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+        None,
+        None,
+    );
+    run(args2).expect("resume run");
+
+    // The fixture's payload is `b'X' * 67_500_000`. Walk the
+    // extracted directory to find the entry (the fixture's
+    // entry name is opaque to this test); there must be exactly
+    // one regular file of the expected size and content.
+    let extracted = read_dir_recursive(&work);
+    assert_eq!(extracted.len(), 1, "expected one entry, got: {extracted:?}");
+    assert_eq!(
+        extracted[0].1.len(),
+        expected_len,
+        "decoded length mismatch"
+    );
+    assert!(
+        extracted[0].1.iter().all(|&b| b == b'X'),
+        "decoded bytes contained a non-'X' byte"
+    );
+}

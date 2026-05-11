@@ -2432,30 +2432,32 @@ performance numbers.
   the `source_cursor_from_blob` zero contract, and serialize →
   resume → serialize round-trip lossless-ness.
 - [`tests/test_coordinator_rar3.rs::crash_resume_mid_entry_produces_identical_output`](../tests/test_coordinator_rar3.rs)
-  is the integration-level crash-resume test. It mirrors the
-  RAR5 sibling in
-  [`tests/test_coordinator_rar.rs`](../tests/test_coordinator_rar.rs):
-  a 4 MiB single-entry STORED legacy archive, kill-switch after
-  the first `CheckpointWritten`, resume in a fresh run, expect
-  byte-identical on-disk output. The STORED-entry path doesn't
-  exercise the §F1 snapshot blob (STORED goes through
-  `extract_legacy_entry`, not the compressed path) but it does
-  prove the `entries_completed` / `current_entry_offset`
-  checkpoint machinery still works for legacy archives across
-  the §E1 / §F1 pipeline reshuffle. The compressed-entry sibling
-  is bottlenecked on a curated legacy fixture whose decoded size
-  exceeds the streaming adapter's drain chunk; that's the same
-  Goldilocks-fixture problem flagged in
-  `PLAN_rar5_decoder.md` §F1's postmortem note for the RAR5
-  compressed-entry crash-test.
+  drives a 4 MiB single-entry STORED legacy archive through the
+  full coordinator pipeline. STORED goes through
+  `extract_legacy_entry` (not the §F1 snapshot path) but the
+  test pins the `entries_completed` / `current_entry_offset`
+  checkpoint machinery for legacy archives across the §E1 / §F1
+  pipeline reshuffle.
+- [`tests/test_coordinator_rar3.rs::crash_resume_mid_compressed_entry_produces_identical_output`](../tests/test_coordinator_rar3.rs)
+  is the headline §F1 end-to-end crash-resume. Uses the new
+  Goldilocks fixture
+  [`large_lz_normal.rar`](../tests/fixtures/rar_legacy/large_lz_normal.rar)
+  (256 KiB decoded, ~800 B compressed, `rar 5.0.0 -ma4 -m3`).
+  Decoded size exceeds the streaming adapter's
+  `STREAM_CHUNK_BYTES` so the live `decode_step` loop takes
+  multiple drain steps and the tight `checkpoint_min_bytes = 1`
+  config lands a mid-entry `CheckpointWritten` well before EOF.
+  See
+  [`docs/fixtures/rar_legacy_large_lz_normal.md`](fixtures/rar_legacy_large_lz_normal.md)
+  for the re-encode recipe.
 
 **Demo**: `cargo test --features rar --lib
 decode::rar_legacy::stream` exercises the snapshot/resume
-contract end-to-end (19 unit tests, exhaustive over every
-`decoded_pos` boundary); `cargo test --features rar --test
-test_coordinator_rar3 crash_resume_mid_entry_produces_identical_output`
-drives the legacy crash-resume through the full coordinator
-pipeline.
+contract end-to-end (20 unit tests including the Goldilocks
+fixture round-trip); `cargo test --features rar --test
+test_coordinator_rar3 crash_resume_mid_compressed_entry_produces_identical_output`
+drives the legacy compressed crash-resume through the full
+coordinator pipeline.
 
 ---
 

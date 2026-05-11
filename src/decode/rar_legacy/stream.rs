@@ -630,6 +630,38 @@ mod tests {
         assert_eq!(out, FILTER_E8_BIN);
     }
 
+    /// 256 KiB Goldilocks fixture (`-ma4 -m3`) round-trips
+    /// byte-identical. Decoded size > `STREAM_CHUNK_BYTES` so the
+    /// streaming decoder takes multiple drain steps — proves the
+    /// §F1 mid-drain snapshot path is exercisable by the live
+    /// `decode_step` loop, not just the synthetic-blob unit
+    /// tests. Provenance: rar 5.0.0 Linux via Docker, see
+    /// `tests/fixtures/rar_legacy/README.md`.
+    const LARGE_LZ_NORMAL_RAR: &[u8] =
+        include_bytes!("../../../tests/fixtures/rar_legacy/large_lz_normal.rar");
+    const LARGE_LZ_NORMAL_BIN: &[u8] =
+        include_bytes!("../../../tests/fixtures/rar_legacy/large_lz_normal.bin");
+
+    #[test]
+    fn streams_large_lz_normal_entry_round_trips() {
+        let summary = walk_archive(LARGE_LZ_NORMAL_RAR).unwrap();
+        let entry = &summary.entries[0];
+        let compressed = &LARGE_LZ_NORMAL_RAR
+            [entry.data_offset as usize..(entry.data_offset + entry.header.packed_size) as usize];
+        let dict_capacity = entry.header.file_flags.dictionary_size().unwrap() as usize;
+        let dec = RarLegacyStreamDecoder::new(
+            Box::new(Cursor::new(compressed.to_vec())),
+            entry.header.packed_size,
+            entry.header.unpacked_size,
+            entry.header.method,
+            dict_capacity,
+        )
+        .expect("construct");
+        let out = drain_to_vec(dec);
+        assert_eq!(out.len(), LARGE_LZ_NORMAL_BIN.len());
+        assert_eq!(out, LARGE_LZ_NORMAL_BIN);
+    }
+
     #[test]
     fn bytes_consumed_advances_after_first_step() {
         let summary = walk_archive(FILTER_E8_RAR).unwrap();

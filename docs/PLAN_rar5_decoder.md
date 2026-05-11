@@ -267,6 +267,29 @@ in [`PLAN_macos_puncher_race.md`](PLAN_macos_puncher_race.md).
 The crash-resume test now passes 100/100 on macOS arm64 in both
 debug and release.
 
+**Postmortem note** (2026-05-11): wiring the
+`crash_resume_mid_compressed_entry_produces_identical_output`
+integration test (the multi-block sibling of the original §F1
+coverage) surfaced a real bug in the snapshot serializer. After
+each non-last block, `RarStreamDecoder::read_block` pulls
+`BLOCK_LOOKAHEAD_BYTES = 4` past the block end into `prepend_buf`
+so the LZSS dispatcher's symbol peek can read across the seam.
+The snapshot serialized `src_consumed` verbatim and the resume
+factory cleared `prepend_buf`, so the resumed decoder's source
+delivered bytes starting **past** the next block's prologue —
+the next `read_block` call read garbage. Fix: serialize
+`src_consumed - prepend_buf.len()` (the "logical" source cursor)
+so the resumed decoder's fresh `src` re-delivers those 4
+lookahead bytes as the next block's prologue. Byte-equivalent to
+the original lookahead-replay state; avoids serializing the
+lookahead bytes themselves. No-op on single-block snapshots
+(prepend_buf is always empty there), so the existing
+`snapshot_resume_round_trips_at_every_step` test stays green
+without changes. The new integration test pins the multi-block
+resume path against the curated `multi_block_p27.rar` fixture
+(67.5 MB decoded, 2.8 KB compressed — Goldilocks for the tight
+checkpoint cadence).
+
 ---
 
 ## Phase G — Throughput
