@@ -80,13 +80,14 @@ pub struct LocalRunArgs {
     /// `--force-format-from-magic`: trust magic bytes when they
     /// disagree with the source filename suffix.
     pub force_format_from_magic: bool,
-    /// `-k/--keep-archive`. `true` preserves the source archive
-    /// across the run (no punching, no deletion); `false` is the
-    /// destructive default — the source is punched as the decoder
-    /// advances and deleted on clean completion.
-    pub keep_archive: bool,
+    /// `-d/--destructive`. `false` (the default) preserves the
+    /// source archive across the run — no punching, no deletion.
+    /// `true` opts into the disk-pressure contract: the source is
+    /// punched as the decoder advances and deleted on clean
+    /// completion (`docs/PLAN_local_file_extract.md` §1).
+    pub destructive: bool,
     /// Extractor-side minimum gap between in-loop punch syscalls.
-    /// Ignored when [`Self::keep_archive`] is `true`.
+    /// Ignored when [`Self::destructive`] is `false`.
     pub punch_threshold: u64,
     /// Minimum source-byte progress between checkpoint writes.
     /// Same meaning as
@@ -145,7 +146,7 @@ impl LocalRunArgs {
             output,
             forced_format: None,
             force_format_from_magic: false,
-            keep_archive: false,
+            destructive: false,
             punch_threshold: DEFAULT_PUNCH_THRESHOLD,
             checkpoint_min_bytes: 8 * 1024 * 1024,
             checkpoint_min_interval: Duration::from_secs(2),
@@ -435,13 +436,13 @@ fn read_local_resume_plan(
     ckpt_path: &Path,
     source_meta: &std::fs::Metadata,
 ) -> Result<LocalResumePlan, CoordinatorError> {
-    if args.keep_archive {
-        // §6: `-k` runs do not read or write `.peel.ckpt`. A
-        // stale checkpoint from a prior destructive run is warned
-        // about and otherwise ignored.
+    if !args.destructive {
+        // §6: non-destructive runs do not read or write
+        // `.peel.ckpt`. A stale checkpoint from a prior destructive
+        // run is warned about and otherwise ignored.
         if ckpt_path.exists() {
             tracing::warn!(
-                "ignoring stale `.peel.ckpt` at {} for `-k`/`--keep-archive` run; \
+                "ignoring stale `.peel.ckpt` at {} for non-destructive local run; \
                  delete the file to silence this warning",
                 ckpt_path.display(),
             );
@@ -745,19 +746,20 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     decoder.set_source_start_offset(decoder_start_offset);
 
     // Puncher selection (`docs/PLAN_local_file_extract.md` §2
-    // step 3): `-k` forces a NoopPuncher regardless of
-    // `--io-backend`; destructive mode picks the platform default
-    // (LinuxPuncher / MacosPuncher / Noop on other OSes).
-    let puncher: Box<dyn PunchHole> = if args.keep_archive {
-        Box::new(NoopPuncher::new())
-    } else {
+    // step 3): the non-destructive default forces a NoopPuncher
+    // regardless of `--io-backend`; `-d/--destructive` picks the
+    // platform default (LinuxPuncher / MacosPuncher / Noop on
+    // other OSes).
+    let puncher: Box<dyn PunchHole> = if args.destructive {
         default_puncher()
+    } else {
+        Box::new(NoopPuncher::new())
     };
 
-    let effective_punch_threshold = if args.keep_archive {
-        u64::MAX
-    } else {
+    let effective_punch_threshold = if args.destructive {
         args.punch_threshold
+    } else {
+        u64::MAX
     };
     let extractor_cfg = ExtractorConfig {
         punch_threshold: effective_punch_threshold,
@@ -773,12 +775,11 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     }
 
     // Destructive runs persist a `.peel.ckpt` at every
-    // quiescent advance. `-k` runs skip the observer entirely
-    // — there is nothing to recover from since the source is
-    // never punched, so a kill mid-run is "restart against the
-    // intact source" the same way pre-§5 destructive mode used
-    // to fail.
-    let write_checkpoints = !args.keep_archive;
+    // quiescent advance. Non-destructive runs skip the observer
+    // entirely — there is nothing to recover from since the
+    // source is never punched, so a kill mid-run is "restart
+    // against the intact source".
+    let write_checkpoints = args.destructive;
     let ckpt_writer = if write_checkpoints {
         Some(Arc::new(Mutex::new(LocalCheckpointWriter {
             source_path: args.source.clone(),
@@ -837,10 +838,11 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     // Destructive-mode cleanup: delete the source on clean
     // completion *unless* the FS refused to punch (in which case
     // the bytes never went anywhere and deleting would be
-    // surprising; preserve the source as if `-k` had been set).
-    // The `.peel.ckpt` is removed in both completion branches —
-    // the run finished, so there is nothing left to resume.
-    if !args.keep_archive {
+    // surprising; preserve the source as the non-destructive
+    // default would have). The `.peel.ckpt` is removed in both
+    // completion branches — the run finished, so there is
+    // nothing left to resume.
+    if args.destructive {
         let _ = fs::remove_file(&ckpt_path);
         if stats.punch_unsupported {
             tracing::warn!(

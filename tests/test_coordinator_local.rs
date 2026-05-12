@@ -4,7 +4,8 @@
 //! These tests exercise the local-file path end-to-end without an
 //! HTTP server: build a compressed archive on disk, hand its path
 //! to the coordinator, and check the produced output (and the
-//! source-file post-state for destructive vs. keep-archive runs).
+//! source-file post-state for destructive vs. non-destructive
+//! runs).
 
 #![cfg(unix)]
 
@@ -54,8 +55,32 @@ fn build_raw_zst(dir: &std::path::Path, payload: &[u8]) -> PathBuf {
 }
 
 #[test]
-fn local_tar_zst_extracts_destructive_default_deletes_source() {
-    let dir = unique_dir("destructive_default");
+fn local_tar_zst_default_preserves_source() {
+    // Default local-mode behavior: extract into the output tree
+    // and leave the source archive untouched.
+    let dir = unique_dir("default_preserves");
+    let source = build_tar_zst(&dir, &[("a.txt", b"alpha\n"), ("b.txt", b"beta\n")]);
+    let archive_size_before = std::fs::metadata(&source).expect("stat").len();
+    let out = dir.join("out");
+
+    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    local_run(args).expect("local run");
+
+    let a = std::fs::read(out.join("a.txt")).expect("read a");
+    assert_eq!(a, b"alpha\n");
+    // Source preserved at full size.
+    let archive_size_after = std::fs::metadata(&source).expect("stat after").len();
+    assert_eq!(
+        archive_size_after, archive_size_before,
+        "non-destructive default must preserve the source archive's size",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_tar_zst_with_destructive_flag_deletes_source() {
+    let dir = unique_dir("destructive_opt_in");
     let source = build_tar_zst(
         &dir,
         &[
@@ -66,7 +91,7 @@ fn local_tar_zst_extracts_destructive_default_deletes_source() {
     let out = dir.join("out");
 
     let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
-    args.keep_archive = false;
+    args.destructive = true;
     local_run(args).expect("local run");
 
     // Output tree present.
@@ -75,36 +100,13 @@ fn local_tar_zst_extracts_destructive_default_deletes_source() {
     let nested = std::fs::read(out.join("dir/inside.txt")).expect("read nested");
     assert_eq!(nested, b"nested\n");
 
-    // Destructive default: source deleted (or, if the FS didn't
+    // Destructive opt-in: source deleted (or, if the FS didn't
     // support punching, preserved — the implementation surfaces a
     // tracing::warn! in that case but the test runs on macOS APFS
     // or Linux tmpfs both of which do support punching).
     assert!(
         !source.exists(),
-        "destructive default should delete the source archive"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn local_tar_zst_with_keep_archive_preserves_source() {
-    let dir = unique_dir("keep_archive");
-    let source = build_tar_zst(&dir, &[("a.txt", b"alpha\n"), ("b.txt", b"beta\n")]);
-    let archive_size_before = std::fs::metadata(&source).expect("stat").len();
-    let out = dir.join("out");
-
-    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
-    args.keep_archive = true;
-    local_run(args).expect("local run");
-
-    let a = std::fs::read(out.join("a.txt")).expect("read a");
-    assert_eq!(a, b"alpha\n");
-    // Source preserved at full size.
-    let archive_size_after = std::fs::metadata(&source).expect("stat after").len();
-    assert_eq!(
-        archive_size_after, archive_size_before,
-        "-k must preserve the source file's size"
+        "-d should delete the source archive on clean completion",
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -117,8 +119,7 @@ fn local_raw_zst_extracts_to_file_target() {
     let source = build_raw_zst(&dir, payload);
     let out = dir.join("decoded.bin");
 
-    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::File(out.clone()));
-    args.keep_archive = true; // don't litter
+    let args = LocalRunArgs::new(source.clone(), OutputTarget::File(out.clone()));
     local_run(args).expect("local run");
 
     let decoded = std::fs::read(&out).expect("read decoded");
@@ -171,7 +172,6 @@ fn local_forced_format_overrides_filename_suffix() {
 
     let mut args = LocalRunArgs::new(source, OutputTarget::File(out.clone()));
     args.forced_format = Some("zstd".to_string());
-    args.keep_archive = true;
     local_run(args).expect("local run");
 
     let decoded = std::fs::read(&out).expect("read decoded");
@@ -195,7 +195,8 @@ fn local_run_pumps_progress_state_counters() {
 
     let state = peel::progress::ProgressState::new();
     let mut args = LocalRunArgs::new(source, OutputTarget::Dir(out));
-    args.keep_archive = true; // so the run doesn't unlink the source mid-test
+    // Non-destructive default keeps the source intact; the
+    // ProgressReader still pumps every read byte.
     args.progress_state = Some(Arc::clone(&state));
     local_run(args).expect("local run");
 
@@ -253,10 +254,10 @@ fn local_zip_rejected_with_clear_error() {
 
 #[test]
 fn local_destructive_clean_run_deletes_both_source_and_ckpt() {
-    // Destructive default: clean completion removes both the
-    // source archive and the `.peel.ckpt` sidecar. (Pre-§5 only
-    // removed the source; the new code also unlinks the ckpt to
-    // prevent stale-resume warnings on subsequent runs.)
+    // `-d`: clean completion removes both the source archive and
+    // the `.peel.ckpt` sidecar. (Pre-§5 only removed the source;
+    // the new code also unlinks the ckpt to prevent stale-resume
+    // warnings on subsequent runs.)
     let dir = unique_dir("destructive_clean_ckpt");
     let source = build_tar_zst(&dir, &[("a.txt", b"alpha\n"), ("b.txt", b"beta\n")]);
     let ckpt = {
@@ -266,14 +267,12 @@ fn local_destructive_clean_run_deletes_both_source_and_ckpt() {
     };
     let out = dir.join("out");
 
-    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
+    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
+    args.destructive = true;
     local_run(args).expect("local run");
 
-    assert!(!source.exists(), "destructive default deletes the source");
-    assert!(
-        !ckpt.exists(),
-        "destructive default removes the .peel.ckpt on clean exit",
-    );
+    assert!(!source.exists(), "-d deletes the source on clean exit");
+    assert!(!ckpt.exists(), "-d removes the .peel.ckpt on clean exit",);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -327,7 +326,8 @@ fn local_destructive_resume_rejects_size_drift() {
     ckpt.write(&ckpt_path).expect("write ckpt");
 
     let out = dir.join("out");
-    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
+    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
+    args.destructive = true;
     let err = local_run(args).expect_err("size drift should reject");
     assert!(matches!(
         err,
@@ -383,7 +383,8 @@ fn local_destructive_resume_rejects_mode_mismatch() {
     ckpt.write(&ckpt_path).expect("write ckpt");
 
     let out = dir.join("out");
-    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
+    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
+    args.destructive = true;
     let err = local_run(args).expect_err("mode mismatch should reject");
     assert!(matches!(
         err,
@@ -394,11 +395,12 @@ fn local_destructive_resume_rejects_mode_mismatch() {
 }
 
 #[test]
-fn local_keep_archive_ignores_stale_ckpt() {
-    // `-k` runs do not consult `.peel.ckpt`; a stale one from a
-    // prior destructive run must be ignored (warned about, not
-    // rejected), so the user can opt back into preservation
-    // without having to clean up first.
+fn local_non_destructive_ignores_stale_ckpt() {
+    // Non-destructive runs (the local-mode default) do not
+    // consult `.peel.ckpt`; a stale one from a prior destructive
+    // run must be ignored (warned about, not rejected), so the
+    // user can stop opting into `-d` without having to clean up
+    // first.
     let dir = unique_dir("stale_ckpt_ignored");
     let source = build_tar_zst(&dir, &[("a.txt", b"alpha\n")]);
     let ckpt_path = {
@@ -439,9 +441,8 @@ fn local_keep_archive_ignores_stale_ckpt() {
     ckpt.write(&ckpt_path).expect("write ckpt");
 
     let out = dir.join("out");
-    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
-    args.keep_archive = true;
-    local_run(args).expect("keep-archive run must succeed despite stale ckpt");
+    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    local_run(args).expect("non-destructive run must succeed despite stale ckpt");
 
     let a = std::fs::read(out.join("a.txt")).expect("read a.txt");
     assert_eq!(a, b"alpha\n");
@@ -454,11 +455,12 @@ fn local_keep_archive_ignores_stale_ckpt() {
 }
 
 #[test]
-fn local_keep_archive_writes_no_checkpoint() {
-    // §6 (PLAN_local_file_extract.md): `-k` runs do not write
-    // `.peel.ckpt` — the run is one-pass and a kill mid-run just
-    // means re-run from scratch against the still-intact source.
-    let dir = unique_dir("keep_no_ckpt");
+fn local_non_destructive_writes_no_checkpoint() {
+    // §6 (PLAN_local_file_extract.md): non-destructive runs (the
+    // local-mode default) do not write `.peel.ckpt` — the run is
+    // one-pass and a kill mid-run just means re-run from scratch
+    // against the still-intact source.
+    let dir = unique_dir("non_destructive_no_ckpt");
     let source = build_tar_zst(&dir, &[("a.txt", b"alpha\n")]);
     let archive_size_before = std::fs::metadata(&source).expect("stat").len();
     let ckpt_path = {
@@ -468,19 +470,18 @@ fn local_keep_archive_writes_no_checkpoint() {
     };
     let out = dir.join("out");
 
-    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
-    args.keep_archive = true;
+    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out));
     local_run(args).expect("local run");
 
     // Source preserved at full size, no checkpoint written.
     assert_eq!(
         std::fs::metadata(&source).expect("stat after").len(),
         archive_size_before,
-        "-k must preserve the source archive's size",
+        "non-destructive default must preserve the source archive's size",
     );
     assert!(
         !ckpt_path.exists(),
-        "-k runs must not write `.peel.ckpt` — got one at {}",
+        "non-destructive runs must not write `.peel.ckpt` — got one at {}",
         ckpt_path.display(),
     );
 
@@ -544,6 +545,7 @@ fn local_destructive_kill_mid_run_resumes_to_byte_identical_output() {
     });
 
     let mut args1 = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    args1.destructive = true;
     args1.kill_switch = Some(Arc::clone(&kill));
     args1.checkpoint_min_bytes = 1; // fire on every quiescent boundary
     args1.checkpoint_min_interval = std::time::Duration::from_millis(0);
@@ -560,7 +562,8 @@ fn local_destructive_kill_mid_run_resumes_to_byte_identical_output() {
         // (or the source was untouched and we run from scratch
         // anyway). Either way the second run produces a complete
         // output tree.
-        let args2 = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+        let mut args2 = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+        args2.destructive = true;
         local_run(args2).expect("resume run");
     }
 
@@ -607,7 +610,8 @@ fn local_destructive_writes_checkpoint_during_run() {
     std::fs::write(&source, &zst).expect("write");
     let out = dir.join("out");
 
-    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    let mut args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    args.destructive = true;
     local_run(args).expect("local run");
     assert!(!source.exists(), "destructive run deletes the source");
     assert_eq!(
@@ -625,8 +629,7 @@ fn local_run_produces_consistent_run_stats() {
     let total_size = std::fs::metadata(&source).expect("stat").len();
     let out = dir.join("out");
 
-    let mut args = LocalRunArgs::new(source, OutputTarget::Dir(out));
-    args.keep_archive = true;
+    let args = LocalRunArgs::new(source, OutputTarget::Dir(out));
     let stats = local_run(args).expect("local run");
 
     assert_eq!(stats.total_size, total_size);

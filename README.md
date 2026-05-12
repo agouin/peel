@@ -504,6 +504,7 @@ should fail the build).
 | `-o, --output-file <PATH>` | URL basename, suffixes stripped | Output path. Directory for tree-shaped formats (tar / zip / 7z / rar / any `.tar.<x>` wrapper); file for stream-shaped formats (raw `.zst`, `.xz`, `.lz4`, `.gz`). A trailing slash forces directory semantics. |
 | `--no-extract` (alias: `--download-only`) | off | Skip extraction; download the source bytes verbatim. |
 | `-k, --keep-archive[=<PATH>]` | off | Extract AND keep the source archive on disk. Bare `-k` places the archive as a sibling of `-o`; `-k=<PATH>` is explicit. |
+| `-d, --destructive` | off | Hole-punch and delete the source archive as extraction proceeds. Required to enable destructive behavior in local mode (preservation is the default there); a no-op for HTTP runs, which are destructive by default. Combining `-d` with `-k` for an HTTP source is an error. |
 | `--strict-format` | off | Treat unrecognized formats as a hard error rather than falling back to download-only. |
 | `--workers <N>` | 8 | Parallel download workers. |
 | `--chunk-size <BYTES>` | 4 MiB | Bitmap unit. With adaptive sizing, dispatch may coalesce several. |
@@ -530,39 +531,32 @@ peel's hand-rolled decoders instead of `tar -I zstd -xf` /
 `unzip` / `7z x`:
 
 ```sh
-# Destructive by default: hole-punches the source as the
-# decoder advances; deletes it on clean completion. A TTY
-# user is prompted before this begins; non-TTY runs must
-# pass -y or -k explicitly.
-peel /tmp/dataset.tar.zst -o ./out/
+# Non-destructive by default: extracts to ./dataset/ and
+# leaves the source archive untouched.
+peel /tmp/dataset.tar.zst
 
-# Skip the prompt non-interactively.
-peel /tmp/dataset.tar.zst -o ./out/ -y
-
-# Preserve the source archive (non-destructive). The same `-k`
-# flag the HTTP path uses; in local mode it always means "keep
-# the existing file untouched."
-peel /tmp/dataset.tar.zst -o ./out/ -k
+# Destructive opt-in: hole-punches the source as the decoder
+# advances and deletes it on clean completion.
+peel -d /tmp/dataset.tar.zst -o ./out/
 ```
 
 | Flag | Local-mode behaviour |
 | --- | --- |
-| (default, TTY) | destructive — prompt for confirmation, hole-punch the source, delete on completion |
-| (default, non-TTY) | hard error at parse time; pass `-y` or `-k` |
-| `-y` / `--yes` | bypass the prompt; destructive mode proceeds |
-| `-k` / `--keep-archive` | preserve the source archive; no punching, no deletion |
+| (default) | non-destructive — extract and leave the source untouched, no `.peel.ckpt` written |
+| `-d` / `--destructive` | hole-punch the source as the decoder advances and delete it on clean completion |
+| `-k` / `--keep-archive` | no-op in local mode (preservation is already the default); kept for cross-source script compatibility |
 | `--format <NAME>` | force a decoder (same semantics as HTTP mode) |
-| `--workdir <DIR>` | place the `.peel.ckpt` sidecar here instead of next to the source |
+| `--workdir <DIR>` | place the `.peel.ckpt` sidecar here instead of next to the source (destructive mode only) |
 | `--io-backend ...` | selects the puncher implementation (`auto` / `blocking` / `mmap`) |
 | `--punch-threshold` | minimum gap between in-loop punch syscalls in destructive mode |
 
 Resume-after-crash is supported in destructive mode: peel writes
 a `.peel.ckpt` next to the source after each quiescent decoder
 boundary, and a `kill -9` mid-run followed by a re-invocation
-with the same arguments converges to the same final output tree
-as a clean single run. `-k` runs are one-pass — no `.peel.ckpt`
-is written, and a kill mid-run just means re-run from scratch
-against the still-intact source.
+(with the same `-d`) converges to the same final output tree as a
+clean single run. Non-destructive runs are one-pass — no
+`.peel.ckpt` is written, and a kill mid-run just means re-run
+from scratch against the still-intact source.
 
 A few HTTP-only flags are rejected at parse time in local mode
 (`--mirror`, `--sha256`, `--workers`, `--chunk-size`,

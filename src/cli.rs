@@ -8,7 +8,6 @@
 
 #![cfg(unix)]
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -239,7 +238,7 @@ pub struct Cli {
     /// Keep the source archive on disk alongside the extracted
     /// output (`docs/PLAN_download_modes.md` §3).
     ///
-    /// Three forms:
+    /// HTTP-source forms:
     ///   * `-k` / `--keep-archive` (bare) — preserve the archive
     ///     as a sibling of `-o`, named after the URL basename.
     ///   * `-k=<PATH>` / `--keep-archive=<PATH>` — preserve the
@@ -249,6 +248,13 @@ pub struct Cli {
     ///   * flag absent — default behaviour: the source bytes are
     ///     dropped (sparse hole-punching trims them as the decoder
     ///     advances; the part file is removed on success).
+    ///
+    /// Local-source mode preserves the source by default, so `-k`
+    /// is a harmless no-op there (kept for scripts that pass `-k`
+    /// across both HTTP and local sources). Pass `-d/--destructive`
+    /// in local mode to opt into hole-punching + delete-on-success.
+    /// The `-k=<PATH>` value form is rejected in local mode because
+    /// the archive is already at the positional path.
     ///
     /// With `-k` the puncher is forced to no-op and the archive is
     /// preserved at its full `Content-Length` size. Redundant with
@@ -320,20 +326,25 @@ pub struct Cli {
     #[arg(long = "password-from", value_name = "SOURCE")]
     pub password_from: Option<String>,
 
-    /// Skip the destructive-mode confirmation prompt in local-file
-    /// mode (`docs/PLAN_local_file_extract.md` §1).
+    /// Destroy the source archive as extraction proceeds
+    /// (`docs/PLAN_local_file_extract.md` §1).
     ///
-    /// When the positional argument is a local path peel runs in
-    /// destructive mode by default: the source archive is
+    /// Local-file mode is non-destructive by default — `peel
+    /// abc.tar.xz` extracts into `./abc/` and leaves `abc.tar.xz`
+    /// untouched. Passing `-d/--destructive` opts in to the
+    /// disk-pressure contract of the HTTP path: the source is
     /// progressively hole-punched as the decoder advances and
-    /// deleted on clean completion. In a TTY the user is prompted
-    /// before this begins; `-y/--yes` bypasses the prompt.
-    /// `-k/--keep-archive` preserves the source archive instead;
-    /// combining `-y` with `-k` is harmless (`-k` wins).
+    /// deleted on clean completion, freeing the archive's blocks
+    /// before the extracted tree is fully written. `-d` overrides
+    /// `-k` in local mode (info-logged; non-destructive is the
+    /// default so `-k` is already a no-op there).
     ///
-    /// Has no effect for HTTP sources.
-    #[arg(short = 'y', long = "yes", default_value_t = false)]
-    pub yes: bool,
+    /// HTTP runs are destructive by default already, so `-d` is a
+    /// harmless no-op for an HTTP source (info-logged). Passing
+    /// `-d` *and* `-k/--keep-archive` together with an HTTP source
+    /// is an error — the two intents are contradictory.
+    #[arg(short = 'd', long = "destructive", default_value_t = false)]
+    pub destructive: bool,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -601,10 +612,15 @@ pub enum CliError {
     /// `-k=<PATH>` was given alongside a local source. In local
     /// mode the archive already lives at the user-supplied
     /// positional path; the `-k <PATH>` value form is rejected per
-    /// `docs/PLAN_local_file_extract.md` §1 step 3.
+    /// `docs/PLAN_local_file_extract.md` §1 step 3. Bare `-k` in
+    /// local mode is a no-op (local mode preserves the source by
+    /// default); pass `-d/--destructive` to hole-punch and delete
+    /// the source as extraction proceeds.
     #[error(
         "`-k=<PATH>` does not apply to local-file mode \
-         (the archive is already at the positional path; use bare `-k` to preserve it)"
+         (the archive is already at the positional path; local mode \
+         preserves the source by default — pass `-d/--destructive` to \
+         opt into hole-punching + delete-on-success)"
     )]
     LocalKeepArchiveWithPath,
 
@@ -613,17 +629,20 @@ pub enum CliError {
     #[error("--password-from value is not a valid password source")]
     InvalidPasswordSource(#[source] crate::secret::source::PasswordSourceParseError),
 
-    /// Local-file mode would default to destructive extraction but
-    /// stdin is not a TTY and neither `-y` nor `-k` was passed
-    /// (`docs/PLAN_local_file_extract.md` §1 step 4). peel will not
-    /// silently destroy the source archive in a non-interactive
-    /// environment.
+    /// Both `-d/--destructive` and `-k/--keep-archive` were passed
+    /// alongside an HTTP source. `-d` asks for the downloaded
+    /// archive to be hole-punched and deleted on success (the
+    /// HTTP-mode default); `-k` asks for it to be preserved. The
+    /// two intents are contradictory, so peel rejects the
+    /// combination rather than silently picking one. (Local mode
+    /// resolves this the other way — `-d` wins and `-k` is
+    /// logged as a no-op — because the local-mode default is
+    /// non-destructive and `-d` is the explicit opt-in signal.)
     #[error(
-        "peel destroys the source archive by default in local-file mode \
-         and stdin is not a TTY — re-run with `-y` to confirm destructive \
-         extraction, or `-k` to preserve the source"
+        "`-d/--destructive` and `-k/--keep-archive` are contradictory for HTTP sources: \
+         drop `-d` (HTTP runs are destructive by default) or drop `-k` (to allow it)"
     )]
-    LocalConsentRequired,
+    HttpDestructiveConflictsKeepArchive,
 }
 
 /// Compression and archive suffixes stripped when deriving a default
@@ -941,20 +960,15 @@ pub enum Dispatch {
     /// carries config, client, registry, …) — sizing the bare
     /// variant skews the enum.
     Http(Box<RunArgs>),
-    /// Local-file run (`docs/PLAN_local_file_extract.md`). Carries
-    /// a `needs_consent_prompt` flag that the binary observes: when
-    /// `true`, the binary prompts on `/dev/tty` (per §1) before
-    /// invoking the coordinator; when `false`, the run is either
-    /// non-destructive (`-k`) or the user has already consented via
-    /// `-y`.
+    /// Local-file run (`docs/PLAN_local_file_extract.md`).
+    /// Non-destructive by default: the source archive is left on
+    /// disk untouched. Destructive mode (`-d/--destructive`)
+    /// hole-punches the source as the decoder advances and
+    /// deletes it on success; the dispatch layer encodes that
+    /// choice in [`LocalRunArgs::destructive`].
     Local {
         /// Arguments for [`crate::coordinator::local::run`].
         args: Box<LocalRunArgs>,
-        /// True iff the binary must prompt the user before
-        /// invoking the coordinator. Implies destructive mode and
-        /// a TTY-attached stdin (the non-TTY rule errors at parse
-        /// time; explicit `-y` / `-k` short-circuit the prompt).
-        needs_consent_prompt: bool,
     },
 }
 
@@ -1359,9 +1373,7 @@ impl Cli {
     /// regular file, [`CliError::LocalFlagNotApplicable`] when an
     /// HTTP-only flag is combined with a local source,
     /// [`CliError::LocalKeepArchiveWithPath`] when `-k=<PATH>` is
-    /// used in local mode, [`CliError::LocalConsentRequired`] when
-    /// destructive local mode is requested in a non-TTY context
-    /// without `-y` / `-k`, or any of the variants
+    /// used in local mode, or any of the variants
     /// [`Self::into_run_args`] surfaces.
     pub fn into_dispatch(self) -> Result<Dispatch, CliError> {
         // Hard cutover migration error for the removed `-C` flag
@@ -1381,6 +1393,23 @@ impl Cli {
             .all(|s| matches!(s, SourceClassification::Local(_)));
 
         if !is_local {
+            // HTTP runs are destructive by default — the
+            // downloaded archive's part-file is progressively
+            // hole-punched and removed on success. `-d` against
+            // an HTTP source therefore restates the default and
+            // is a harmless no-op; `-k` is the explicit opt-out.
+            // Combining the two is a contradiction we surface as
+            // a typed error rather than silently letting one win.
+            if self.destructive && self.keep_archive.is_some() {
+                return Err(CliError::HttpDestructiveConflictsKeepArchive);
+            }
+            if self.destructive {
+                tracing::info!(
+                    "`-d/--destructive` is a no-op for HTTP sources \
+                     (the downloaded archive is hole-punched and deleted by default; \
+                     pass `-k/--keep-archive` to opt out)",
+                );
+            }
             return self.into_run_args().map(Box::new).map(Dispatch::Http);
         }
 
@@ -1403,28 +1432,30 @@ impl Cli {
             SourceClassification::Http(_) => unreachable!("filtered above"),
         };
 
-        // `-k` (bare or with value): in local mode the archive is
-        // already at the user-supplied positional path, so the
-        // `-k=<PATH>` value form is meaningless. Bare `-k` is the
-        // opt-out flag (no destruction, source preserved).
-        let keep_archive = match self.keep_archive.as_deref() {
-            None => false,
-            Some("") => true,
+        // Local mode is non-destructive by default
+        // (`docs/PLAN_local_file_extract.md` §1). `-d/--destructive`
+        // opts into hole-punch + delete-on-success. `-k` is a no-op
+        // in local mode (local mode already preserves the source);
+        // we still reject the `-k=<PATH>` value form because the
+        // archive is already at the positional path.
+        match self.keep_archive.as_deref() {
+            None | Some("") => {}
             Some(_) => return Err(CliError::LocalKeepArchiveWithPath),
-        };
-
-        // Destructive-default consent rule (§1 step 4): when the
-        // run will modify the source and we're not in a TTY,
-        // require explicit consent via `-y` or `-k`.
-        let destructive = !keep_archive;
-        let stdin_is_tty = std::io::stdin().is_terminal();
-        let needs_consent_prompt = if destructive && !self.yes {
-            stdin_is_tty
-        } else {
-            false
-        };
-        if destructive && !self.yes && !stdin_is_tty {
-            return Err(CliError::LocalConsentRequired);
+        }
+        let destructive = self.destructive;
+        if self.keep_archive.is_some() {
+            if destructive {
+                tracing::info!(
+                    "`-d/--destructive` overrides `-k/--keep-archive` in local mode; \
+                     running destructively",
+                );
+            } else {
+                tracing::info!(
+                    "local mode preserves the source archive by default; \
+                     `-k/--keep-archive` is a no-op here (pass `-d/--destructive` \
+                     to enable hole-punching + delete-on-success)",
+                );
+            }
         }
 
         let registry = DecoderRegistry::with_defaults();
@@ -1446,7 +1477,7 @@ impl Cli {
             output,
             forced_format: self.forced_format,
             force_format_from_magic: self.force_format_from_magic,
-            keep_archive,
+            destructive,
             punch_threshold: self.punch_threshold,
             checkpoint_min_bytes: self.checkpoint_min_bytes,
             checkpoint_min_interval: Duration::from_secs_f64(self.checkpoint_min_secs.max(0.0)),
@@ -1462,7 +1493,6 @@ impl Cli {
 
         Ok(Dispatch::Local {
             args: Box::new(args),
-            needs_consent_prompt,
         })
     }
 }
@@ -2788,36 +2818,48 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_existing_file_with_yes_routes_to_local() {
-        let p = make_local_fixture("dispatch_yes");
-        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y"]).expect("parse");
+    fn dispatch_existing_file_routes_to_local_non_destructive_by_default() {
+        let p = make_local_fixture("dispatch_default");
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8")]).expect("parse");
         let dispatch = cli.into_dispatch().expect("dispatch");
         let _ = std::fs::remove_file(&p);
         match dispatch {
-            Dispatch::Local {
-                args,
-                needs_consent_prompt,
-            } => {
-                assert!(!needs_consent_prompt, "-y must skip the prompt");
-                assert!(!args.keep_archive, "default mode is destructive");
+            Dispatch::Local { args } => {
+                assert!(
+                    !args.destructive,
+                    "local mode preserves the source by default"
+                );
             }
             Dispatch::Http(_) => panic!("expected Local"),
         }
     }
 
     #[test]
-    fn dispatch_existing_file_with_keep_archive_routes_to_local_non_destructive() {
-        let p = make_local_fixture("dispatch_keep");
+    fn dispatch_existing_file_with_destructive_flag_opts_in() {
+        let p = make_local_fixture("dispatch_destructive");
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-d"]).expect("parse");
+        let dispatch = cli.into_dispatch().expect("dispatch");
+        let _ = std::fs::remove_file(&p);
+        match dispatch {
+            Dispatch::Local { args } => {
+                assert!(args.destructive, "-d must opt into destructive mode");
+            }
+            Dispatch::Http(_) => panic!("expected Local"),
+        }
+    }
+
+    #[test]
+    fn dispatch_existing_file_with_keep_archive_is_no_op_in_local_mode() {
+        let p = make_local_fixture("dispatch_keep_noop");
         let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-k"]).expect("parse");
         let dispatch = cli.into_dispatch().expect("dispatch");
         let _ = std::fs::remove_file(&p);
         match dispatch {
-            Dispatch::Local {
-                args,
-                needs_consent_prompt,
-            } => {
-                assert!(!needs_consent_prompt, "-k must skip the prompt");
-                assert!(args.keep_archive, "-k must opt out of destructive mode");
+            Dispatch::Local { args } => {
+                assert!(
+                    !args.destructive,
+                    "-k in local mode is a no-op; non-destructive is already the default",
+                );
             }
             Dispatch::Http(_) => panic!("expected Local"),
         }
@@ -2848,7 +2890,7 @@ mod tests {
     #[test]
     fn dispatch_local_rejects_http_only_flags() {
         let p = make_local_fixture("dispatch_workers");
-        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y", "--workers", "8"])
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "--workers", "8"])
             .expect("parse");
         let result = cli.into_dispatch();
         let _ = std::fs::remove_file(&p);
@@ -2862,14 +2904,9 @@ mod tests {
     #[test]
     fn dispatch_local_rejects_mirror_flag() {
         let p = make_local_fixture("dispatch_mirror");
-        let cli = Cli::try_parse_from([
-            "peel",
-            p.to_str().expect("utf8"),
-            "-y",
-            "--mirror",
-            "https://m/x",
-        ])
-        .expect("parse");
+        let cli =
+            Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "--mirror", "https://m/x"])
+                .expect("parse");
         let result = cli.into_dispatch();
         let _ = std::fs::remove_file(&p);
         let err = result.err().expect("must error");
@@ -2882,7 +2919,7 @@ mod tests {
     #[test]
     fn dispatch_local_rejects_no_extract() {
         let p = make_local_fixture("dispatch_no_extract");
-        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y", "--no-extract"])
+        let cli = Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "--no-extract"])
             .expect("parse");
         let result = cli.into_dispatch();
         let _ = std::fs::remove_file(&p);
@@ -2911,23 +2948,45 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_local_yes_and_keep_archive_resolves_as_keep() {
-        let p = make_local_fixture("dispatch_yk");
+    fn dispatch_local_destructive_overrides_keep_archive() {
+        // `-d` is the explicit destructive opt-in; `-k` in local
+        // mode is a no-op. Combining them is harmless and resolves
+        // to destructive (with an info-level log noting `-k` was
+        // ignored).
+        let p = make_local_fixture("dispatch_dk");
         let cli =
-            Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-y", "-k"]).expect("parse");
+            Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "-d", "-k"]).expect("parse");
         let dispatch = cli.into_dispatch().expect("dispatch");
         let _ = std::fs::remove_file(&p);
         match dispatch {
-            Dispatch::Local {
-                args,
-                needs_consent_prompt,
-            } => {
-                // `-k` wins: not destructive, no prompt needed.
-                assert!(args.keep_archive);
-                assert!(!needs_consent_prompt);
+            Dispatch::Local { args } => {
+                assert!(args.destructive, "-d wins over -k in local mode");
             }
             Dispatch::Http(_) => panic!("expected Local"),
         }
+    }
+
+    #[test]
+    fn dispatch_http_with_destructive_is_no_op() {
+        // HTTP runs are destructive by default; `-d` restates the
+        // default and is a harmless no-op (logged at info level).
+        // The dispatch still produces an Http run.
+        let cli =
+            Cli::try_parse_from(["peel", "https://example.com/x.tar.zst", "-d"]).expect("parse");
+        let dispatch = cli.into_dispatch().expect("dispatch");
+        assert!(matches!(dispatch, Dispatch::Http(_)));
+    }
+
+    #[test]
+    fn dispatch_http_destructive_and_keep_archive_conflict_errors() {
+        // `-d` says "destroy the archive" (HTTP default) and `-k`
+        // says "preserve it". The two intents are contradictory;
+        // peel rejects the combination rather than silently
+        // picking one.
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.tar.zst", "-d", "-k"])
+            .expect("parse");
+        let err = cli.into_dispatch().err().expect("must error");
+        assert!(matches!(err, CliError::HttpDestructiveConflictsKeepArchive));
     }
 
     #[test]
@@ -2939,7 +2998,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "peel",
             p.to_str().expect("utf8"),
-            "-y",
             "--format",
             "zstd",
             "-o",

@@ -378,18 +378,8 @@ fn main() -> Result<()> {
     // every HTTP-side knob — no scheduler retries, no
     // multi-attempt rebuild, no mirror state. Handle it before
     // setting up the HTTP-flavored renderer scaffolding.
-    if let Dispatch::Local {
-        args: local_args,
-        needs_consent_prompt,
-    } = dispatch
-    {
-        return run_local_dispatch(
-            *local_args,
-            needs_consent_prompt,
-            stderr_is_tty,
-            &kill_switch,
-            cleanup_done,
-        );
+    if let Dispatch::Local { args: local_args } = dispatch {
+        return run_local_dispatch(*local_args, stderr_is_tty, &kill_switch, cleanup_done);
     }
     let mut args = match dispatch {
         Dispatch::Http(args) => *args,
@@ -537,92 +527,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Prompt the user on `/dev/tty` for destructive-mode consent in
-/// local-file mode (`docs/PLAN_local_file_extract.md` §1).
-///
-/// Reading from `/dev/tty` directly (rather than `stdin`) means a
-/// piped `stdin` does not silently answer the prompt — the CLI's
-/// non-TTY rule already errors out at parse time when stdin is not
-/// a TTY *and* neither `-y` nor `-k` was passed, but the
-/// belt-and-suspenders `/dev/tty` read makes the interactive UX
-/// robust against unexpected setups (e.g. `xargs peel ...`).
-///
-/// Returns `Ok(true)` when the user typed `y`/`Y`, `Ok(false)` for
-/// anything else (the typical "accidental enter" → abort). An IO
-/// failure on `/dev/tty` (no controlling terminal, etc.) surfaces
-/// as the wrapped error.
-fn prompt_local_destructive_consent(source: &std::path::Path) -> Result<bool> {
-    let ckpt = source.with_file_name({
-        let mut name = source
-            .file_name()
-            .map(std::ffi::OsString::from)
-            .unwrap_or_default();
-        name.push(".peel.ckpt");
-        name
-    });
-    let mut tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("opening /dev/tty for the destructive-mode consent prompt")?;
-    use std::io::{BufRead, BufReader, Write};
-    let banner = format!(
-        "peel will hole-punch {} as extraction proceeds, freeing\n\
-         disk blocks. On successful completion the source will be\n\
-         deleted. On any failure (crash, Ctrl-C, OOM, power loss)\n\
-         the source is left partially destroyed and cannot be\n\
-         re-extracted without a fresh copy — the checkpoint at\n\
-         {} can only resume an interrupted run on the *same*\n\
-         punched file.\n\n\
-         Make a backup if you might need this archive again.\n\n\
-         Continue? [y/N] ",
-        source.display(),
-        ckpt.display(),
-    );
-    tty.write_all(banner.as_bytes())
-        .context("writing the consent prompt to /dev/tty")?;
-    tty.flush().ok();
-    let mut reader = BufReader::new(tty);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .context("reading the consent prompt response from /dev/tty")?;
-    let trimmed = line.trim();
-    Ok(matches!(trimmed, "y" | "Y" | "yes" | "Yes" | "YES"))
-}
-
 /// Drive the local-file extractor
 /// (`docs/PLAN_local_file_extract.md`). Mirrors the HTTP path's
 /// renderer / IO-backend / kill-switch wiring but skips the
 /// download-side retry loop entirely: a local extraction either
 /// completes or surfaces a clean error.
 ///
-/// `needs_consent_prompt` is the bit the dispatch layer set when
-/// the run will be destructive *and* `-y` was not passed *and*
-/// stdin is a TTY. When `true`, we read `/dev/tty` directly so a
-/// piped stdin can't accidentally answer; declining the prompt
-/// exits non-zero with the same exit code as the SIGINT path.
+/// Local mode is non-destructive by default — the source archive
+/// is preserved on disk. `-d/--destructive` opts into hole-punching
+/// the source as the decoder advances and deleting it on clean
+/// completion; the choice is encoded in [`LocalRunArgs::destructive`]
+/// before this function is called, so there is nothing left to
+/// prompt or confirm here.
 fn run_local_dispatch(
     mut args: LocalRunArgs,
-    needs_consent_prompt: bool,
     stderr_is_tty: bool,
     kill_switch: &Arc<AtomicBool>,
     cleanup_done: Arc<AtomicBool>,
 ) -> Result<()> {
-    if needs_consent_prompt {
-        match prompt_local_destructive_consent(&args.source) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!(
-                    "[abort] aborted — re-run with `-k/--keep-archive` to preserve the source",
-                );
-                cleanup_done.store(true, Ordering::Release);
-                std::process::exit(1);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
     // Resolve the IO backend in `main` so the `io_backend=…`
     // banner is plain stderr scrollback ABOVE the renderer's
     // redraw region (mirroring the HTTP path). Local mode passes
