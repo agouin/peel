@@ -20,7 +20,9 @@
 //!   [`crate::rar::RarError::UnsupportedFeature`].
 
 use crate::encryption::EncryptionError;
-use crate::rar::encrypt::ArchiveEncryptionHeader;
+use crate::rar::encrypt::{
+    find_file_encryption_record, ArchiveEncryptionHeader, FileEncryptionRecord,
+};
 use crate::rar::error::RarError;
 use crate::rar::format::{
     parse_end_of_archive_header, parse_file_header, parse_generic_header,
@@ -64,9 +66,20 @@ pub struct FileEntry {
     /// schedule a ranged download for the entry's payload.
     pub data_offset: u64,
     /// Compressed-data length in bytes (i.e. the file header's
-    /// `data_size`). Equals [`FileHeader::unpacked_size`] for
-    /// STORED-method entries.
+    /// `data_size`). For unencrypted STORED entries this equals
+    /// [`FileHeader::unpacked_size`]. For encrypted entries it is
+    /// `round_up_16(plaintext_data_size)` — the archive zero-pads
+    /// the data area to a 16-byte boundary so AES-CBC can decrypt
+    /// it block-aligned; the [`FileEncryptionRecord`] on the entry
+    /// signals the padding semantics.
     pub packed_size: u64,
+    /// Parsed encryption record from the file-header extra area,
+    /// when the entry's data is per-file-encrypted (the extra area
+    /// carries a type-1 record). `None` for unencrypted entries.
+    /// Independent of archive-header encryption (which encrypts the
+    /// header itself; the data area may or may not also be encrypted
+    /// via this field).
+    pub encryption: Option<FileEncryptionRecord>,
 }
 
 /// Walk an entire RAR5 archive in `buf` and produce the
@@ -148,10 +161,17 @@ pub fn walk_archive(buf: &[u8]) -> Result<ArchiveSummary, RarError> {
                         ),
                     });
                 }
+                let extra = &buf[cursor + header.extra_offset_in_input
+                    ..cursor + header.extra_offset_in_input + header.extra_size_in_input];
+                let encryption = find_file_encryption_record(
+                    extra,
+                    header.archive_offset + header.extra_offset_in_input as u64,
+                )?;
                 summary.entries.push(FileEntry {
                     header: file,
                     data_offset,
                     packed_size,
+                    encryption,
                 });
             }
             HeaderType::Service => {

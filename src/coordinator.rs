@@ -3001,6 +3001,8 @@ fn run_rar(
         download_outcome,
         sparse_fd: sparse.as_fd(),
         progress_state,
+        password_source: config.password_source.as_ref(),
+        password_label: requested_url,
     };
 
     let mut last_write_at = Instant::now()

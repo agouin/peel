@@ -61,6 +61,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::bitmap::ChunkBitmap;
+use crate::crypto::aes::BLOCK_LEN;
 use crate::decode::rar_legacy::RarLegacyStreamDecoder;
 use crate::decode::rar_native::dict::MAX_DICT_BYTES;
 use crate::decode::rar_native::RarStreamDecoder;
@@ -70,7 +71,9 @@ use crate::download::sparse_file::{SparseFile, SparseFileError};
 use crate::encryption::EncryptionError;
 use crate::punch::{align_down, align_up, PunchError, PunchHole};
 use crate::rar::archive::FileEntry;
-use crate::rar::encrypt::ArchiveEncryptionHeader;
+use crate::rar::encrypt::{
+    derive_keys, verify_pswcheck, ArchiveEncryptionHeader, FileEncryptionRecord, Rar5CbcStream,
+};
 use crate::rar::format::{
     parse_end_of_archive_header, parse_file_header, parse_generic_header,
     parse_main_archive_header, HeaderType,
@@ -84,6 +87,7 @@ use crate::rar::legacy::format::{
 use crate::rar::{
     detect_signature, RarError, SignatureKind, LEGACY_SIGNATURE_MAGIC, SIGNATURE_MAGIC,
 };
+use crate::secret::Password;
 use crate::sink::rar::{BeginEntryOutcome, EntryFinalize, RarSink};
 use crate::sink::SinkError;
 use crate::types::{ByteOffset, ChunkIndex};
@@ -334,6 +338,18 @@ pub struct RarPipeline<'a> {
     /// `None` is supported for tests but is never the production
     /// path.
     pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
+    /// Password source for encrypted archives
+    /// (`docs/PLAN_archive_encryption.md` §4). `None` means peel
+    /// has no password to offer; an encrypted entry then surfaces
+    /// [`EncryptionError::PasswordMissing`] before any data flows.
+    /// Resolved (loaded into a [`crate::secret::Password`]) lazily
+    /// when the first encrypted artefact is encountered so an
+    /// archive with cleartext-only entries never prompts.
+    pub password_source: Option<&'a crate::secret::source::PasswordSource>,
+    /// Human-readable archive label (URL or local path) the
+    /// password loader includes in TTY prompts. Used only when
+    /// [`Self::password_source`] is interactive.
+    pub password_label: &'a str,
 }
 
 impl<'a> RarPipeline<'a> {
@@ -397,6 +413,17 @@ impl<'a> RarPipeline<'a> {
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut solid = false;
         let mut saw_main = false;
+        // Set after parsing HEAD_CRYPT: subsequent headers are
+        // AES-256-CBC encrypted under this key, each prefixed by
+        // its own 16-byte IV.
+        let mut archive_keys: Option<crate::rar::encrypt::DerivedKeys> = None;
+        // Lazily-loaded password cache reused for archive-header
+        // encryption AND per-file data encryption — RAR5 archives
+        // that ship both layers always share the same password.
+        // Stays `None` for archives without encrypted artefacts;
+        // populated on the first encrypted header/entry and reused
+        // thereafter so an interactive prompt fires at most once.
+        let mut password_cache: Option<Password> = None;
         loop {
             if cursor >= self.config.total_size {
                 return Err(RarPipelineError::Rar(RarError::CorruptHeader {
@@ -404,13 +431,22 @@ impl<'a> RarPipeline<'a> {
                     reason: "archive ends before end-of-archive marker".to_string(),
                 }));
             }
-            let (header_buf, header_buf_start) = self.read_header_window(cursor)?;
-            let header =
-                parse_generic_header(&header_buf[(cursor - header_buf_start) as usize..], cursor)
-                    .map_err(RarPipelineError::Rar)?;
-            // Re-slice so per-header parsers see byte 0 = start of
-            // their own header.
-            let local_buf = &header_buf[(cursor - header_buf_start) as usize..];
+            // Switch on whether the walker is in encrypted-header
+            // mode. The first header (HEAD_CRYPT, when present) is
+            // cleartext; archive_keys is only Some *after* it has
+            // been parsed and the password verified.
+            let header_buf: Vec<u8>;
+            let local_buf: &[u8];
+            if let Some(keys) = archive_keys.as_ref() {
+                header_buf = self.read_encrypted_header_window(cursor, &keys.aes_key)?;
+                local_buf = &header_buf[..];
+            } else {
+                let (window_buf, window_start) = self.read_header_window(cursor)?;
+                let offset_in_window = (cursor - window_start) as usize;
+                header_buf = window_buf[offset_in_window..].to_vec();
+                local_buf = &header_buf[..];
+            }
+            let header = parse_generic_header(local_buf, cursor).map_err(RarPipelineError::Rar)?;
             match header.header_type {
                 HeaderType::MainArchive => {
                     if saw_main {
@@ -449,45 +485,60 @@ impl<'a> RarPipeline<'a> {
                         }));
                     }
                     let packed_size = header.data_size.unwrap_or(0);
-                    let data_offset = cursor + header.total_header_bytes as u64;
+                    // In archive-header-encrypted mode the on-disk
+                    // header consumes IV + round_up(cleartext, 16);
+                    // the data area follows that. In cleartext
+                    // mode it's just total_header_bytes.
+                    let on_disk_header_size = if archive_keys.is_some() {
+                        let cleartext_size = header.total_header_bytes;
+                        let padded = cleartext_size
+                            + ((BLOCK_LEN - (cleartext_size % BLOCK_LEN)) % BLOCK_LEN);
+                        BLOCK_LEN + padded
+                    } else {
+                        header.total_header_bytes
+                    };
+                    let data_offset = cursor + on_disk_header_size as u64;
+                    let extra = &local_buf[header.extra_offset_in_input
+                        ..header.extra_offset_in_input + header.extra_size_in_input];
+                    let encryption = crate::rar::encrypt::find_file_encryption_record(
+                        extra,
+                        header.archive_offset + header.extra_offset_in_input as u64,
+                    )
+                    .map_err(RarPipelineError::Rar)?;
                     entries.push(FileEntry {
                         header: file,
                         data_offset,
                         packed_size,
+                        encryption,
                     });
                 }
                 HeaderType::Service => {
                     // Skip past header + data area.
                 }
                 HeaderType::ArchiveEncryption => {
-                    // Parse the encryption header for diagnostic
-                    // detail, then surface the unified
-                    // [`EncryptionError`]. The encryption header
-                    // parser validates the spec-defined fields
-                    // (version, kdf_count cap, salt length); a
-                    // malformed header surfaces a RarError variant
-                    // before the user even sees the encryption
-                    // refusal, which is more useful.
-                    // Full archive-header decryption support is
-                    // tracked in `docs/PLAN_archive_encryption.md` §4
-                    // — the encryption primitives module
-                    // [`crate::rar::encrypt`] lands the parsers + KDF
-                    // groundwork; the walker-side header-stream
-                    // wrapping is invasive enough that it stays in a
-                    // follow-on commit.
+                    // Archive-header encryption: parse the
+                    // encryption header, derive the AES key from
+                    // the password, verify against the optional
+                    // pswcheck, and flip the walker into
+                    // encrypted-header mode. Subsequent headers
+                    // are read by [`Self::read_encrypted_header_window`]
+                    // and consume `16 + round_up(total_header_bytes, 16)`
+                    // bytes on disk apiece (the IV prefix + CBC
+                    // ciphertext, zero-padded to a 16-byte
+                    // boundary).
+                    if archive_keys.is_some() {
+                        return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                            archive_offset: header.archive_offset,
+                            reason: "second HEAD_CRYPT header encountered".to_string(),
+                        }));
+                    }
                     let fields = &local_buf[header.fields_offset_in_input
                         ..header.fields_offset_in_input + header.fields_size];
-                    let _enc = ArchiveEncryptionHeader::parse(fields)
+                    let enc = ArchiveEncryptionHeader::parse(fields)
                         .map_err(RarError::from)
                         .map_err(RarPipelineError::Rar)?;
-                    return Err(RarPipelineError::Rar(RarError::Encryption(
-                        EncryptionError::UnsupportedCipher {
-                            detail: "archive-header encryption (RAR5 AES-256-CBC, encryption \
-                                     header type 4) — peel parses the encryption header but \
-                                     does not yet decrypt the subsequent header stream"
-                                .to_string(),
-                        },
-                    )));
+                    let keys = self.resolve_archive_password_and_keys(&enc, &mut password_cache)?;
+                    archive_keys = Some(keys);
                 }
                 HeaderType::EndOfArchive => {
                     let _eof = parse_end_of_archive_header(&header, local_buf)
@@ -506,7 +557,23 @@ impl<'a> RarPipeline<'a> {
                     }
                 }
             }
-            cursor = cursor.saturating_add(header.total_bytes_with_data());
+            cursor = if archive_keys.is_some()
+                && !matches!(header.header_type, HeaderType::ArchiveEncryption)
+            {
+                // Encrypted header: IV (16) + ciphertext rounded up
+                // to a 16-byte boundary + data area (unencrypted at
+                // this layer; per-file encryption is a separate
+                // record-driven layer).
+                let cleartext_size = header.total_header_bytes;
+                let padded =
+                    cleartext_size + ((BLOCK_LEN - (cleartext_size % BLOCK_LEN)) % BLOCK_LEN);
+                cursor
+                    .saturating_add(BLOCK_LEN as u64)
+                    .saturating_add(padded as u64)
+                    .saturating_add(header.data_size.unwrap_or(0))
+            } else {
+                cursor.saturating_add(header.total_bytes_with_data())
+            };
         }
         let trailer_end = cursor;
 
@@ -527,6 +594,9 @@ impl<'a> RarPipeline<'a> {
 
         // Step 3: per-entry extraction in archive order.
         let completed_set: HashSet<u32> = resume.entries_completed.iter().copied().collect();
+        // `password_cache` was set up above (before the walker
+        // loop) and may already hold the archive-header password
+        // we'll reuse here for per-file encryption.
         for (idx, entry) in entries.iter().enumerate() {
             let idx = idx as u32;
             if completed_set.contains(&idx) {
@@ -546,12 +616,21 @@ impl<'a> RarPipeline<'a> {
             // hot path's calling convention stays byte-identical
             // to round-one §3 (a tight crash-resume test is
             // sensitive to its event timing).
-            let resume_blob: Option<&[u8]> =
-                if Some(idx) == resume.current_entry && entry.header.compression.method() != 0 {
-                    resume.current_entry_decoder_state.as_deref()
-                } else {
-                    None
-                };
+            //
+            // Encrypted entries never carry a decoder-state blob
+            // through resume (we force a from-zero restart on
+            // resume because the CBC chain cannot be migrated
+            // across a checkpoint snapshot in the current
+            // checkpoint shape); the dispatch below already routes
+            // them through [`Self::extract_entry`].
+            let resume_blob: Option<&[u8]> = if Some(idx) == resume.current_entry
+                && entry.header.compression.method() != 0
+                && entry.encryption.is_none()
+            {
+                resume.current_entry_decoder_state.as_deref()
+            } else {
+                None
+            };
             let (bytes_written, bytes_punched) = match resume_blob {
                 Some(blob) => self.extract_compressed_entry_with_resume(
                     idx,
@@ -562,9 +641,15 @@ impl<'a> RarPipeline<'a> {
                     puncher,
                     &mut callback,
                 )?,
-                None => {
-                    self.extract_entry(idx, entry, resume_offset, sink, puncher, &mut callback)?
-                }
+                None => self.extract_entry(
+                    idx,
+                    entry,
+                    resume_offset,
+                    sink,
+                    puncher,
+                    &mut password_cache,
+                    &mut callback,
+                )?,
             };
             stats.entries_extracted = stats.entries_extracted.saturating_add(1);
             stats.bytes_written = stats.bytes_written.saturating_add(bytes_written);
@@ -596,6 +681,7 @@ impl<'a> RarPipeline<'a> {
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn extract_entry<F>(
         &self,
         idx: u32,
@@ -603,6 +689,7 @@ impl<'a> RarPipeline<'a> {
         resume_offset: u64,
         sink: &mut RarSink,
         puncher: &dyn PunchHole,
+        password_cache: &mut Option<Password>,
         callback: &mut F,
     ) -> Result<(u64, u64), RarPipelineError>
     where
@@ -624,16 +711,26 @@ impl<'a> RarPipeline<'a> {
         }
         self.wait_for_range(data_offset, data_end)?;
 
-        // STORED entries always resume from the byte-offset alone
-        // (the sink's prefix-replay seeds the running hashes, and
-        // there's no decoder state to migrate). Compressed
-        // entries always restart from byte 0 in this code path —
-        // the §F1 decoder-state-aware dispatch lives in
-        // [`Self::extract_compressed_entry_with_resume`] and is
-        // selected by `run` ahead of `extract_entry` for `method
-        // != 0` entries with a saved decoder-state blob.
         let method = entry.header.compression.method();
-        let effective_resume_offset = if method == 0 { resume_offset } else { 0 };
+        let is_encrypted = entry.encryption.is_some();
+        // STORED entries resume from the sink's byte offset alone
+        // (the sink's prefix-replay seeds the running hashes, and
+        // there's no decoder state to migrate). Compressed entries
+        // and encrypted entries restart from byte 0 on this code path:
+        //   - Compressed: the §F1 decoder-state-aware dispatch lives
+        //     in [`Self::extract_compressed_entry_with_resume`].
+        //   - Encrypted: the CBC chain cannot be migrated across a
+        //     checkpoint snapshot in the current checkpoint shape,
+        //     so the resumed extraction re-derives the key and
+        //     streams the data area from offset 0. The sink replays
+        //     the on-disk prefix to seed its hashes — same as the
+        //     STORED resume path — so the user-visible bytes are
+        //     byte-identical to a clean run.
+        let effective_resume_offset = if method == 0 && !is_encrypted {
+            resume_offset
+        } else {
+            0
+        };
 
         let begin_outcome = if effective_resume_offset > 0 {
             sink.begin_entry_resume(
@@ -677,7 +774,45 @@ impl<'a> RarPipeline<'a> {
             return Ok((0, punched));
         }
 
-        if method == 0 {
+        if let Some(enc) = entry.encryption.as_ref() {
+            // Per-file encryption: derive the entry's key (sharing
+            // the cached password across all encrypted entries) and
+            // stream-decrypt the data area in 64-KiB chunks. The
+            // last block's padding is dropped at the
+            // `unpacked_size` boundary (STORED) or ignored by the
+            // decoder when it reaches the natural bitstream EOF
+            // (compressed).
+            let keys = self.resolve_password_and_keys(enc, &entry.header.name, password_cache)?;
+            let mut cbc = Rar5CbcStream::new(&keys.aes_key, enc.iv);
+
+            if method == 0 {
+                self.copy_encrypted_stored_to_sink(
+                    idx,
+                    entry,
+                    data_offset,
+                    data_end,
+                    &mut cbc,
+                    sink,
+                    callback,
+                )?;
+            } else {
+                // Compressed encrypted: buffer the whole ciphertext
+                // (matches the round-one §E1 buffering shape for
+                // unencrypted compressed entries), CBC-decrypt in
+                // place, then hand the cleartext to the decoder.
+                self.decompress_entry_to_sink(
+                    idx,
+                    entry,
+                    data_offset,
+                    data_end,
+                    0,
+                    None,
+                    Some(&mut cbc),
+                    sink,
+                    callback,
+                )?;
+            }
+        } else if method == 0 {
             // Stream the entry's data bytes from the sparse file
             // into the sink. STORED is a passthrough so
             // packed_size == unpacked_size; we copy directly.
@@ -712,6 +847,7 @@ impl<'a> RarPipeline<'a> {
                 data_end,
                 0,    // no §F1 mid-entry resume on this path
                 None, // §F1 dispatch lives in `extract_compressed_entry_with_resume`
+                None, // no decryption layer
                 sink,
                 callback,
             )?;
@@ -729,6 +865,299 @@ impl<'a> RarPipeline<'a> {
         .map_err(RarPipelineError::Aborted)?;
 
         Ok((entry.header.unpacked_size, punched))
+    }
+
+    /// Resolve a password against the entry's encryption record,
+    /// caching the loaded [`Password`] so an interactive source
+    /// prompts at most once per archive. Verifies the password
+    /// against the entry's `pswcheck` (when present) and surfaces
+    /// [`EncryptionError::PasswordIncorrect`] on mismatch. Re-prompts
+    /// up to three times on interactive sources.
+    fn resolve_password_and_keys(
+        &self,
+        enc: &FileEncryptionRecord,
+        entry_name: &str,
+        password_cache: &mut Option<Password>,
+    ) -> Result<crate::rar::encrypt::DerivedKeys, RarPipelineError> {
+        let source = self
+            .password_source
+            .ok_or(RarPipelineError::Rar(RarError::Encryption(
+                EncryptionError::PasswordMissing,
+            )))?;
+        let max_attempts: usize = if source.is_interactive() { 3 } else { 1 };
+
+        // First, try the cached password (if any) without re-prompting.
+        if let Some(pw) = password_cache.as_ref() {
+            let keys = derive_keys(pw.as_bytes(), &enc.salt, enc.kdf_count);
+            if let Some(pswcheck) = enc.pswcheck.as_ref() {
+                match verify_pswcheck(&keys.pswcheck_raw, pswcheck, entry_name) {
+                    Ok(()) => return Ok(keys),
+                    Err(EncryptionError::PasswordIncorrect) if source.is_interactive() => {
+                        // Cached password is wrong; drop it and fall
+                        // through to the prompt loop. Non-interactive
+                        // sources can't yield a different answer, so
+                        // we'd just return the same error.
+                        *password_cache = None;
+                    }
+                    Err(e) => return Err(RarPipelineError::Rar(RarError::Encryption(e))),
+                }
+            } else {
+                // No verifier on this entry — accept and let the
+                // decode / CRC check surface a bad password.
+                return Ok(keys);
+            }
+        }
+
+        let mut last_err = EncryptionError::PasswordIncorrect;
+        for _attempt in 0..max_attempts {
+            let prompt = format!("password for {}: ", self.password_label);
+            let pw = source.load(&prompt).map_err(|e| {
+                // Map load errors to PasswordMissing — the user
+                // failed to provide a usable password.
+                RarPipelineError::Rar(RarError::Encryption(EncryptionError::UnsupportedKdf {
+                    detail: format!("password load failed: {e}"),
+                }))
+            })?;
+            let keys = derive_keys(pw.as_bytes(), &enc.salt, enc.kdf_count);
+            if let Some(pswcheck) = enc.pswcheck.as_ref() {
+                match verify_pswcheck(&keys.pswcheck_raw, pswcheck, entry_name) {
+                    Ok(()) => {
+                        *password_cache = Some(pw);
+                        return Ok(keys);
+                    }
+                    Err(EncryptionError::PasswordIncorrect) if source.is_interactive() => {
+                        last_err = EncryptionError::PasswordIncorrect;
+                        continue;
+                    }
+                    Err(e) => return Err(RarPipelineError::Rar(RarError::Encryption(e))),
+                }
+            } else {
+                // No pswcheck — accept tentatively.
+                *password_cache = Some(pw);
+                return Ok(keys);
+            }
+        }
+        Err(RarPipelineError::Rar(RarError::Encryption(last_err)))
+    }
+
+    /// Same shape as [`Self::resolve_password_and_keys`] but driven
+    /// by an [`ArchiveEncryptionHeader`] (which carries its own
+    /// salt / kdf_count / optional pswcheck, distinct from a
+    /// per-file [`FileEncryptionRecord`]). Used once per archive
+    /// the first time HEAD_CRYPT is observed.
+    fn resolve_archive_password_and_keys(
+        &self,
+        enc: &ArchiveEncryptionHeader,
+        password_cache: &mut Option<Password>,
+    ) -> Result<crate::rar::encrypt::DerivedKeys, RarPipelineError> {
+        let source = self
+            .password_source
+            .ok_or(RarPipelineError::Rar(RarError::Encryption(
+                EncryptionError::PasswordMissing,
+            )))?;
+        let max_attempts: usize = if source.is_interactive() { 3 } else { 1 };
+
+        // Try the cached password first.
+        if let Some(pw) = password_cache.as_ref() {
+            let keys = derive_keys(pw.as_bytes(), &enc.salt, enc.kdf_count);
+            if let Some(pswcheck) = enc.pswcheck.as_ref() {
+                match verify_pswcheck(&keys.pswcheck_raw, pswcheck, "archive header") {
+                    Ok(()) => return Ok(keys),
+                    Err(EncryptionError::PasswordIncorrect) if source.is_interactive() => {
+                        *password_cache = None;
+                    }
+                    Err(e) => return Err(RarPipelineError::Rar(RarError::Encryption(e))),
+                }
+            } else {
+                return Ok(keys);
+            }
+        }
+
+        let mut last_err = EncryptionError::PasswordIncorrect;
+        for _attempt in 0..max_attempts {
+            let prompt = format!("password for {}: ", self.password_label);
+            let pw = source.load(&prompt).map_err(|e| {
+                RarPipelineError::Rar(RarError::Encryption(EncryptionError::UnsupportedKdf {
+                    detail: format!("password load failed: {e}"),
+                }))
+            })?;
+            let keys = derive_keys(pw.as_bytes(), &enc.salt, enc.kdf_count);
+            if let Some(pswcheck) = enc.pswcheck.as_ref() {
+                match verify_pswcheck(&keys.pswcheck_raw, pswcheck, "archive header") {
+                    Ok(()) => {
+                        *password_cache = Some(pw);
+                        return Ok(keys);
+                    }
+                    Err(EncryptionError::PasswordIncorrect) if source.is_interactive() => {
+                        last_err = EncryptionError::PasswordIncorrect;
+                        continue;
+                    }
+                    Err(e) => return Err(RarPipelineError::Rar(RarError::Encryption(e))),
+                }
+            } else {
+                *password_cache = Some(pw);
+                return Ok(keys);
+            }
+        }
+        Err(RarPipelineError::Rar(RarError::Encryption(last_err)))
+    }
+
+    /// Read 16 bytes IV + a window of ciphertext at `start`, CBC-
+    /// decrypt the ciphertext under `aes_key`, then probe the
+    /// cleartext for a generic header. On `Truncated`, double the
+    /// ciphertext window and re-decrypt from the same IV; the IV is
+    /// fixed by the encrypted-header layout (every header has its
+    /// own IV at its on-disk offset).
+    ///
+    /// Returns `(cleartext_buf, start_of_header_in_buf)` where the
+    /// buffer's byte 0 is the first cleartext byte of the header
+    /// (immediately after the IV). The on-disk consumption of this
+    /// header is `16 + round_up(total_header_bytes, BLOCK_LEN)`
+    /// bytes; the caller advances its cursor accordingly.
+    fn read_encrypted_header_window(
+        &self,
+        start: u64,
+        aes_key: &[u8; 32],
+    ) -> Result<Vec<u8>, RarPipelineError> {
+        // Initial ciphertext window. A typical RAR5 header is a few
+        // hundred bytes; 4 KiB covers every header type comfortably
+        // including a long file-name + extra-area. Truncated grows
+        // it to a power of two.
+        let mut cipher_window: u64 = 4 * 1024;
+        loop {
+            let iv_end = start.saturating_add(BLOCK_LEN as u64);
+            let cipher_end = iv_end
+                .saturating_add(cipher_window)
+                .min(self.config.total_size);
+            if cipher_end < iv_end {
+                return Err(RarPipelineError::Rar(RarError::Truncated {
+                    what: format!("encrypted header IV at archive offset {start}"),
+                    needed: BLOCK_LEN,
+                }));
+            }
+            let cipher_len = cipher_end - iv_end;
+            // CBC needs block-aligned input; round down.
+            let cipher_len = cipher_len - (cipher_len % BLOCK_LEN as u64);
+            if cipher_len == 0 {
+                return Err(RarPipelineError::Rar(RarError::Truncated {
+                    what: format!("encrypted header ciphertext at archive offset {iv_end}"),
+                    needed: BLOCK_LEN,
+                }));
+            }
+            self.cursor.store(start, Ordering::Release);
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(start);
+            }
+            self.wait_for_range(start, iv_end.saturating_add(cipher_len))?;
+
+            let mut iv = [0u8; BLOCK_LEN];
+            self.sparse
+                .read_exact_at(ByteOffset::new(start), &mut iv)
+                .map_err(RarPipelineError::Sparse)?;
+            let mut buf = vec![0u8; cipher_len as usize];
+            self.sparse
+                .read_exact_at(ByteOffset::new(iv_end), &mut buf)
+                .map_err(RarPipelineError::Sparse)?;
+            let mut cbc = Rar5CbcStream::new(aes_key, iv);
+            cbc.decrypt_blocks(&mut buf);
+
+            // Try to parse a generic header from the cleartext.
+            // We report `archive_offset = start` (the on-disk
+            // offset of the IV) so error messages name the right
+            // location.
+            match parse_generic_header(&buf, start) {
+                Ok(_) => return Ok(buf),
+                Err(RarError::Truncated { needed: _, .. }) => {
+                    if iv_end.saturating_add(cipher_window) >= self.config.total_size {
+                        return Err(RarPipelineError::Rar(RarError::Truncated {
+                            what: format!(
+                                "encrypted header at archive offset {start} exceeds remaining \
+                                 archive size"
+                            ),
+                            needed: 0,
+                        }));
+                    }
+                    cipher_window = cipher_window.saturating_mul(2);
+                }
+                Err(other) => return Err(RarPipelineError::Rar(other)),
+            }
+        }
+    }
+
+    /// Stream-decrypt an encrypted STORED entry's data area into the
+    /// sink. CBC-decrypts the ciphertext in 64 KiB blocks (each call
+    /// fed in 16-byte-multiple chunks; the [`Rar5CbcStream`] wrapper
+    /// chains the CBC IV across calls) and stops feeding the sink at
+    /// the `unpacked_size` boundary — the trailing padding bytes are
+    /// not part of the plaintext.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_encrypted_stored_to_sink<F>(
+        &self,
+        idx: u32,
+        entry: &FileEntry,
+        data_offset: u64,
+        data_end: u64,
+        cbc: &mut Rar5CbcStream,
+        sink: &mut RarSink,
+        callback: &mut F,
+    ) -> Result<(), RarPipelineError>
+    where
+        F: FnMut(&RarPipelineEvent) -> io::Result<()>,
+    {
+        let plaintext_total = entry.header.unpacked_size;
+        let mut plaintext_written: u64 = 0;
+        let mut cursor_in_entry = data_offset;
+        // 64 KiB is a multiple of 16 bytes (the AES block size).
+        let mut buf = vec![0u8; 64 * 1024];
+        while cursor_in_entry < data_end {
+            let mut want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
+            // CBC requires block-aligned input. The data-area size
+            // is rounded up to a 16-byte multiple at archive
+            // creation, so the final chunk is naturally aligned;
+            // intermediate chunks round down to a multiple of the
+            // block size.
+            if cursor_in_entry.saturating_add(want as u64) < data_end {
+                want -= want % BLOCK_LEN;
+                if want == 0 {
+                    return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                        archive_offset: cursor_in_entry,
+                        reason: "encrypted STORED entry data range is not a multiple of 16 bytes"
+                            .to_string(),
+                    }));
+                }
+            } else if !want.is_multiple_of(BLOCK_LEN) {
+                return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: cursor_in_entry,
+                    reason: format!(
+                        "encrypted STORED entry data range is not a multiple of 16 bytes \
+                         (trailing {} bytes)",
+                        want % BLOCK_LEN
+                    ),
+                }));
+            }
+            self.sparse
+                .read_exact_at(ByteOffset::new(cursor_in_entry), &mut buf[..want])
+                .map_err(RarPipelineError::Sparse)?;
+            cbc.decrypt_blocks(&mut buf[..want]);
+
+            let remaining_plain = plaintext_total.saturating_sub(plaintext_written);
+            let to_sink = (want as u64).min(remaining_plain) as usize;
+            if to_sink > 0 {
+                sink.write_entry(&buf[..to_sink])
+                    .map_err(RarPipelineError::Sink)?;
+                plaintext_written = plaintext_written.saturating_add(to_sink as u64);
+            }
+            cursor_in_entry = cursor_in_entry.saturating_add(want as u64);
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(cursor_in_entry);
+            }
+            callback(&RarPipelineEvent::InEntryProgress {
+                index: idx,
+                bytes_written: sink.current_entry_offset(),
+            })
+            .map_err(RarPipelineError::Aborted)?;
+        }
+        Ok(())
     }
 
     /// §F1 mid-entry-resume dispatch for compressed entries.
@@ -807,6 +1236,7 @@ impl<'a> RarPipeline<'a> {
             data_end,
             resume_offset,
             Some(resume_decoder_state),
+            None, // §F1-resume compressed path never coincides with encryption
             sink,
             callback,
         )?;
@@ -856,6 +1286,7 @@ impl<'a> RarPipeline<'a> {
         data_end: u64,
         resume_offset: u64,
         resume_decoder_state: Option<&[u8]>,
+        cbc: Option<&mut Rar5CbcStream>,
         sink: &mut RarSink,
         callback: &mut F,
     ) -> Result<(), RarPipelineError>
@@ -876,6 +1307,26 @@ impl<'a> RarPipeline<'a> {
             self.sparse
                 .read_exact_at(ByteOffset::new(data_offset), &mut compressed)
                 .map_err(RarPipelineError::Sparse)?;
+        }
+
+        // Per-file encryption layer: CBC-decrypt the buffered
+        // ciphertext in place before feeding it to the decoder. The
+        // archive zero-pads the data area to a 16-byte boundary so
+        // `compressed.len()` is always a multiple of `BLOCK_LEN`; the
+        // decoder ignores the trailing padding (it stops at the
+        // natural bitstream EOF before consuming the pad bytes).
+        if let Some(cbc) = cbc {
+            if compressed.len() % BLOCK_LEN != 0 {
+                return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: data_offset,
+                    reason: format!(
+                        "encrypted compressed entry data range is not a multiple of 16 bytes \
+                         (got {} bytes)",
+                        compressed.len()
+                    ),
+                }));
+            }
+            cbc.decrypt_blocks(&mut compressed);
         }
 
         let dict_capacity = dict_capacity_for(&entry.header.compression).map_err(|e| {

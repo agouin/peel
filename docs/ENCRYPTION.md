@@ -12,8 +12,8 @@ this file is the shipping-feature surface.
 |--------|--------|-----|---------------|--------|
 | zip | WinZip-AES (AE-1 / AE-2; AES-128/192/256-CTR) | PBKDF2-HMAC-SHA1, 1000 iterations | HMAC-SHA1-80 trailer | shipping (§3) |
 | zip | PKWARE traditional "ZipCrypto" (CRC32-keyed PRGA) | password-derived 12-byte header | none (CRC32 of plaintext) | shipping (§3b) — *insecure* |
-| rar5 | AES-256-CBC, archive-header encryption (type 4) | PBKDF2-HMAC-SHA256 with `iterations = 1 << (kdf_count + 15)` | optional pswcheck (8-byte truncated HMAC-SHA256) | **not yet** (§4 lays the parser groundwork; decryption pending) |
-| rar5 | AES-256-CBC, per-file encryption (extra record 1) | same as above | optional pswcheck (8-byte truncated) | **not yet** (§4) |
+| rar5 | AES-256-CBC, archive-header encryption (type 4) | PBKDF2-HMAC-SHA256 with `iterations = 1 << (kdf_count + 15)`; running-XOR fused stages produce AES key + HMAC key + pswcheck source in one pass | optional pswcheck (8-byte XOR-fold of `PBKDF2(c=N+2)` + 4-byte SHA-256 sum) | shipping (§4) |
+| rar5 | AES-256-CBC, per-file encryption (extra record 1) | same as above (per-record salt / IV / `kdf_count`) | optional pswcheck (8-byte XOR-fold + 4-byte SHA-256 sum) | shipping (§4) |
 | 7z | AES-256-CBC (coder id `06:F1:07:01`) | bespoke SHA-256 "round-tower" KDF (`crate::crypto::sevenz_kdf`) | none (CRC32 of plaintext) | **not yet** (§5 wires recognition + error surface; decryption pending) |
 
 The "**not yet**" rows surface a clean
@@ -21,6 +21,38 @@ The "**not yet**" rows surface a clean
 binary boundary with a precise detail message; the same shape and exit
 code (4) the shipping ZIP paths use. Scripts that catch encrypted
 archives can match on the error chain regardless of format.
+
+### RAR5 encryption layers
+
+RAR5 ships two independent encryption layers; an archive may use
+either, both, or neither:
+
+1. **Archive-header encryption** (HEAD_CRYPT, header type 4). When
+   present, every header after HEAD_CRYPT is AES-256-CBC encrypted
+   under a per-archive key derived from the password. Each
+   encrypted header is prefixed by its own 16-byte IV and padded to a
+   16-byte boundary on disk. Data areas are *not* encrypted by this
+   layer; they pass through cleartext (or under per-file encryption,
+   below). The walker in `src/download/rar_pipeline.rs` switches into
+   encrypted-header mode after parsing HEAD_CRYPT and reads
+   subsequent headers via `read_encrypted_header_window`.
+2. **Per-file data encryption** (encryption record, extra-record
+   type 1). Each file header may carry an encryption record with
+   its own salt, IV, `kdf_count`, and optional pswcheck. When
+   present, the file's data area is AES-256-CBC encrypted under a
+   per-file key derived from the same password. The padding scheme
+   matches archive-header encryption: zero-pad the plaintext to a
+   16-byte boundary, encrypt, and report the on-disk size in the
+   file header's `data_size` field. STORED entries discard the
+   padding at the `unpacked_size` boundary; compressed entries
+   discard it when the decoder reaches its natural EOF.
+
+Both layers share a single password (resolved once per archive). When
+a checkpoint resumes a partially-extracted run, encrypted entries
+restart from byte 0 on the in-flight entry — the CBC chain cannot
+yet be migrated across a checkpoint snapshot. The sink replays the
+on-disk prefix to seed its hashes, so the user-visible bytes remain
+byte-identical to a clean run.
 
 ## Supplying a password
 

@@ -13,12 +13,14 @@
 #[path = "support/mod.rs"]
 mod support;
 
+use peel::encryption::EncryptionError;
 use peel::rar::archive::walk_archive;
 use peel::rar::format::arc_flags;
 use peel::rar::RarError;
 
 use support::rar_fixtures::{
-    build_rar4_magic_only, build_rar5, build_rar5_encrypted_header, RarEntrySpec,
+    build_rar4_magic_only, build_rar5, build_rar5_encrypted_header, build_rar5_per_file_encrypted,
+    EncryptedEntrySpec, RarEntrySpec,
 };
 
 #[test]
@@ -107,14 +109,19 @@ fn walk_multi_volume_without_volume_number_still_rejects() {
 
 #[test]
 fn walk_archive_encryption_header_rejects_with_encryption_label() {
+    // Archive-header encryption (HEAD_CRYPT) currently surfaces a
+    // unified [`EncryptionError::UnsupportedCipher`] until the
+    // walker-side header-stream wrapping lands (`docs/PLAN_archive_encryption.md`
+    // §4). Per-file encryption is supported separately via the file
+    // header's encryption extra record.
     let entries = vec![RarEntrySpec::stored("locked.txt", b"x".to_vec())];
     let archive = build_rar5_encrypted_header(&entries);
     let err = walk_archive(&archive).expect_err("walk should fail on encryption");
     match err {
-        RarError::UnsupportedFeature { feature } => {
-            assert!(feature.contains("encryption"), "got {feature}");
+        RarError::Encryption(EncryptionError::UnsupportedCipher { detail }) => {
+            assert!(detail.contains("archive-header encryption"), "got {detail}");
         }
-        other => panic!("expected UnsupportedFeature, got {other:?}"),
+        other => panic!("expected Encryption(UnsupportedCipher), got {other:?}"),
     }
 }
 
@@ -224,5 +231,29 @@ fn walk_archive_rejects_reserved_compression_method() {
             );
         }
         other => panic!("expected UnsupportedFeature, got {other:?}"),
+    }
+}
+
+#[test]
+fn walk_per_file_encrypted_archive_surfaces_encryption_record() {
+    let password = b"hunter2";
+    let entries = vec![
+        EncryptedEntrySpec::stored("alpha.txt", b"hello, RAR".to_vec()),
+        EncryptedEntrySpec::stored("nested/beta.bin", vec![0x42u8; 1024]),
+    ];
+    let archive = build_rar5_per_file_encrypted(password, &entries);
+
+    let summary = walk_archive(&archive).expect("walk encrypted archive");
+    assert_eq!(summary.entries.len(), 2);
+    for (got, spec) in summary.entries.iter().zip(entries.iter()) {
+        assert_eq!(got.header.name, spec.name);
+        // packed_size is round-up-to-16 of plaintext length.
+        let expected_packed = (spec.uncompressed.len() + 15) & !15;
+        assert_eq!(got.packed_size, expected_packed as u64);
+        let enc = got.encryption.as_ref().expect("entry is encrypted");
+        assert_eq!(enc.salt, spec.salt);
+        assert_eq!(enc.iv, spec.iv);
+        assert_eq!(enc.kdf_count, spec.kdf_count);
+        assert!(enc.pswcheck.is_some());
     }
 }

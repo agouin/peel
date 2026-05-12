@@ -37,7 +37,10 @@ use peel::http::{Client, ClientConfig};
 mod support;
 
 use support::mock_server::{MockResponse, MockServer};
-use support::rar_fixtures::{build_rar5, RarEntrySpec};
+use support::rar_fixtures::{
+    build_rar5, build_rar5_archive_header_encrypted, build_rar5_per_file_encrypted,
+    EncryptedEntrySpec, RarEntrySpec,
+};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -404,5 +407,198 @@ fn crash_resume_mid_compressed_entry_produces_identical_output() {
     assert!(
         extracted[0].1.iter().all(|&b| b == b'X'),
         "decoded bytes contained a non-'X' byte"
+    );
+}
+
+/// Write `password` to a temporary file with mode 0600 and return
+/// the path. The returned `CleanupDir` owns the parent directory so
+/// the file is removed at test scope-end.
+fn temp_password_file(label: &str, password: &[u8]) -> (PathBuf, CleanupDir) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_dir(label);
+    let path = dir.join("password.txt");
+    fs::write(&path, password).expect("write password file");
+    let mut perms = fs::metadata(&path).expect("stat").permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&path, perms).expect("chmod 0600");
+    (path, CleanupDir(dir))
+}
+
+fn coord_config_with_password(
+    chunk_size: u64,
+    source: peel::secret::source::PasswordSource,
+) -> CoordinatorConfig {
+    let mut cfg = coord_config(chunk_size);
+    cfg.password_source = Some(source);
+    cfg
+}
+
+#[test]
+fn round_trip_per_file_encrypted_stored_archive() {
+    let password = b"correct horse battery staple";
+    let entries = vec![
+        EncryptedEntrySpec::stored("alpha.txt", b"hello, encrypted RAR".to_vec()),
+        EncryptedEntrySpec::stored(
+            "nested/beta.bin",
+            (0..1024u32).map(|i| (i & 0xFF) as u8).collect::<Vec<u8>>(),
+        ),
+        EncryptedEntrySpec::stored("gamma.dat", vec![0xA5u8; 4096]),
+    ];
+    let body = build_rar5_per_file_encrypted(password, &entries);
+    let server = MockServer::start(ok_handler(body));
+
+    let (pw_path, _pw_dir) = temp_password_file("enc_pw", password);
+    let work = unique_dir("enc_round_trip");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config_with_password(
+            64 * 1024,
+            peel::secret::source::PasswordSource::File(pw_path.clone()),
+        ),
+        None,
+        None,
+    );
+    run(args).expect("extracts encrypted archive cleanly");
+
+    let extracted = read_dir_recursive(&work);
+    assert_eq!(extracted.len(), entries.len(), "found: {extracted:?}");
+    let mut sorted_specs = entries.clone();
+    sorted_specs.sort_by(|a, b| a.name.cmp(&b.name));
+    for (got, spec) in extracted.iter().zip(sorted_specs.iter()) {
+        assert_eq!(got.0, spec.name);
+        assert_eq!(got.1, spec.uncompressed);
+    }
+}
+
+#[test]
+fn per_file_encrypted_wrong_password_surfaces_password_incorrect() {
+    let password = b"correct password";
+    let wrong = b"definitely-not-right";
+    let entries = vec![EncryptedEntrySpec::stored("locked.txt", b"secret".to_vec())];
+    let body = build_rar5_per_file_encrypted(password, &entries);
+    let server = MockServer::start(ok_handler(body));
+
+    let (pw_path, _pw_dir) = temp_password_file("enc_wrong_pw", wrong);
+    let work = unique_dir("enc_wrong_pw_out");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config_with_password(
+            64 * 1024,
+            peel::secret::source::PasswordSource::File(pw_path.clone()),
+        ),
+        None,
+        None,
+    );
+    let err = run(args).expect_err("wrong password should fail");
+    let msg = format!("{err:?}\n{err}");
+    assert!(
+        msg.contains("password did not match") || msg.contains("PasswordIncorrect"),
+        "expected PasswordIncorrect-flavored error, got: {msg}"
+    );
+}
+
+#[test]
+fn round_trip_archive_header_encrypted_archive() {
+    let password = b"super-secret";
+    let entries = vec![
+        RarEntrySpec::stored("alpha.txt", b"hello, headers".to_vec()),
+        RarEntrySpec::stored(
+            "nested/beta.bin",
+            (0..2048u32).map(|i| (i & 0xFF) as u8).collect::<Vec<u8>>(),
+        ),
+        RarEntrySpec::stored("gamma.dat", vec![0x33u8; 5000]),
+    ];
+    let body = build_rar5_archive_header_encrypted(password, &entries);
+    let server = MockServer::start(ok_handler(body));
+
+    let (pw_path, _pw_dir) = temp_password_file("hdr_enc_pw", password);
+    let work = unique_dir("hdr_enc_round_trip");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config_with_password(
+            64 * 1024,
+            peel::secret::source::PasswordSource::File(pw_path.clone()),
+        ),
+        None,
+        None,
+    );
+    run(args).expect("extracts header-encrypted archive cleanly");
+
+    let extracted = read_dir_recursive(&work);
+    assert_eq!(extracted.len(), entries.len(), "found: {extracted:?}");
+    let mut sorted_specs = entries.clone();
+    sorted_specs.sort_by(|a, b| a.name.cmp(&b.name));
+    for (got, spec) in extracted.iter().zip(sorted_specs.iter()) {
+        assert_eq!(got.0, spec.name);
+        assert_eq!(got.1, spec.uncompressed);
+    }
+}
+
+#[test]
+fn archive_header_encrypted_wrong_password_surfaces_password_incorrect() {
+    let password = b"the-real-secret";
+    let wrong = b"not-it";
+    let entries = vec![RarEntrySpec::stored(
+        "locked.txt",
+        b"behind a header".to_vec(),
+    )];
+    let body = build_rar5_archive_header_encrypted(password, &entries);
+    let server = MockServer::start(ok_handler(body));
+
+    let (pw_path, _pw_dir) = temp_password_file("hdr_enc_wrong_pw", wrong);
+    let work = unique_dir("hdr_enc_wrong");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config_with_password(
+            64 * 1024,
+            peel::secret::source::PasswordSource::File(pw_path.clone()),
+        ),
+        None,
+        None,
+    );
+    let err = run(args).expect_err("wrong password should fail");
+    let msg = format!("{err:?}\n{err}");
+    assert!(
+        msg.contains("password did not match") || msg.contains("PasswordIncorrect"),
+        "expected PasswordIncorrect-flavored error, got: {msg}"
+    );
+}
+
+#[test]
+fn per_file_encrypted_missing_password_surfaces_password_missing() {
+    let password = b"any-password";
+    let entries = vec![EncryptedEntrySpec::stored("locked.txt", b"secret".to_vec())];
+    let body = build_rar5_per_file_encrypted(password, &entries);
+    let server = MockServer::start(ok_handler(body));
+
+    let work = unique_dir("enc_missing_pw");
+    let _g = CleanupDir(work.clone());
+
+    // No password_source: the coordinator must surface a missing-
+    // password error before any plaintext lands on disk.
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024),
+        None,
+        None,
+    );
+    let err = run(args).expect_err("missing password should fail");
+    let msg = format!("{err:?}\n{err}");
+    assert!(
+        msg.contains("no password source") || msg.contains("PasswordMissing"),
+        "expected PasswordMissing-flavored error, got: {msg}"
     );
 }

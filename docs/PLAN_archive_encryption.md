@@ -265,11 +265,18 @@ appears once.
 
 ---
 
-## §4. RAR5 archive + file encryption
+## §4. RAR5 archive + file encryption (**shipped**)
 
-**What**: rar5's AES-256-CTR encryption, both at the file level
-(per-entry) and at the archive-header level (the entire central
-record is encrypted).
+**Status: shipping (2026-05-12).** Both encryption layers extract
+end-to-end; integration coverage in `tests/test_coordinator_rar.rs`
+exercises round-trip extraction, wrong-password (→
+`PasswordIncorrect`), and missing-password (→ `PasswordMissing`) for
+each layer.
+
+**What**: rar5's AES-256-CBC encryption (the spec table earlier in
+this doc mistakenly listed it as CTR — the wire format is CBC), both
+at the file level (per-entry) and at the archive-header level (every
+header after HEAD_CRYPT is encrypted).
 
 **Why now**: rar5 already has the deepest decoder work in peel;
 keeping it at feature parity matters.

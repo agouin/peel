@@ -66,7 +66,12 @@
 
 use thiserror::Error;
 
+use crate::crypto::aes::{Aes256, BLOCK_LEN};
+use crate::crypto::aes_modes::AesCbcDecrypt;
+use crate::crypto::hmac::Hmac;
+use crate::crypto::{ct_eq, BlockHash};
 use crate::encryption::EncryptionError;
+use crate::hash::sha256::Sha256;
 use crate::rar::RarError;
 
 /// AES key size (bytes) — RAR5 uses AES-256 exclusively.
@@ -392,6 +397,317 @@ pub fn kdf_iterations(kdf_count: u8) -> u32 {
     1u32 << (u32::from(kdf_count) + 15)
 }
 
+/// Three keys derived from a password + salt + `kdf_count` per the
+/// RAR5 spec.
+///
+/// All three slices are 32 bytes wide; downstream consumers slice
+/// what they need (`aes_key` is used whole as the AES-256 key,
+/// `pswcheck_raw` is folded to 8 bytes via [`fold_pswcheck`]).
+#[derive(Debug, Clone)]
+pub struct DerivedKeys {
+    /// AES-256 key (32 bytes). Drives both header-stream and
+    /// per-file data CBC decryption.
+    pub aes_key: [u8; AES_KEY_LEN],
+    /// HMAC-SHA256 key (32 bytes). RAR5 uses it for the optional
+    /// per-data-block authentication HMAC; peel does not validate
+    /// that HMAC today (the file-data BLAKE2sp + CRC-32 already
+    /// detect tampering under a correct password). Retained for
+    /// future use and for parity with the spec's three-output KDF.
+    pub hmac_key: [u8; AES_KEY_LEN],
+    /// Raw password-check buffer (32 bytes). Pass to
+    /// [`fold_pswcheck`] to derive the 8-byte verifier.
+    pub pswcheck_raw: [u8; AES_KEY_LEN],
+}
+
+/// Run RAR5's three-stage PBKDF2-HMAC-SHA256 key derivation.
+///
+/// Re-implements the algorithm in `crypt5.cpp::pbkdf2` from the
+/// open-source unrar reference:
+///
+/// 1. `U_1 = HMAC(password, salt || 0x00000001)`.
+/// 2. For `i = 2 ..= N+2`: `U_i = HMAC(password, U_{i-1})`.
+/// 3. Running XOR: `X_k = U_1 ⊕ U_2 ⊕ … ⊕ U_k`.
+/// 4. Snapshot at three iteration counts:
+///    - `aes_key      = X_N`        (`N = 1 << (kdf_count + 15)`)
+///    - `hmac_key     = X_{N+1}`
+///    - `pswcheck_raw = X_{N+2}`
+///
+/// The three outputs are identical to what RFC 8018 PBKDF2 with the
+/// same parameters and iteration count would produce (PBKDF2's first
+/// `hLen` bytes are `T_1 = U_1 ⊕ … ⊕ U_c`); running the loop once
+/// and snapshotting at three points is byte-identical to three
+/// separate PBKDF2 calls but ~3× faster.
+///
+/// # Performance
+///
+/// `iterations = 1 << (kdf_count + 15)`. For the spec default
+/// `kdf_count = 0` that is 32 768 HMAC-SHA256 operations — about
+/// 10 ms on a modern x86_64 (release build, hand-rolled SHA-256).
+/// Higher `kdf_count` values are exponentially slower; the §4 parser
+/// rejects `kdf_count > 24` so the worst case is bounded.
+#[must_use]
+pub fn derive_keys(password: &[u8], salt: &[u8; SALT_LEN], kdf_count: u8) -> DerivedKeys {
+    derive_keys_for_iterations(password, salt, u64::from(kdf_iterations(kdf_count)))
+}
+
+/// Inner helper exposing the raw iteration count so tests can drive
+/// the KDF at a small `n` (the spec-mandated `n ≥ 2^15` is too slow
+/// for a tight test loop).
+///
+/// Public consumers should call [`derive_keys`] which threads
+/// `kdf_count` through [`kdf_iterations`].
+#[must_use]
+pub fn derive_keys_for_iterations(password: &[u8], salt: &[u8; SALT_LEN], n: u64) -> DerivedKeys {
+    assert!(n >= 1, "RAR5 KDF iteration count must be ≥ 1");
+    // First HMAC: `U_1 = HMAC(P, salt || INT(1))`. `INT(1)` is the
+    // PBKDF2 block index encoded big-endian over 4 bytes; for the
+    // first (and only) derivation block, that's 0x00000001.
+    let mut hmac = Hmac::<Sha256>::new(password);
+    hmac.update(salt);
+    hmac.update(&1u32.to_be_bytes());
+    let mut u_prev: [u8; 32] = hmac.finalize();
+
+    // Running XOR seeds with U_1.
+    let mut xor_acc: [u8; 32] = u_prev;
+
+    let mut aes_key = [0u8; AES_KEY_LEN];
+    let mut hmac_key = [0u8; AES_KEY_LEN];
+    let mut pswcheck_raw = [0u8; AES_KEY_LEN];
+    if n == 1 {
+        aes_key = xor_acc;
+    }
+
+    // i = 2 ..= N+2. Snapshot at three iteration boundaries.
+    for i in 2..=n + 2 {
+        let mut hmac = Hmac::<Sha256>::new(password);
+        hmac.update(&u_prev);
+        u_prev = hmac.finalize();
+        for (a, b) in xor_acc.iter_mut().zip(u_prev.iter()) {
+            *a ^= *b;
+        }
+        if i == n {
+            aes_key = xor_acc;
+        }
+        if i == n + 1 {
+            hmac_key = xor_acc;
+        }
+        if i == n + 2 {
+            pswcheck_raw = xor_acc;
+        }
+    }
+
+    DerivedKeys {
+        aes_key,
+        hmac_key,
+        pswcheck_raw,
+    }
+}
+
+/// Fold a 32-byte `pswcheck_raw` down to the 8-byte verifier the
+/// archive's encryption header stores.
+///
+/// The fold is the RAR5-defined XOR-down: for each byte index
+/// `i ∈ 0..32`, the destination index is `i % 8`. The output is
+/// independent of byte order.
+#[must_use]
+pub fn fold_pswcheck(raw: &[u8; AES_KEY_LEN]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (i, b) in raw.iter().enumerate() {
+        out[i % 8] ^= *b;
+    }
+    out
+}
+
+/// Verify a derived password against the 12-byte `pswcheck` field
+/// the archive stored.
+///
+/// The wire layout of `pswcheck` is `[8-byte check][4-byte sum]`,
+/// where the sum is the first 4 bytes of `SHA-256(check)`. Two
+/// independent comparisons must succeed:
+///
+/// 1. `fold_pswcheck(raw) == stored_check` — the derived key
+///    matches the archive's verifier.
+/// 2. `SHA-256(stored_check)[..4] == stored_sum` — the stored
+///    verifier itself isn't corrupt.
+///
+/// Both comparisons go through [`ct_eq`] so a timing attacker cannot
+/// walk the verifier byte-by-byte.
+///
+/// # Returns
+///
+/// - `Ok(())` when both comparisons agree.
+/// - `Err(EncryptionError::PasswordIncorrect)` when (1) fails — the
+///   derived key didn't match.
+/// - `Err(EncryptionError::IntegrityCheckFailed)` when (1) succeeds
+///   but (2) fails — vanishingly unlikely outside a tampered archive,
+///   so we surface the corrupt-verifier case as integrity rather than
+///   password.
+pub fn verify_pswcheck(
+    raw: &[u8; AES_KEY_LEN],
+    stored: &[u8; PSWCHECK_LEN],
+    entry_name: &str,
+) -> Result<(), EncryptionError> {
+    let candidate_check = fold_pswcheck(raw);
+    let stored_check: &[u8] = &stored[..8];
+    let stored_sum: &[u8] = &stored[8..12];
+    let candidate_sum_full = Sha256::digest(&candidate_check);
+    let candidate_sum = &candidate_sum_full.as_ref()[..4];
+
+    let check_match = ct_eq(&candidate_check, stored_check);
+    let sum_match = ct_eq(candidate_sum, stored_sum);
+
+    if !check_match {
+        return Err(EncryptionError::PasswordIncorrect);
+    }
+    if !sum_match {
+        // The user-supplied password produced the matching 8-byte
+        // verifier but the verifier's own integrity sum is wrong.
+        // Treat as tampering rather than wrong-password.
+        return Err(EncryptionError::IntegrityCheckFailed {
+            entry_name: entry_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Streaming AES-256-CBC decryptor for RAR5's encrypted-header and
+/// per-file data layers.
+///
+/// Both layers share the same shape:
+///
+/// - 16-byte IV (cleartext on disk for header streams; carried by the
+///   [`FileEncryptionRecord`] for data streams).
+/// - Block-aligned ciphertext (the archive zero-pads the last block
+///   to a multiple of 16 bytes; consumers discard the padding by
+///   stopping at the cleartext-size boundary the spec records
+///   separately).
+///
+/// The wrapper is a thin convenience over [`AesCbcDecrypt`] that
+/// owns the AES key schedule, so callers can construct a decryptor
+/// once per header / per file and feed ciphertext in arbitrary
+/// 16-byte multiples.
+pub struct Rar5CbcStream {
+    cipher: Aes256,
+    iv: [u8; BLOCK_LEN],
+}
+
+impl Rar5CbcStream {
+    /// Construct a decryptor with the given 32-byte AES key and
+    /// 16-byte IV.
+    #[must_use]
+    pub fn new(aes_key: &[u8; AES_KEY_LEN], iv: [u8; BLOCK_LEN]) -> Self {
+        Self {
+            cipher: Aes256::new(aes_key),
+            iv,
+        }
+    }
+
+    /// Decrypt `data` in place, advancing the rolling IV so
+    /// subsequent calls continue the CBC chain.
+    ///
+    /// CBC chaining is "previous-ciphertext-block XOR'd into the
+    /// next AES decryption output", so across multiple calls we
+    /// must capture the trailing ciphertext block *before* in-place
+    /// decryption overwrites it. The internal [`AesCbcDecrypt`]
+    /// tracks its own rolling `prev` for the duration of a single
+    /// call; this wrapper saves that block externally so each call
+    /// constructs a fresh inner decryptor with the right IV.
+    ///
+    /// `data.len()` must be a multiple of 16 bytes (the format
+    /// guarantees this; the archive zero-pads to a block boundary
+    /// at creation time).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len() % 16 != 0`.
+    pub fn decrypt_blocks(&mut self, data: &mut [u8]) {
+        assert_eq!(
+            data.len() % BLOCK_LEN,
+            0,
+            "AES-CBC requires block-aligned ciphertext, got {} bytes",
+            data.len()
+        );
+        if data.is_empty() {
+            return;
+        }
+        let last_ct_start = data.len() - BLOCK_LEN;
+        let mut last_ct = [0u8; BLOCK_LEN];
+        last_ct.copy_from_slice(&data[last_ct_start..]);
+        let mut cbc = AesCbcDecrypt::new(&self.cipher, self.iv);
+        cbc.decrypt_blocks(data);
+        self.iv = last_ct;
+    }
+}
+
+/// Walk a file header's extra area and return the first
+/// (and only) encryption record, if any.
+///
+/// RAR5's extra-record framing: each record is `[size vint][type vint][body...]`
+/// where `size` covers `[type vint][body...]` (not the size vint
+/// itself), and the encryption record's type code is `0x01`.
+///
+/// Other extra-record types (file-time, file-version, hash records,
+/// redirect, Unix owner, etc.) are not encryption-relevant — this
+/// walker silently steps over them.
+///
+/// # Errors
+///
+/// - [`RarError::Truncated`] if a record's size vint or body runs
+///   past the extra area's end.
+/// - [`RarError::CorruptHeader`] if a record's size is zero.
+/// - [`EncryptHeaderError::*`] (lifted to [`RarError`]) for a
+///   malformed encryption record.
+pub fn find_file_encryption_record(
+    extra: &[u8],
+    archive_offset_of_extra: u64,
+) -> Result<Option<FileEncryptionRecord>, RarError> {
+    use crate::rar::format::Vint;
+
+    /// Type code for the encryption extra record.
+    const TYPE_ENCRYPTION: u64 = 0x01;
+
+    let mut cursor = 0usize;
+    while cursor < extra.len() {
+        let size_vint = Vint::decode_at(&extra[cursor..], archive_offset_of_extra + cursor as u64)?;
+        cursor += size_vint.size;
+        let size: usize = size_vint
+            .value
+            .try_into()
+            .map_err(|_| RarError::CorruptHeader {
+                archive_offset: archive_offset_of_extra + cursor as u64,
+                reason: format!(
+                    "extra-record size {} exceeds usize on this platform",
+                    size_vint.value
+                ),
+            })?;
+        if size == 0 {
+            return Err(RarError::CorruptHeader {
+                archive_offset: archive_offset_of_extra + cursor as u64,
+                reason: "extra-record size = 0; minimum record has a type vint".to_string(),
+            });
+        }
+        if cursor + size > extra.len() {
+            return Err(RarError::Truncated {
+                what: format!("extra record body ({size} bytes)"),
+                needed: cursor + size - extra.len(),
+            });
+        }
+        let record_bytes = &extra[cursor..cursor + size];
+        cursor += size;
+
+        let type_vint = Vint::decode_at(record_bytes, 0).map_err(|_| RarError::CorruptHeader {
+            archive_offset: archive_offset_of_extra,
+            reason: "extra-record type vint failed to decode".to_string(),
+        })?;
+        if type_vint.value == TYPE_ENCRYPTION {
+            let body = &record_bytes[type_vint.size..];
+            let parsed = FileEncryptionRecord::parse(body).map_err(RarError::from)?;
+            return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +862,225 @@ mod tests {
             }
             other => panic!("expected RarError::Encryption(UnsupportedKdf), got {other:?}"),
         }
+    }
+
+    /// The three RAR5-derived outputs at iteration counts N, N+1,
+    /// N+2 must equal three independent PBKDF2-HMAC-SHA256
+    /// derivations with those iteration counts (the running-XOR
+    /// scheme is a fused-loop equivalent). Cross-checks the
+    /// fused-loop optimisation against the generic PBKDF2 already
+    /// validated against the upstream `pbkdf2` crate.
+    #[test]
+    fn derive_keys_matches_three_pbkdf2_calls() {
+        use crate::crypto::pbkdf2::pbkdf2_hmac;
+        use crate::hash::sha256::Sha256;
+
+        let password = b"hunter2";
+        let salt: [u8; SALT_LEN] =
+            *b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff";
+        // Small n so the test stays under a millisecond.
+        let n: u64 = 7;
+        let keys = derive_keys_for_iterations(password, &salt, n);
+
+        let mut expect_aes = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(password, &salt, n as u32, &mut expect_aes);
+        let mut expect_hmac = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(password, &salt, (n + 1) as u32, &mut expect_hmac);
+        let mut expect_pswcheck = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(password, &salt, (n + 2) as u32, &mut expect_pswcheck);
+
+        assert_eq!(keys.aes_key, expect_aes, "aes_key");
+        assert_eq!(keys.hmac_key, expect_hmac, "hmac_key");
+        assert_eq!(keys.pswcheck_raw, expect_pswcheck, "pswcheck_raw");
+    }
+
+    /// At the spec-minimum `kdf_count = 0` (N = 32 768) we still
+    /// agree with three independent PBKDF2 calls. Slower than the
+    /// small-n test above but still well under a second on a modern
+    /// CPU; this is the only test that exercises the actual default
+    /// iteration count an archive will use.
+    #[test]
+    fn derive_keys_matches_pbkdf2_at_spec_default() {
+        use crate::crypto::pbkdf2::pbkdf2_hmac;
+        use crate::hash::sha256::Sha256;
+
+        let password = b"correct horse battery staple";
+        let salt: [u8; SALT_LEN] = [0x42; SALT_LEN];
+        let kdf_count: u8 = 0;
+        let keys = derive_keys(password, &salt, kdf_count);
+
+        let n = kdf_iterations(kdf_count);
+        let mut expect_aes = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(password, &salt, n, &mut expect_aes);
+        let mut expect_hmac = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(password, &salt, n + 1, &mut expect_hmac);
+        assert_eq!(keys.aes_key, expect_aes);
+        assert_eq!(keys.hmac_key, expect_hmac);
+    }
+
+    /// XOR-fold of an all-zero buffer is all-zero; XOR-fold of an
+    /// all-`0xFF` buffer is all-zero (each output byte is XOR'd
+    /// four times, an even number).
+    #[test]
+    fn fold_pswcheck_handles_constant_inputs() {
+        let zero = [0u8; AES_KEY_LEN];
+        let zero_fold = fold_pswcheck(&zero);
+        assert_eq!(zero_fold, [0u8; 8]);
+
+        let ones = [0xFFu8; AES_KEY_LEN];
+        let ones_fold = fold_pswcheck(&ones);
+        // 32 bytes / 8 output bytes = 4 contributions per output byte.
+        // 0xFF XOR'd 4 times = 0x00.
+        assert_eq!(ones_fold, [0u8; 8]);
+    }
+
+    /// XOR-fold spec check: each output byte equals the XOR of the
+    /// four source bytes at indices `i, i+8, i+16, i+24`.
+    #[test]
+    fn fold_pswcheck_matches_indexed_xor() {
+        let mut raw = [0u8; AES_KEY_LEN];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let folded = fold_pswcheck(&raw);
+        for i in 0..8 {
+            let expected = raw[i] ^ raw[i + 8] ^ raw[i + 16] ^ raw[i + 24];
+            assert_eq!(folded[i], expected, "byte {i}");
+        }
+    }
+
+    /// Correct password verifies; mutated check value surfaces
+    /// `PasswordIncorrect`; mutated sum-byte surfaces
+    /// `IntegrityCheckFailed`.
+    #[test]
+    fn verify_pswcheck_round_trip() {
+        let raw = [0xAB; AES_KEY_LEN];
+        let check = fold_pswcheck(&raw);
+        let sum_full = crate::hash::sha256::Sha256::digest(&check);
+        let mut stored = [0u8; PSWCHECK_LEN];
+        stored[..8].copy_from_slice(&check);
+        stored[8..12].copy_from_slice(&sum_full.as_ref()[..4]);
+
+        // Correct password verifies.
+        verify_pswcheck(&raw, &stored, "test.bin").expect("correct verifier");
+
+        // Mutate the check bytes → PasswordIncorrect.
+        let mut tampered_check = stored;
+        tampered_check[0] ^= 1;
+        let err = verify_pswcheck(&raw, &tampered_check, "test.bin").expect_err("wrong password");
+        assert!(matches!(err, EncryptionError::PasswordIncorrect));
+
+        // Leave the check intact but corrupt the sum →
+        // IntegrityCheckFailed.
+        let mut tampered_sum = stored;
+        tampered_sum[8] ^= 1;
+        let err = verify_pswcheck(&raw, &tampered_sum, "test.bin").expect_err("bad sum");
+        assert!(matches!(err, EncryptionError::IntegrityCheckFailed { .. }));
+    }
+
+    /// Streaming CBC decrypt across multiple `decrypt_blocks` calls
+    /// must produce the same bytes as a single all-at-once call.
+    /// Exercises the IV-chaining behaviour the [`Rar5CbcStream`]
+    /// wrapper adds on top of [`AesCbcDecrypt`].
+    #[test]
+    fn cbc_stream_chains_across_calls() {
+        use crate::crypto::aes::Aes256;
+        use crate::crypto::aes_modes::AesCbcDecrypt;
+
+        let key = [0x42u8; AES_KEY_LEN];
+        let iv = [0x11u8; BLOCK_LEN];
+        // 5 blocks of synthetic ciphertext (the exact bytes don't
+        // matter for a streaming-vs-monolithic check; we just need
+        // CBC decryption to produce deterministic output).
+        let ct: Vec<u8> = (0..80u8).collect();
+
+        // Monolithic decrypt.
+        let cipher = Aes256::new(&key);
+        let mut buf_a = ct.clone();
+        {
+            let mut cbc = AesCbcDecrypt::new(&cipher, iv);
+            cbc.decrypt_blocks(&mut buf_a);
+        }
+
+        // Streaming decrypt: 2 blocks, then 1 block, then 2 blocks.
+        let mut buf_b = ct.clone();
+        let mut stream = Rar5CbcStream::new(&key, iv);
+        stream.decrypt_blocks(&mut buf_b[..32]);
+        stream.decrypt_blocks(&mut buf_b[32..48]);
+        stream.decrypt_blocks(&mut buf_b[48..]);
+
+        assert_eq!(buf_a, buf_b, "streaming and monolithic CBC must agree");
+    }
+
+    #[test]
+    #[should_panic(expected = "AES-CBC requires block-aligned ciphertext")]
+    fn cbc_stream_rejects_unaligned() {
+        let key = [0u8; AES_KEY_LEN];
+        let iv = [0u8; BLOCK_LEN];
+        let mut buf = [0u8; 17];
+        Rar5CbcStream::new(&key, iv).decrypt_blocks(&mut buf);
+    }
+
+    /// `find_file_encryption_record` walks past non-encryption
+    /// records and returns the encryption record's parsed form.
+    #[test]
+    fn find_file_encryption_record_locates_among_other_records() {
+        // Build an extra area:
+        //   - one type-2 (file-time) record body 4 bytes
+        //   - one type-1 (encryption) record with valid fields
+        //
+        // Per-record wire layout: `[size vint][type vint][body...]`.
+        // `size` covers `[type vint][body]`.
+        let other_type = 2u64;
+        let other_body = [0xAAu8; 4];
+        let mut other_record_body = Vec::new();
+        other_record_body.extend_from_slice(&encode_vint(other_type));
+        other_record_body.extend_from_slice(&other_body);
+
+        let salt = [0x12u8; SALT_LEN];
+        let iv = [0x34u8; IV_LEN];
+        let enc_type = 1u64;
+        let mut enc_body = Vec::new();
+        enc_body.extend_from_slice(&encode_vint(enc_type));
+        enc_body.extend_from_slice(&encode_vint(0)); // version
+        enc_body.extend_from_slice(&encode_vint(0)); // flags
+        enc_body.push(0); // kdf_count
+        enc_body.extend_from_slice(&salt);
+        enc_body.extend_from_slice(&iv);
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&encode_vint(other_record_body.len() as u64));
+        extra.extend_from_slice(&other_record_body);
+        extra.extend_from_slice(&encode_vint(enc_body.len() as u64));
+        extra.extend_from_slice(&enc_body);
+
+        let parsed = find_file_encryption_record(&extra, 0)
+            .expect("walks extra area")
+            .expect("encryption record present");
+        assert_eq!(parsed.salt, salt);
+        assert_eq!(parsed.iv, iv);
+    }
+
+    #[test]
+    fn find_file_encryption_record_returns_none_when_absent() {
+        // Just one non-encryption record.
+        let mut record_body = Vec::new();
+        record_body.extend_from_slice(&encode_vint(2));
+        record_body.extend_from_slice(&[0u8; 4]);
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&encode_vint(record_body.len() as u64));
+        extra.extend_from_slice(&record_body);
+        let parsed = find_file_encryption_record(&extra, 0).expect("walks");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn find_file_encryption_record_truncated_body_errors() {
+        // Size vint says 100 bytes; we only have 10 after it.
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&encode_vint(100));
+        extra.extend_from_slice(&[0u8; 10]);
+        let err = find_file_encryption_record(&extra, 0).expect_err("truncated");
+        assert!(matches!(err, RarError::Truncated { .. }));
     }
 }

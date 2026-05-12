@@ -22,8 +22,21 @@
 
 #![allow(dead_code)] // Different integration tests use different subsets.
 
+use peel::crypto::aes::{Aes256, AesBlockCipher, BLOCK_LEN};
+use peel::hash::sha256::Sha256;
+use peel::rar::encrypt::{derive_keys, fold_pswcheck};
 use peel::rar::format::{arc_flags, file_flags, hdr_flags, RAR4_SIGNATURE_MAGIC};
 use peel::rar::SIGNATURE_MAGIC;
+
+/// AES block-size constant re-exported so the fixture builder's
+/// padding arithmetic doesn't depend on the runtime constant moving
+/// out from under it.
+const AES_BLOCK: usize = BLOCK_LEN;
+
+/// Block hash trait method needed for the SHA-256 sum of the
+/// pswcheck. Imported under an alias to keep the trait name out of
+/// the public namespace of this module.
+use peel::crypto::BlockHash as _BlockHash;
 
 /// Encode a `u64` as a RAR5 vint.
 pub fn encode_vint(mut value: u64) -> Vec<u8> {
@@ -207,21 +220,301 @@ pub fn build_rar5(
 
 /// Build a RAR5 archive with a header-type-4 (archive encryption)
 /// header inserted between the main header and the first file
-/// header. The encryption header's body is intentionally minimal —
-/// the round-one walker rejects on the type code alone, so its
-/// contents don't matter.
+/// header. The encryption header carries a structurally valid body
+/// (version 0, no pswcheck, kdf_count 0, a 16-byte all-zero salt)
+/// so the walker's encryption-header parser succeeds and surfaces
+/// the [`peel::encryption::EncryptionError::UnsupportedCipher`]
+/// refusal that signals archive-header encryption is not yet
+/// supported end-to-end. The file headers and data areas after the
+/// CRYPT header are cleartext — the walker would never read them,
+/// since it returns immediately on the encryption header.
 pub fn build_rar5_encrypted_header(entries: &[RarEntrySpec]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&SIGNATURE_MAGIC);
     out.extend_from_slice(&build_main_header(0, None));
-    // Header type 4 with no flags or fields.
-    out.extend_from_slice(&build_generic_header(4, 0, &[], &[], None));
+    let mut enc_body = Vec::new();
+    enc_body.extend_from_slice(&encode_vint(0)); // version
+    enc_body.extend_from_slice(&encode_vint(0)); // flags (no pswcheck)
+    enc_body.push(0); // kdf_count
+    enc_body.extend_from_slice(&[0u8; 16]); // salt
+    out.extend_from_slice(&build_generic_header(4, 0, &enc_body, &[], None));
     for entry in entries {
         let (header, data) = build_file_header(entry);
         out.extend_from_slice(&header);
         out.extend_from_slice(&data);
     }
     out.extend_from_slice(&build_end_of_archive());
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Per-file encryption fixture builder
+// (`docs/PLAN_archive_encryption.md` §4 follow-on)
+// ─────────────────────────────────────────────────────────────────
+
+/// One STORED entry whose data area is to be AES-256-CBC encrypted
+/// under the per-file encryption record in its file-header extra
+/// area. Mirrors [`RarEntrySpec`] but tagged with the per-file
+/// IV / salt the fixture builder will embed in the extra record.
+#[derive(Clone)]
+pub struct EncryptedEntrySpec {
+    /// Entry name.
+    pub name: String,
+    /// Plaintext payload.
+    pub uncompressed: Vec<u8>,
+    /// 16-byte salt for the entry's KDF. Each entry can carry its
+    /// own salt; real RAR5 archives typically reuse one salt across
+    /// the whole file but the spec permits per-entry salts.
+    pub salt: [u8; 16],
+    /// 16-byte IV for the entry's CBC stream. Must be unique per
+    /// salt+password combination; the test fixtures pick a fixed
+    /// value per entry name.
+    pub iv: [u8; AES_BLOCK],
+    /// `kdf_count` byte — `iterations = 1 << (kdf_count + 15)`.
+    /// Tests use `0` (32 768 iterations) so the KDF stays under a
+    /// few hundred milliseconds.
+    pub kdf_count: u8,
+    /// `true` to embed an 8-byte pswcheck + 4-byte sum in the
+    /// extra record. Real archives almost always set this; the
+    /// flag gives tests a knob to exercise the no-verifier branch
+    /// in the pipeline.
+    pub include_pswcheck: bool,
+}
+
+impl EncryptedEntrySpec {
+    /// New entry with conventional defaults (deterministic
+    /// salt/IV derived from the name so the fixture builds are
+    /// reproducible).
+    pub fn stored(name: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+        let name = name.into();
+        let payload = payload.into();
+        let mut salt = [0u8; 16];
+        for (i, b) in name.bytes().enumerate().take(16) {
+            salt[i] = b.wrapping_add(0x10);
+        }
+        let mut iv = [0u8; AES_BLOCK];
+        for (i, b) in name.bytes().enumerate().take(AES_BLOCK) {
+            iv[i] = b.wrapping_add(0x20);
+        }
+        Self {
+            name,
+            uncompressed: payload,
+            salt,
+            iv,
+            kdf_count: 0,
+            include_pswcheck: true,
+        }
+    }
+}
+
+/// Encrypt one entry's plaintext payload with AES-256-CBC and a
+/// trailing zero-pad to a 16-byte boundary. Returns the on-disk
+/// ciphertext bytes (length is `round_up(plaintext.len(), 16)`).
+fn encrypt_entry_data(plaintext: &[u8], key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Vec<u8> {
+    let mut buf = plaintext.to_vec();
+    // Zero-pad to a multiple of 16 bytes (the RAR5 spec is silent
+    // on the exact pad bytes; unrar emits zero pads, which is what
+    // every observed real archive does).
+    let pad = (AES_BLOCK - (buf.len() % AES_BLOCK)) % AES_BLOCK;
+    buf.resize(buf.len() + pad, 0u8);
+
+    let cipher = Aes256::new(key);
+    let mut prev = *iv;
+    for chunk in buf.chunks_exact_mut(AES_BLOCK) {
+        // CBC encrypt: xor plaintext with prev, then AES-encrypt.
+        for (b, p) in chunk.iter_mut().zip(prev.iter()) {
+            *b ^= *p;
+        }
+        let block: &mut [u8; AES_BLOCK] = chunk.try_into().unwrap();
+        cipher.encrypt_block(block);
+        prev.copy_from_slice(block);
+    }
+    buf
+}
+
+/// Build a file header for an encrypted STORED entry: the file
+/// header carries a type-1 (encryption) extra record describing
+/// the salt/iv/kdf_count, and the data area is the ciphertext
+/// produced by [`encrypt_entry_data`].
+fn build_encrypted_file_header(password: &[u8], entry: &EncryptedEntrySpec) -> (Vec<u8>, Vec<u8>) {
+    let mut fields = Vec::new();
+    // Always emit CRC32 of the plaintext so the sink validates the
+    // decrypted bytes end-to-end.
+    let crc = {
+        let mut state: u32 = !0;
+        for &b in &entry.uncompressed {
+            state ^= u32::from(b);
+            for _ in 0..8 {
+                let lsb = state & 1;
+                state >>= 1;
+                if lsb != 0 {
+                    state ^= 0xEDB8_8320;
+                }
+            }
+        }
+        !state
+    };
+    fields.extend_from_slice(&encode_vint(file_flags::CRC32_PRESENT));
+    fields.extend_from_slice(&encode_vint(entry.uncompressed.len() as u64));
+    fields.extend_from_slice(&encode_vint(0)); // attributes
+    fields.extend_from_slice(&crc.to_le_bytes());
+    fields.extend_from_slice(&encode_vint(0)); // compression info: STORED
+    fields.extend_from_slice(&encode_vint(1)); // host OS: Unix
+    fields.extend_from_slice(&encode_vint(entry.name.len() as u64));
+    fields.extend_from_slice(entry.name.as_bytes());
+
+    let keys = derive_keys(password, &entry.salt, entry.kdf_count);
+    let ciphertext = encrypt_entry_data(&entry.uncompressed, &keys.aes_key, &entry.iv);
+
+    // Encryption extra record body:
+    //   [version vint][flags vint][kdf_count u8][salt 16][iv 16][pswcheck 12?]
+    let flags: u64 = if entry.include_pswcheck { 0x0001 } else { 0 };
+    let mut enc_body = Vec::new();
+    enc_body.extend_from_slice(&encode_vint(0)); // version
+    enc_body.extend_from_slice(&encode_vint(flags));
+    enc_body.push(entry.kdf_count);
+    enc_body.extend_from_slice(&entry.salt);
+    enc_body.extend_from_slice(&entry.iv);
+    if entry.include_pswcheck {
+        let check = fold_pswcheck(&keys.pswcheck_raw);
+        let sum = Sha256::digest(&check);
+        enc_body.extend_from_slice(&check);
+        enc_body.extend_from_slice(&sum.as_ref()[..4]);
+    }
+    // Wrap into an extra-record envelope: [size vint][type vint=1][body]
+    let mut record = Vec::new();
+    record.extend_from_slice(&encode_vint(1)); // type
+    record.extend_from_slice(&enc_body);
+    let mut extra = Vec::new();
+    extra.extend_from_slice(&encode_vint(record.len() as u64));
+    extra.extend_from_slice(&record);
+
+    let header = build_generic_header(
+        2,
+        hdr_flags::DATA_AREA | hdr_flags::EXTRA_AREA,
+        &fields,
+        &extra,
+        Some(ciphertext.len() as u64),
+    );
+    (header, ciphertext)
+}
+
+/// Build a complete RAR5 archive whose file entries' data areas are
+/// per-file AES-256-CBC encrypted under `password`.
+///
+/// The archive itself has no archive-header encryption (HEAD_CRYPT
+/// is absent); only the entries' data carries an encryption layer.
+pub fn build_rar5_per_file_encrypted(password: &[u8], entries: &[EncryptedEntrySpec]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&SIGNATURE_MAGIC);
+    out.extend_from_slice(&build_main_header(0, None));
+    for entry in entries {
+        let (header, data) = build_encrypted_file_header(password, entry);
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&data);
+    }
+    out.extend_from_slice(&build_end_of_archive());
+    out
+}
+
+/// Encrypt one cleartext header under the archive-header CBC
+/// scheme: prepend a 16-byte IV (chosen by the caller), zero-pad
+/// the cleartext to a 16-byte boundary, and AES-256-CBC-encrypt the
+/// padded block. Returns the wire bytes for the encrypted header.
+fn encrypt_header_with_iv(
+    cleartext_header: &[u8],
+    aes_key: &[u8; 32],
+    iv: &[u8; AES_BLOCK],
+) -> Vec<u8> {
+    let mut padded = cleartext_header.to_vec();
+    let pad = (AES_BLOCK - (padded.len() % AES_BLOCK)) % AES_BLOCK;
+    padded.resize(padded.len() + pad, 0u8);
+
+    let cipher = Aes256::new(aes_key);
+    let mut prev = *iv;
+    for chunk in padded.chunks_exact_mut(AES_BLOCK) {
+        for (b, p) in chunk.iter_mut().zip(prev.iter()) {
+            *b ^= *p;
+        }
+        let block: &mut [u8; AES_BLOCK] = chunk.try_into().unwrap();
+        cipher.encrypt_block(block);
+        prev.copy_from_slice(block);
+    }
+
+    let mut out = Vec::with_capacity(AES_BLOCK + padded.len());
+    out.extend_from_slice(iv);
+    out.extend_from_slice(&padded);
+    out
+}
+
+/// Build a complete RAR5 archive with archive-header encryption
+/// enabled. Every header after HEAD_CRYPT is AES-256-CBC encrypted
+/// under a per-archive key derived from `password`, salted with the
+/// fixture's fixed `[0xAA; 16]` value. Each header is prefixed by
+/// its own 16-byte IV (the fixture derives a deterministic IV from
+/// the header index so the archive is reproducible).
+///
+/// The file data areas are *not* encrypted at the archive-header
+/// layer; per-file encryption (a separate, independent layer) is
+/// not exercised by this fixture — `entries` are plain STORED
+/// payloads inside the encrypted headers.
+pub fn build_rar5_archive_header_encrypted(password: &[u8], entries: &[RarEntrySpec]) -> Vec<u8> {
+    // Use a fixed salt / kdf_count so the fixture stays reproducible.
+    let salt: [u8; 16] = [0xAA; 16];
+    let kdf_count: u8 = 0;
+    let keys = derive_keys(password, &salt, kdf_count);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&SIGNATURE_MAGIC);
+
+    // HEAD_CRYPT (cleartext, present once at the start).
+    let mut enc_body = Vec::new();
+    enc_body.extend_from_slice(&encode_vint(0)); // version
+    enc_body.extend_from_slice(&encode_vint(0x0001)); // FLAG_PSWCHECK
+    enc_body.push(kdf_count);
+    enc_body.extend_from_slice(&salt);
+    let check = fold_pswcheck(&keys.pswcheck_raw);
+    let sum = Sha256::digest(&check);
+    enc_body.extend_from_slice(&check);
+    enc_body.extend_from_slice(&sum.as_ref()[..4]);
+    out.extend_from_slice(&build_generic_header(4, 0, &enc_body, &[], None));
+
+    // Headers from here on are encrypted. Each gets a unique IV
+    // (incrementing counter so the archive is reproducible).
+    let mut iv_seed: u8 = 1;
+    let mut next_iv = || -> [u8; AES_BLOCK] {
+        let iv = [iv_seed; AES_BLOCK];
+        iv_seed = iv_seed.wrapping_add(1);
+        iv
+    };
+
+    // Main header (encrypted).
+    let main_clear = build_main_header(0, None);
+    out.extend_from_slice(&encrypt_header_with_iv(
+        &main_clear,
+        &keys.aes_key,
+        &next_iv(),
+    ));
+
+    // Each file header (encrypted) + cleartext data area.
+    for entry in entries {
+        let (file_clear, data) = build_file_header(entry);
+        out.extend_from_slice(&encrypt_header_with_iv(
+            &file_clear,
+            &keys.aes_key,
+            &next_iv(),
+        ));
+        out.extend_from_slice(&data);
+    }
+
+    // End-of-archive (encrypted).
+    let eoa_clear = build_end_of_archive();
+    out.extend_from_slice(&encrypt_header_with_iv(
+        &eoa_clear,
+        &keys.aes_key,
+        &next_iv(),
+    ));
+
     out
 }
 
