@@ -35,8 +35,11 @@
 //! AES, the AES modes (CTR, CBC), and the 7z round-tower KDF land
 //! in their own submodules in §2b of the plan.
 
+pub mod aes;
+pub mod aes_modes;
 pub mod hmac;
 pub mod pbkdf2;
+pub mod sevenz_kdf;
 pub mod sha1;
 
 /// Compare two byte slices in constant time relative to the input

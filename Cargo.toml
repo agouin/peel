@@ -151,6 +151,12 @@ hyper = { version = "1", default-features = false, features = ["server"] }
 sha1 = "0.10"
 hmac = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# Dev-only AES reference for the AES / AES-CTR / AES-CBC
+# differential cross-check
+# (`docs/PLAN_archive_encryption.md` §2 / `tests/test_crypto_diff.rs`).
+aes = "0.8"
+ctr = "0.9"
+cbc = "0.1"
 
 [profile.release]
 debug = "line-tables-only"

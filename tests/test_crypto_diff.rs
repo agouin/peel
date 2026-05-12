@@ -12,10 +12,16 @@
 //! (the §10 SHA-256 hand-roll) and the BLAKE2sp differential corpus
 //! in `src/hash/blake2sp.rs`.
 //!
-//! AES + AES-CTR + AES-CBC + 7z KDF land in §2b; their differential
-//! checks will be appended to this file when those primitives ship.
+//! §2b primitives (AES-128/192/256 ECB + AES-CTR + AES-CBC) are
+//! cross-checked here against the `aes`, `ctr`, and `cbc` reference
+//! crates. The 7z bespoke KDF has no upstream reference crate; its
+//! correctness is asserted by hand-traced inline-SHA-256 vectors
+//! in `src/crypto/sevenz_kdf.rs`.
 
+use aes::cipher::{BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit, StreamCipher};
 use hmac::{Hmac as RefHmac, Mac};
+use peel::crypto::aes::{Aes128, Aes192, Aes256, AesBlockCipher, BLOCK_LEN};
+use peel::crypto::aes_modes::{AesCbcDecrypt, AesCtr, CounterEndian};
 use peel::crypto::hmac::Hmac;
 use peel::crypto::pbkdf2::pbkdf2_hmac;
 use peel::crypto::sha1::Sha1;
@@ -234,6 +240,202 @@ fn pbkdf2_sha256_matches_reference_random_short_iterations() {
         );
     }
 }
+
+// ============================================================
+// §2b: AES + AES-CTR + AES-CBC differential cross-checks.
+// ============================================================
+
+/// AES-128 ECB encrypt round-trips: 1024 random blocks, both
+/// directions, both vs reference.
+#[test]
+fn aes128_ecb_matches_reference_for_1024_random_blocks() {
+    let mut rng = Xs64::new(0xAE51_2810_0000_0001);
+    for _ in 0..1024 {
+        let mut key = [0u8; 16];
+        rng.fill_bytes(&mut key);
+        let mut block = [0u8; 16];
+        rng.fill_bytes(&mut block);
+
+        let ours = Aes128::new(&key);
+        let theirs = aes::Aes128::new(&key.into());
+
+        let mut ours_enc = block;
+        ours.encrypt_block(&mut ours_enc);
+        let mut theirs_enc = block.into();
+        theirs.encrypt_block(&mut theirs_enc);
+        assert_eq!(ours_enc.as_slice(), theirs_enc.as_slice());
+
+        let mut ours_dec = ours_enc;
+        ours.decrypt_block(&mut ours_dec);
+        assert_eq!(ours_dec, block);
+    }
+}
+
+/// AES-192 ECB cross-check.
+#[test]
+fn aes192_ecb_matches_reference_for_1024_random_blocks() {
+    let mut rng = Xs64::new(0xAE51_2810_0000_0002);
+    for _ in 0..1024 {
+        let mut key = [0u8; 24];
+        rng.fill_bytes(&mut key);
+        let mut block = [0u8; 16];
+        rng.fill_bytes(&mut block);
+
+        let ours = Aes192::new(&key);
+        let theirs = aes::Aes192::new(&key.into());
+
+        let mut ours_enc = block;
+        ours.encrypt_block(&mut ours_enc);
+        let mut theirs_enc = block.into();
+        theirs.encrypt_block(&mut theirs_enc);
+        assert_eq!(ours_enc.as_slice(), theirs_enc.as_slice());
+
+        let mut ours_dec = ours_enc;
+        ours.decrypt_block(&mut ours_dec);
+        assert_eq!(ours_dec, block);
+    }
+}
+
+/// AES-256 ECB cross-check.
+#[test]
+fn aes256_ecb_matches_reference_for_1024_random_blocks() {
+    let mut rng = Xs64::new(0xAE51_2810_0000_0003);
+    for _ in 0..1024 {
+        let mut key = [0u8; 32];
+        rng.fill_bytes(&mut key);
+        let mut block = [0u8; 16];
+        rng.fill_bytes(&mut block);
+
+        let ours = Aes256::new(&key);
+        let theirs = aes::Aes256::new(&key.into());
+
+        let mut ours_enc = block;
+        ours.encrypt_block(&mut ours_enc);
+        let mut theirs_enc = block.into();
+        theirs.encrypt_block(&mut theirs_enc);
+        assert_eq!(ours_enc.as_slice(), theirs_enc.as_slice());
+
+        let mut ours_dec = ours_enc;
+        ours.decrypt_block(&mut ours_dec);
+        assert_eq!(ours_dec, block);
+    }
+}
+
+/// AES-128-CTR with a big-endian counter: 1024 random
+/// key/IV/plaintext combinations match the reference.
+#[test]
+fn aes128_ctr_be_matches_reference() {
+    use ctr::Ctr128BE;
+    type RefCtr = Ctr128BE<aes::Aes128>;
+    let mut rng = Xs64::new(0xCAFEBABE_C0DEFACE);
+    for _ in 0..1024 {
+        let mut key = [0u8; 16];
+        rng.fill_bytes(&mut key);
+        let mut iv = [0u8; 16];
+        rng.fill_bytes(&mut iv);
+        let len = 1 + rng.len_up_to(127);
+        let plaintext = rng.vec(len);
+
+        let cipher = Aes128::new(&key);
+        let mut ours_buf = plaintext.clone();
+        AesCtr::new(&cipher, iv, CounterEndian::Big).apply_keystream(&mut ours_buf);
+
+        let mut their_buf = plaintext.clone();
+        let mut their_ctr = RefCtr::new(&key.into(), &iv.into());
+        their_ctr.apply_keystream(&mut their_buf);
+
+        assert_eq!(ours_buf, their_buf, "len={len}");
+    }
+}
+
+/// AES-256-CTR-BE cross-check (the rar5 footprint).
+#[test]
+fn aes256_ctr_be_matches_reference() {
+    use ctr::Ctr128BE;
+    type RefCtr = Ctr128BE<aes::Aes256>;
+    let mut rng = Xs64::new(0xCAFEBABE_DEADBEEF);
+    for _ in 0..1024 {
+        let mut key = [0u8; 32];
+        rng.fill_bytes(&mut key);
+        let mut iv = [0u8; 16];
+        rng.fill_bytes(&mut iv);
+        let len = 1 + rng.len_up_to(127);
+        let plaintext = rng.vec(len);
+
+        let cipher = Aes256::new(&key);
+        let mut ours_buf = plaintext.clone();
+        AesCtr::new(&cipher, iv, CounterEndian::Big).apply_keystream(&mut ours_buf);
+
+        let mut their_buf = plaintext.clone();
+        let mut their_ctr = RefCtr::new(&key.into(), &iv.into());
+        their_ctr.apply_keystream(&mut their_buf);
+
+        assert_eq!(ours_buf, their_buf, "len={len}");
+    }
+}
+
+/// AES-128-CTR with a little-endian counter (zip-AES footprint).
+/// The reference `ctr` crate exposes `Ctr128LE` for this.
+#[test]
+fn aes128_ctr_le_matches_reference() {
+    use ctr::Ctr128LE;
+    type RefCtr = Ctr128LE<aes::Aes128>;
+    let mut rng = Xs64::new(0x1234_5678_9ABC_DEF1);
+    for _ in 0..1024 {
+        let mut key = [0u8; 16];
+        rng.fill_bytes(&mut key);
+        let mut iv = [0u8; 16];
+        rng.fill_bytes(&mut iv);
+        let len = 1 + rng.len_up_to(127);
+        let plaintext = rng.vec(len);
+
+        let cipher = Aes128::new(&key);
+        let mut ours_buf = plaintext.clone();
+        AesCtr::new(&cipher, iv, CounterEndian::Little).apply_keystream(&mut ours_buf);
+
+        let mut their_buf = plaintext.clone();
+        let mut their_ctr = RefCtr::new(&key.into(), &iv.into());
+        their_ctr.apply_keystream(&mut their_buf);
+
+        assert_eq!(ours_buf, their_buf, "len={len}");
+    }
+}
+
+/// AES-256-CBC decryption matches the reference. We pre-encrypt
+/// with the reference (since we don't have CBC encrypt locally)
+/// and verify peel decrypts to the original plaintext.
+#[test]
+fn aes256_cbc_decrypt_matches_reference() {
+    type RefEnc = cbc::Encryptor<aes::Aes256>;
+    let mut rng = Xs64::new(0xCBC0_CBC0_CBC0_CBC0);
+    for _ in 0..256 {
+        let mut key = [0u8; 32];
+        rng.fill_bytes(&mut key);
+        let mut iv = [0u8; 16];
+        rng.fill_bytes(&mut iv);
+        // CBC needs block-aligned input.
+        let blocks = 1 + rng.len_up_to(8);
+        let plaintext = rng.vec(blocks * BLOCK_LEN);
+
+        let ref_enc = RefEnc::new(&key.into(), &iv.into());
+        let mut ciphertext = vec![0u8; plaintext.len()];
+        ref_enc
+            .encrypt_padded_b2b_mut::<cbc::cipher::block_padding::NoPadding>(
+                &plaintext,
+                &mut ciphertext,
+            )
+            .expect("ref cbc encrypt");
+
+        let cipher = Aes256::new(&key);
+        let mut buf = ciphertext.clone();
+        AesCbcDecrypt::new(&cipher, iv).decrypt_blocks(&mut buf);
+        assert_eq!(buf, plaintext, "blocks={blocks}");
+    }
+}
+
+// ============================================================
+// PBKDF2 (continuing from §2a).
+// ============================================================
 
 /// Pin the zip-AES iteration count (1000) and PBKDF2-SHA1 against
 /// the reference. The iteration count itself is a hot-spot constant
