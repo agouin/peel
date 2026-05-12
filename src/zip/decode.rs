@@ -54,6 +54,7 @@ use crate::decode::{deflate_native, DecodeError, DecodeStatus, StreamingDecoder}
 use crate::secret::Password;
 use crate::sink::{SinkError, ZipSink};
 use crate::zip::aes_decrypt::{downcast_encryption_error, AesDecryptReader};
+use crate::zip::encrypt_legacy::ZipCryptoReader;
 use crate::zip::format::{AesExtra, CompressionMethod};
 use crate::zip::ZipError;
 
@@ -157,6 +158,42 @@ pub struct AesDecryptParams<'a> {
     pub compressed_size: u64,
 }
 
+/// Per-entry ZipCrypto decryption parameters
+/// (`docs/PLAN_archive_encryption.md` §3b).
+///
+/// When threaded into [`decompress_entry_with_resume`], the source
+/// reader is wrapped in a [`ZipCryptoReader`] (which consumes the
+/// 12-byte encryption header and verifies the password against the
+/// entry's CRC-32 high byte) before the inner (STORED / DEFLATE /
+/// zstd) decoder runs against it.
+#[derive(Debug)]
+pub struct ZipCryptoDecryptParams<'a> {
+    /// User-supplied password. Borrowed; the pipeline keeps the
+    /// owning [`Password`] alive across the entire run.
+    pub password: &'a Password,
+    /// Total ciphertext size for the entry — equal to the central
+    /// directory's `compressed_size` field. The wrapper uses this
+    /// to bound the post-header payload.
+    pub compressed_size: u64,
+    /// High byte of the entry's CRC-32 from the central directory.
+    /// The ZipCrypto encryption-header verifier byte must equal this
+    /// or the password is wrong.
+    pub crc32_high_byte: u8,
+}
+
+/// Per-entry encryption parameters: either WinZip-AES or legacy
+/// PKWARE ZipCrypto. Mutually exclusive — every encrypted ZIP entry
+/// is one or the other.
+#[derive(Debug)]
+pub enum EntryDecryptParams<'a> {
+    /// WinZip-AES (compression method 99, AE-1 / AE-2). See
+    /// [`AesDecryptParams`].
+    Aes(AesDecryptParams<'a>),
+    /// Legacy PKWARE "ZipCrypto" (general-purpose flag bit 0, no
+    /// AES extra). See [`ZipCryptoDecryptParams`].
+    ZipCrypto(ZipCryptoDecryptParams<'a>),
+}
+
 /// Decompress one entry's compressed bytes into the sink.
 ///
 /// `compressed` is a `Read` that yields exactly the entry's
@@ -211,26 +248,44 @@ pub fn decompress_entry_with_resume<R: Read>(
     entry_name: &str,
     resume: Option<DecompressResume<'_>>,
     progress: InEntryProgressCallback<'_>,
-    aes: Option<AesDecryptParams<'_>>,
+    decrypt: Option<EntryDecryptParams<'_>>,
 ) -> Result<u64, EntryDecodeError> {
-    if let Some(params) = aes {
-        if resume.is_some() {
-            // §3 deliberately rules mid-entry resume out for AES
-            // entries: the AES-CTR keystream is anchored at the
-            // start of the ciphertext and the HMAC must see every
-            // byte, so a partial-entry restart would need both the
-            // pre-resume HMAC state and a way to skip the salt /
-            // verifier prefix. Round-one falls back to "restart the
-            // entry from byte 0" by signalling the unsupported
-            // feature to the caller, which then drops the resume
-            // hint and re-enters here without it.
-            return Err(EntryDecodeError::Zip(ZipError::UnsupportedFeature {
-                feature: format!("AES-encrypted entry resume ({entry_name:?})"),
-            }));
+    match decrypt {
+        Some(EntryDecryptParams::Aes(params)) => {
+            if resume.is_some() {
+                // §3 deliberately rules mid-entry resume out for AES
+                // entries: the AES-CTR keystream is anchored at the
+                // start of the ciphertext and the HMAC must see every
+                // byte, so a partial-entry restart would need both the
+                // pre-resume HMAC state and a way to skip the salt /
+                // verifier prefix. Round-one falls back to "restart the
+                // entry from byte 0" by signalling the unsupported
+                // feature to the caller, which then drops the resume
+                // hint and re-enters here without it.
+                return Err(EntryDecodeError::Zip(ZipError::UnsupportedFeature {
+                    feature: format!("AES-encrypted entry resume ({entry_name:?})"),
+                }));
+            }
+            decompress_aes_entry(method, compressed, sink, entry_name, progress, params)
         }
-        return decompress_aes_entry(method, compressed, sink, entry_name, progress, params);
+        Some(EntryDecryptParams::ZipCrypto(params)) => {
+            if resume.is_some() {
+                // ZipCrypto's keystream is stateful and seeded by
+                // the password + the 12-byte encryption header; the
+                // keys advance through every plaintext byte. Like
+                // AES, mid-entry resume would need the keystream
+                // state at the resume offset, which we don't
+                // checkpoint. Restart from byte 0.
+                return Err(EntryDecodeError::Zip(ZipError::UnsupportedFeature {
+                    feature: format!("ZipCrypto-encrypted entry resume ({entry_name:?})"),
+                }));
+            }
+            decompress_zipcrypto_entry(method, compressed, sink, entry_name, progress, params)
+        }
+        None => {
+            decompress_unencrypted_entry(method, compressed, sink, entry_name, resume, progress)
+        }
     }
-    decompress_unencrypted_entry(method, compressed, sink, entry_name, resume, progress)
 }
 
 /// Dispatch one entry on its compression method. Shared by the
@@ -342,6 +397,48 @@ fn decompress_aes_entry<R: Read>(
 
     // Inner-decoder error: re-extract any embedded encryption
     // error so it surfaces with the precise zip-layer message.
+    match result {
+        Ok(n) => Ok(n),
+        Err(EntryDecodeError::Read { entry_name, source }) => {
+            if let Some(enc) = downcast_encryption_error(&source) {
+                return Err(EntryDecodeError::Zip(ZipError::Encryption(enc.clone())));
+            }
+            Err(EntryDecodeError::Read { entry_name, source })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Drive a ZipCrypto-encrypted entry through the [`ZipCryptoReader`]
+/// wrapper, then dispatch on the entry's outer compression method.
+/// Unlike AES (which carries the actual method in the AES extra),
+/// ZipCrypto entries declare their compression method directly in the
+/// central-directory `method` field.
+fn decompress_zipcrypto_entry<R: Read>(
+    method: CompressionMethod,
+    compressed: R,
+    sink: &mut ZipSink,
+    entry_name: &str,
+    progress: InEntryProgressCallback<'_>,
+    params: ZipCryptoDecryptParams<'_>,
+) -> Result<u64, EntryDecodeError> {
+    let wrapper = ZipCryptoReader::new(
+        compressed,
+        params.password,
+        params.compressed_size,
+        params.crc32_high_byte,
+        entry_name,
+    )
+    .map_err(|e| aes_io_to_entry_decode(e, entry_name))?;
+
+    let result = decompress_unencrypted_entry(method, wrapper, sink, entry_name, None, progress);
+
+    // ZipCrypto has no integrity tag, so there is no post-decode
+    // verifier work to run; the inner decompressor's CRC32 check
+    // (the existing per-entry plaintext CRC) catches the wrong-but-
+    // verifier-byte-collided password case. Map any encryption-tagged
+    // IO error coming out of the inner decoder back onto the
+    // structured error path.
     match result {
         Ok(n) => Ok(n),
         Err(EntryDecodeError::Read { entry_name, source }) => {

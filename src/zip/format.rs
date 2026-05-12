@@ -503,6 +503,13 @@ pub struct CentralDirectoryEntry {
     /// extra field present and well-formed). `None` for unencrypted
     /// entries.
     pub aes: Option<AesExtra>,
+    /// `true` iff the entry uses the legacy PKWARE "ZipCrypto"
+    /// encryption (`docs/PLAN_archive_encryption.md` §3b): general-
+    /// purpose flag bit 0 set, NO WinZip AES extra field, NOT bit 6
+    /// (PKWARE strong encryption). The decoder pipeline wraps the
+    /// entry's raw payload in a [`crate::zip::ZipCryptoReader`] when
+    /// this is set.
+    pub zipcrypto: bool,
 }
 
 impl CentralDirectoryEntry {
@@ -552,6 +559,12 @@ pub struct LocalFileHeader {
     /// [`CentralDirectoryEntry::aes`]; cross-checked against the
     /// CDE's value in [`Self::validate_against`].
     pub aes: Option<AesExtra>,
+    /// `true` iff the entry uses the legacy PKWARE "ZipCrypto"
+    /// encryption (`docs/PLAN_archive_encryption.md` §3b). Same
+    /// semantics as [`CentralDirectoryEntry::zipcrypto`];
+    /// cross-checked against the CDE's value in
+    /// [`Self::validate_against`].
+    pub zipcrypto: bool,
 }
 
 /// Locate the EOCD record inside `tail`, where `tail` is a contiguous
@@ -771,10 +784,12 @@ pub fn parse_central_directory(
         let aes = find_aes_extra(extra_bytes, cde_offset)?;
 
         // Encryption-bit handling: AES is signalled by method=99 +
-        // bit 0 set + an AES extra. Any other bit-0 combination
-        // (legacy "ZipCrypto") is refused for now — §3b of the
-        // encryption plan adds it; until then we surface the
-        // specific scheme so the user can tell why we declined.
+        // bit 0 set + an AES extra; "ZipCrypto" is signalled by
+        // bit 0 set with no AES extra and no bit-6 strong-encryption
+        // flag (bit 6 is already rejected upstream). Anything else
+        // with bit 0 set surfaces a specific error so the user can
+        // tell why we declined.
+        let mut zipcrypto = false;
         if method_code == METHOD_CODE_AES_MARKER {
             if !gp_flags.is_encrypted() {
                 return Err(ZipError::MalformedHeader {
@@ -790,9 +805,10 @@ pub fn parse_central_directory(
                 });
             }
         } else if gp_flags.is_encrypted() {
-            return Err(ZipError::UnsupportedFeature {
-                feature: "traditional PKWARE encryption (general-purpose flag bit 0)".into(),
-            });
+            // Legacy PKWARE "ZipCrypto" (`docs/PLAN_archive_encryption.md`
+            // §3b). Insecure but ubiquitous in legacy archives; we
+            // decode it and emit a one-shot caveat banner per entry.
+            zipcrypto = true;
         }
 
         let method = CompressionMethod::from_code(method_code);
@@ -809,6 +825,7 @@ pub fn parse_central_directory(
             cde_offset,
             cde_size,
             aes,
+            zipcrypto,
         });
 
         cursor = body_end;
@@ -920,6 +937,7 @@ impl LocalFileHeader {
         let extra_bytes =
             &bytes[LFH_FIXED_LEN + filename_length..LFH_FIXED_LEN + filename_length + extra_length];
         let aes = find_aes_extra(extra_bytes, lfh_archive_offset)?;
+        let mut zipcrypto = false;
         if method_code == METHOD_CODE_AES_MARKER {
             if !gp_flags.is_encrypted() {
                 return Err(ZipError::MalformedHeader {
@@ -935,9 +953,7 @@ impl LocalFileHeader {
                 });
             }
         } else if gp_flags.is_encrypted() {
-            return Err(ZipError::UnsupportedFeature {
-                feature: "traditional PKWARE encryption (general-purpose flag bit 0)".into(),
-            });
+            zipcrypto = true;
         }
         let method = CompressionMethod::from_code(method_code);
         Ok(Self {
@@ -949,6 +965,7 @@ impl LocalFileHeader {
             uncompressed_size: u64::from(uncompressed_size),
             data_offset_relative: body_end as u64,
             aes,
+            zipcrypto,
         })
     }
 
@@ -1017,6 +1034,15 @@ impl LocalFileHeader {
                 });
             }
             (None, None) => {}
+        }
+        if self.zipcrypto != cd.zipcrypto {
+            return Err(ZipError::MalformedHeader {
+                archive_offset: 0,
+                reason: format!(
+                    "ZipCrypto encryption flag disagreement for entry {:?}: LFH={} vs CDE={}",
+                    cd.name, self.zipcrypto, cd.zipcrypto,
+                ),
+            });
         }
         if self.name != cd.name {
             // For the name mismatch, surface "name disagreement" as a
@@ -1409,17 +1435,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_central_directory_rejects_encrypted_entry() {
+    fn parse_central_directory_marks_zipcrypto_entry_for_decode() {
+        // §3b: bit-0-encrypted entries with no AES extra are
+        // ZipCrypto. The parser must mark them for the decoder
+        // rather than refusing.
         let mut b = ZipBuilder::new();
         b.add_entry("secret.bin", 0, 0x0001, b"opaque", b"opaque", 0);
         let archive = b.finish();
         let total = archive.len() as u64;
         let eocd = find_eocd(&archive, total).expect("eocd");
         let cd_bytes = &archive[eocd.cd_offset as usize..(eocd.cd_offset + eocd.cd_size) as usize];
-        match parse_central_directory(cd_bytes, eocd.cd_offset, eocd.cd_entry_count) {
-            Err(ZipError::UnsupportedFeature { feature }) => assert!(feature.contains("PKWARE")),
-            other => panic!("expected UnsupportedFeature, got {other:?}"),
-        }
+        let entries =
+            parse_central_directory(cd_bytes, eocd.cd_offset, eocd.cd_entry_count).expect("cd");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].zipcrypto);
+        assert!(entries[0].aes.is_none());
     }
 
     #[test]

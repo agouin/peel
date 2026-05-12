@@ -183,6 +183,25 @@ pub fn ieee(data: &[u8]) -> u32 {
     c.finalize()
 }
 
+/// Apply one byte of the reflected CRC-32 step to `state` and return
+/// the new state, without the initial / final `!` inversion the
+/// [`Crc32`] hasher applies.
+///
+/// This is the raw inner-loop transform used by the PKWARE
+/// "ZipCrypto" key-update routine (`docs/PLAN_archive_encryption.md`
+/// §3b): each input byte advances three 32-bit keys, and two of
+/// those advances are exactly one CRC-32 step over a key value whose
+/// initial state is NOT `!0u32` (it's `0x1234_5678` / `0x3456_7890`).
+/// Reusing the existing [`TABLE`] keeps the polynomial / endianness
+/// invariants in one place; this helper is the seam.
+///
+/// Not exposed publicly outside the crate; ZipCrypto is the only
+/// caller.
+#[must_use]
+pub(crate) fn crc32_step(state: u32, byte: u8) -> u32 {
+    TABLE[((state ^ u32::from(byte)) & 0xFF) as usize] ^ (state >> 8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

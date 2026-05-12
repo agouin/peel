@@ -48,11 +48,13 @@
 pub mod aes_decrypt;
 pub mod crc32;
 pub mod decode;
+pub mod encrypt_legacy;
 pub mod format;
 
 pub use aes_decrypt::AesDecryptReader;
 pub use crc32::{ieee, Crc32};
 pub use decode::{decompress_entry, EntryDecodeError, COPY_BUFFER_LEN};
+pub use encrypt_legacy::ZipCryptoReader;
 pub use format::{
     find_aes_extra, find_eocd, parse_central_directory, AesExtra, AesStrength, AesVersion,
     CentralDirectoryEntry, CompressionMethod, EndOfCentralDirectory, GeneralPurposeFlags,

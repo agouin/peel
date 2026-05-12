@@ -61,11 +61,70 @@ use crate::secret::Password;
 use crate::sink::{BeginEntryOutcome, SinkError, ZipSink};
 use crate::types::{ByteOffset, ChunkIndex};
 use crate::zip::aes_decrypt::{AesKeys, VERIFIER_LEN};
+use crate::zip::encrypt_legacy::{
+    verify_password as zipcrypto_verify, HEADER_LEN as ZIPCRYPTO_HEADER_LEN,
+};
 use crate::zip::format::{AesExtra, LFH_FIXED_LEN};
 use crate::zip::{
     find_eocd, parse_central_directory, CentralDirectoryEntry, EncryptionError, EntryDecodeError,
     LocalFileHeader, ZipError, MAX_EOCD_TAIL_BYTES,
 };
+
+/// Internal per-entry encryption descriptor used by [`ZipPipeline::extract_entry`].
+///
+/// Bundles the (possibly cached) password with the entry-specific
+/// metadata the decoder dispatch needs. Carried by reference so the
+/// password's lifetime is tied to the [`Option<Password>`] cache held
+/// in the outer extraction loop.
+enum EntryEncryption<'a> {
+    /// Plain (unencrypted) entry — the decoder runs directly against
+    /// the entry's compressed bytes.
+    None,
+    /// WinZip-AES-encrypted entry. The decoder wraps the source in an
+    /// [`crate::zip::aes_decrypt::AesDecryptReader`].
+    Aes {
+        extra: AesExtra,
+        password: &'a Password,
+    },
+    /// Legacy PKWARE "ZipCrypto"-encrypted entry. The decoder wraps
+    /// the source in a [`crate::zip::ZipCryptoReader`].
+    ZipCrypto {
+        password: &'a Password,
+        /// High byte of the entry's plaintext CRC-32 — the value the
+        /// encryption header's verifier byte must equal.
+        crc32_high_byte: u8,
+    },
+}
+
+impl<'a> EntryEncryption<'a> {
+    /// Lower this into the [`crate::zip::decode::EntryDecryptParams`]
+    /// shape the decoder dispatch consumes.
+    fn to_decrypt_params(
+        &self,
+        compressed_size: u64,
+    ) -> Option<crate::zip::decode::EntryDecryptParams<'a>> {
+        match *self {
+            Self::None => None,
+            Self::Aes { extra, password } => Some(crate::zip::decode::EntryDecryptParams::Aes(
+                crate::zip::decode::AesDecryptParams {
+                    password,
+                    extra,
+                    compressed_size,
+                },
+            )),
+            Self::ZipCrypto {
+                password,
+                crc32_high_byte,
+            } => Some(crate::zip::decode::EntryDecryptParams::ZipCrypto(
+                crate::zip::decode::ZipCryptoDecryptParams {
+                    password,
+                    compressed_size,
+                    crc32_high_byte,
+                },
+            )),
+        }
+    }
+}
 
 /// Configuration for a [`ZipPipeline::run`] invocation.
 #[derive(Debug, Clone)]
@@ -521,37 +580,53 @@ impl<'a> ZipPipeline<'a> {
         // whole entry sits on disk simultaneously) and the
         // streaming win.
 
-        // AES-encrypted entries (`docs/PLAN_archive_encryption.md`
-        // §3): resolve a password upfront, before the source reader
-        // is constructed. Verification happens against a fixed
-        // 18-byte prefix (max salt + verifier) read directly from
-        // the sparse file, so a wrong-password retry costs nothing
-        // beyond re-prompting the user. Non-interactive sources
-        // fail-fast after one attempt. Verified passwords are
-        // cached in `password_cache` for subsequent entries.
-        let aes_params: Option<(AesExtra, &Password)> = if let Some(extra) = entry.aes {
+        // Encrypted entries (`docs/PLAN_archive_encryption.md`
+        // §3 / §3b): resolve a password upfront, before the source
+        // reader is constructed. Verification happens against a
+        // fixed prefix read directly from the sparse file (18 bytes
+        // for AES, 12 bytes for ZipCrypto), so a wrong-password
+        // retry costs nothing beyond re-prompting the user.
+        // Non-interactive sources fail-fast after one attempt.
+        // Verified passwords are cached in `password_cache` for
+        // subsequent entries.
+        let encryption_kind: EntryEncryption<'_> = if let Some(extra) = entry.aes {
             let pw =
                 self.resolve_password_for_entry(extra, data_start, &entry.name, password_cache)?;
-            Some((extra, pw))
+            EntryEncryption::Aes {
+                extra,
+                password: pw,
+            }
+        } else if entry.zipcrypto {
+            let pw = self.resolve_password_for_zipcrypto_entry(
+                data_start,
+                entry.crc32,
+                &entry.name,
+                password_cache,
+            )?;
+            EntryEncryption::ZipCrypto {
+                password: pw,
+                crc32_high_byte: (entry.crc32 >> 24) as u8,
+            }
         } else {
-            None
+            EntryEncryption::None
         };
+        let is_encrypted = !matches!(encryption_kind, EntryEncryption::None);
 
         // Phase 9b: figure out whether this entry can mid-resume,
         // and how. STORED entries always can (sink-side resume);
         // DEFLATE / zstd entries can only when a codec blob was
-        // captured at the saved offset. AES-encrypted entries
-        // restart from byte 0 (§3 ruled mid-entry AES resume out
-        // of round-one — the keystream / HMAC state aren't
-        // checkpointable without invasive plumbing).
+        // captured at the saved offset. Encrypted entries restart
+        // from byte 0 (§3 / §3b ruled mid-entry resume out of
+        // round-one — the keystream / HMAC / ZipCrypto-key state
+        // aren't checkpointable without invasive plumbing).
         let is_stored = matches!(entry.method, crate::zip::CompressionMethod::Stored);
         let can_codec_resume = matches!(
             entry.method,
             crate::zip::CompressionMethod::Deflate | crate::zip::CompressionMethod::Zstd
         ) && resume_blob.is_some()
-            && aes_params.is_none();
+            && !is_encrypted;
         let resume_mid_entry =
-            resume_offset > 0 && aes_params.is_none() && (is_stored || can_codec_resume);
+            resume_offset > 0 && !is_encrypted && (is_stored || can_codec_resume);
 
         let outcome = if resume_mid_entry {
             sink.begin_entry_resume(
@@ -664,13 +739,7 @@ impl<'a> ZipPipeline<'a> {
                 &entry.name,
                 resume_ctx,
                 &mut tee,
-                aes_params
-                    .as_ref()
-                    .map(|(extra, password)| crate::zip::decode::AesDecryptParams {
-                        password,
-                        extra: *extra,
-                        compressed_size: entry.compressed_size,
-                    }),
+                encryption_kind.to_decrypt_params(entry.compressed_size),
             )
             .map_err(ZipPipelineError::EntryDecode)?;
         }
@@ -753,9 +822,11 @@ impl<'a> ZipPipeline<'a> {
         let (salt, wire_verifier) = prefix.split_at(salt_len);
         // `wire_verifier` is exactly VERIFIER_LEN bytes by construction.
 
-        let source = self.password_source.ok_or(ZipPipelineError::Zip(ZipError::Encryption(
-            EncryptionError::PasswordMissing,
-        )))?;
+        let source = self
+            .password_source
+            .ok_or(ZipPipelineError::Zip(ZipError::Encryption(
+                EncryptionError::PasswordMissing,
+            )))?;
 
         // If the cache already holds a verified password, see if it
         // matches *this* entry's verifier. If yes, we're done. If
@@ -798,6 +869,82 @@ impl<'a> ZipPipeline<'a> {
             // Re-prompt with a "wrong password" banner on
             // interactive sources. Non-interactive sources never
             // reach this branch because `max_attempts == 1`.
+            prompt_label = format!(
+                "Wrong password. Password for {}:{} ",
+                self.password_label, entry_name,
+            );
+        }
+    }
+
+    /// Resolve a [`Password`] for a ZipCrypto-encrypted entry
+    /// (`docs/PLAN_archive_encryption.md` §3b).
+    ///
+    /// Mirrors [`Self::resolve_password_for_entry`] but uses the
+    /// ZipCrypto verification primitive instead of PBKDF2 + verifier
+    /// bytes. The 12-byte encryption header is read directly from the
+    /// sparse file at `data_start` and checked against the high byte
+    /// of the entry's CRC-32. Note: ZipCrypto's verifier has a 1/256
+    /// false-positive rate; a wrong password that happens to collide
+    /// is caught later by the post-decompression CRC32 check.
+    fn resolve_password_for_zipcrypto_entry<'p>(
+        &self,
+        data_start: u64,
+        crc32: u32,
+        entry_name: &str,
+        password_cache: &'p mut Option<Password>,
+    ) -> Result<&'p Password, ZipPipelineError> {
+        let prefix_end = data_start.saturating_add(ZIPCRYPTO_HEADER_LEN as u64);
+        if prefix_end > self.config.total_size {
+            return Err(ZipPipelineError::Zip(ZipError::MalformedHeader {
+                archive_offset: data_start,
+                reason: format!(
+                    "ZipCrypto entry {entry_name:?} prefix ({ZIPCRYPTO_HEADER_LEN} bytes) \
+                     extends past archive end {}",
+                    self.config.total_size,
+                ),
+            }));
+        }
+        self.wait_for_range(data_start, prefix_end)?;
+        let mut header = [0u8; ZIPCRYPTO_HEADER_LEN];
+        self.sparse
+            .read_exact_at(ByteOffset::new(data_start), &mut header)
+            .map_err(ZipPipelineError::Sparse)?;
+        let crc32_high = (crc32 >> 24) as u8;
+
+        let source = self
+            .password_source
+            .ok_or(ZipPipelineError::Zip(ZipError::Encryption(
+                EncryptionError::PasswordMissing,
+            )))?;
+
+        if let Some(cached) = password_cache.as_ref() {
+            if zipcrypto_verify(cached, &header, crc32_high) {
+                return Ok(password_cache.as_ref().expect("just matched"));
+            }
+            *password_cache = None;
+        }
+
+        let max_attempts = if source.is_interactive() { 3 } else { 1 };
+        let mut prompt_label = format!("Password for {}:{} ", self.password_label, entry_name);
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let password =
+                source
+                    .load(&prompt_label)
+                    .map_err(|source| ZipPipelineError::PasswordLoad {
+                        archive_label: self.password_label.to_string(),
+                        source,
+                    })?;
+            if zipcrypto_verify(&password, &header, crc32_high) {
+                *password_cache = Some(password);
+                return Ok(password_cache.as_ref().expect("just stored"));
+            }
+            if attempt >= max_attempts {
+                return Err(ZipPipelineError::Zip(ZipError::Encryption(
+                    EncryptionError::PasswordIncorrect,
+                )));
+            }
             prompt_label = format!(
                 "Wrong password. Password for {}:{} ",
                 self.password_label, entry_name,
