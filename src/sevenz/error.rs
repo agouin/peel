@@ -14,6 +14,8 @@
 
 use thiserror::Error;
 
+use crate::encryption::EncryptionError;
+
 /// Errors produced while parsing or extracting a 7z archive.
 ///
 /// Per `docs/ENGINEERING_STANDARDS.md` §3.1 every variant carries
@@ -83,4 +85,12 @@ pub enum SevenzError {
         /// `ArchiveVersion.minor` byte from the SignatureHeader.
         minor: u8,
     },
+
+    /// Encryption-specific failure: missing password, wrong password,
+    /// or integrity-tag / CRC mismatch under a successfully derived
+    /// key. The shared [`EncryptionError`] enum
+    /// (`docs/PLAN_archive_encryption.md` §6) carries the variant;
+    /// this is the 7z-side container.
+    #[error("7z encryption: {0}")]
+    Encryption(#[source] EncryptionError),
 }

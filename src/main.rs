@@ -31,6 +31,7 @@ use peel::coordinator::local::{run as run_local, LocalRunArgs};
 use peel::coordinator::{run, CoordinatorError, ProgressEvent, ProgressFn, RunArgs, RunStats};
 use peel::decode::DecoderRegistry;
 use peel::download::{SchedulerError, WorkerError};
+use peel::encryption::EncryptionError;
 use peel::progress::{spawn_renderer, LogRenderer, ProgressState, TtyRenderer};
 
 /// SIGINT — `Ctrl-C` from an interactive shell.
@@ -303,6 +304,33 @@ fn install_graceful_watchdog(deadline: Duration, cleanup_done: Arc<AtomicBool>) 
         .expect("spawn graceful watchdog");
 }
 
+/// Walk an [`anyhow::Error`]'s source chain looking for an
+/// [`EncryptionError`] variant that should map to exit code 4.
+///
+/// Returns `true` for [`EncryptionError::PasswordIncorrect`] and
+/// [`EncryptionError::PasswordMissing`] — both indicate the user
+/// can retry with a different / supplied password and we want
+/// scripts to distinguish that from the generic "extraction
+/// failed" code 1.
+///
+/// Implements the exit-code routing described in
+/// `docs/PLAN_archive_encryption.md` §6.
+fn password_exit_code_required(err: &anyhow::Error) -> bool {
+    let mut current: &(dyn StdError + 'static) = err.as_ref();
+    loop {
+        if let Some(enc) = current.downcast_ref::<EncryptionError>() {
+            return matches!(
+                enc,
+                EncryptionError::PasswordIncorrect | EncryptionError::PasswordMissing,
+            );
+        }
+        match current.source() {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -467,7 +495,23 @@ fn main() -> Result<()> {
             );
             std::process::exit(128 + sig);
         }
-        Err(other) => return Err(anyhow::Error::from(other).context("running peel")),
+        Err(other) => {
+            let wrapped = anyhow::Error::from(other).context("running peel");
+            // §6 of `docs/PLAN_archive_encryption.md`: surface a
+            // wrong-password / missing-password failure as exit code
+            // 4 so scripts can distinguish it from the generic
+            // "extraction failed" code 1. The error chain may wrap
+            // the `EncryptionError` several layers deep
+            // (CoordinatorError → ZipPipelineError → ZipError →
+            // EncryptionError, etc.), so we walk the
+            // `Error::source` chain.
+            if password_exit_code_required(&wrapped) {
+                eprintln!("[error] {wrapped:#}");
+                cleanup_done.store(true, Ordering::Release);
+                std::process::exit(4);
+            }
+            return Err(wrapped);
+        }
     };
 
     eprintln!(
@@ -633,7 +677,14 @@ fn run_local_dispatch(
             );
             std::process::exit(128 + sig);
         }
-        Err(other) => return Err(anyhow::Error::from(other).context("running peel")),
+        Err(other) => {
+            let wrapped = anyhow::Error::from(other).context("running peel");
+            if password_exit_code_required(&wrapped) {
+                eprintln!("[error] {wrapped:#}");
+                std::process::exit(4);
+            }
+            return Err(wrapped);
+        }
     };
 
     eprintln!(

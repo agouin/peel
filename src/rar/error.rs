@@ -13,6 +13,8 @@
 
 use thiserror::Error;
 
+use crate::encryption::EncryptionError;
+
 /// Errors produced while parsing or extracting a RAR5 archive.
 ///
 /// Per `docs/ENGINEERING_BEST_PRACTICES.md` §3.1 every variant
@@ -154,4 +156,12 @@ pub enum RarError {
         /// hex-encoded.
         computed: String,
     },
+
+    /// Encryption-specific failure: missing password, wrong password,
+    /// or integrity-tag mismatch under a successfully derived key.
+    /// The shared [`EncryptionError`] enum
+    /// (`docs/PLAN_archive_encryption.md` §6) carries the variant;
+    /// this is the rar-side container.
+    #[error("RAR encryption: {0}")]
+    Encryption(#[source] EncryptionError),
 }

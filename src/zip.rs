@@ -215,60 +215,11 @@ pub enum ZipError {
     },
 
     /// Encryption-specific failure: missing password, wrong password,
-    /// or HMAC integrity-tag mismatch. The plan's §6 calls for a
-    /// shared `EncryptionError` enum across the three encrypted
-    /// formats; this variant is the zip-side container.
+    /// or HMAC integrity-tag mismatch. The shared
+    /// [`EncryptionError`] enum (`docs/PLAN_archive_encryption.md`
+    /// §6) carries the variant; this is the zip-side container.
     #[error("ZIP encryption: {0}")]
     Encryption(#[source] EncryptionError),
 }
 
-/// Encryption-layer failures surfaced through
-/// [`ZipError::Encryption`] (and, once §4 / §5 of
-/// `docs/PLAN_archive_encryption.md` land, through `RarError` /
-/// `SevenZError` too).
-///
-/// Variants are deliberately small. The CLI maps each one to a
-/// dedicated exit code in §6; until then the binary maps the whole
-/// `Encryption` arm to its generic "extraction failed" code.
-#[derive(Debug, Clone, Error)]
-pub enum EncryptionError {
-    /// The archive declares an encrypted entry but the user did not
-    /// supply a password (no `--password-from`). The CLI shouldn't
-    /// land here in practice because it offers `prompt` as the
-    /// default for encrypted archives, but library callers may.
-    #[error(
-        "archive contains an encrypted entry but no password source was configured \
-         (pass --password-from <SOURCE>)"
-    )]
-    PasswordMissing,
-
-    /// The user-supplied password did not match the archive's
-    /// password-verifier (or, when no verifier exists, the integrity
-    /// check failed in a way that strongly suggests the wrong
-    /// password). The CLI re-prompts on interactive sources.
-    #[error("password did not match the archive's stored verifier")]
-    PasswordIncorrect,
-
-    /// The HMAC / integrity-tag check failed *after* the password
-    /// matched its verifier — the archive itself is corrupt or
-    /// tampered. Distinct from [`Self::PasswordIncorrect`] so the
-    /// user knows retrying with the same password won't help.
-    #[error(
-        "integrity check failed for entry {entry_name:?} (HMAC mismatch — \
-         archive may be corrupt or tampered)"
-    )]
-    IntegrityCheckFailed {
-        /// The entry whose integrity tag failed.
-        entry_name: String,
-    },
-
-    /// The archive uses an encryption scheme this build does not
-    /// support (e.g. the legacy PKWARE "ZipCrypto" before §3b lands,
-    /// or an unknown AES strength). The message is verbatim from
-    /// the format-specific parser.
-    #[error("unsupported encryption scheme: {detail}")]
-    Unsupported {
-        /// Human-readable detail.
-        detail: String,
-    },
-}
+pub use crate::encryption::EncryptionError;

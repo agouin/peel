@@ -105,6 +105,7 @@ pub mod crypto;
 pub mod decode;
 #[cfg(unix)]
 pub mod download;
+pub mod encryption;
 pub mod error;
 #[cfg(unix)]
 pub mod extractor;
