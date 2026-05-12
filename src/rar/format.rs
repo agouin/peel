@@ -56,7 +56,10 @@
 //!   [`crate::rar::RarError::UnsupportedFeature`] naming the volume
 //!   number.
 //! - **Encryption** header type (4):
-//!   [`crate::rar::RarError::UnsupportedFeature`] = `"encryption (header)"`.
+//!   [`crate::rar::RarError::Encryption`] carrying
+//!   [`crate::encryption::EncryptionError::UnsupportedCipher`] (peel
+//!   parses the encryption header via [`crate::rar::encrypt`] but
+//!   does not yet decrypt the subsequent header stream).
 
 use crate::rar::error::RarError;
 use crate::zip::crc32;

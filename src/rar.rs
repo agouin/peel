@@ -81,6 +81,8 @@
 #[cfg(feature = "rar")]
 pub mod archive;
 #[cfg(feature = "rar")]
+pub mod encrypt;
+#[cfg(feature = "rar")]
 pub mod error;
 #[cfg(feature = "rar")]
 pub mod format;

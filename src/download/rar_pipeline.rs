@@ -67,8 +67,10 @@ use crate::decode::rar_native::RarStreamDecoder;
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
 use crate::download::scheduler::{DownloadStats, SchedulerError};
 use crate::download::sparse_file::{SparseFile, SparseFileError};
+use crate::encryption::EncryptionError;
 use crate::punch::{align_down, align_up, PunchError, PunchHole};
 use crate::rar::archive::FileEntry;
+use crate::rar::encrypt::ArchiveEncryptionHeader;
 use crate::rar::format::{
     parse_end_of_archive_header, parse_file_header, parse_generic_header,
     parse_main_archive_header, HeaderType,
@@ -458,9 +460,34 @@ impl<'a> RarPipeline<'a> {
                     // Skip past header + data area.
                 }
                 HeaderType::ArchiveEncryption => {
-                    return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
-                        feature: "encryption (header)".to_string(),
-                    }));
+                    // Parse the encryption header for diagnostic
+                    // detail, then surface the unified
+                    // [`EncryptionError`]. The encryption header
+                    // parser validates the spec-defined fields
+                    // (version, kdf_count cap, salt length); a
+                    // malformed header surfaces a RarError variant
+                    // before the user even sees the encryption
+                    // refusal, which is more useful.
+                    // Full archive-header decryption support is
+                    // tracked in `docs/PLAN_archive_encryption.md` §4
+                    // — the encryption primitives module
+                    // [`crate::rar::encrypt`] lands the parsers + KDF
+                    // groundwork; the walker-side header-stream
+                    // wrapping is invasive enough that it stays in a
+                    // follow-on commit.
+                    let fields = &local_buf[header.fields_offset_in_input
+                        ..header.fields_offset_in_input + header.fields_size];
+                    let _enc = ArchiveEncryptionHeader::parse(fields)
+                        .map_err(RarError::from)
+                        .map_err(RarPipelineError::Rar)?;
+                    return Err(RarPipelineError::Rar(RarError::Encryption(
+                        EncryptionError::UnsupportedCipher {
+                            detail: "archive-header encryption (RAR5 AES-256-CBC, encryption \
+                                     header type 4) — peel parses the encryption header but \
+                                     does not yet decrypt the subsequent header stream"
+                                .to_string(),
+                        },
+                    )));
                 }
                 HeaderType::EndOfArchive => {
                     let _eof = parse_end_of_archive_header(&header, local_buf)

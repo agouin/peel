@@ -19,6 +19,8 @@
 //! - **Archive encryption header** (header type 4) —
 //!   [`crate::rar::RarError::UnsupportedFeature`].
 
+use crate::encryption::EncryptionError;
+use crate::rar::encrypt::ArchiveEncryptionHeader;
 use crate::rar::error::RarError;
 use crate::rar::format::{
     parse_end_of_archive_header, parse_file_header, parse_generic_header,
@@ -158,9 +160,23 @@ pub fn walk_archive(buf: &[u8]) -> Result<ArchiveSummary, RarError> {
                 // refuses these — we just step over them.
             }
             HeaderType::ArchiveEncryption => {
-                return Err(RarError::UnsupportedFeature {
-                    feature: "encryption (header)".to_string(),
-                });
+                // Parse the encryption header for diagnostic
+                // detail, then surface the unified
+                // [`EncryptionError`] (`docs/PLAN_archive_encryption.md`
+                // §4 / §6). End-to-end archive-header decryption is
+                // not yet implemented in this walker — see
+                // `crate::rar::encrypt` for the parser + KDF
+                // primitives and the rar_pipeline for the
+                // walker-side wiring that follows.
+                let fields = &buf[cursor + header.fields_offset_in_input
+                    ..cursor + header.fields_offset_in_input + header.fields_size];
+                let _enc = ArchiveEncryptionHeader::parse(fields).map_err(RarError::from)?;
+                return Err(RarError::Encryption(EncryptionError::UnsupportedCipher {
+                    detail: "archive-header encryption (RAR5 AES-256-CBC, encryption header \
+                             type 4) — peel parses the encryption header but does not yet \
+                             decrypt the subsequent header stream"
+                        .to_string(),
+                }));
             }
             HeaderType::EndOfArchive => {
                 let eof = parse_end_of_archive_header(&header, &buf[cursor..])?;
