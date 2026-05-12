@@ -52,8 +52,11 @@ use crate::decode::sevenz::header::{
 };
 use crate::download::scheduler::{DownloadStats, SchedulerError};
 use crate::download::sparse_file::{SparseFile, SparseFileError};
+use crate::encryption::EncryptionError;
 use crate::hash::crc32::ieee as crc32_ieee;
 use crate::punch::{align_down, align_up, PunchError, PunchHole};
+use crate::secret::source::PasswordSource;
+use crate::secret::Password;
 use crate::sevenz::SevenzError;
 use crate::sink::{SevenzSink, SinkError};
 use crate::types::{ByteOffset, ChunkIndex};
@@ -212,6 +215,18 @@ pub struct SevenzPipeline<'a> {
     /// lookahead) and the pipeline runs without bound — useful
     /// for tests but never the production path.
     pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
+    /// Password source for encrypted folders
+    /// (`docs/PLAN_archive_encryption.md` §5). `None` means peel has
+    /// no password to offer; an encrypted folder then surfaces
+    /// [`EncryptionError::PasswordMissing`] before any decryption
+    /// work. Resolved (loaded into a [`crate::secret::Password`])
+    /// lazily on the first encrypted folder so an archive whose
+    /// folders are all cleartext never prompts.
+    pub password_source: Option<&'a PasswordSource>,
+    /// Human-readable archive label (URL or local path) the password
+    /// loader includes in TTY prompts. Used only when
+    /// [`Self::password_source`] is [`PasswordSource::Prompt`].
+    pub password_label: &'a str,
 }
 
 impl SevenzPipeline<'_> {
@@ -317,6 +332,11 @@ impl SevenzPipeline<'_> {
 
         // Step 3: per-folder extraction.
         let completed_set: HashSet<u32> = resume.folders_completed.iter().copied().collect();
+        // Lazily-loaded password cache. Populated on the first
+        // encrypted folder; reused across subsequent encrypted
+        // folders so an interactive prompt fires at most once per
+        // archive. Stays `None` for archives without encryption.
+        let mut password_cache: Option<Password> = None;
         if let Some(streams) = header.main_streams.as_ref() {
             let pack_origin = SIGNATURE_HEADER_LEN as u64;
             let pack_section_start =
@@ -392,12 +412,29 @@ impl SevenzPipeline<'_> {
                     pack_size,
                 );
                 let file_indices = header.folder_to_files.get(i).cloned().unwrap_or_default();
-                let decoder = FolderDecoder::new(
+
+                // If the folder is encrypted, ensure a password is
+                // loaded before constructing the decoder. The cache
+                // ensures only the first encrypted folder prompts;
+                // subsequent ones reuse the same loaded password.
+                let folder_encrypted = FolderDecoder::folder_is_encrypted(&streams.folders[i]);
+                if folder_encrypted && password_cache.is_none() {
+                    let pw = self.load_password_lazy()?;
+                    password_cache = Some(pw);
+                }
+                let pw_ref: Option<&Password> = if folder_encrypted {
+                    password_cache.as_ref()
+                } else {
+                    None
+                };
+
+                let decoder = FolderDecoder::with_password(
                     &streams.folders[i],
                     streams,
                     idx,
                     &file_indices,
                     &mut packed_reader,
+                    pw_ref,
                 );
                 decoder
                     .decode(sink)
@@ -442,6 +479,25 @@ impl SevenzPipeline<'_> {
         .map_err(SevenzPipelineError::Aborted)?;
 
         Ok(stats)
+    }
+
+    /// Load the password from the configured source, surfacing a
+    /// typed `PasswordMissing` if no source was supplied. 7z has
+    /// no in-archive verifier (unlike RAR5's `pswcheck`), so the
+    /// only correctness signal is the post-decryption CRC32 on
+    /// the first decoded substream — re-prompting on failure is
+    /// handled by the user re-running the command rather than by
+    /// the in-loop retry that RAR5 uses.
+    fn load_password_lazy(&self) -> Result<Password, SevenzPipelineError> {
+        let source = self.password_source.ok_or(SevenzPipelineError::Sevenz(
+            SevenzError::Encryption(EncryptionError::PasswordMissing),
+        ))?;
+        let prompt = format!("password for {}: ", self.password_label);
+        source.load(&prompt).map_err(|e| {
+            SevenzPipelineError::Sevenz(SevenzError::Encryption(EncryptionError::UnsupportedKdf {
+                detail: format!("password load failed: {e}"),
+            }))
+        })
     }
 
     /// Parse the trailer, decoding an embedded `EncodedHeader`
@@ -1011,6 +1067,8 @@ mod tests {
             download_outcome: &outcome,
             sparse_fd: sparse.as_fd(),
             progress_state: None,
+            password_source: None,
+            password_label: "test.7z",
         };
         let puncher = NoopPuncher::new();
         let stats = pipeline

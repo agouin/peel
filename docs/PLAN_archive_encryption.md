@@ -317,7 +317,17 @@ CHECK is present) or `IntegrityCheckFailed` (when it isn't).
 
 ---
 
-## §5. 7z AES-256-CBC decryption
+## §5. 7z AES-256-CBC decryption (**shipped**)
+
+**Status: shipping (2026-05-12).** The AES coder dispatch, KDF,
+CBC decryption, and post-decrypt CRC32 → `PasswordIncorrect`
+translation all land end-to-end. Integration coverage in
+`tests/test_coordinator_sevenz.rs` exercises round-trip
+extraction, wrong-password (→ `PasswordIncorrect`), and
+missing-password (→ `PasswordMissing`). Spec compliance is
+verified against a real `7z a -mx0 -p<pw>` fixture as a one-off
+cross-check (not committed to CI to avoid the host-binary
+dependency).
 
 **What**: 7z's per-folder AES coder (coder ID `06 F1 07 01`).
 

@@ -32,7 +32,9 @@ use peel::http::{Client, ClientConfig};
 mod support;
 
 use support::mock_server::{MockResponse, MockServer};
-use support::sevenz_fixtures::{build_copy_sevenz, build_copy_sevenz_with_trailer_padding};
+use support::sevenz_fixtures::{
+    build_aes_copy_sevenz, build_copy_sevenz, build_copy_sevenz_with_trailer_padding,
+};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -322,4 +324,137 @@ fn resume_after_clean_run_under_tight_cap_is_idempotent() {
     run(args2).expect("second run");
     let after_second = fs::read(work.join("file.bin")).expect("read second");
     assert_eq!(after_second, payload);
+}
+
+// ---------------------------------------------------------------
+// AES-256-CBC encryption tests (`docs/PLAN_archive_encryption.md` §5)
+// ---------------------------------------------------------------
+
+/// Write `password` to a temporary file with mode 0600 and return
+/// the path; the [`CleanupDir`] owns the parent directory.
+fn temp_password_file(label: &str, password: &[u8]) -> (PathBuf, CleanupDir) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_dir(label);
+    let path = dir.join("password.txt");
+    fs::write(&path, password).expect("write password file");
+    let mut perms = fs::metadata(&path).expect("stat").permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&path, perms).expect("chmod 0600");
+    (path, CleanupDir(dir))
+}
+
+fn coord_config_with_password(
+    chunk_size: u64,
+    source: peel::secret::source::PasswordSource,
+) -> CoordinatorConfig {
+    let mut cfg = coord_config(chunk_size, None);
+    cfg.password_source = Some(source);
+    cfg
+}
+
+#[test]
+fn round_trip_aes_encrypted_archive() {
+    let password = b"correct horse battery staple";
+    let salt = [0x42u8; 16];
+    let iv = [0x77u8; 16];
+    let power: u8 = 8;
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("alpha.txt", b"hello, encrypted 7z".to_vec()),
+        (
+            "nested/beta.bin",
+            (0..2048u32).map(|i| (i * 3) as u8).collect(),
+        ),
+        ("gamma.dat", vec![0xA5u8; 1024]),
+    ];
+    let body = build_aes_copy_sevenz(password, &salt, &iv, power, &files);
+    let server = MockServer::start(ok_handler(body));
+
+    let (pw_path, _pw_dir) = temp_password_file("sevenz_enc_pw", password);
+    let work = unique_dir("sevenz_enc_round_trip");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config_with_password(
+            64 * 1024,
+            peel::secret::source::PasswordSource::File(pw_path.clone()),
+        ),
+    );
+    run(args).expect("extracts encrypted 7z archive cleanly");
+
+    let extracted = read_dir_recursive(&work);
+    assert_eq!(extracted.len(), files.len(), "found: {extracted:?}");
+    let mut sorted: Vec<(&str, Vec<u8>)> = files.clone();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (got, want) in extracted.iter().zip(sorted.iter()) {
+        assert_eq!(got.0, want.0);
+        assert_eq!(got.1, want.1);
+    }
+}
+
+#[test]
+fn aes_encrypted_wrong_password_surfaces_password_incorrect() {
+    let password = b"correct password";
+    let wrong = b"definitely-not-right";
+    let salt = [0x33u8; 16];
+    let iv = [0x55u8; 16];
+    let power: u8 = 4;
+    let files: Vec<(&str, Vec<u8>)> = vec![("locked.txt", b"secret".to_vec())];
+    let body = build_aes_copy_sevenz(password, &salt, &iv, power, &files);
+    let server = MockServer::start(ok_handler(body));
+
+    let (pw_path, _pw_dir) = temp_password_file("sevenz_enc_wrong_pw", wrong);
+    let work = unique_dir("sevenz_enc_wrong_pw_out");
+    let _g = CleanupDir(work.clone());
+
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config_with_password(
+            64 * 1024,
+            peel::secret::source::PasswordSource::File(pw_path.clone()),
+        ),
+    );
+    let err = run(args).expect_err("wrong password should fail");
+    let msg = format!("{err:?}\n{err}");
+    assert!(
+        msg.contains("password did not match") || msg.contains("PasswordIncorrect"),
+        "expected PasswordIncorrect-shaped error, got: {msg}",
+    );
+}
+
+#[test]
+fn aes_encrypted_missing_password_surfaces_password_missing() {
+    let password = b"any-password";
+    let salt = [0x11u8; 16];
+    let iv = [0x22u8; 16];
+    let files: Vec<(&str, Vec<u8>)> = vec![("locked.txt", b"secret".to_vec())];
+    let body = build_aes_copy_sevenz(password, &salt, &iv, 4, &files);
+    let server = MockServer::start(ok_handler(body));
+
+    let work = unique_dir("sevenz_enc_missing_pw_out");
+    let _g = CleanupDir(work.clone());
+
+    // No password_source: the coordinator must surface a missing-
+    // password error before any plaintext lands on disk.
+    let args = make_args(
+        &server,
+        OutputTarget::Dir(work.clone()),
+        coord_config(64 * 1024, None),
+    );
+    let err = run(args).expect_err("missing password should fail");
+    let msg = format!("{err:?}\n{err}");
+    assert!(
+        msg.contains("PasswordMissing")
+            || msg.contains("no password source was configured")
+            || msg.contains("--password-from"),
+        "expected PasswordMissing-shaped error, got: {msg}",
+    );
+
+    let extracted = read_dir_recursive(&work);
+    assert!(
+        extracted.is_empty(),
+        "no plaintext should land when password is missing, found: {extracted:?}",
+    );
 }

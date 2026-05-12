@@ -34,10 +34,14 @@ use std::io::{self, Read, Write};
 
 use thiserror::Error;
 
+use crate::crypto::aes::{Aes256, BLOCK_LEN};
+use crate::crypto::aes_modes::AesCbcDecrypt;
+use crate::crypto::sevenz_kdf::{password_to_utf16le, sevenz_derive_key, MAX_POWER};
 use crate::decode::deflate_native::Decoder as DeflateDecoder;
 use crate::decode::xz_liblzma::raw::{decode_lzma1_raw, decode_lzma2_raw};
 use crate::decode::{DecodeStatus, StreamingDecoder};
 use crate::encryption::EncryptionError;
+use crate::secret::Password;
 
 use super::header::Coder;
 
@@ -225,13 +229,26 @@ pub trait CoderImpl: Send {
 
 /// Resolve a parsed [`Coder`] to its runtime [`CoderImpl`].
 ///
+/// `password` is consulted only when the coder is the AES-256-CBC
+/// encryption coder; it is `None` for archives without encrypted
+/// folders. An encrypted coder with `password == None` surfaces
+/// [`EncryptionError::PasswordMissing`] so the user sees a precise
+/// "supply a password" message instead of a generic dispatch
+/// failure.
+///
 /// # Errors
 ///
 /// [`CoderError::UnsupportedFeature`] if the coder's id does
 /// not match any registered runtime.
 /// [`CoderError::BadProps`] if the props blob size disagrees
 /// with the coder's expectations.
-pub fn dispatch(coder: &Coder) -> Result<Box<dyn CoderImpl>, CoderError> {
+/// [`CoderError::Encryption`] if the coder is the AES encryption
+/// coder and either no password was supplied, the KDF parameters
+/// are unsupported, or the cipher parameters are invalid.
+pub fn dispatch(
+    coder: &Coder,
+    password: Option<&Password>,
+) -> Result<Box<dyn CoderImpl>, CoderError> {
     let id = CoderId::from_bytes(&coder.id);
     match id {
         CoderId::Copy => {
@@ -274,34 +291,135 @@ pub fn dispatch(coder: &Coder) -> Result<Box<dyn CoderImpl>, CoderError> {
                 props_byte: coder.props[0],
             }))
         }
-        CoderId::Aes256Cbc => {
-            // The AES coder's props blob carries the per-folder KDF
-            // power byte plus the (variable-length) salt and IV.
-            // Validate the prefix shape so a malformed encrypted
-            // archive surfaces a structured error before the user
-            // sees the encryption refusal banner.
-            if coder.props.is_empty() {
-                return Err(CoderError::BadProps {
-                    coder: "aes256cbc",
-                    reason: "encryption coder requires at least 1 props byte (power|flags)"
-                        .to_string(),
-                });
-            }
-            // Round-one returns the unified encryption error
-            // immediately. Threading a password through dispatch +
-            // folder decode + pipeline is left for a follow-on
-            // commit; this commit unblocks consumers that want a
-            // consistent EncryptionError surface across ZIP / RAR /
-            // 7z without parsing the props blob.
-            Err(CoderError::Encryption(EncryptionError::UnsupportedCipher {
-                detail: "7z AES-256-CBC coder (id 06:F1:07:01) — peel recognises the coder \
-                         but does not yet decrypt encrypted folders"
-                    .to_string(),
-            }))
-        }
+        CoderId::Aes256Cbc => build_aes_coder(&coder.props, password),
         CoderId::Unsupported(_) => Err(CoderError::UnsupportedFeature {
             feature: format!("coder id {}", id.hex_repr()),
         }),
+    }
+}
+
+/// Parse the 7z AES-256-CBC coder's props blob and assemble the
+/// runtime decryption coder.
+///
+/// Props layout (from the LZMA SDK reference, `7zAes.cpp`):
+///
+/// ```text
+/// byte0:
+///   bits 0..6   = numCyclesPower (KDF rounds = 2^power)
+///   bit 6       = (ivSize - 0) carry-bit: when 1, ivSize gains +1
+///   bit 7       = (saltSize - 0) carry-bit: when 1, saltSize gains +1
+///
+/// if (byte0 & 0xC0) != 0:
+///   byte1:
+///     high nibble = remaining saltSize (0..15) added to the carry above
+///     low nibble  = remaining ivSize  (0..15) added to the carry above
+///   salt[saltSize], iv[ivSize] follow
+/// otherwise:
+///   no salt, no IV, no second byte
+/// ```
+///
+/// The on-disk salt / IV may be shorter than 16 bytes; in that
+/// case the AES IV is the IV bytes padded with zeros to a full
+/// 16-byte block. The KDF salt is the salt bytes as-is.
+fn build_aes_coder(
+    props: &[u8],
+    password: Option<&Password>,
+) -> Result<Box<dyn CoderImpl>, CoderError> {
+    if props.is_empty() {
+        return Err(CoderError::BadProps {
+            coder: "aes256cbc",
+            reason: "encryption coder requires at least 1 props byte (power|flags)".to_string(),
+        });
+    }
+    let byte0 = props[0];
+    let num_cycles_power = byte0 & 0x3F;
+    let (salt_size, iv_size, header_len) = if (byte0 & 0xC0) == 0 {
+        (0usize, 0usize, 1usize)
+    } else {
+        if props.len() < 2 {
+            return Err(CoderError::BadProps {
+                coder: "aes256cbc",
+                reason: "props byte 0 has salt/iv-present bits set but props is only 1 byte long"
+                    .to_string(),
+            });
+        }
+        let byte1 = props[1];
+        let salt_size = (((byte0 >> 7) & 1) + (byte1 >> 4)) as usize;
+        let iv_size = (((byte0 >> 6) & 1) + (byte1 & 0x0F)) as usize;
+        (salt_size, iv_size, 2usize)
+    };
+    let total_props = header_len + salt_size + iv_size;
+    if props.len() < total_props {
+        return Err(CoderError::BadProps {
+            coder: "aes256cbc",
+            reason: format!(
+                "props blob too short: header+salt+iv = {total_props}, got {}",
+                props.len(),
+            ),
+        });
+    }
+    if salt_size > BLOCK_LEN || iv_size > BLOCK_LEN {
+        return Err(CoderError::BadProps {
+            coder: "aes256cbc",
+            reason: format!(
+                "salt_size={salt_size} or iv_size={iv_size} exceeds AES block size {BLOCK_LEN}",
+            ),
+        });
+    }
+    let salt = props[header_len..header_len + salt_size].to_vec();
+    let mut iv = [0u8; BLOCK_LEN];
+    iv[..iv_size].copy_from_slice(&props[header_len + salt_size..header_len + salt_size + iv_size]);
+
+    if num_cycles_power > MAX_POWER {
+        return Err(CoderError::Encryption(EncryptionError::UnsupportedKdf {
+            detail: format!("7z AES KDF power={num_cycles_power} exceeds spec max {MAX_POWER}",),
+        }));
+    }
+    // 7-Zip's reference implementation treats power == 0x3F as a
+    // "raw key" shortcut (no SHA-256 round tower, key = salt || password).
+    // The format spec does not require this; reject it explicitly so a
+    // user who hits this case gets a precise error rather than a silent
+    // (and unconscionably slow at 2^63 rounds) wrong-key decode. If a
+    // real-world archive surfaces, plumb the shortcut through
+    // `sevenz_kdf` behind a clear comment.
+    if num_cycles_power == MAX_POWER {
+        return Err(CoderError::Encryption(EncryptionError::UnsupportedKdf {
+            detail: "7z AES KDF power=0x3F (raw-key shortcut) is not implemented".to_string(),
+        }));
+    }
+
+    let pw = match password {
+        Some(p) => p,
+        None => {
+            return Err(CoderError::Encryption(EncryptionError::PasswordMissing));
+        }
+    };
+    let utf16 = password_to_utf16le_from_bytes(pw.as_bytes());
+    let key = sevenz_derive_key(&utf16, &salt, num_cycles_power);
+    let cipher = Aes256::new(&key);
+    Ok(Box::new(AesCbcCoder { cipher, iv }))
+}
+
+/// Convert raw UTF-8 password bytes into 7z's UTF-16LE wire format.
+///
+/// The CLI's [`Password`] wrapper stores the password as a UTF-8 byte
+/// vector; 7z's KDF requires UTF-16LE. Decoding via [`str::from_utf8`]
+/// preserves non-ASCII characters correctly; if the bytes happen to
+/// not be valid UTF-8 (a password loaded from a binary source), fall
+/// back to a byte-wise zero-extension so the KDF still has *some*
+/// derivation to chew on. The fallback path matches what `7z` itself
+/// does for non-UTF-8 inputs (treat each byte as a `u16` low-byte).
+fn password_to_utf16le_from_bytes(bytes: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => password_to_utf16le(s),
+        Err(_) => {
+            let mut out = Vec::with_capacity(bytes.len() * 2);
+            for &b in bytes {
+                out.push(b);
+                out.push(0);
+            }
+            out
+        }
     }
 }
 
@@ -522,6 +640,77 @@ impl CoderImpl for Lzma2Coder {
     }
 }
 
+/// AES-256-CBC decryption coder for 7z folders.
+///
+/// Consumes block-aligned ciphertext from `src`, CBC-decrypts each
+/// 16-byte block under the per-folder key derived from the password
+/// and salt, and writes the plaintext to `dst` up to
+/// `expected_unpack_size` bytes. Trailing decrypted padding bytes
+/// (the ciphertext is always rounded up to a 16-byte boundary; the
+/// final plaintext block may carry up to 15 bytes of arbitrary
+/// padding) are discarded silently — 7z does not authenticate
+/// the encryption layer; the CRC32 on the *decoded primary output*
+/// is the only correctness check, and that lives in the §6
+/// folder decoder, not here.
+struct AesCbcCoder {
+    cipher: Aes256,
+    iv: [u8; BLOCK_LEN],
+}
+
+impl CoderImpl for AesCbcCoder {
+    fn decode_one_block(
+        &mut self,
+        src: &mut dyn Read,
+        dst: &mut dyn Write,
+        expected_unpack_size: u64,
+    ) -> Result<(), CoderError> {
+        let mut cbc = AesCbcDecrypt::new(&self.cipher, self.iv);
+        let mut written: u64 = 0;
+        let mut block = [0u8; BLOCK_LEN];
+        loop {
+            let mut filled = 0;
+            while filled < BLOCK_LEN {
+                let n = src.read(&mut block[filled..]).map_err(CoderError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                break;
+            }
+            if filled != BLOCK_LEN {
+                return Err(CoderError::BadProps {
+                    coder: "aes256cbc",
+                    reason: format!(
+                        "ciphertext is not block-aligned: ran out after {filled} bytes \
+                         in the final block (expected {BLOCK_LEN})",
+                    ),
+                });
+            }
+            cbc.decrypt_block(&mut block);
+            let remaining = expected_unpack_size.saturating_sub(written);
+            let take = remaining.min(BLOCK_LEN as u64) as usize;
+            if take > 0 {
+                dst.write_all(&block[..take]).map_err(CoderError::Io)?;
+                written += take as u64;
+            }
+        }
+        if written != expected_unpack_size {
+            return Err(CoderError::UnpackSizeMismatch {
+                coder: "aes256cbc",
+                expected: expected_unpack_size,
+                got: written,
+            });
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "aes256cbc"
+    }
+}
+
 /// Convert a [`crate::decode::DecodeError`] from the deflate
 /// backend to our [`CoderError::Decode`] shape, preserving the
 /// underlying [`std::io::Error`] so callers can match on its
@@ -606,7 +795,7 @@ mod tests {
     /// helper that panics on `Err` without printing the boxed
     /// trait object.
     fn dispatched(coder: &Coder) -> Box<dyn CoderImpl> {
-        match dispatch(coder) {
+        match dispatch(coder, None) {
             Ok(c) => c,
             Err(e) => panic!("dispatch failed: {e:?}"),
         }
@@ -647,7 +836,7 @@ mod tests {
 
     #[test]
     fn dispatch_copy_rejects_props() {
-        match dispatch(&fake_coder(&[0x00], &[0xAA])) {
+        match dispatch(&fake_coder(&[0x00], &[0xAA]), None) {
             Err(CoderError::BadProps { coder, reason }) => {
                 assert_eq!(coder, "copy");
                 assert!(reason.contains("0 prop"), "got {reason}");
@@ -715,7 +904,7 @@ mod tests {
 
     #[test]
     fn dispatch_lzma_rejects_wrong_props_length() {
-        match dispatch(&fake_coder(&[0x03, 0x01, 0x01], &[0; 3])) {
+        match dispatch(&fake_coder(&[0x03, 0x01, 0x01], &[0; 3]), None) {
             Err(CoderError::BadProps { coder, reason }) => {
                 assert_eq!(coder, "lzma");
                 assert!(reason.contains("5 bytes"), "got {reason}");
@@ -727,7 +916,7 @@ mod tests {
 
     #[test]
     fn dispatch_lzma2_rejects_wrong_props_length() {
-        match dispatch(&fake_coder(&[0x21], &[0; 3])) {
+        match dispatch(&fake_coder(&[0x21], &[0; 3]), None) {
             Err(CoderError::BadProps { coder, reason }) => {
                 assert_eq!(coder, "lzma2");
                 assert!(reason.contains("1 byte"), "got {reason}");
@@ -810,7 +999,7 @@ mod tests {
 
     #[test]
     fn dispatch_unknown_id_is_unsupported() {
-        match dispatch(&fake_coder(&[0x04, 0x02, 0x02], &[])) {
+        match dispatch(&fake_coder(&[0x04, 0x02, 0x02], &[]), None) {
             Err(CoderError::UnsupportedFeature { feature }) => {
                 assert!(feature.contains("04:02:02"), "got {feature}");
             }
@@ -829,20 +1018,18 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_aes_coder_surfaces_unified_encryption_error() {
-        // Realistic props blob: 1 byte (power|flags) + 16-byte salt
-        // + 16-byte IV. Round-one returns the unified
-        // EncryptionError immediately without actually parsing the
-        // blob, but the BadProps fast-path needs a non-empty blob to
-        // skip.
-        let props = [0u8; 33];
-        match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &props)) {
-            Err(CoderError::Encryption(EncryptionError::UnsupportedCipher { detail })) => {
-                assert!(detail.contains("AES-256-CBC"), "got {detail}");
-                assert!(detail.contains("06:F1:07:01"), "got {detail}");
-            }
-            Ok(_) => panic!("expected Encryption, got Ok"),
-            Err(other) => panic!("expected Encryption, got {other:?}"),
+    fn dispatch_aes_coder_without_password_surfaces_password_missing() {
+        // Realistic props blob: byte0 = power=0x10 | salt-present | iv-present
+        // (0xC0 high bits), byte1 = nibble splits, then 16 salt + 16 iv.
+        let mut props = Vec::with_capacity(34);
+        props.push(0xC0 | 0x10); // both salt+iv carry bits set, power=16
+        props.push(0xFF); // salt extra = 15 → total 16; iv extra = 15 → total 16
+        props.extend_from_slice(&[0xAA; 16]); // salt
+        props.extend_from_slice(&[0xBB; 16]); // iv
+        match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &props), None) {
+            Err(CoderError::Encryption(EncryptionError::PasswordMissing)) => {}
+            Ok(_) => panic!("expected PasswordMissing, got Ok"),
+            Err(other) => panic!("expected PasswordMissing, got {other:?}"),
         }
     }
 
@@ -850,8 +1037,106 @@ mod tests {
     fn dispatch_aes_coder_rejects_empty_props() {
         // An AES coder with an empty props blob is malformed
         // (the spec requires at least the power|flags byte).
-        match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &[])) {
+        match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &[]), None) {
             Err(CoderError::BadProps { coder, .. }) => assert_eq!(coder, "aes256cbc"),
+            Ok(_) => panic!("expected BadProps, got Ok"),
+            Err(other) => panic!("expected BadProps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_aes_coder_rejects_raw_key_power_3f() {
+        // power == 0x3F is the LZMA-SDK-only "raw key" shortcut.
+        // We reject it explicitly so the user sees a precise error
+        // instead of an unconscionably slow 2^63-round decode.
+        let mut props = vec![0x3Fu8]; // power=0x3F, no salt/iv flags
+        props.push(0x00);
+        match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &props), None) {
+            Err(CoderError::Encryption(EncryptionError::UnsupportedKdf { detail })) => {
+                // The raw-key path triggers under power=0x3F even
+                // when high bits are clear (saltSize/ivSize stay 0).
+                assert!(
+                    detail.contains("0x3F") || detail.contains("3F"),
+                    "got {detail}"
+                );
+            }
+            Ok(_) => panic!("expected UnsupportedKdf, got Ok"),
+            Err(other) => panic!("expected UnsupportedKdf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_aes_coder_round_trips_plaintext_under_known_key() {
+        // End-to-end: derive a key with the in-tree KDF, encrypt
+        // a plaintext with AES-256-CBC, then build an AES coder
+        // via dispatch and decrypt back through it.
+        let pw_bytes = b"hunter2".to_vec();
+        let pw = Password::new(pw_bytes.clone());
+        let salt = [0xAAu8; 16];
+        let iv = [0xBBu8; 16];
+        let power: u8 = 8;
+
+        let utf16 = password_to_utf16le(std::str::from_utf8(&pw_bytes).unwrap());
+        let key = sevenz_derive_key(&utf16, &salt, power);
+
+        // Encrypt 64 bytes (4 blocks) so we have a non-trivial round trip.
+        let plaintext: Vec<u8> = (0..64u32).map(|i| (i * 7) as u8).collect();
+        let mut ciphertext = plaintext.clone();
+        {
+            use crate::crypto::aes::AesBlockCipher;
+            let cipher = Aes256::new(&key);
+            // Encrypt by XORing each block with the previous ciphertext
+            // (or IV for the first block) then AES-encrypting.
+            let mut prev = iv;
+            for chunk in ciphertext.chunks_exact_mut(16) {
+                for (b, p) in chunk.iter_mut().zip(prev.iter()) {
+                    *b ^= *p;
+                }
+                let block: &mut [u8; 16] = chunk.try_into().unwrap();
+                cipher.encrypt_block(block);
+                prev.copy_from_slice(block);
+            }
+        }
+
+        // Build the props blob: byte0 = 0xC0 | power, byte1 = 0xFF
+        // (salt 15+1=16, iv 15+1=16), then salt, then iv.
+        let mut props = Vec::with_capacity(2 + 16 + 16);
+        props.push(0xC0 | power);
+        props.push(0xFF);
+        props.extend_from_slice(&salt);
+        props.extend_from_slice(&iv);
+
+        let mut coder = match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &props), Some(&pw)) {
+            Ok(c) => c,
+            Err(e) => panic!("dispatch failed: {e:?}"),
+        };
+        assert_eq!(coder.name(), "aes256cbc");
+        let mut src = std::io::Cursor::new(ciphertext);
+        let mut dst = Vec::new();
+        coder
+            .decode_one_block(&mut src, &mut dst, plaintext.len() as u64)
+            .expect("decrypts");
+        assert_eq!(dst, plaintext);
+    }
+
+    #[test]
+    fn dispatch_aes_coder_rejects_non_block_aligned_ciphertext() {
+        let pw = Password::new(b"x".to_vec());
+        let mut props = vec![0x00u8]; // power=0, no salt/iv flags
+                                      // No second byte needed when both flags are clear.
+        let _ = &mut props;
+        let mut coder = match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &props), Some(&pw)) {
+            Ok(c) => c,
+            Err(e) => panic!("dispatch failed: {e:?}"),
+        };
+        // 17 bytes of "ciphertext" — not block aligned.
+        let mut src = std::io::Cursor::new(vec![0u8; 17]);
+        let mut dst = Vec::new();
+        match coder.decode_one_block(&mut src, &mut dst, 16) {
+            Err(CoderError::BadProps { coder, reason }) => {
+                assert_eq!(coder, "aes256cbc");
+                assert!(reason.contains("block-aligned"), "got {reason}");
+            }
             Ok(_) => panic!("expected BadProps, got Ok"),
             Err(other) => panic!("expected BadProps, got {other:?}"),
         }

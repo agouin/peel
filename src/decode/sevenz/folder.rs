@@ -30,10 +30,12 @@ use thiserror::Error;
 // runs over every decoded byte; on a 256 MiB folder the
 // difference between ~500 MB/s and ~5 GB/s is ~450 ms of
 // wall-clock at 10 Gbps × 256 MiB.
+use crate::encryption::EncryptionError;
+use crate::secret::Password;
 use crate::sevenz::SevenzError;
 use crate::zip::crc32::Crc32;
 
-use super::coders::{dispatch, CoderError};
+use super::coders::{dispatch, CoderError, CoderId};
 use super::header::{Folder, StreamsInfo};
 
 /// Sink that consumes the decoded output of a [`FolderDecoder`],
@@ -129,6 +131,7 @@ pub struct FolderDecoder<'a> {
     folder_idx: u32,
     file_indices_for_folder: &'a [u32],
     packed_bytes: &'a mut dyn Read,
+    password: Option<&'a Password>,
 }
 
 impl<'a> FolderDecoder<'a> {
@@ -148,13 +151,51 @@ impl<'a> FolderDecoder<'a> {
         file_indices_for_folder: &'a [u32],
         packed_bytes: &'a mut dyn Read,
     ) -> Self {
+        Self::with_password(
+            folder,
+            streams_info,
+            folder_idx,
+            file_indices_for_folder,
+            packed_bytes,
+            None,
+        )
+    }
+
+    /// Same as [`Self::new`] but threads a password through to
+    /// the AES coder dispatch. `None` is acceptable for archives
+    /// without encrypted folders; an encrypted folder seen with
+    /// `password == None` surfaces
+    /// [`EncryptionError::PasswordMissing`] before any decode
+    /// work begins.
+    pub fn with_password(
+        folder: &'a Folder,
+        streams_info: &'a StreamsInfo,
+        folder_idx: u32,
+        file_indices_for_folder: &'a [u32],
+        packed_bytes: &'a mut dyn Read,
+        password: Option<&'a Password>,
+    ) -> Self {
         Self {
             folder,
             streams_info,
             folder_idx,
             file_indices_for_folder,
             packed_bytes,
+            password,
         }
+    }
+
+    /// `true` iff the folder's coder chain contains the
+    /// AES-256-CBC encryption coder. Used by the §8 pipeline to
+    /// decide whether to load a password before invoking decode,
+    /// and by the splitter to translate post-decrypt CRC32
+    /// mismatches into [`EncryptionError::PasswordIncorrect`].
+    #[must_use]
+    pub fn folder_is_encrypted(folder: &Folder) -> bool {
+        folder
+            .coders
+            .iter()
+            .any(|c| matches!(CoderId::from_bytes(&c.id), CoderId::Aes256Cbc))
     }
 
     /// Drive the coder chain to completion, splitting the final
@@ -227,12 +268,14 @@ impl<'a> FolderDecoder<'a> {
             });
         }
 
+        let is_encrypted = Self::folder_is_encrypted(self.folder);
         let mut splitter = SubstreamSplitter::new(
             sink,
             substream_sizes,
             substream_crcs,
             &file_indices,
             self.folder.unpack_crc,
+            is_encrypted,
         );
         splitter.begin_first()?;
 
@@ -259,7 +302,7 @@ impl<'a> FolderDecoder<'a> {
                         reason: format!("folder unpack_sizes missing entry for coder {i}"),
                     }
                 })?;
-                let mut coder_impl = dispatch(coder).map_err(coder_err_to_sevenz)?;
+                let mut coder_impl = dispatch(coder, self.password).map_err(coder_err_to_sevenz)?;
                 let mut buf: Vec<u8> = Vec::with_capacity(coder_size as usize);
                 let res = match intermediate.as_mut() {
                     None => coder_impl.decode_one_block(self.packed_bytes, &mut buf, coder_size),
@@ -282,7 +325,7 @@ impl<'a> FolderDecoder<'a> {
                     reason: format!("folder unpack_sizes missing entry for last coder {last_idx}",),
                 })?
         };
-        let mut last_impl = dispatch(last_coder).map_err(coder_err_to_sevenz)?;
+        let mut last_impl = dispatch(last_coder, self.password).map_err(coder_err_to_sevenz)?;
         let res = match intermediate.as_mut() {
             None => last_impl.decode_one_block(self.packed_bytes, &mut splitter, last_size),
             Some(cur) => last_impl.decode_one_block(cur, &mut splitter, last_size),
@@ -312,9 +355,20 @@ fn coder_err_to_sevenz(e: CoderError) -> SevenzError {
         CoderError::Decode { coder, source } => SevenzError::CorruptHeader {
             reason: format!("{coder} coder decode failure: {source}"),
         },
-        CoderError::Io(source) => SevenzError::CorruptHeader {
-            reason: format!("coder IO failure: {source}"),
-        },
+        CoderError::Io(source) => {
+            // The splitter's `Write` impl funnels post-decrypt CRC
+            // mismatches through this path tagged with
+            // `ENCRYPTED_CRC_MISMATCH_SENTINEL`. Catch the sentinel
+            // here and rewrite back into the unified
+            // [`EncryptionError::PasswordIncorrect`] surface.
+            if source.to_string().contains(ENCRYPTED_CRC_MISMATCH_SENTINEL) {
+                SevenzError::Encryption(EncryptionError::PasswordIncorrect)
+            } else {
+                SevenzError::CorruptHeader {
+                    reason: format!("coder IO failure: {source}"),
+                }
+            }
+        }
         // Encryption coder surfaces directly through the unified
         // SevenzError::Encryption variant
         // (`docs/PLAN_archive_encryption.md` §5 / §6) — the shared
@@ -332,6 +386,13 @@ struct SubstreamSplitter<'a> {
     substream_crcs: &'a [Option<u32>],
     file_indices: &'a [u32],
     folder_unpack_crc: Option<u32>,
+    /// When `true`, post-decrypt CRC mismatches surface as
+    /// [`EncryptionError::PasswordIncorrect`] (the user is much
+    /// more likely to have typed the wrong password than to be
+    /// looking at a corrupted archive that *also* happens to be
+    /// encrypted). 7z has no integrity tag on its encryption
+    /// layer, so the substream CRC32 is the only signal we have.
+    encrypted: bool,
 
     current_substream: usize,
     bytes_in_current_substream: u64,
@@ -347,6 +408,7 @@ impl<'a> SubstreamSplitter<'a> {
         substream_crcs: &'a [Option<u32>],
         file_indices: &'a [u32],
         folder_unpack_crc: Option<u32>,
+        encrypted: bool,
     ) -> Self {
         Self {
             sink,
@@ -354,6 +416,7 @@ impl<'a> SubstreamSplitter<'a> {
             substream_crcs,
             file_indices,
             folder_unpack_crc,
+            encrypted,
             current_substream: 0,
             bytes_in_current_substream: 0,
             folder_crc: Crc32::new(),
@@ -406,6 +469,9 @@ impl<'a> SubstreamSplitter<'a> {
         if let Some(expected) = self.folder_unpack_crc {
             let computed = self.folder_crc.current();
             if computed != expected {
+                if self.encrypted {
+                    return Err(SevenzError::Encryption(EncryptionError::PasswordIncorrect));
+                }
                 return Err(SevenzError::CorruptHeader {
                     reason: format!(
                         "folder CRC32 mismatch: expected {expected:#010x}, \
@@ -437,13 +503,17 @@ impl Write for SubstreamSplitter<'_> {
             let remaining = target_size - self.bytes_in_current_substream;
             let take = ((buf.len() - consumed) as u64).min(remaining) as usize;
             let slice = &buf[consumed..consumed + take];
-            self.sink.write_substream(slice).map_err(io::Error::other)?;
+            self.sink
+                .write_substream(slice)
+                .map_err(|e| substream_sink_err_to_io(e, self.encrypted))?;
             self.folder_crc.update(slice);
             self.bytes_in_current_substream += take as u64;
             consumed += take;
             if self.bytes_in_current_substream == target_size {
                 let crc = self.substream_crcs[self.current_substream];
-                self.sink.end_substream(crc).map_err(io::Error::other)?;
+                self.sink
+                    .end_substream(crc)
+                    .map_err(|e| substream_sink_err_to_io(e, self.encrypted))?;
                 self.current_substream += 1;
                 self.bytes_in_current_substream = 0;
                 if self.current_substream < self.substream_sizes.len() {
@@ -453,7 +523,7 @@ impl Write for SubstreamSplitter<'_> {
                             self.file_indices[self.current_substream],
                             self.substream_sizes[self.current_substream],
                         )
-                        .map_err(io::Error::other)?;
+                        .map_err(|e| substream_sink_err_to_io(e, self.encrypted))?;
                 }
             }
         }
@@ -462,6 +532,31 @@ impl Write for SubstreamSplitter<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Sentinel string the splitter inserts into [`io::Error`] when a
+/// substream CRC mismatch happens inside an encrypted folder. The
+/// `coder_err_to_sevenz` translator at the [`FolderDecoder::decode`]
+/// boundary catches this sentinel and rewrites the error into
+/// [`SevenzError::Encryption(EncryptionError::PasswordIncorrect)`].
+///
+/// Carried through `io::Error` rather than a typed channel because
+/// the splitter is plugged into a `Write` chain (whose only error
+/// type *is* `io::Error`); we don't have a typed back-channel and
+/// don't want to widen the `CoderImpl` trait for a single edge case.
+const ENCRYPTED_CRC_MISMATCH_SENTINEL: &str = "peel:7z:encrypted-folder-crc-mismatch";
+
+/// Translate a [`FolderSinkError`] into an [`io::Error`] suitable for
+/// returning from the splitter's `Write` impl. CRC mismatches in
+/// encrypted folders carry the sentinel so the decode-level
+/// translator can rewrite them into [`EncryptionError::PasswordIncorrect`].
+fn substream_sink_err_to_io(e: FolderSinkError, encrypted: bool) -> io::Error {
+    match e {
+        FolderSinkError::Crc32Mismatch { .. } if encrypted => {
+            io::Error::other(ENCRYPTED_CRC_MISMATCH_SENTINEL)
+        }
+        other => io::Error::other(other),
     }
 }
 
@@ -739,5 +834,225 @@ mod tests {
             .decode(&mut sink)
             .expect("decodes");
         assert_eq!(sink.substreams[0], payload);
+    }
+
+    /// Build an AES-256-CBC props blob: byte0 = 0xC0|power,
+    /// byte1 = 0xFF (salt nibble 15+carry 1 = 16, iv nibble 15+
+    /// carry 1 = 16), then 16 salt bytes, then 16 IV bytes.
+    fn aes_props(power: u8, salt: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(2 + 16 + 16);
+        p.push(0xC0 | (power & 0x3F));
+        p.push(0xFF);
+        p.extend_from_slice(salt);
+        p.extend_from_slice(iv);
+        p
+    }
+
+    fn encrypt_aes256_cbc(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        use crate::crypto::aes::{Aes256, AesBlockCipher};
+        let cipher = Aes256::new(key);
+        let mut padded = plaintext.to_vec();
+        let pad = (16 - (padded.len() % 16)) % 16;
+        padded.extend(std::iter::repeat_n(0u8, pad));
+        let mut prev = *iv;
+        let mut out = padded.clone();
+        for chunk in out.chunks_exact_mut(16) {
+            for (b, p) in chunk.iter_mut().zip(prev.iter()) {
+                *b ^= *p;
+            }
+            let block: &mut [u8; 16] = chunk.try_into().unwrap();
+            cipher.encrypt_block(block);
+            prev.copy_from_slice(block);
+        }
+        out
+    }
+
+    #[test]
+    fn folder_decoder_round_trips_single_aes_substream() {
+        use crate::crypto::sevenz_kdf::{password_to_utf16le, sevenz_derive_key};
+        use crate::secret::Password;
+
+        // 96 bytes (6 blocks) — plenty to exercise multi-block CBC.
+        let payload: Vec<u8> = (0..96u32).map(|i| (i * 5) as u8).collect();
+        let salt = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let power: u8 = 6;
+        let pw_bytes = b"hunter2".to_vec();
+        let key = sevenz_derive_key(
+            &password_to_utf16le(std::str::from_utf8(&pw_bytes).unwrap()),
+            &salt,
+            power,
+        );
+        let mut key32 = [0u8; 32];
+        key32.copy_from_slice(&key);
+        let ciphertext = encrypt_aes256_cbc(&key32, &iv, &payload);
+
+        let aes_coder = Coder {
+            id: vec![0x06, 0xF1, 0x07, 0x01],
+            props: aes_props(power, &salt, &iv),
+            num_in_streams: 1,
+            num_out_streams: 1,
+        };
+        let folder = Folder {
+            coders: vec![aes_coder],
+            bind_pairs: vec![],
+            packed_stream_indices: vec![],
+            unpack_sizes: vec![payload.len() as u64],
+            unpack_crc: Some(crate::hash::crc32::ieee(&payload)),
+        };
+        let info = StreamsInfo {
+            pack_pos: 0,
+            pack_sizes: vec![ciphertext.len() as u64],
+            pack_crcs: vec![None],
+            folders: vec![folder.clone()],
+            sub_streams: SubStreamsInfo {
+                num_unpack_streams: vec![1],
+                unpack_sizes: vec![payload.len() as u64],
+                unpack_crcs: vec![Some(crate::hash::crc32::ieee(&payload))],
+            },
+        };
+
+        let pw = Password::new(pw_bytes);
+        let mut sink = VecSink::new();
+        let mut src = Cursor::new(ciphertext);
+        FolderDecoder::with_password(&info.folders[0], &info, 0, &[1u32], &mut src, Some(&pw))
+            .decode(&mut sink)
+            .expect("decrypts and decodes");
+        assert_eq!(sink.substreams.len(), 1);
+        assert_eq!(sink.substreams[0], payload);
+    }
+
+    #[test]
+    fn folder_decoder_wrong_password_surfaces_password_incorrect() {
+        // Same setup as the round-trip test but feed a wrong
+        // password. Wrong password → garbage plaintext → CRC
+        // mismatch → translated to PasswordIncorrect because
+        // the folder is encrypted.
+        use crate::crypto::sevenz_kdf::{password_to_utf16le, sevenz_derive_key};
+        use crate::secret::Password;
+
+        let payload: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        let salt = [0xAAu8; 16];
+        let iv = [0xBBu8; 16];
+        let power: u8 = 4;
+        let real_pw = b"correct horse";
+        let key = sevenz_derive_key(
+            &password_to_utf16le(std::str::from_utf8(real_pw).unwrap()),
+            &salt,
+            power,
+        );
+        let mut key32 = [0u8; 32];
+        key32.copy_from_slice(&key);
+        let ciphertext = encrypt_aes256_cbc(&key32, &iv, &payload);
+        let crc = crate::hash::crc32::ieee(&payload);
+
+        let aes_coder = Coder {
+            id: vec![0x06, 0xF1, 0x07, 0x01],
+            props: aes_props(power, &salt, &iv),
+            num_in_streams: 1,
+            num_out_streams: 1,
+        };
+        let folder = Folder {
+            coders: vec![aes_coder],
+            bind_pairs: vec![],
+            packed_stream_indices: vec![],
+            unpack_sizes: vec![payload.len() as u64],
+            unpack_crc: Some(crc),
+        };
+        let info = StreamsInfo {
+            pack_pos: 0,
+            pack_sizes: vec![ciphertext.len() as u64],
+            pack_crcs: vec![None],
+            folders: vec![folder.clone()],
+            sub_streams: SubStreamsInfo {
+                num_unpack_streams: vec![1],
+                unpack_sizes: vec![payload.len() as u64],
+                unpack_crcs: vec![Some(crc)],
+            },
+        };
+
+        let wrong = Password::new(b"wrong password".to_vec());
+        let mut sink = VecSink::new();
+        let mut src = Cursor::new(ciphertext);
+        match FolderDecoder::with_password(
+            &info.folders[0],
+            &info,
+            0,
+            &[1u32],
+            &mut src,
+            Some(&wrong),
+        )
+        .decode(&mut sink)
+        {
+            Err(SevenzError::Encryption(EncryptionError::PasswordIncorrect)) => {}
+            Ok(_) => panic!("expected PasswordIncorrect, got Ok"),
+            Err(other) => panic!("expected PasswordIncorrect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_decoder_missing_password_surfaces_password_missing() {
+        // An encrypted folder without a password threaded in
+        // must surface PasswordMissing at dispatch time, before
+        // any bytes flow.
+        let salt = [0x00u8; 16];
+        let iv = [0x00u8; 16];
+        let aes_coder = Coder {
+            id: vec![0x06, 0xF1, 0x07, 0x01],
+            props: aes_props(0, &salt, &iv),
+            num_in_streams: 1,
+            num_out_streams: 1,
+        };
+        let folder = Folder {
+            coders: vec![aes_coder],
+            bind_pairs: vec![],
+            packed_stream_indices: vec![],
+            unpack_sizes: vec![16],
+            unpack_crc: None,
+        };
+        let info = StreamsInfo {
+            pack_pos: 0,
+            pack_sizes: vec![16],
+            pack_crcs: vec![None],
+            folders: vec![folder.clone()],
+            sub_streams: SubStreamsInfo {
+                num_unpack_streams: vec![1],
+                unpack_sizes: vec![16],
+                unpack_crcs: vec![None],
+            },
+        };
+
+        let mut sink = VecSink::new();
+        let mut src = Cursor::new(vec![0u8; 16]);
+        match FolderDecoder::new(&info.folders[0], &info, 0, &[1u32], &mut src).decode(&mut sink) {
+            Err(SevenzError::Encryption(EncryptionError::PasswordMissing)) => {}
+            Ok(_) => panic!("expected PasswordMissing, got Ok"),
+            Err(other) => panic!("expected PasswordMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_is_encrypted_reflects_aes_coder_presence() {
+        let plain = Folder {
+            coders: vec![copy_coder()],
+            bind_pairs: vec![],
+            packed_stream_indices: vec![],
+            unpack_sizes: vec![0],
+            unpack_crc: None,
+        };
+        assert!(!FolderDecoder::folder_is_encrypted(&plain));
+        let encrypted = Folder {
+            coders: vec![Coder {
+                id: vec![0x06, 0xF1, 0x07, 0x01],
+                props: vec![0x00],
+                num_in_streams: 1,
+                num_out_streams: 1,
+            }],
+            bind_pairs: vec![],
+            packed_stream_indices: vec![],
+            unpack_sizes: vec![0],
+            unpack_crc: None,
+        };
+        assert!(FolderDecoder::folder_is_encrypted(&encrypted));
     }
 }

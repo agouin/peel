@@ -14,13 +14,16 @@ this file is the shipping-feature surface.
 | zip | PKWARE traditional "ZipCrypto" (CRC32-keyed PRGA) | password-derived 12-byte header | none (CRC32 of plaintext) | shipping (§3b) — *insecure* |
 | rar5 | AES-256-CBC, archive-header encryption (type 4) | PBKDF2-HMAC-SHA256 with `iterations = 1 << (kdf_count + 15)`; running-XOR fused stages produce AES key + HMAC key + pswcheck source in one pass | optional pswcheck (8-byte XOR-fold of `PBKDF2(c=N+2)` + 4-byte SHA-256 sum) | shipping (§4) |
 | rar5 | AES-256-CBC, per-file encryption (extra record 1) | same as above (per-record salt / IV / `kdf_count`) | optional pswcheck (8-byte XOR-fold + 4-byte SHA-256 sum) | shipping (§4) |
-| 7z | AES-256-CBC (coder id `06:F1:07:01`) | bespoke SHA-256 "round-tower" KDF (`crate::crypto::sevenz_kdf`) | none (CRC32 of plaintext) | **not yet** (§5 wires recognition + error surface; decryption pending) |
+| 7z | AES-256-CBC (coder id `06:F1:07:01`) | bespoke SHA-256 "round-tower" KDF (`crate::crypto::sevenz_kdf`) | none (CRC32 of plaintext) | shipping (§5) |
 
-The "**not yet**" rows surface a clean
-[`EncryptionError::UnsupportedCipher`](../src/encryption.rs) at the
-binary boundary with a precise detail message; the same shape and exit
-code (4) the shipping ZIP paths use. Scripts that catch encrypted
-archives can match on the error chain regardless of format.
+7z has no in-archive password verifier (unlike RAR5's optional
+`pswcheck` or ZIP-AES's 2-byte PBKDF2 verifier); the only
+correctness signal is the post-decryption CRC32 on each decoded
+substream. A wrong password produces garbage plaintext, the CRC32
+mismatches at the first substream boundary, and peel translates
+that into [`EncryptionError::PasswordIncorrect`] — the user sees
+the same exit code 4 and the same message shape as the other
+formats.
 
 ### RAR5 encryption layers
 
@@ -53,6 +56,43 @@ restart from byte 0 on the in-flight entry — the CBC chain cannot
 yet be migrated across a checkpoint snapshot. The sink replays the
 on-disk prefix to seed its hashes, so the user-visible bytes remain
 byte-identical to a clean run.
+
+### 7z encryption layer
+
+7z has a single encryption shape: an AES-256-CBC coder (id
+`06:F1:07:01`) that sits at the front of a folder's coder chain.
+The coder's props blob encodes:
+
+- `numCyclesPower` (low 6 bits of byte 0): the SHA-256 round-tower
+  KDF runs `2^power` rounds.
+- Optional salt (up to 16 bytes) and IV (up to 16 bytes), present
+  when the high bits of byte 0 are set.
+
+The KDF derives a 32-byte AES-256 key by hashing
+`salt || password_utf16le || round_counter_le` for each of the
+`2^power` rounds (`crate::crypto::sevenz_kdf::sevenz_derive_key`).
+The on-disk IV is zero-padded to 16 bytes if shorter. The chain
+then flows: ciphertext → AES-CBC decrypt → (optional LZMA2 / COPY)
+→ folder substreams → per-file CRC32 → on-disk.
+
+7z does not carry a password verifier. The first correctness
+signal is the per-substream CRC32 inside the decoded plaintext;
+under a wrong password the plaintext is random and the CRC32
+mismatches with overwhelming probability. `FolderDecoder`
+translates that into [`EncryptionError::PasswordIncorrect`]
+when it knows the folder is encrypted (per the
+`folder_is_encrypted` check). All folders in an archive share
+one password (loaded lazily on the first encrypted folder),
+matching 7-Zip's own behaviour. Resume from a checkpoint restarts
+the in-flight folder from byte 0 — same constraint as RAR5's
+per-file encryption, for the same reason (CBC chain state).
+
+The reference for this implementation is the LZMA SDK
+`CPP/7zip/Crypto/7zAes.cpp` source; the in-tree KDF
+(`crate::crypto::sevenz_kdf`) and CBC primitives
+(`crate::crypto::aes_modes::AesCbcDecrypt`) are mechanically
+equivalent to the SDK's behaviour and have differential test
+corpora against a reference `aes` / `cbc` crate.
 
 ## Supplying a password
 
