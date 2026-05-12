@@ -315,6 +315,12 @@ fn coder_err_to_sevenz(e: CoderError) -> SevenzError {
         CoderError::Io(source) => SevenzError::CorruptHeader {
             reason: format!("coder IO failure: {source}"),
         },
+        // Encryption coder surfaces directly through the unified
+        // SevenzError::Encryption variant
+        // (`docs/PLAN_archive_encryption.md` §5 / §6) — the shared
+        // EncryptionError type makes ZIP / RAR / 7z encryption
+        // refusals match on the same shape.
+        CoderError::Encryption(inner) => SevenzError::Encryption(inner),
     }
 }
 

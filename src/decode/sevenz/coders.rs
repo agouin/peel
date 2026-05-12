@@ -37,6 +37,7 @@ use thiserror::Error;
 use crate::decode::deflate_native::Decoder as DeflateDecoder;
 use crate::decode::xz_liblzma::raw::{decode_lzma1_raw, decode_lzma2_raw};
 use crate::decode::{DecodeStatus, StreamingDecoder};
+use crate::encryption::EncryptionError;
 
 use super::header::Coder;
 
@@ -59,6 +60,13 @@ pub enum CoderId {
     Lzma,
     /// `[0x21]` — LZMA2 (with its 1-byte `dictSize` prop).
     Lzma2,
+    /// `[0x06, 0xF1, 0x07, 0x01]` — AES-256-CBC, the only encryption
+    /// coder defined by the 7z spec (`docs/PLAN_archive_encryption.md`
+    /// §5). Recognised here so dispatch surfaces a unified
+    /// [`EncryptionError`] instead of the generic "unknown coder id"
+    /// error; actual decryption requires threading a password through
+    /// the folder decode path and lands in a follow-on commit.
+    Aes256Cbc,
     /// Anything else. Carries the raw id for use in error
     /// messages.
     Unsupported(Vec<u8>),
@@ -74,6 +82,7 @@ impl CoderId {
             [0x04, 0x01, 0x08] => Self::Deflate,
             [0x03, 0x01, 0x01] => Self::Lzma,
             [0x21] => Self::Lzma2,
+            [0x06, 0xF1, 0x07, 0x01] => Self::Aes256Cbc,
             _ => Self::Unsupported(bytes.to_vec()),
         }
     }
@@ -89,6 +98,7 @@ impl CoderId {
             Self::Deflate => &[0x04u8, 0x01, 0x08][..],
             Self::Lzma => &[0x03u8, 0x01, 0x01][..],
             Self::Lzma2 => &[0x21u8][..],
+            Self::Aes256Cbc => &[0x06u8, 0xF1, 0x07, 0x01][..],
             Self::Unsupported(b) => b.as_slice(),
         };
         bytes
@@ -160,6 +170,18 @@ pub enum CoderError {
         /// Human-readable feature name.
         feature: String,
     },
+
+    /// The folder includes an encryption coder. Carried by the
+    /// shared [`EncryptionError`] enum
+    /// (`docs/PLAN_archive_encryption.md` §6) so callers see the
+    /// same shape they see for ZIP-AES / RAR5 encryption refusals.
+    /// Dispatch returns this when the folder's coder chain
+    /// contains the AES-256-CBC id and no password has been
+    /// threaded through; actual decryption needs a follow-on
+    /// commit that plumbs the password from the CLI into the
+    /// folder decode path.
+    #[error("7z encryption coder: {0}")]
+    Encryption(#[source] EncryptionError),
 }
 
 /// Runtime decoder for one [`Coder`] inside a [`super::header::Folder`].
@@ -250,6 +272,31 @@ pub fn dispatch(coder: &Coder) -> Result<Box<dyn CoderImpl>, CoderError> {
             }
             Ok(Box::new(Lzma2Coder {
                 props_byte: coder.props[0],
+            }))
+        }
+        CoderId::Aes256Cbc => {
+            // The AES coder's props blob carries the per-folder KDF
+            // power byte plus the (variable-length) salt and IV.
+            // Validate the prefix shape so a malformed encrypted
+            // archive surfaces a structured error before the user
+            // sees the encryption refusal banner.
+            if coder.props.is_empty() {
+                return Err(CoderError::BadProps {
+                    coder: "aes256cbc",
+                    reason: "encryption coder requires at least 1 props byte (power|flags)"
+                        .to_string(),
+                });
+            }
+            // Round-one returns the unified encryption error
+            // immediately. Threading a password through dispatch +
+            // folder decode + pipeline is left for a follow-on
+            // commit; this commit unblocks consumers that want a
+            // consistent EncryptionError surface across ZIP / RAR /
+            // 7z without parsing the props blob.
+            Err(CoderError::Encryption(EncryptionError::UnsupportedCipher {
+                detail: "7z AES-256-CBC coder (id 06:F1:07:01) — peel recognises the coder \
+                         but does not yet decrypt encrypted folders"
+                    .to_string(),
             }))
         }
         CoderId::Unsupported(_) => Err(CoderError::UnsupportedFeature {
@@ -769,6 +816,44 @@ mod tests {
             }
             Ok(_) => panic!("expected UnsupportedFeature, got Ok"),
             Err(other) => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coder_id_recognises_aes_256_cbc() {
+        assert_eq!(
+            CoderId::from_bytes(&[0x06, 0xF1, 0x07, 0x01]),
+            CoderId::Aes256Cbc,
+        );
+        assert_eq!(CoderId::Aes256Cbc.hex_repr(), "06:F1:07:01");
+    }
+
+    #[test]
+    fn dispatch_aes_coder_surfaces_unified_encryption_error() {
+        // Realistic props blob: 1 byte (power|flags) + 16-byte salt
+        // + 16-byte IV. Round-one returns the unified
+        // EncryptionError immediately without actually parsing the
+        // blob, but the BadProps fast-path needs a non-empty blob to
+        // skip.
+        let props = [0u8; 33];
+        match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &props)) {
+            Err(CoderError::Encryption(EncryptionError::UnsupportedCipher { detail })) => {
+                assert!(detail.contains("AES-256-CBC"), "got {detail}");
+                assert!(detail.contains("06:F1:07:01"), "got {detail}");
+            }
+            Ok(_) => panic!("expected Encryption, got Ok"),
+            Err(other) => panic!("expected Encryption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_aes_coder_rejects_empty_props() {
+        // An AES coder with an empty props blob is malformed
+        // (the spec requires at least the power|flags byte).
+        match dispatch(&fake_coder(&[0x06, 0xF1, 0x07, 0x01], &[])) {
+            Err(CoderError::BadProps { coder, .. }) => assert_eq!(coder, "aes256cbc"),
+            Ok(_) => panic!("expected BadProps, got Ok"),
+            Err(other) => panic!("expected BadProps, got {other:?}"),
         }
     }
 
