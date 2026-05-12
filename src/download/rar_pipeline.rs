@@ -815,6 +815,12 @@ impl<'a> RarPipeline<'a> {
             let resume_blob: Option<&[u8]> = if Some(idx) == resume.current_entry
                 && entry.header.compression.method() != 0
                 && entry.encryption.is_none()
+                // §2d: mid-entry decoder snapshots across volume
+                // boundaries are out of scope; a SPLIT entry
+                // restarts from byte 0 on resume rather than
+                // attempting to deserialize a partial decoder
+                // state that no codepath ever serialized.
+                && entry.extra_segments.is_empty()
             {
                 resume.current_entry_decoder_state.as_deref()
             } else {
@@ -1072,23 +1078,11 @@ impl<'a> RarPipeline<'a> {
                 }
             }
         } else {
-            if is_split {
-                return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
-                    feature: format!(
-                        "compressed entry {:?} spans volume boundary; \
-                         multi-volume RAR5-decoder continuation is not yet \
-                         supported in peel",
-                        entry.header.name
-                    ),
-                }));
-            }
-            let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
-                RarPipelineError::Rar(RarError::CorruptHeader {
-                    archive_offset: data_offset,
-                    reason: "entry data range overflows u64".to_string(),
-                })
-            })?;
-            self.wait_for_range(data_offset, data_end)?;
+            // Compressed, no encryption. decompress_entry_to_sink
+            // walks the entry's segment list internally, so this
+            // path covers single-volume entries and §2d
+            // multi-volume continuations uniformly.
+            let data_end = data_offset.saturating_add(packed_size);
             self.decompress_entry_to_sink(
                 idx,
                 entry,
@@ -1546,7 +1540,32 @@ impl<'a> RarPipeline<'a> {
     where
         F: FnMut(&RarPipelineEvent) -> io::Result<()>,
     {
-        let packed_size = data_end.saturating_sub(data_offset);
+        let is_split = !entry.extra_segments.is_empty();
+        if cbc.is_some() && is_split {
+            return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                feature: format!(
+                    "per-file encrypted compressed entry {:?} spans volume \
+                     boundary; encrypted multi-volume entry continuation is not \
+                     yet supported in peel",
+                    entry.header.name
+                ),
+            }));
+        }
+        // SPLIT entries override the §F1 resume path: mid-entry
+        // decoder snapshots across volume boundaries are out of
+        // scope for §2d, so a checkpoint that nominates a SPLIT
+        // entry as `current_entry` ignores its decoder_state blob
+        // and force-restarts from byte 0. The dispatch in `run()`
+        // already takes the same conservative stance; this is a
+        // defensive belt-and-braces check.
+        let (resume_offset, resume_decoder_state) = if is_split {
+            (0, None)
+        } else {
+            (resume_offset, resume_decoder_state)
+        };
+
+        let segments = entry_data_segments(entry);
+        let packed_size: u64 = segments.iter().map(|(_, s)| *s).sum();
         let mut compressed = vec![
             0u8;
             usize::try_from(packed_size).map_err(|_| {
@@ -1556,10 +1575,32 @@ impl<'a> RarPipeline<'a> {
                 })
             })?
         ];
-        if !compressed.is_empty() {
+        let mut write_at: usize = 0;
+        for (seg_off, seg_size) in &segments {
+            if *seg_size == 0 {
+                continue;
+            }
+            let seg_end = seg_off.checked_add(*seg_size).ok_or_else(|| {
+                RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: *seg_off,
+                    reason: "segment data range overflows u64".to_string(),
+                })
+            })?;
+            // Steer the scheduler toward each segment as we read
+            // it so workers fill the next contiguous range.
+            self.cursor.store(*seg_off, Ordering::Release);
+            self.wait_for_range(*seg_off, seg_end)?;
+            let want = *seg_size as usize;
             self.sparse
-                .read_exact_at(ByteOffset::new(data_offset), &mut compressed)
+                .read_exact_at(
+                    ByteOffset::new(*seg_off),
+                    &mut compressed[write_at..write_at + want],
+                )
                 .map_err(RarPipelineError::Sparse)?;
+            write_at += want;
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(seg_end);
+            }
         }
 
         // Per-file encryption layer: CBC-decrypt the buffered
@@ -1640,8 +1681,13 @@ impl<'a> RarPipeline<'a> {
         // Decoder consumed every compressed byte; nudge the
         // progress meter so the scheduler's max_disk_buffer
         // throttle treats the entry's source range as released.
-        if let Some(p) = self.progress_state {
-            p.set_bytes_decoded_input(data_end);
+        // For non-SPLIT entries `data_end` is the trailing byte; for
+        // SPLIT entries the per-segment loop above already pushed
+        // the cumulative cursor to the last segment's end.
+        if !is_split {
+            if let Some(p) = self.progress_state {
+                p.set_bytes_decoded_input(data_end);
+            }
         }
         Ok(())
     }

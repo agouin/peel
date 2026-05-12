@@ -61,6 +61,19 @@ fn read_volume(name: &str) -> Vec<u8> {
     std::fs::read(fixture_dir().join(name)).unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
 }
 
+/// Repo path to the compressed-multi-volume fixture directory.
+fn compressed_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("rar5_multivolume_compressed")
+}
+
+fn read_compressed_volume(name: &str) -> Vec<u8> {
+    std::fs::read(compressed_fixture_dir().join(name))
+        .unwrap_or_else(|e| panic!("read compressed fixture {name}: {e}"))
+}
+
 #[test]
 fn walk_first_volume_alone_surfaces_volume_set_mismatch_after_2d() {
     // The committed multi.part1.rar's EOA carries `more_volumes`
@@ -409,4 +422,105 @@ fn pipeline_extracts_real_stored_spanning_entry() {
     let got_big = std::fs::read(out_dir.join("big.bin")).expect("read big.bin");
     let expected_big = vec![b'X'; 35_000];
     assert_eq!(got_big, expected_big);
+}
+
+/// SHA-256 of the expected `comp_a.bin` plaintext (30 000 bytes
+/// over `ABCDEFGHabcdefgh `). Captured from `unrar x multi.part1.rar`
+/// when the fixture was generated; regenerating the fixture
+/// requires updating this digest.
+const COMP_A_SHA256: [u8; 32] = [
+    0xc6, 0x44, 0xa7, 0x54, 0x4f, 0x64, 0xde, 0x26, 0x88, 0x5c, 0x88, 0x6e, 0x45, 0xd2, 0x01, 0xba,
+    0x93, 0xca, 0x74, 0xc4, 0xad, 0x79, 0x19, 0x2d, 0x2e, 0x88, 0xe7, 0x84, 0x5c, 0x4b, 0x22, 0x76,
+];
+
+/// SHA-256 of the expected `comp_b.bin` plaintext (20 000 bytes
+/// over `XYZxyz `). Captured from `unrar x` at fixture-creation time.
+const COMP_B_SHA256: [u8; 32] = [
+    0xde, 0x72, 0xfe, 0x84, 0x33, 0x74, 0x3b, 0x74, 0x1c, 0x12, 0x5e, 0x51, 0x92, 0xd8, 0x3b, 0xa0,
+    0xe8, 0xf4, 0xcc, 0xfc, 0xa6, 0xd3, 0x29, 0x2c, 0x1e, 0xf3, 0x4b, 0x2f, 0x54, 0xad, 0x52, 0xc1,
+];
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use peel::crypto::BlockHash;
+    use peel::hash::sha256::Sha256;
+    Sha256::digest(bytes).as_ref().try_into().expect("32 bytes")
+}
+
+#[test]
+fn pipeline_extracts_real_compressed_spanning_entries() {
+    // §2d compressed end-to-end: the four-volume fixture's
+    // `comp_a.bin` spans volumes 1→2→3 and `comp_b.bin` spans
+    // volumes 3→4 (so volume 3 carries a SPLIT_BEFORE entry
+    // immediately followed by a SPLIT_AFTER entry — exercises
+    // back-to-back SPLIT-folding in the walker). The pipeline
+    // gathers each entry's compressed segments into one buffer,
+    // hands it to the RAR5 decoder, and writes byte-identical
+    // plaintext to the sink.
+    let v1 = read_compressed_volume("multi.part1.rar");
+    let v2 = read_compressed_volume("multi.part2.rar");
+    let v3 = read_compressed_volume("multi.part3.rar");
+    let v4 = read_compressed_volume("multi.part4.rar");
+    let volumes = vec![v1, v2, v3, v4];
+    let (bytes, volume_starts) = concat_with_starts(&volumes);
+    let total_size = bytes.len() as u64;
+
+    let tmp = tempdir("pipeline_split_compressed");
+    let sparse_path = tmp.path().join("archive.bin");
+    let sparse = SparseFile::open_or_create(&sparse_path, total_size).expect("sparse");
+    sparse
+        .pwrite_at(ByteOffset::new(0), &bytes)
+        .expect("seed sparse");
+
+    let chunk_size: u64 = 64 * 1024;
+    let num_chunks = total_size.div_ceil(chunk_size) as u32;
+    let bitmap = ChunkBitmap::new(num_chunks);
+    bitmap.complete_range(ChunkIndex::new(0), ChunkIndex::new(num_chunks));
+
+    let cursor = Arc::new(AtomicU64::new(0));
+    let download_done = Arc::new(AtomicBool::new(true));
+    let download_outcome = Arc::new(Mutex::new(None));
+    let pipeline = RarPipeline {
+        config: RarPipelineConfig {
+            total_size,
+            chunk_size,
+            poll_interval: Duration::from_millis(1),
+            initial_header_window: 64 * 1024,
+            volume_starts: volume_starts.clone(),
+        },
+        sparse: &sparse,
+        bitmap: &bitmap,
+        cursor: &cursor,
+        download_done: &download_done,
+        download_outcome: &download_outcome,
+        sparse_fd: sparse.as_fd(),
+        progress_state: None,
+        password_source: None,
+        password_label: "test://split-compressed",
+    };
+
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).expect("mkdir out");
+    let mut sink = RarSink::new(&out_dir).expect("rar sink");
+    let puncher = NoopPuncher::new();
+
+    let stats = pipeline
+        .run(&mut sink, &puncher, RarResumeState::default(), |_| Ok(()))
+        .expect("multi-volume compressed-SPLIT extraction succeeds");
+    assert_eq!(stats.entries_extracted, 2);
+
+    let got_a = std::fs::read(out_dir.join("comp_a.bin")).expect("read comp_a.bin");
+    assert_eq!(got_a.len(), 30_000);
+    assert_eq!(
+        sha256(&got_a),
+        COMP_A_SHA256,
+        "comp_a.bin SHA-256 must match the pinned digest"
+    );
+
+    let got_b = std::fs::read(out_dir.join("comp_b.bin")).expect("read comp_b.bin");
+    assert_eq!(got_b.len(), 20_000);
+    assert_eq!(
+        sha256(&got_b),
+        COMP_B_SHA256,
+        "comp_b.bin SHA-256 must match the pinned digest"
+    );
 }
