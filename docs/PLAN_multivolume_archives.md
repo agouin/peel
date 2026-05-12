@@ -260,35 +260,73 @@ same — both invocations should work.
 
 ## §5. Checkpoint format bump
 
+**Status (2026-05-12):** the format bump itself has landed.
+`FORMAT_VERSION` is v14; `PartRecord` carries an
+`Option<VolumeRole>` that round-trips through the on-disk
+layout, with a byte-identical fallback for runs whose parts are
+all `None`. The resume-side enforcement (steps 3 and 4 below)
+remains future work, gated on §1's discovery and §2/§3/§4's
+per-format decoders.
+
 **What**: extend the checkpoint to remember the volume set.
 
 **Why now**: the existing v8 checkpoint already carries a
 `Vec<PartRecord>` (see `PLAN_multi_url_source.md` §5). Multi-
 volume archives reuse that vector with one twist: a
-`volume_role: enum { LinearByte, Rar5Volume, SevenZVolume,
+`volume_role: enum { Rar5Volume, SevenZVolume,
 ZipSpannedVolume }` tag so a resume can verify the volume set's
-shape matches.
+shape matches. The original sketch listed a fourth `LinearByte`
+variant; the implementation collapses that into the
+`Option`-`None` arm because `Option<VolumeRole>` already
+encodes "no multi-volume role" without redundancy.
 
 **Sketch**:
 
-1. Bump `FORMAT_VERSION` (already coordinating with the
-   `PLAN_download_modes.md` bump — these can land in the same
-   version step).
-2. Each `PartRecord` gains an `Option<VolumeRole>` field. `None`
-   means linear byte-concat (today's behaviour).
-3. On resume: shape match enforced.
-4. Mid-flight kill across a volume boundary: existing per-part
-   SHA-256 still verifies each volume independently as it
-   completes; the decoder context (LZ window, etc.) is captured
-   in the same `decoder_state` blob the streaming formats
-   already use. rar5's decoder state across a volume boundary
-   needs a one-line confirmation test that the existing blob
-   captures everything (LZ window + PPMd model + repeat
-   offsets); if not, that's a follow-up before §2 is done.
+1. ✅ **Bumped `FORMAT_VERSION` to 14.** A new
+   `FORMAT_VERSION_MULTIVOLUME = 14` constant names the floor;
+   `Checkpoint::required_format_version` returns 14 only when at
+   least one part has `Some(volume_role)`. Runs whose parts are
+   all `None` keep writing the pre-v14 layout byte-identically
+   so existing crash-resume tests do not see a sidecar-size
+   drift.
+2. ✅ **Each `PartRecord` gains an `Option<VolumeRole>` field.**
+   `None` is the linear byte-concat shape (single-URL,
+   multi-URL split-byte, and every pre-v14 checkpoint). The
+   three concrete variants are `Rar5Volume`, `SevenZVolume`,
+   and `ZipSpannedVolume`.
+   - **Wire format:** at v14+ each `PartRecord` appends a
+     presence byte after `expected_sha256`. When the presence
+     byte is `1`, a one-byte tag follows
+     (`0 = Rar5Volume`, `1 = SevenZVolume`,
+     `2 = ZipSpannedVolume`). The trailer is written for *every*
+     part once the writer commits to the v14 layout — the read
+     loop has a fixed shape, with no per-part dispatch. A mixed
+     vec (some `Some`, some `None`) is legal and round-trips
+     verbatim.
+   - **Forward-compat:** v13-and-earlier checkpoints decode with
+     every part's `volume_role` defaulting to `None`. Older
+     binaries reading a v14 checkpoint surface
+     `CheckpointError::UnsupportedVersion`.
+3. **On resume: shape match enforced.** *(Pending.)* The
+   coordinator's resume validator will fail with a typed error
+   when the discovered volume set's roles disagree with the
+   recorded set (e.g. a checkpoint that recorded `Rar5Volume`
+   parts resumed against a `.7z.NNN` set). This wires into the
+   §1 discovery output once it lands.
+4. **Mid-flight kill across a volume boundary.** *(Pending.)*
+   Existing per-part SHA-256 still verifies each volume
+   independently as it completes; the decoder context (LZ
+   window, etc.) is captured in the same `decoder_state` blob
+   the streaming formats already use. rar5's decoder state
+   across a volume boundary needs a one-line confirmation test
+   that the existing blob captures everything (LZ window +
+   PPMd model + repeat offsets); if not, that's a follow-up
+   before §2 is done.
 
-**Demo**: kill mid-decode at a volume boundary, restart, verify
-byte-identical output. Same crash-test harness as `PLAN.md` §10.3,
-extended to multi-volume fixtures.
+**Demo (pending §2..§4):** kill mid-decode at a volume
+boundary, restart, verify byte-identical output. Same
+crash-test harness as `PLAN.md` §10.3, extended to multi-volume
+fixtures.
 
 ---
 

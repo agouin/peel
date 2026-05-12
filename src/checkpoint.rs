@@ -82,6 +82,7 @@
 //!         etag,
 //!         last_modified: None,
 //!         expected_sha256: None,
+//!         volume_role: None,
 //!     }],
 //!     total_size,
 //!     chunk_size: 4 * 1024 * 1024,
@@ -205,7 +206,30 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 /// the flag). Forward-compat: v11 and earlier read as
 /// [`RunMode::Extract`]; v12 writes only fire when `mode !=
 /// Extract` (the byte-identical lower bound).
-pub const FORMAT_VERSION: u32 = 13;
+///
+/// **v13** — adds the [`Checkpoint::source_mtime`] trailer for
+/// [`RunMode::LocalDestructive`] runs
+/// (`docs/PLAN_local_file_extract.md` §5). The trailer is written
+/// only for `LocalDestructive`; every other mode falls through to
+/// the pre-§5 byte-identical layout.
+///
+/// **v14** — adds a per-[`PartRecord`] `volume_role` tag
+/// (`docs/PLAN_multivolume_archives.md` §5) so a multi-volume
+/// resume can verify the volume set's shape matches what the
+/// checkpoint was written under. The tag is per-part because each
+/// part of a multi-volume archive is its own self-contained volume
+/// with its own format-specific metadata; the role identifies
+/// which format dialect the part belongs to.
+/// [`PartRecord::volume_role`] is [`Option<VolumeRole>`]: `None`
+/// is the legacy linear byte-concat shape (today's single-URL and
+/// multi-URL behaviour). The writer only bumps the on-disk header
+/// to v14 when at least one part has `Some(role)`; runs whose
+/// parts are all `None` continue writing v8..=v13 layouts
+/// byte-identically. v14 readers parse v1..=v13 transparently
+/// with every part's `volume_role` defaulting to `None`. Older
+/// binaries refuse v14 files with
+/// [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 14;
 
 /// Pre-§F1 max format version, written when no SinkState payload
 /// uses v11-only fields. Keeping the on-disk version dynamic
@@ -228,6 +252,15 @@ const FORMAT_VERSION_RUN_MODE: u32 = 12;
 /// trailer so the resume path can defend against a same-size
 /// swap of the underlying archive between runs.
 const FORMAT_VERSION_LOCAL_DESTRUCTIVE: u32 = 13;
+
+/// `docs/PLAN_multivolume_archives.md` §5: format version the
+/// writer upgrades to when at least one [`PartRecord`] carries a
+/// non-`None` [`VolumeRole`]. The per-part role byte is appended
+/// for every part in the body (uniformly, so the read loop has a
+/// fixed shape) — runs where every part is linear byte-concat
+/// keep writing v8..=v13 layouts byte-identically so the existing
+/// resume tests do not see a sidecar-size drift on the bump.
+const FORMAT_VERSION_MULTIVOLUME: u32 = 14;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -287,6 +320,75 @@ const RUN_MODE_TAG_NO_EXTRACT: u8 = 1;
 const RUN_MODE_TAG_KEEP_ARCHIVE: u8 = 2;
 /// Run-mode tag for [`RunMode::LocalDestructive`]. Added in v13.
 const RUN_MODE_TAG_LOCAL_DESTRUCTIVE: u8 = 3;
+
+/// `docs/PLAN_multivolume_archives.md` §5: which multi-volume
+/// archive format a [`PartRecord`] represents one volume of.
+///
+/// Carried as `Option<VolumeRole>` on [`PartRecord`]; `None` means
+/// "linear byte-concat" — every pre-v14 [`PartRecord`] decodes as
+/// `None`, single-URL runs serialize `None`, and the
+/// multi-URL-source path (`docs/PLAN_multi_url_source.md`) also
+/// serializes `None` because its parts byte-concatenate into one
+/// logical stream rather than each carrying their own format
+/// metadata.
+///
+/// The three concrete variants describe the three multi-volume
+/// archive formats `peel` discovers in
+/// [`crate::multivolume`]. They are persisted so a resume can
+/// confirm the volume set discovered on the second run still has
+/// the same shape — a heterogeneous mix (e.g. a checkpoint that
+/// recorded `Rar5Volume` parts resuming against a `.7z.NNN` set)
+/// is a hard error rather than a silently-wrong decode.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VolumeRole {
+    /// One volume of a RAR5 multi-volume archive
+    /// (`<base>.part<NN>.rar`). Volumes are not a byte-concat —
+    /// each volume carries its own RAR main+end headers, and
+    /// files marked `FHD_SPLIT_BEFORE` / `FHD_SPLIT_AFTER` span
+    /// volume boundaries with the format parser stitching the
+    /// logical stream.
+    Rar5Volume,
+    /// One volume of a 7z multi-volume archive
+    /// (`<base>.7z.<NNN>`). Volumes *are* a byte-concat — the
+    /// logical `.7z` is `cat name.7z.001 … name.7z.NNN`. The role
+    /// tag is still recorded so the resume path can verify the
+    /// discovered set is a 7z volume set (and not, say, a same-
+    /// shaped numbered URL list whose parts happen to byte-
+    /// concatenate into a tar stream).
+    SevenZVolume,
+    /// One volume of a spanned ZIP archive (`<base>.z<NN>`
+    /// siblings + trailing `<base>.zip`). The final `.zip`
+    /// carries the EOCD + central directory; earlier volumes
+    /// hold the per-entry local-file-header payload, which can
+    /// itself span volume boundaries.
+    ZipSpannedVolume,
+}
+
+/// Volume-role tag for [`VolumeRole::Rar5Volume`]. Added in v14.
+const VOLUME_ROLE_TAG_RAR5: u8 = 0;
+/// Volume-role tag for [`VolumeRole::SevenZVolume`]. Added in v14.
+const VOLUME_ROLE_TAG_SEVENZ: u8 = 1;
+/// Volume-role tag for [`VolumeRole::ZipSpannedVolume`]. Added in v14.
+const VOLUME_ROLE_TAG_ZIP_SPANNED: u8 = 2;
+
+impl VolumeRole {
+    fn to_tag(self) -> u8 {
+        match self {
+            VolumeRole::Rar5Volume => VOLUME_ROLE_TAG_RAR5,
+            VolumeRole::SevenZVolume => VOLUME_ROLE_TAG_SEVENZ,
+            VolumeRole::ZipSpannedVolume => VOLUME_ROLE_TAG_ZIP_SPANNED,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            VOLUME_ROLE_TAG_RAR5 => Some(VolumeRole::Rar5Volume),
+            VOLUME_ROLE_TAG_SEVENZ => Some(VolumeRole::SevenZVolume),
+            VOLUME_ROLE_TAG_ZIP_SPANNED => Some(VolumeRole::ZipSpannedVolume),
+            _ => None,
+        }
+    }
+}
 
 impl std::fmt::Display for RunMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -796,6 +898,23 @@ pub struct PartRecord {
     /// at the part-end boundary by the
     /// [`crate::hash::IntegrityHasher`] state machine.
     pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
+    /// Multi-volume archive role this part plays, if any
+    /// (`docs/PLAN_multivolume_archives.md` §5).
+    ///
+    /// `None` is the linear byte-concat shape — every single-URL
+    /// run, every multi-URL run that byte-concatenates into a tar
+    /// (`docs/PLAN_multi_url_source.md`), and every checkpoint
+    /// written by a pre-v14 binary.
+    ///
+    /// `Some(role)` identifies which multi-volume format this
+    /// part is one volume of, so a resume can refuse to silently
+    /// stitch the wrong volume set together. Added in checkpoint
+    /// format v14; v13-and-earlier readers see `None`. The on-
+    /// disk header bumps to v14 only when at least one part has
+    /// `Some(role)` — runs whose parts are all `None` keep
+    /// writing the pre-v14 layout byte-identically so existing
+    /// crash-resume sidecar-size assertions hold.
+    pub volume_role: Option<VolumeRole>,
 }
 
 /// Active-part hasher snapshot stored in [`Checkpoint::hash_state`]
@@ -998,11 +1117,22 @@ impl Checkpoint {
                 etag: self.etag.clone(),
                 last_modified: self.last_modified.clone(),
                 expected_sha256: None,
+                volume_role: None,
             }];
             &synthesized_parts
         } else {
             &self.parts
         };
+        // v14: write a per-part volume_role trailer when at least
+        // one part carries a role. Writing it uniformly across
+        // every part (rather than only the populated ones) keeps
+        // the read loop's shape fixed: at v14 the reader always
+        // expects exactly one presence byte per part. When every
+        // part is `None` the writer falls back to the v13 layout
+        // byte-identically so multi-URL and single-source
+        // checkpoints written by v14 binaries decode under v8..=v13
+        // readers and produce identical bytes to a v13 writer.
+        let any_volume_role = parts_ref.iter().any(|p| p.volume_role.is_some());
         let parts_count = u32::try_from(parts_ref.len()).unwrap_or(u32::MAX);
         write_u32(&mut body, parts_count);
         for part in parts_ref.iter().take(parts_count as usize) {
@@ -1016,6 +1146,15 @@ impl Checkpoint {
                     body.extend_from_slice(digest);
                 }
                 None => body.push(0),
+            }
+            if any_volume_role {
+                match part.volume_role {
+                    Some(role) => {
+                        body.push(1);
+                        body.push(role.to_tag());
+                    }
+                    None => body.push(0),
+                }
             }
         }
         write_u64(&mut body, self.total_size);
@@ -1275,7 +1414,19 @@ impl Checkpoint {
             } => FORMAT_VERSION_RAR_F1,
             _ => FORMAT_VERSION_RAR_STORED_ONLY,
         };
-        mode_version.max(sink_version)
+        // v14 (`docs/PLAN_multivolume_archives.md` §5): any part
+        // carrying a non-`None` [`VolumeRole`] forces v14 so the
+        // reader's `format_version >= 14` dispatch picks up the
+        // per-part trailer. The synthesized one-element fallback
+        // path (`self.parts.is_empty()` in serialize_with) never
+        // populates a role, so it cannot drive this bump on its
+        // own — only an explicitly populated `parts` vec can.
+        let parts_version = if self.parts.iter().any(|p| p.volume_role.is_some()) {
+            FORMAT_VERSION_MULTIVOLUME
+        } else {
+            0
+        };
+        mode_version.max(sink_version).max(parts_version)
     }
 
     /// Parse a checkpoint from its on-disk binary representation.
@@ -1408,12 +1559,36 @@ impl Checkpoint {
                         });
                     }
                 };
+                let volume_role = if format_version >= FORMAT_VERSION_MULTIVOLUME {
+                    let presence = cursor.read_u8("parts[].volume_role.is_some")?;
+                    match presence {
+                        0 => None,
+                        1 => {
+                            let tag = cursor.read_u8("parts[].volume_role.tag")?;
+                            Some(VolumeRole::from_tag(tag).ok_or(
+                                CheckpointError::InvalidEnumTag {
+                                    field: "parts[].volume_role",
+                                    tag,
+                                },
+                            )?)
+                        }
+                        other => {
+                            return Err(CheckpointError::InvalidPresence {
+                                field: "parts[].volume_role",
+                                value: other,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
                 acc.push(PartRecord {
                     url,
                     size,
                     etag,
                     last_modified,
                     expected_sha256,
+                    volume_role,
                 });
             }
             acc
@@ -1803,6 +1978,7 @@ impl Checkpoint {
                 etag: etag.clone(),
                 last_modified: last_modified.clone(),
                 expected_sha256: None,
+                volume_role: None,
             }]
         };
 
@@ -2548,6 +2724,7 @@ mod tests {
                 etag,
                 last_modified,
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size,
             chunk_size: 65_536,
@@ -2580,6 +2757,7 @@ mod tests {
                 etag,
                 last_modified,
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size,
             chunk_size: 4 * 1024 * 1024,
@@ -2611,6 +2789,7 @@ mod tests {
             etag: Some("\"p0\"".into()),
             last_modified: None,
             expected_sha256: Some([0x11; crate::hash::sha256::DIGEST_LEN]),
+            volume_role: None,
         };
         let part1 = PartRecord {
             url: "https://h/a.tar.part0001".into(),
@@ -2618,6 +2797,7 @@ mod tests {
             etag: Some("\"p1\"".into()),
             last_modified: Some("Sun, 01 Jan 2026 00:00:00 GMT".into()),
             expected_sha256: Some([0x22; crate::hash::sha256::DIGEST_LEN]),
+            volume_role: None,
         };
         let part2 = PartRecord {
             url: "https://h/a.tar.part0002".into(),
@@ -2625,6 +2805,7 @@ mod tests {
             etag: None,
             last_modified: None,
             expected_sha256: None,
+            volume_role: None,
         };
         let total_size = part0.size + part1.size + part2.size;
         let mut active = crate::hash::sha256::Sha256::new();
@@ -2715,6 +2896,7 @@ mod tests {
                 etag,
                 last_modified,
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size,
             chunk_size: 4 * 1024 * 1024,
@@ -2767,7 +2949,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_thirteen() {
+    fn checkpoint_format_version_is_fourteen() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
         // work (v6), `docs/PLAN_deflate_block_decoder.md` Phase 9b's
@@ -2780,13 +2962,14 @@ mod tests {
         // `docs/PLAN_rar5_decoder.md` §F1's
         // `current_entry_decoder_state` blob (v11),
         // `docs/PLAN_download_modes.md` §5's [`RunMode`] tag (v12),
-        // and `docs/PLAN_local_file_extract.md` §5's
+        // `docs/PLAN_local_file_extract.md` §5's
         // [`RunMode::LocalDestructive`] + `source_mtime` trailer
-        // (v13) each bumped this when an optional trailer landed.
-        // If a future change resets it, this guards against
-        // silently dropping the upgrade-required signal older
-        // readers depend on.
-        assert_eq!(FORMAT_VERSION, 13);
+        // (v13), and `docs/PLAN_multivolume_archives.md` §5's
+        // per-`PartRecord` [`VolumeRole`] tag (v14) each bumped
+        // this when an optional trailer landed. If a future change
+        // resets it, this guards against silently dropping the
+        // upgrade-required signal older readers depend on.
+        assert_eq!(FORMAT_VERSION, 14);
     }
 
     // ---- §5: RunMode round-trip + forward-compat -----------------------
@@ -2804,6 +2987,7 @@ mod tests {
                 etag: Some("\"v12-mode\"".to_string()),
                 last_modified: None,
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size: 4096,
             chunk_size: 1024,
@@ -2901,6 +3085,252 @@ mod tests {
         assert_eq!(parsed.source_mtime, None);
     }
 
+    // ---- §5: multi-volume VolumeRole round-trip + forward-compat -----
+
+    /// Build a multi-part checkpoint whose `parts` carry the
+    /// supplied volume roles. Used for the v14 round-trip and
+    /// version-bump assertions below.
+    fn sample_volume_role_checkpoint(roles: &[Option<VolumeRole>]) -> Checkpoint {
+        assert!(!roles.is_empty(), "at least one part required");
+        let parts: Vec<PartRecord> = roles
+            .iter()
+            .enumerate()
+            .map(|(i, role)| PartRecord {
+                url: format!("https://h/multi.part{:04}.rar", i + 1),
+                size: 1024 * 1024,
+                etag: Some(format!("\"p{i}\"")),
+                last_modified: None,
+                expected_sha256: None,
+                volume_role: *role,
+            })
+            .collect();
+        let total_size: u64 = parts.iter().map(|p| p.size).sum();
+        Checkpoint {
+            url: parts[0].url.clone(),
+            etag: parts[0].etag.clone(),
+            last_modified: None,
+            parts,
+            total_size,
+            chunk_size: 256 * 1024,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![0xFFu8; 16],
+            created_at: UNIX_EPOCH + Duration::new(1_900_000_000, 0),
+            sink_state: SinkState::Raw { bytes_written: 0 },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+        }
+    }
+
+    #[test]
+    fn round_trip_volume_role_rar5() {
+        let ckpt = sample_volume_role_checkpoint(&[
+            Some(VolumeRole::Rar5Volume),
+            Some(VolumeRole::Rar5Volume),
+            Some(VolumeRole::Rar5Volume),
+        ]);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        for part in &parsed.parts {
+            assert_eq!(part.volume_role, Some(VolumeRole::Rar5Volume));
+        }
+    }
+
+    #[test]
+    fn round_trip_volume_role_sevenz_and_zip() {
+        // Each format gets at least one round-trip so all three
+        // tag values are exercised by the encode/decode loop.
+        for role in [VolumeRole::SevenZVolume, VolumeRole::ZipSpannedVolume] {
+            let ckpt = sample_volume_role_checkpoint(&[Some(role), Some(role)]);
+            let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+            assert_eq!(parsed, ckpt);
+            assert!(parsed.parts.iter().all(|p| p.volume_role == Some(role)));
+        }
+    }
+
+    #[test]
+    fn volume_role_bumps_format_version_to_fourteen() {
+        // At least one Some(role) → the writer must declare v14
+        // in the header so older binaries refuse cleanly with
+        // UnsupportedVersion rather than silently dropping the
+        // per-part trailer.
+        let ckpt = sample_volume_role_checkpoint(&[Some(VolumeRole::Rar5Volume)]);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_MULTIVOLUME,
+            "a populated volume_role should write v{FORMAT_VERSION_MULTIVOLUME}, got v{format_version}",
+        );
+    }
+
+    #[test]
+    fn all_none_volume_role_does_not_bump_to_v14() {
+        // Byte-identical guarantee: a multi-URL or single-source
+        // checkpoint whose parts all have `volume_role: None`
+        // serializes to the pre-v14 layout. The actual on-disk
+        // version is `required_format_version`, which dips below
+        // v14 for payloads that fit older layouts (a Raw-sink
+        // Extract-mode all-None checkpoint sits at v10).
+        let ckpt = sample_volume_role_checkpoint(&[None, None, None]);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert!(
+            format_version < FORMAT_VERSION_MULTIVOLUME,
+            "all-None volume_role should not bump to v{FORMAT_VERSION_MULTIVOLUME}; got v{format_version}",
+        );
+        // And reading it back must round-trip with every part's
+        // volume_role decoded as None.
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+        for part in &parsed.parts {
+            assert_eq!(part.volume_role, None);
+        }
+    }
+
+    #[test]
+    fn mixed_volume_role_writes_full_v14_trailer_for_every_part() {
+        // The writer's per-part trailer is unconditional once any
+        // part carries `Some(role)` — the read loop has a fixed
+        // shape at v14. Verify a mixed vec round-trips by reading
+        // back each part's role exactly.
+        let ckpt = sample_volume_role_checkpoint(&[
+            Some(VolumeRole::Rar5Volume),
+            None,
+            Some(VolumeRole::Rar5Volume),
+        ]);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(format_version, FORMAT_VERSION_MULTIVOLUME);
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+        let roles: Vec<Option<VolumeRole>> = parsed.parts.iter().map(|p| p.volume_role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                Some(VolumeRole::Rar5Volume),
+                None,
+                Some(VolumeRole::Rar5Volume)
+            ],
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_volume_role_tag() {
+        // Hand-build a v14 body with parts.len()=1 carrying a
+        // volume_role presence byte = 1 (Some) and an unknown tag
+        // value. Reader must surface InvalidEnumTag for
+        // `parts[].volume_role` rather than silently mapping to a
+        // default variant.
+        let mut body = Vec::new();
+        write_u32(&mut body, 1); // parts.len = 1
+        write_string(&mut body, "u");
+        write_u64(&mut body, 0); // size
+        write_optional_string(&mut body, None); // etag
+        write_optional_string(&mut body, None); // last_modified
+        body.push(0); // expected_sha256 absent
+        body.push(1); // volume_role presence
+        body.push(0xEE); // unknown volume_role tag
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION_MULTIVOLUME);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::InvalidEnumTag { field, tag } => {
+                assert_eq!(tag, 0xEE);
+                assert_eq!(field, "parts[].volume_role");
+            }
+            other => panic!("expected InvalidEnumTag(volume_role), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_volume_role_presence_byte() {
+        // Same shape as above but with the presence byte itself
+        // out of range. Reader must surface InvalidPresence rather
+        // than the InvalidEnumTag arm.
+        let mut body = Vec::new();
+        write_u32(&mut body, 1);
+        write_string(&mut body, "u");
+        write_u64(&mut body, 0);
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        body.push(0); // expected_sha256 absent
+        body.push(7); // bogus volume_role presence
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION_MULTIVOLUME);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::InvalidPresence { field, value } => {
+                assert_eq!(value, 7);
+                assert_eq!(field, "parts[].volume_role");
+            }
+            other => panic!("expected InvalidPresence(volume_role), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v13_checkpoint_bytes_decode_with_volume_role_none() {
+        // Forward-compat: a v13 body (multi-URL, Raw sink, no
+        // mode trailer) read by the v14 reader must surface every
+        // part's volume_role as None — the reader's `format_version
+        // >= 14` dispatch must NOT consume any bytes for v13
+        // checkpoints. Build the body by hand at v8 layout (which
+        // every version up to and including v13 inherits for the
+        // parts loop), frame at v13.
+        let mut body = Vec::new();
+        write_u32(&mut body, 2); // parts.len = 2
+                                 // parts[0]
+        write_string(&mut body, "https://h/a");
+        write_u64(&mut body, 1024);
+        write_optional_string(&mut body, Some("\"e0\""));
+        write_optional_string(&mut body, None);
+        body.push(0); // expected_sha256 absent
+                      // parts[1]
+        write_string(&mut body, "https://h/b");
+        write_u64(&mut body, 2048);
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        body.push(0); // expected_sha256 absent
+        write_u64(&mut body, 3072); // total_size
+        write_u64(&mut body, 1024); // chunk_size
+        write_u64(&mut body, 0); // decoder_position
+        write_byte_array(&mut body, &[0xFFu8; 1]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 0);
+        body.push(0); // hash_state absent
+        body.push(0); // chunk_crc32c absent
+        body.push(0); // decoder_state absent
+                      // Skip the v12 mode trailer — Extract is implicit when
+                      // remaining() == 0.
+
+        let bytes = frame_legacy_body(&body, 13);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v13 still parses");
+        assert_eq!(parsed.parts.len(), 2);
+        for part in &parsed.parts {
+            assert_eq!(
+                part.volume_role, None,
+                "v13 readers should not conjure a volume_role",
+            );
+        }
+    }
+
     #[test]
     fn pre_v12_checkpoints_decode_as_extract_mode() {
         // Forward-compat: take a v12 Extract checkpoint (which
@@ -2925,6 +3355,7 @@ mod tests {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size: 4_096_000,
             chunk_size: 65_536,
@@ -2982,6 +3413,7 @@ mod tests {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size: 8_192_000,
             chunk_size: 65_536,
@@ -3610,6 +4042,7 @@ mod tests {
                 etag: Some(String::new()),
                 last_modified: Some(String::new()),
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size: 0,
             chunk_size: 0,
@@ -3712,17 +4145,22 @@ mod tests {
 
     #[test]
     fn rejects_invalid_sink_tag() {
-        // Build a v8 body that has every field up to a bogus sink tag,
-        // then re-frame.
+        // Build a v14-shaped body that has every field up to a
+        // bogus sink tag, then re-frame at FORMAT_VERSION. Framing
+        // tracks the current `FORMAT_VERSION` so the test exercises
+        // the latest reader's dispatch — every per-part field
+        // (including the v14 volume_role trailer when at v14+) must
+        // be supplied for the read to reach the sink-tag check.
         let mut body = Vec::new();
         // parts: 1 element, url="u", size=0, no etag, no last_modified,
-        // no expected_sha256.
+        // no expected_sha256, no volume_role.
         write_u32(&mut body, 1);
         write_string(&mut body, "u");
         write_u64(&mut body, 0);
         write_optional_string(&mut body, None);
         write_optional_string(&mut body, None);
         body.push(0); // expected_sha256 absent
+        body.push(0); // v14: volume_role absent
         write_u64(&mut body, 0); // total_size
         write_u64(&mut body, 0); // chunk_size
         write_u64(&mut body, 0); // decoder_position
@@ -4130,6 +4568,7 @@ mod tests {
                     etag,
                     last_modified,
                     expected_sha256: None,
+                    volume_role: None,
                 }],
                 total_size,
                 chunk_size,

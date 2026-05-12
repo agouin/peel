@@ -3948,6 +3948,7 @@ fn parts_from_source(
             etag: p.fingerprint.etag.clone(),
             last_modified: p.fingerprint.last_modified.clone(),
             expected_sha256: None,
+            volume_role: None,
         })
         .collect()
 }
@@ -4847,6 +4848,7 @@ mod tests {
                 etag,
                 last_modified: None,
                 expected_sha256: None,
+                volume_role: None,
             }],
             total_size,
             chunk_size,

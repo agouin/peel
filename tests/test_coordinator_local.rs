@@ -307,6 +307,7 @@ fn local_destructive_resume_rejects_size_drift() {
             etag: None,
             last_modified: None,
             expected_sha256: None,
+            volume_role: None,
         }],
         total_size: total_size + 1, // mismatch
         chunk_size: 0,
@@ -362,6 +363,7 @@ fn local_destructive_resume_rejects_mode_mismatch() {
             etag: None,
             last_modified: None,
             expected_sha256: None,
+            volume_role: None,
         }],
         total_size,
         chunk_size: 0,
@@ -422,6 +424,7 @@ fn local_non_destructive_ignores_stale_ckpt() {
             etag: None,
             last_modified: None,
             expected_sha256: None,
+            volume_role: None,
         }],
         total_size: std::fs::metadata(&source).unwrap().len(),
         chunk_size: 0,

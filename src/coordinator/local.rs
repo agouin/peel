@@ -558,6 +558,7 @@ fn build_local_checkpoint(
             etag: None,
             last_modified: None,
             expected_sha256: None,
+            volume_role: None,
         }],
         total_size,
         chunk_size: 0,
