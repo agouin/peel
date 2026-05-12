@@ -676,20 +676,69 @@ fn strip_archive_extensions(name: &str) -> &str {
 }
 
 /// Derive the default output directory when neither `-C` nor `-o` is
-/// given: parse the URL, take its basename, strip the multi-part
-/// `.partNNNN` suffix (`docs/PLAN_multi_url_source.md` §3 step 4) if
-/// present, then strip known compression / archive extensions, and
+/// given: parse the URL, take its basename, strip the multi-volume
+/// volume suffix (`docs/PLAN_multivolume_archives.md` §6 — handles
+/// `.part<NN>.rar`, `.7z.<NN>`, `.z<NN>`, `.zip`), fall back to the
+/// `.partNNNN` byte-concat suffix
+/// (`docs/PLAN_multi_url_source.md` §3 step 4) if no volume pattern
+/// matched, then strip known compression / archive extensions, and
 /// place the result in the current working directory (as a relative
 /// path).
 fn default_output_dir(url: &str) -> Result<PathBuf, CliError> {
     let parsed = Url::parse(url).map_err(CliError::InvalidUrl)?;
     let name = filename_from_url(&parsed).ok_or(CliError::NoDefaultOutput)?;
-    let depart = strip_part_suffix(&name);
+    let depart = strip_volume_or_part_suffix(&name);
     let stripped = strip_archive_extensions(depart);
     if stripped.is_empty() {
         return Err(CliError::NoDefaultOutput);
     }
     Ok(PathBuf::from(stripped))
+}
+
+/// Strip either a multi-volume volume suffix
+/// (`docs/PLAN_multivolume_archives.md` §6 — `.part<NN>.rar`,
+/// `.7z.<NN>`, `.z<NN>`, `.zip`) or a byte-concat `.partNNNN`
+/// suffix. Used by the output-name derivation so a seed of
+/// `foo.7z.001` lands at `./foo/` rather than `./foo.7z.001/`,
+/// and `foo.tar.part0000` keeps landing at `./foo/`.
+///
+/// The multi-volume pattern is checked first because some names
+/// (e.g. `foo.tar.part0001.rar`) match both; the volume pattern
+/// peels off the `.part0001.rar` suffix in one step while the
+/// byte-concat parser would only see `.part0001` if the `.rar`
+/// were not at the tail.
+fn strip_volume_or_part_suffix(name: &str) -> &str {
+    if let Some(parsed) = crate::multivolume::parse_volume_name(name) {
+        // For ZIP final volumes (`<base>.zip`) the parsed base is
+        // the user-facing identity, which is also what
+        // [`strip_archive_extensions`] would have produced from
+        // the original name (`.zip` is in `STRIPPABLE_EXTENSIONS`).
+        // Either path lands on the same prefix.
+        return slice_for_base(name, &parsed.base);
+    }
+    strip_part_suffix(name)
+}
+
+/// Helper for [`strip_volume_or_part_suffix`]: locate the
+/// `base` prefix inside `name` and return the corresponding slice
+/// from `name` so the result keeps the original casing rather than
+/// the lowercased / normalized base returned by [`parse_volume_name`].
+fn slice_for_base<'a>(name: &'a str, base: &str) -> &'a str {
+    if name.len() >= base.len()
+        && name[..base.len()].eq_ignore_ascii_case(base)
+        && name.as_bytes()[..base.len()] == *base.as_bytes()
+    {
+        &name[..base.len()]
+    } else if name.len() >= base.len() && name[..base.len()].eq_ignore_ascii_case(base) {
+        // Case-folded match but bytes differ (e.g. seed had mixed
+        // case for the base portion that parse_volume_name kept).
+        &name[..base.len()]
+    } else {
+        // Defensive: parse_volume_name guarantees `base` is a
+        // prefix of the original basename (modulo the suffix it
+        // peeled off), so this branch is unreachable in practice.
+        name
+    }
 }
 
 /// If `name` ends in `.partNNNN…` (one or more decimal digits, any
@@ -812,7 +861,7 @@ fn shape_from_url_or_format(
     }
     let parsed = Url::parse(primary_url).ok()?;
     let basename = filename_from_url(&parsed)?;
-    let depart = strip_part_suffix(&basename);
+    let depart = strip_volume_or_part_suffix(&basename);
     registry.shape_for_name(depart)
 }
 
@@ -845,7 +894,7 @@ fn resolve_keep_archive(
         // server-side splits.
         let parsed = Url::parse(primary_url).map_err(CliError::InvalidUrl)?;
         let basename = filename_from_url(&parsed).ok_or(CliError::NoDefaultOutput)?;
-        let depart = strip_part_suffix(&basename);
+        let depart = strip_volume_or_part_suffix(&basename);
         if depart.is_empty() {
             return Err(CliError::NoDefaultOutput);
         }
@@ -874,10 +923,12 @@ fn resolve_keep_archive(
 fn default_output_file_with_suffix(url: &str) -> Result<PathBuf, CliError> {
     let parsed = Url::parse(url).map_err(CliError::InvalidUrl)?;
     let name = filename_from_url(&parsed).ok_or(CliError::NoDefaultOutput)?;
-    // Strip the multi-part `.partNNNN` suffix so the user gets a
-    // single output file when downloading split-archive parts. The
-    // compression suffix (if any) is intentionally preserved.
-    let depart = strip_part_suffix(&name);
+    // Strip the multi-volume volume suffix (multivolume §6) or the
+    // byte-concat `.partNNNN` suffix, so the user gets a single
+    // output file when downloading split-archive parts or
+    // multi-volume seeds. The compression suffix (if any) is
+    // intentionally preserved.
+    let depart = strip_volume_or_part_suffix(&name);
     if depart.is_empty() {
         return Err(CliError::NoDefaultOutput);
     }
@@ -2450,6 +2501,60 @@ mod tests {
         assert_eq!(strip_part_suffix("pruned.tar"), "pruned.tar");
         assert_eq!(strip_part_suffix("pruned.partAA"), "pruned.partAA");
         assert_eq!(strip_part_suffix("pruned.part"), "pruned.part");
+    }
+
+    #[test]
+    fn strip_volume_or_part_handles_multivolume_names() {
+        // RAR5 multi-volume: peels the `.part<N>.rar` suffix.
+        assert_eq!(strip_volume_or_part_suffix("foo.part0001.rar"), "foo");
+        assert_eq!(
+            strip_volume_or_part_suffix("dataset.tar.part12.rar"),
+            "dataset.tar"
+        );
+        // 7z multi-volume: peels `.7z.<NNN>`.
+        assert_eq!(strip_volume_or_part_suffix("snap.7z.001"), "snap");
+        assert_eq!(strip_volume_or_part_suffix("snap.tar.7z.005"), "snap.tar");
+        // ZIP spanned: peels `.z<NN>` siblings AND the `.zip` final.
+        assert_eq!(strip_volume_or_part_suffix("archive.z01"), "archive");
+        assert_eq!(strip_volume_or_part_suffix("archive.zip"), "archive");
+        // Byte-concat `.partNNNN` still falls through to the legacy
+        // strip when no multi-volume pattern matches.
+        assert_eq!(
+            strip_volume_or_part_suffix("pruned.tar.part0000"),
+            "pruned.tar"
+        );
+        // Non-matching names pass through.
+        assert_eq!(strip_volume_or_part_suffix("foo.tar.zst"), "foo.tar.zst");
+    }
+
+    #[test]
+    fn default_output_dir_strips_7z_multivolume_suffix() {
+        let cli = Cli::try_parse_from(["peel", "https://h/snap/pruned.7z.001"]).expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        match args.output {
+            OutputTarget::Dir(p) => assert_eq!(p, PathBuf::from("pruned")),
+            OutputTarget::File(_) => panic!("expected Dir target"),
+        }
+    }
+
+    #[test]
+    fn default_output_dir_strips_rar5_multivolume_suffix() {
+        let cli = Cli::try_parse_from(["peel", "https://h/foo.part0001.rar"]).expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        match args.output {
+            OutputTarget::Dir(p) => assert_eq!(p, PathBuf::from("foo")),
+            OutputTarget::File(_) => panic!("expected Dir target"),
+        }
+    }
+
+    #[test]
+    fn default_output_dir_strips_zip_spanned_suffix() {
+        let cli = Cli::try_parse_from(["peel", "https://h/archive.z01"]).expect("parse");
+        let args = cli.into_run_args().expect("run args");
+        match args.output {
+            OutputTarget::Dir(p) => assert_eq!(p, PathBuf::from("archive")),
+            OutputTarget::File(_) => panic!("expected Dir target"),
+        }
     }
 
     // ---- §2: --no-extract -----------------------------------------------

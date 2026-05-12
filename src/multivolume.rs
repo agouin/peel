@@ -178,6 +178,21 @@ pub enum MvError {
         #[source]
         source: std::io::Error,
     },
+    /// Discovery walked forward past the safety cap without seeing
+    /// a 404 / `ENOENT`. Surfaces when the origin is misconfigured
+    /// (always returns 2xx) or the user pointed peel at a
+    /// pathologically large volume set; the cap protects against an
+    /// infinite probe loop.
+    #[error(
+        "{kind} discovery exceeded {cap} volumes without observing a missing volume — \
+         the origin / filesystem may be misconfigured (every probed sibling returned success)"
+    )]
+    DiscoveryExceededCap {
+        /// Format whose discovery exceeded the cap.
+        kind: VolumeKind,
+        /// Maximum volume count discovery is willing to walk.
+        cap: u32,
+    },
     /// A sibling URL constructed from the seed could not be parsed
     /// back into a [`Url`]. Realistically unreachable — the URL
     /// crate's [`Url::join`] returns this for malformed input and
@@ -238,6 +253,17 @@ pub fn format_volume_name(base: &str, kind: VolumeKind, volume: u32, width: usiz
 pub fn format_zip_final(base: &str) -> String {
     format!("{base}.zip")
 }
+
+/// Maximum volume count any discovery walk will probe before
+/// surfacing [`MvError::DiscoveryExceededCap`]. The real-world
+/// upper bound for a multi-volume archive is well below this
+/// (rar's `-v` per-volume size is typically MiB-to-GiB; a 100k-
+/// volume archive would imply a ridiculously small volume size).
+/// The cap exists to protect against an origin that returns 2xx
+/// for *every* probed sibling — e.g. test mocks that don't model
+/// 404 — so a misconfigured server cannot pin discovery in an
+/// infinite loop.
+pub const DISCOVERY_VOLUME_CAP: u32 = 9_999;
 
 /// Discover the full ordered set of volume paths from a local-mode
 /// seed.
@@ -443,7 +469,9 @@ fn strip_suffix_ci<'a>(input: &'a str, suffix: &str) -> Option<&'a str> {
 
 /// Walk forward over numbered volumes (`{base}.part{N}.rar` or
 /// `{base}.7z.{N}`) until the first `ENOENT`. Verify the seed's
-/// volume number is in `[1, last_found]`.
+/// volume number is in `[1, last_found]`. Capped at
+/// [`DISCOVERY_VOLUME_CAP`] to bound the worst case when every
+/// probed path appears to exist.
 fn walk_forward_local(
     parent: &Path,
     base: &str,
@@ -453,27 +481,27 @@ fn walk_forward_local(
 ) -> Result<Vec<PathBuf>, MvError> {
     debug_assert!(matches!(kind, VolumeKind::Rar5 | VolumeKind::SevenZ));
     let mut volumes = Vec::new();
-    let mut n: u32 = 1;
-    loop {
+    for n in 1..=DISCOVERY_VOLUME_CAP {
         let name = format_volume_name(base, kind, n, width);
         let path = parent.join(&name);
         match path.metadata() {
             Ok(_) => volumes.push(path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if seed_volume == 0 || (seed_volume as usize) > volumes.len() {
+                    return Err(MvError::MissingVolume {
+                        kind,
+                        missing: seed_volume,
+                    });
+                }
+                return Ok(volumes);
+            }
             Err(source) => return Err(MvError::Io { path, source }),
         }
-        n = n.checked_add(1).ok_or(MvError::MissingVolume {
-            kind,
-            missing: u32::MAX,
-        })?;
     }
-    if seed_volume == 0 || (seed_volume as usize) > volumes.len() {
-        return Err(MvError::MissingVolume {
-            kind,
-            missing: seed_volume,
-        });
-    }
-    Ok(volumes)
+    Err(MvError::DiscoveryExceededCap {
+        kind,
+        cap: DISCOVERY_VOLUME_CAP,
+    })
 }
 
 /// Spanned-ZIP local discovery.
@@ -495,19 +523,24 @@ fn discover_zip_local(
 ) -> Result<Vec<PathBuf>, MvError> {
     let width = if parsed.width == 0 { 2 } else { parsed.width };
     let mut volumes = Vec::new();
-    let mut n: u32 = 1;
-    loop {
+    let mut hit_cap = true;
+    for n in 1..=DISCOVERY_VOLUME_CAP {
         let name = format_volume_name(&parsed.base, VolumeKind::Zip, n, width);
         let path = parent.join(&name);
         match path.metadata() {
             Ok(_) => volumes.push(path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                hit_cap = false;
+                break;
+            }
             Err(source) => return Err(MvError::Io { path, source }),
         }
-        n = n.checked_add(1).ok_or(MvError::MissingVolume {
+    }
+    if hit_cap {
+        return Err(MvError::DiscoveryExceededCap {
             kind: VolumeKind::Zip,
-            missing: u32::MAX,
-        })?;
+            cap: DISCOVERY_VOLUME_CAP,
+        });
     }
     let final_name = format_zip_final(&parsed.base);
     let final_path = parent.join(&final_name);
@@ -574,7 +607,11 @@ fn head_volume(client: &Client, url: &Url) -> Result<Option<Url>, MvError> {
     }
 }
 
-/// HTTP version of [`walk_forward_local`].
+/// HTTP version of [`walk_forward_local`]. Capped at
+/// [`DISCOVERY_VOLUME_CAP`]: an origin that returns 2xx for every
+/// probed sibling (a misconfigured mock or a captive-portal style
+/// 200) surfaces [`MvError::DiscoveryExceededCap`] rather than
+/// spinning forever.
 fn walk_forward_http(
     client: &Client,
     seed: &Url,
@@ -585,8 +622,7 @@ fn walk_forward_http(
 ) -> Result<Vec<Url>, MvError> {
     debug_assert!(matches!(kind, VolumeKind::Rar5 | VolumeKind::SevenZ));
     let mut volumes = Vec::new();
-    let mut n: u32 = 1;
-    loop {
+    for n in 1..=DISCOVERY_VOLUME_CAP {
         let name = format_volume_name(base, kind, n, width);
         let candidate = seed.join(&name).map_err(|source| MvError::BadSiblingUrl {
             name: name.clone(),
@@ -594,28 +630,29 @@ fn walk_forward_http(
         })?;
         match head_volume(client, &candidate)? {
             Some(final_url) => volumes.push(final_url),
-            None => break,
+            None => {
+                if seed_volume == 0 || (seed_volume as usize) > volumes.len() {
+                    return Err(MvError::MissingVolume {
+                        kind,
+                        missing: seed_volume,
+                    });
+                }
+                return Ok(volumes);
+            }
         }
-        n = n.checked_add(1).ok_or(MvError::MissingVolume {
-            kind,
-            missing: u32::MAX,
-        })?;
     }
-    if seed_volume == 0 || (seed_volume as usize) > volumes.len() {
-        return Err(MvError::MissingVolume {
-            kind,
-            missing: seed_volume,
-        });
-    }
-    Ok(volumes)
+    Err(MvError::DiscoveryExceededCap {
+        kind,
+        cap: DISCOVERY_VOLUME_CAP,
+    })
 }
 
 /// HTTP version of [`discover_zip_local`].
 fn discover_zip_http(client: &Client, seed: &Url, parsed: VolumeName) -> Result<Vec<Url>, MvError> {
     let width = if parsed.width == 0 { 2 } else { parsed.width };
     let mut volumes = Vec::new();
-    let mut n: u32 = 1;
-    loop {
+    let mut hit_cap = true;
+    for n in 1..=DISCOVERY_VOLUME_CAP {
         let name = format_volume_name(&parsed.base, VolumeKind::Zip, n, width);
         let candidate = seed.join(&name).map_err(|source| MvError::BadSiblingUrl {
             name: name.clone(),
@@ -623,12 +660,17 @@ fn discover_zip_http(client: &Client, seed: &Url, parsed: VolumeName) -> Result<
         })?;
         match head_volume(client, &candidate)? {
             Some(final_url) => volumes.push(final_url),
-            None => break,
+            None => {
+                hit_cap = false;
+                break;
+            }
         }
-        n = n.checked_add(1).ok_or(MvError::MissingVolume {
+    }
+    if hit_cap {
+        return Err(MvError::DiscoveryExceededCap {
             kind: VolumeKind::Zip,
-            missing: u32::MAX,
-        })?;
+            cap: DISCOVERY_VOLUME_CAP,
+        });
     }
     let final_name = format_zip_final(&parsed.base);
     let final_candidate = seed
@@ -666,6 +708,17 @@ fn path_basename(p: &Path) -> &str {
 
 /// Extract a basename from a [`Url`]'s path, dropping any query
 /// string. The returned slice borrows from the URL's stored path.
+///
+/// Re-exported under a name explicit about its purpose for callers
+/// outside this module who need to feed [`parse_volume_name`] from
+/// a [`Url`] without re-implementing the path-to-basename slice.
+#[must_use]
+pub fn url_basename_for_discovery(url: &Url) -> &str {
+    url_basename(url)
+}
+
+/// Extract a basename from a [`Url`]'s path, dropping any query
+/// string.
 fn url_basename(url: &Url) -> &str {
     let path = url.path();
     let no_query = match path.find('?') {
