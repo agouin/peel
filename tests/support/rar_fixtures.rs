@@ -194,8 +194,46 @@ pub fn build_file_header(entry: &RarEntrySpec) -> (Vec<u8>, Vec<u8>) {
 /// before we get here, but the marker still terminates the byte
 /// stream).
 pub fn build_end_of_archive() -> Vec<u8> {
-    let fields = encode_vint(0);
+    build_end_of_archive_with_flags(false)
+}
+
+/// Build an end-of-archive header (header type 5) and explicitly set
+/// the `more_volumes` flag. Pairs with [`build_rar5_multivolume`]
+/// (§2b): non-final volumes carry `more_volumes=true`, the final
+/// volume carries `more_volumes=false`.
+pub fn build_end_of_archive_with_flags(more_volumes: bool) -> Vec<u8> {
+    let fields = encode_vint(if more_volumes { 0x0001 } else { 0 });
     build_generic_header(5, 0, &fields, &[], None)
+}
+
+/// Build a synthetic multi-volume RAR5 archive: one `Vec<u8>` per
+/// volume, in order. Each volume gets its own signature + main
+/// header (`MHD_VOLUME | MHD_VOLUME_NUMBER`, 0-based volume_number
+/// matching the position) + the caller's entries + an
+/// end-of-archive header with `more_volumes=true` (all but the
+/// last volume) or `more_volumes=false` (last volume).
+///
+/// `per_volume` is one entry list per volume. Entries must fit
+/// entirely inside their volume — this builder does not emit
+/// `FHD_SPLIT_BEFORE` / `FHD_SPLIT_AFTER` (§2d's job, alongside the
+/// walker-side support for cross-volume continuations).
+pub fn build_rar5_multivolume(per_volume: &[Vec<RarEntrySpec>]) -> Vec<Vec<u8>> {
+    let mut volumes = Vec::with_capacity(per_volume.len());
+    for (i, entries) in per_volume.iter().enumerate() {
+        let mut vol = Vec::new();
+        vol.extend_from_slice(&SIGNATURE_MAGIC);
+        let flags = arc_flags::VOLUME | arc_flags::VOLUME_NUMBER;
+        vol.extend_from_slice(&build_main_header(flags, Some(i as u64)));
+        for entry in entries {
+            let (header, data) = build_file_header(entry);
+            vol.extend_from_slice(&header);
+            vol.extend_from_slice(&data);
+        }
+        let is_last = i + 1 == per_volume.len();
+        vol.extend_from_slice(&build_end_of_archive_with_flags(!is_last));
+        volumes.push(vol);
+    }
+    volumes
 }
 
 /// Build a complete RAR5 archive: signature + main header (with the

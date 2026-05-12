@@ -164,4 +164,20 @@ pub enum RarError {
     /// this is the rar-side container.
     #[error("RAR encryption: {0}")]
     Encryption(#[source] EncryptionError),
+
+    /// The supplied set of volume buffers does not match the
+    /// multi-volume archive's declared shape — either a volume past
+    /// the end of the supplied set carries the end-of-archive
+    /// `more_volumes` flag (caller did not supply enough volumes),
+    /// or an end-of-archive marker without `more_volumes` was
+    /// observed before all supplied volumes were consumed (caller
+    /// supplied extra volumes). Distinct from [`Self::CorruptHeader`]:
+    /// every individual volume parses cleanly; the mismatch is
+    /// between volumes.
+    #[error("RAR volume-set mismatch: {detail}")]
+    VolumeSetMismatch {
+        /// Human-readable detail naming the affected volume and the
+        /// nature of the mismatch.
+        detail: String,
+    },
 }

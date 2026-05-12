@@ -1,23 +1,37 @@
-//! Archive-level walker over a RAR5 byte buffer.
+//! Archive-level walker over a RAR5 byte buffer (or buffer set).
 //!
 //! Drives [`crate::rar::format`]'s per-header parsers from the
 //! signature at offset 0 to the end-of-archive marker, surfacing the
 //! archive-wide flags and the per-file metadata the §1 demo prints.
-//! Round-one consumers feed the entire archive bytes (the §3
-//! pipeline streams ranged downloads on top of the same parser
-//! primitives, but for §1's "open archive, list entries" milestone
-//! the in-memory walker is the simplest exercise of the wire-format
-//! layer end-to-end).
+//! The walker exposes two front doors with the same shape:
 //!
-//! The walker enforces the §0 round-one rejections:
+//! - [`walk_archive`] takes a single byte buffer containing one
+//!   self-contained archive (single-volume or, after
+//!   `docs/PLAN_multivolume_archives.md` §2, the first volume of a
+//!   set when the caller only has the first volume in hand).
+//! - [`walk_archive_multivolume`] takes an ordered slice of volume
+//!   buffers and stitches them into one [`ArchiveSummary`] whose
+//!   `data_offset` fields are absolute byte offsets into the byte
+//!   concatenation of the volumes in input order. Each volume's
+//!   leading signature and main archive header are skipped; the
+//!   walker still counts the bytes they occupy in the global offset
+//!   space because the §3 pipeline addresses entries through a
+//!   [`crate::download::multi_url::MultiPartSource`] whose virtual
+//!   stream is exactly that concatenation.
+//!
+//! The walker enforces the round-one rejections:
 //!
 //! - **RAR4** — surfaced by [`crate::rar::format::parse_signature`]
 //!   as [`crate::rar::RarError::UnsupportedFormatVersion`].
-//! - **Multi-volume** (`MHD_VOLUME` set in the main archive header)
-//!   — [`crate::rar::RarError::UnsupportedFeature`] naming the
-//!   detected volume number.
 //! - **Archive encryption header** (header type 4) —
 //!   [`crate::rar::RarError::UnsupportedFeature`].
+//!
+//! Multi-volume support layers in by sub-phase
+//! (`docs/PLAN_multivolume_archives.md` §2). §2b lands the
+//! per-volume walk but rejects file headers carrying
+//! `FHD_SPLIT_BEFORE` / `FHD_SPLIT_AFTER` with a precise
+//! [`RarError::UnsupportedFeature`] naming the affected entry — the
+//! cross-volume continuation logic lands in §2d.
 
 use crate::encryption::EncryptionError;
 use crate::rar::encrypt::{
@@ -25,7 +39,7 @@ use crate::rar::encrypt::{
 };
 use crate::rar::error::RarError;
 use crate::rar::format::{
-    parse_end_of_archive_header, parse_file_header, parse_generic_header,
+    arc_flags, hdr_flags, parse_end_of_archive_header, parse_file_header, parse_generic_header,
     parse_main_archive_header, parse_signature, FileHeader, HeaderType,
 };
 
@@ -45,9 +59,14 @@ pub struct ArchiveSummary {
     pub has_recovery_record: bool,
     /// `true` iff the archive is "locked" (advisory bit).
     pub locked: bool,
-    /// `true` iff the end-of-archive header carried the
-    /// `more_volumes` flag — informational only in round-one
-    /// (multi-volume archives are rejected at the main header).
+    /// `true` iff the **final** processed volume's end-of-archive
+    /// header carried the `more_volumes` flag. After
+    /// [`walk_archive_multivolume`] returns successfully on a
+    /// multi-volume input this is always `false` (otherwise the
+    /// walker would have surfaced [`RarError::VolumeSetMismatch`]).
+    /// For the single-volume [`walk_archive`] entry point, `true`
+    /// means the caller fed the first volume of a multi-volume set
+    /// and would need to provide the rest to extract entries.
     pub eof_more_volumes: bool,
     /// One entry per file header (header type 2). Service headers
     /// (type 3) are skipped — round-one does not extract recovery
@@ -62,8 +81,11 @@ pub struct FileEntry {
     pub header: FileHeader,
     /// Byte offset of the entry's compressed data within the
     /// archive (the offset of the first byte of the data area
-    /// following the file header). The §3 pipeline uses this to
-    /// schedule a ranged download for the entry's payload.
+    /// following the file header). For [`walk_archive_multivolume`]
+    /// this is the absolute offset into the byte concatenation of
+    /// all volumes in input order — directly consumable by the §3
+    /// pipeline's [`crate::download::multi_url::MultiPartSource`]
+    /// without further translation.
     pub data_offset: u64,
     /// Compressed-data length in bytes (i.e. the file header's
     /// `data_size`). For unencrypted STORED entries this equals
@@ -82,28 +104,74 @@ pub struct FileEntry {
     pub encryption: Option<FileEncryptionRecord>,
 }
 
-/// Walk an entire RAR5 archive in `buf` and produce the
-/// [`ArchiveSummary`].
+/// Walk a single RAR5 buffer and produce the [`ArchiveSummary`].
 ///
-/// `buf` must start at the very beginning of the archive (byte 0,
-/// the start of the magic) and contain the full archive contents
-/// through the end-of-archive header.
+/// Convenience wrapper around [`walk_archive_multivolume`] for the
+/// common single-volume case. `buf` must start at byte 0 of the
+/// archive and contain the full archive contents through the
+/// end-of-archive header.
+///
+/// When `buf` is the first volume of a multi-volume set and any
+/// entry spans into a following volume, the walker surfaces
+/// [`RarError::UnsupportedFeature`] naming the affected entry (per
+/// `docs/PLAN_multivolume_archives.md` §2b). Callers that hold the
+/// rest of the volumes route through [`walk_archive_multivolume`].
 ///
 /// # Errors
 ///
-/// - [`RarError::BadSignature`] / [`RarError::UnsupportedFormatVersion`]
-///   from [`parse_signature`].
-/// - [`RarError::UnsupportedFeature`] for multi-volume archives,
-///   archive-encryption headers (type 4), or unknown header types
-///   that lack the `SKIP_IF_UNKNOWN` flag.
-/// - [`RarError::CorruptHeader`] / [`RarError::Truncated`] /
-///   [`RarError::HeaderCrc32Mismatch`] from the per-header parsers.
-/// - [`RarError::CorruptHeader`] (`reason = "missing end-of-archive
-///   marker"`) if the byte stream ends before a header-type-5
-///   header is observed.
+/// See [`walk_archive_multivolume`].
 pub fn walk_archive(buf: &[u8]) -> Result<ArchiveSummary, RarError> {
-    let sig_size = parse_signature(buf)?;
-    let mut cursor: usize = sig_size;
+    walk_archive_multivolume(&[buf])
+}
+
+/// Walk an ordered set of RAR5 volume buffers and produce one
+/// [`ArchiveSummary`] over the whole set.
+///
+/// Each `volumes[i]` must start at byte 0 of its respective volume
+/// (the RAR5 signature). Volumes are processed left-to-right; the
+/// walker:
+///
+/// - parses each volume's signature + main archive header;
+/// - records the archive-wide flags from the **first** volume's
+///   main header (the spec requires `MHD_SOLID` and recovery-record
+///   flags to match across volumes; volumes 2+ are spot-checked
+///   only for `MHD_VOLUME` and the optional volume number);
+/// - aggregates [`FileEntry`] metadata across volumes, with
+///   `data_offset` in the global byte space (i.e. accounting for
+///   prior volumes' on-disk sizes);
+/// - verifies each non-final volume terminates with an
+///   `EndArchive` header carrying `more_volumes = true`, and the
+///   final volume's `EndArchive` clears the bit.
+///
+/// Until `docs/PLAN_multivolume_archives.md` §2d, any file header
+/// carrying `FHD_SPLIT_BEFORE` or `FHD_SPLIT_AFTER` surfaces
+/// [`RarError::UnsupportedFeature`] naming the entry. §2d teaches
+/// the walker to fold those into a single logical entry.
+///
+/// # Errors
+///
+/// - [`RarError::CorruptHeader`] if `volumes` is empty.
+/// - [`RarError::BadSignature`] / [`RarError::UnsupportedFormatVersion`]
+///   from [`parse_signature`] on any volume.
+/// - [`RarError::UnsupportedFeature`] for file headers with
+///   `FHD_SPLIT_*` set (§2b), archive-encryption headers (type 4),
+///   or unknown header types missing `SKIP_IF_UNKNOWN`.
+/// - [`RarError::CorruptHeader`] / [`RarError::Truncated`] /
+///   [`RarError::HeaderCrc32Mismatch`] from per-header parsers.
+/// - [`RarError::CorruptHeader`] (`reason = "volume ends before
+///   end-of-archive marker"`) if any volume terminates without an
+///   `EndArchive` header.
+/// - [`RarError::VolumeSetMismatch`] if a non-final volume omits
+///   `more_volumes`, the final volume sets it, or the supplied
+///   volume_number field disagrees with the input order.
+pub fn walk_archive_multivolume(volumes: &[&[u8]]) -> Result<ArchiveSummary, RarError> {
+    if volumes.is_empty() {
+        return Err(RarError::CorruptHeader {
+            archive_offset: 0,
+            reason: "walk_archive_multivolume called with no volume buffers".to_string(),
+        });
+    }
+    let multi = volumes.len() > 1;
     let mut summary = ArchiveSummary {
         solid: false,
         has_recovery_record: false,
@@ -111,124 +179,225 @@ pub fn walk_archive(buf: &[u8]) -> Result<ArchiveSummary, RarError> {
         eof_more_volumes: false,
         entries: Vec::new(),
     };
-    let mut saw_main = false;
-    loop {
-        if cursor >= buf.len() {
-            return Err(RarError::CorruptHeader {
-                archive_offset: cursor as u64,
-                reason: "archive ends before end-of-archive marker".to_string(),
-            });
-        }
-        let header = parse_generic_header(&buf[cursor..], cursor as u64)?;
-        // The per-header parser returns offsets relative to its own
-        // input slice; translate the offsets we'll later index back
-        // into `buf` with by adding the slice's position.
-        let header_in_buf = HeaderInBuf {
-            inner: header,
-            slice_start: cursor,
-        };
-        match header.header_type {
-            HeaderType::MainArchive => {
-                if saw_main {
-                    return Err(RarError::CorruptHeader {
-                        archive_offset: header.archive_offset,
-                        reason: "second main archive header encountered".to_string(),
-                    });
-                }
-                saw_main = true;
-                let main = parse_main_archive_header(&header, &buf[cursor..])?;
-                if main.archive_flags.is_volume() {
-                    let label = match main.volume_number {
-                        Some(n) => format!("multi-volume archive (volume {n})"),
-                        None => "multi-volume archive".to_string(),
-                    };
-                    return Err(RarError::UnsupportedFeature { feature: label });
-                }
-                summary.solid = main.archive_flags.is_solid();
-                summary.has_recovery_record = main.archive_flags.has_recovery_record();
-                summary.locked = main.archive_flags.is_locked();
-            }
-            HeaderType::File => {
-                let file = parse_file_header(&header, &buf[cursor..])?;
-                let packed_size = header.data_size.unwrap_or(0);
-                let data_offset = (cursor as u64) + header.total_header_bytes as u64;
-                let method = file.compression.method();
-                if method > 5 {
-                    return Err(RarError::UnsupportedFeature {
-                        feature: format!(
-                            "compression method {method} (reserved by RAR5 \
-                             spec for future use)"
-                        ),
-                    });
-                }
-                let extra = &buf[cursor + header.extra_offset_in_input
-                    ..cursor + header.extra_offset_in_input + header.extra_size_in_input];
-                let encryption = find_file_encryption_record(
-                    extra,
-                    header.archive_offset + header.extra_offset_in_input as u64,
-                )?;
-                summary.entries.push(FileEntry {
-                    header: file,
-                    data_offset,
-                    packed_size,
-                    encryption,
+    let mut saw_first_main = false;
+    let mut volume_base: u64 = 0;
+    for (vol_idx, buf) in volumes.iter().copied().enumerate() {
+        let is_last_vol = vol_idx + 1 == volumes.len();
+        let sig_size = parse_signature(buf)?;
+        let mut cursor: usize = sig_size;
+        let mut saw_volume_main = false;
+        let eoa_more_volumes: bool = loop {
+            if cursor >= buf.len() {
+                return Err(RarError::CorruptHeader {
+                    archive_offset: volume_base + cursor as u64,
+                    reason: format!("volume {} ends before end-of-archive marker", vol_idx + 1),
                 });
             }
-            HeaderType::Service => {
-                // Skipped: comments, recovery records, quick-open
-                // tables, Unix ACLs. Round-one neither parses nor
-                // refuses these — we just step over them.
-            }
-            HeaderType::ArchiveEncryption => {
-                // Parse the encryption header for diagnostic
-                // detail, then surface the unified
-                // [`EncryptionError`] (`docs/PLAN_archive_encryption.md`
-                // §4 / §6). End-to-end archive-header decryption is
-                // not yet implemented in this walker — see
-                // `crate::rar::encrypt` for the parser + KDF
-                // primitives and the rar_pipeline for the
-                // walker-side wiring that follows.
-                let fields = &buf[cursor + header.fields_offset_in_input
-                    ..cursor + header.fields_offset_in_input + header.fields_size];
-                let _enc = ArchiveEncryptionHeader::parse(fields).map_err(RarError::from)?;
-                return Err(RarError::Encryption(EncryptionError::UnsupportedCipher {
-                    detail: "archive-header encryption (RAR5 AES-256-CBC, encryption header \
-                             type 4) — peel parses the encryption header but does not yet \
-                             decrypt the subsequent header stream"
-                        .to_string(),
-                }));
-            }
-            HeaderType::EndOfArchive => {
-                let eof = parse_end_of_archive_header(&header, &buf[cursor..])?;
-                summary.eof_more_volumes = eof.more_volumes;
-                return Ok(summary);
-            }
-            HeaderType::Other(code) => {
-                if header.header_flags & crate::rar::format::hdr_flags::SKIP_IF_UNKNOWN == 0 {
-                    return Err(RarError::UnsupportedFeature {
-                        feature: format!(
-                            "unknown RAR header type {code} without \
-                             SKIP_IF_UNKNOWN flag"
-                        ),
+            let header_archive_offset = volume_base + cursor as u64;
+            let header = parse_generic_header(&buf[cursor..], header_archive_offset)?;
+            match header.header_type {
+                HeaderType::MainArchive => {
+                    if saw_volume_main {
+                        return Err(RarError::CorruptHeader {
+                            archive_offset: header.archive_offset,
+                            reason: format!("second main archive header in volume {}", vol_idx + 1),
+                        });
+                    }
+                    saw_volume_main = true;
+                    let main = parse_main_archive_header(&header, &buf[cursor..])?;
+                    if vol_idx == 0 {
+                        if saw_first_main {
+                            return Err(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: "second main archive header encountered".to_string(),
+                            });
+                        }
+                        saw_first_main = true;
+                        summary.solid = main.archive_flags.is_solid();
+                        summary.has_recovery_record = main.archive_flags.has_recovery_record();
+                        summary.locked = main.archive_flags.is_locked();
+                        if multi && !main.archive_flags.is_volume() {
+                            return Err(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: "first volume of multi-volume input \
+                                         missing MHD_VOLUME flag"
+                                    .to_string(),
+                            });
+                        }
+                    } else {
+                        if main.archive_flags.0 & arc_flags::VOLUME == 0 {
+                            return Err(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "volume {} main header missing MHD_VOLUME flag",
+                                    vol_idx + 1
+                                ),
+                            });
+                        }
+                        // The wire encodes volume_number 0-based; the
+                        // first volume omits the field entirely
+                        // (implicit 0). Validate the recorded value
+                        // matches the input order when present.
+                        if let Some(vn) = main.volume_number {
+                            let expected = vol_idx as u64;
+                            if vn != expected {
+                                return Err(RarError::VolumeSetMismatch {
+                                    detail: format!(
+                                        "supplied volume {} carries wire \
+                                         volume_number={vn}; expected {expected} \
+                                         (0-based) for that position in the set",
+                                        vol_idx + 1
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                HeaderType::File => {
+                    let file = parse_file_header(&header, &buf[cursor..])?;
+                    if header.header_flags & (hdr_flags::SPLIT_BEFORE | hdr_flags::SPLIT_AFTER) != 0
+                    {
+                        // §2b rejects multi-volume file continuation.
+                        // §2d will fold matching SPLIT_AFTER /
+                        // SPLIT_BEFORE pairs across volumes into one
+                        // logical entry and remove this gate.
+                        let direction = match (
+                            header.header_flags & hdr_flags::SPLIT_BEFORE != 0,
+                            header.header_flags & hdr_flags::SPLIT_AFTER != 0,
+                        ) {
+                            (true, true) => "spans (continues from prior volume into next)",
+                            (true, false) => "continues from prior volume",
+                            (false, true) => "continues into next volume",
+                            (false, false) => unreachable!(),
+                        };
+                        return Err(RarError::UnsupportedFeature {
+                            feature: format!(
+                                "multi-volume file continuation: entry {:?} in \
+                                 volume {} {direction} (RAR5 FHD_SPLIT_*); \
+                                 cross-volume entry stitching not yet \
+                                 implemented in peel",
+                                file.name,
+                                vol_idx + 1
+                            ),
+                        });
+                    }
+                    let packed_size = header.data_size.unwrap_or(0);
+                    let data_offset = header_archive_offset + header.total_header_bytes as u64;
+                    let method = file.compression.method();
+                    if method > 5 {
+                        return Err(RarError::UnsupportedFeature {
+                            feature: format!(
+                                "compression method {method} (reserved by RAR5 \
+                                 spec for future use)"
+                            ),
+                        });
+                    }
+                    let extra = &buf[cursor + header.extra_offset_in_input
+                        ..cursor + header.extra_offset_in_input + header.extra_size_in_input];
+                    let encryption = find_file_encryption_record(
+                        extra,
+                        header.archive_offset + header.extra_offset_in_input as u64,
+                    )?;
+                    summary.entries.push(FileEntry {
+                        header: file,
+                        data_offset,
+                        packed_size,
+                        encryption,
                     });
                 }
+                HeaderType::Service => {
+                    // Skipped: comments, recovery records,
+                    // quick-open tables, Unix ACLs. Round-one
+                    // neither parses nor refuses these — we just
+                    // step over them. Real archives place these
+                    // between the last file entry and the
+                    // end-of-archive marker (one per volume in
+                    // multi-volume sets, since the recovery record
+                    // is per-volume).
+                }
+                HeaderType::ArchiveEncryption => {
+                    let fields = &buf[cursor + header.fields_offset_in_input
+                        ..cursor + header.fields_offset_in_input + header.fields_size];
+                    let _enc = ArchiveEncryptionHeader::parse(fields).map_err(RarError::from)?;
+                    return Err(RarError::Encryption(EncryptionError::UnsupportedCipher {
+                        detail: "archive-header encryption (RAR5 AES-256-CBC, encryption \
+                                 header type 4) — peel parses the encryption header but \
+                                 does not yet decrypt the subsequent header stream"
+                            .to_string(),
+                    }));
+                }
+                HeaderType::EndOfArchive => {
+                    let eof = parse_end_of_archive_header(&header, &buf[cursor..])?;
+                    // Step over the EOA's bytes only for the
+                    // overflow check; the volume's remaining bytes
+                    // belong to whatever the producer appended after
+                    // the marker (typically nothing).
+                    let _next = advance_cursor(cursor, &header, header_archive_offset)?;
+                    break eof.more_volumes;
+                }
+                HeaderType::Other(code) => {
+                    if header.header_flags & hdr_flags::SKIP_IF_UNKNOWN == 0 {
+                        return Err(RarError::UnsupportedFeature {
+                            feature: format!(
+                                "unknown RAR header type {code} without \
+                                 SKIP_IF_UNKNOWN flag"
+                            ),
+                        });
+                    }
+                }
             }
+            cursor = advance_cursor(cursor, &header, header_archive_offset)?;
+        };
+        if eoa_more_volumes && is_last_vol {
+            return Err(RarError::VolumeSetMismatch {
+                detail: format!(
+                    "supplied volume {} (the last in the set) carries \
+                     more_volumes=true; additional volumes were not supplied",
+                    vol_idx + 1
+                ),
+            });
         }
-        cursor = cursor
-            .checked_add(header.total_header_bytes)
-            .and_then(|c| c.checked_add(header.data_size.unwrap_or(0).try_into().ok()?))
-            .ok_or_else(|| RarError::CorruptHeader {
-                archive_offset: header_in_buf.inner.archive_offset,
-                reason: "header + data offset overflows usize".to_string(),
-            })?;
+        if !eoa_more_volumes && !is_last_vol {
+            return Err(RarError::VolumeSetMismatch {
+                detail: format!(
+                    "supplied volume {} terminates the archive \
+                     (more_volumes=false) but {} additional volume(s) were \
+                     supplied beyond it",
+                    vol_idx + 1,
+                    volumes.len() - vol_idx - 1
+                ),
+            });
+        }
+        // For multi-volume input the final summary's
+        // `eof_more_volumes` is always false here (otherwise we'd
+        // have errored above). For single-volume input the field
+        // mirrors the lone EOA's flag, which preserves the previous
+        // walker's behaviour for callers that inspect it.
+        summary.eof_more_volumes = eoa_more_volumes;
+        volume_base =
+            volume_base
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| RarError::CorruptHeader {
+                    archive_offset: volume_base,
+                    reason: "cumulative volume size overflows u64".to_string(),
+                })?;
     }
+    Ok(summary)
 }
 
-/// Internal helper carrying a parsed header along with the offset of
-/// its slice in the larger input buffer. Used so error paths can
-/// emit absolute archive offsets without re-deriving them.
-struct HeaderInBuf {
-    inner: crate::rar::format::GenericHeader,
-    #[allow(dead_code)]
-    slice_start: usize,
+/// Advance an in-volume cursor past a parsed header *and* its
+/// trailing data area. Returns the new cursor or a
+/// [`RarError::CorruptHeader`] on overflow.
+fn advance_cursor(
+    cursor: usize,
+    header: &crate::rar::format::GenericHeader,
+    header_archive_offset: u64,
+) -> Result<usize, RarError> {
+    cursor
+        .checked_add(header.total_header_bytes)
+        .and_then(|c| c.checked_add(header.data_size.unwrap_or(0).try_into().ok()?))
+        .ok_or_else(|| RarError::CorruptHeader {
+            archive_offset: header_archive_offset,
+            reason: "header + data offset overflows usize".to_string(),
+        })
 }

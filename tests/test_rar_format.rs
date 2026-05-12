@@ -19,8 +19,9 @@ use peel::rar::format::arc_flags;
 use peel::rar::RarError;
 
 use support::rar_fixtures::{
-    build_rar4_magic_only, build_rar5, build_rar5_encrypted_header, build_rar5_per_file_encrypted,
-    EncryptedEntrySpec, RarEntrySpec,
+    build_end_of_archive_with_flags, build_file_header, build_main_header, build_rar4_magic_only,
+    build_rar5, build_rar5_encrypted_header, build_rar5_per_file_encrypted, EncryptedEntrySpec,
+    RarEntrySpec,
 };
 
 #[test]
@@ -73,37 +74,52 @@ fn walk_solid_archive_flips_solid_flag() {
 }
 
 #[test]
-fn walk_multi_volume_archive_rejects_with_volume_number() {
+fn walk_first_volume_in_isolation_succeeds_when_no_more_volumes_follow() {
+    // After `docs/PLAN_multivolume_archives.md` §2b the walker no
+    // longer rejects `MHD_VOLUME` archives at the main header. A
+    // self-contained single buffer whose end-of-archive header
+    // clears the `more_volumes` flag is treated like any other
+    // single-volume archive: the entry list is returned.
     let archive = build_rar5(
         arc_flags::VOLUME | arc_flags::VOLUME_NUMBER,
-        Some(3),
+        Some(0), // 0-based wire encoding for "first volume"
         &[RarEntrySpec::stored("only.txt", b"x".to_vec())],
     );
-    let err = walk_archive(&archive).expect_err("walk should fail on multi-volume");
-    match err {
-        RarError::UnsupportedFeature { feature } => {
-            assert!(
-                feature.contains("multi-volume") && feature.contains("volume 3"),
-                "unexpected feature label: {feature}"
-            );
-        }
-        other => panic!("expected UnsupportedFeature, got {other:?}"),
-    }
+    let summary = walk_archive(&archive).expect("self-contained MHD_VOLUME walk succeeds");
+    assert_eq!(summary.entries.len(), 1);
+    assert_eq!(summary.entries[0].header.name, "only.txt");
+    assert!(!summary.eof_more_volumes);
 }
 
 #[test]
-fn walk_multi_volume_without_volume_number_still_rejects() {
-    let archive = build_rar5(
-        arc_flags::VOLUME,
-        None,
-        &[RarEntrySpec::stored("only.txt", b"x".to_vec())],
-    );
-    let err = walk_archive(&archive).expect_err("walk should fail on multi-volume");
+fn walk_first_volume_with_more_volumes_flag_surfaces_volume_set_mismatch() {
+    // Real multi-volume archives have the first volume's
+    // end-of-archive header set `more_volumes = true`; feeding only
+    // the first volume to the single-buffer `walk_archive` entry
+    // point now surfaces a precise `VolumeSetMismatch` instead of
+    // the pre-§2b `UnsupportedFeature` blanket rejection, so callers
+    // can dispatch to multi-volume discovery on the strength of the
+    // diagnostic.
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&peel::rar::SIGNATURE_MAGIC);
+    archive.extend_from_slice(&build_main_header(
+        arc_flags::VOLUME | arc_flags::VOLUME_NUMBER,
+        Some(0),
+    ));
+    let (header, data) = build_file_header(&RarEntrySpec::stored("only.txt", b"x".to_vec()));
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(&data);
+    archive.extend_from_slice(&build_end_of_archive_with_flags(true));
+
+    let err = walk_archive(&archive).expect_err("missing further volumes must surface");
     match err {
-        RarError::UnsupportedFeature { feature } => {
-            assert!(feature.contains("multi-volume"), "got {feature}");
+        RarError::VolumeSetMismatch { detail } => {
+            assert!(
+                detail.contains("more_volumes=true") && detail.contains("not supplied"),
+                "unexpected detail: {detail}"
+            );
         }
-        other => panic!("expected UnsupportedFeature, got {other:?}"),
+        other => panic!("expected VolumeSetMismatch, got {other:?}"),
     }
 }
 
