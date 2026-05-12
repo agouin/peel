@@ -489,9 +489,11 @@ impl SevenzPipeline<'_> {
     /// handled by the user re-running the command rather than by
     /// the in-loop retry that RAR5 uses.
     fn load_password_lazy(&self) -> Result<Password, SevenzPipelineError> {
-        let source = self.password_source.ok_or(SevenzPipelineError::Sevenz(
-            SevenzError::Encryption(EncryptionError::PasswordMissing),
-        ))?;
+        let source =
+            self.password_source
+                .ok_or(SevenzPipelineError::Sevenz(SevenzError::Encryption(
+                    EncryptionError::PasswordMissing,
+                )))?;
         let prompt = format!("password for {}: ", self.password_label);
         source.load(&prompt).map_err(|e| {
             SevenzPipelineError::Sevenz(SevenzError::Encryption(EncryptionError::UnsupportedKdf {
