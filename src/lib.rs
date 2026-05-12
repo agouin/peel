@@ -113,6 +113,8 @@ pub mod hash;
 pub mod http;
 #[cfg(unix)]
 pub mod io_backend;
+#[cfg(unix)]
+pub mod multivolume;
 pub mod progress;
 #[cfg(unix)]
 pub mod punch;
