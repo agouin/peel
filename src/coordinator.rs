@@ -2590,6 +2590,8 @@ fn run_zip(
         download_outcome,
         sparse_fd: sparse.as_fd(),
         progress_state,
+        password_source: config.password_source.as_ref(),
+        password_label: requested_url,
     };
 
     // The zip pipeline now respects `max_disk_buffer`. Same

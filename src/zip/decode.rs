@@ -51,8 +51,10 @@ use std::io::{Cursor, Read};
 use thiserror::Error;
 
 use crate::decode::{deflate_native, DecodeError, DecodeStatus, StreamingDecoder};
+use crate::secret::Password;
 use crate::sink::{SinkError, ZipSink};
-use crate::zip::format::CompressionMethod;
+use crate::zip::aes_decrypt::{downcast_encryption_error, AesDecryptReader};
+use crate::zip::format::{AesExtra, CompressionMethod};
 use crate::zip::ZipError;
 
 /// Buffer size used by [`decompress_entry`]'s copy loop. Sized to
@@ -131,6 +133,30 @@ pub struct DecompressResume<'a> {
 pub type InEntryProgressCallback<'a> =
     &'a mut dyn FnMut(u64, Option<Vec<u8>>) -> std::io::Result<()>;
 
+/// Per-entry AES decryption parameters
+/// (`docs/PLAN_archive_encryption.md` §3).
+///
+/// When threaded into [`decompress_entry_with_resume`], the source
+/// reader is wrapped in an [`AesDecryptReader`] before the inner
+/// (STORED / DEFLATE / zstd) decoder runs against it, and the
+/// 10-byte HMAC trailer is verified at end-of-entry. The outer
+/// `method` argument (always `CompressionMethod::Other(99)` for AES
+/// entries) is ignored in favour of [`AesExtra::actual_method`].
+#[derive(Debug)]
+pub struct AesDecryptParams<'a> {
+    /// User-supplied password. Borrowed; the pipeline keeps the
+    /// owning [`Password`] alive across the entire run.
+    pub password: &'a Password,
+    /// The parsed AES extra field from the entry's central-directory
+    /// record (cross-checked against the LFH's copy upstream).
+    pub extra: AesExtra,
+    /// Total ciphertext size for the entry — equal to the central
+    /// directory's `compressed_size` field. The wrapper uses this
+    /// to compute the inner-payload length (`compressed_size -
+    /// salt_len - 12`).
+    pub compressed_size: u64,
+}
+
 /// Decompress one entry's compressed bytes into the sink.
 ///
 /// `compressed` is a `Read` that yields exactly the entry's
@@ -150,9 +176,15 @@ pub fn decompress_entry<R: Read>(
     sink: &mut ZipSink,
     entry_name: &str,
 ) -> Result<u64, EntryDecodeError> {
-    decompress_entry_with_resume(method, compressed, sink, entry_name, None, &mut |_, _| {
-        Ok(())
-    })
+    decompress_entry_with_resume(
+        method,
+        compressed,
+        sink,
+        entry_name,
+        None,
+        &mut |_, _| Ok(()),
+        None,
+    )
 }
 
 /// Like [`decompress_entry`] but additionally:
@@ -179,6 +211,38 @@ pub fn decompress_entry_with_resume<R: Read>(
     entry_name: &str,
     resume: Option<DecompressResume<'_>>,
     progress: InEntryProgressCallback<'_>,
+    aes: Option<AesDecryptParams<'_>>,
+) -> Result<u64, EntryDecodeError> {
+    if let Some(params) = aes {
+        if resume.is_some() {
+            // §3 deliberately rules mid-entry resume out for AES
+            // entries: the AES-CTR keystream is anchored at the
+            // start of the ciphertext and the HMAC must see every
+            // byte, so a partial-entry restart would need both the
+            // pre-resume HMAC state and a way to skip the salt /
+            // verifier prefix. Round-one falls back to "restart the
+            // entry from byte 0" by signalling the unsupported
+            // feature to the caller, which then drops the resume
+            // hint and re-enters here without it.
+            return Err(EntryDecodeError::Zip(ZipError::UnsupportedFeature {
+                feature: format!("AES-encrypted entry resume ({entry_name:?})"),
+            }));
+        }
+        return decompress_aes_entry(method, compressed, sink, entry_name, progress, params);
+    }
+    decompress_unencrypted_entry(method, compressed, sink, entry_name, resume, progress)
+}
+
+/// Dispatch one entry on its compression method. Shared by the
+/// unencrypted path and the AES path (which calls this after
+/// wrapping the source with an [`AesDecryptReader`]).
+fn decompress_unencrypted_entry<R: Read>(
+    method: CompressionMethod,
+    compressed: R,
+    sink: &mut ZipSink,
+    entry_name: &str,
+    resume: Option<DecompressResume<'_>>,
+    progress: InEntryProgressCallback<'_>,
 ) -> Result<u64, EntryDecodeError> {
     match method {
         CompressionMethod::Stored => {
@@ -197,6 +261,111 @@ pub fn decompress_entry_with_resume<R: Read>(
                 entry_name = entry_name,
             ),
         })),
+    }
+}
+
+/// Drive a WinZip-AES-encrypted entry through the
+/// [`AesDecryptReader`] wrapper, then dispatch on the inner method
+/// the AES extra named. After the downstream decompressor returns,
+/// the wrapper's [`AesDecryptReader::finalize`] drains any payload
+/// bytes the downstream decoder did not consume (zstd's
+/// end-of-frame-before-EOF case) and verifies the HMAC-SHA1-80
+/// trailer.
+fn decompress_aes_entry<R: Read>(
+    outer_method: CompressionMethod,
+    compressed: R,
+    sink: &mut ZipSink,
+    entry_name: &str,
+    progress: InEntryProgressCallback<'_>,
+    params: AesDecryptParams<'_>,
+) -> Result<u64, EntryDecodeError> {
+    // Sanity: AES entries always have outer wire-method = 99
+    // (`METHOD_CODE_AES_MARKER`). A non-99 outer method here is a
+    // pipeline bug — surface it as MalformedHeader rather than
+    // silently mis-dispatching.
+    if !matches!(
+        outer_method,
+        CompressionMethod::Other(crate::zip::format::METHOD_CODE_AES_MARKER)
+    ) {
+        return Err(EntryDecodeError::Zip(ZipError::MalformedHeader {
+            archive_offset: 0,
+            reason: format!(
+                "AES decryption requested for entry {entry_name:?} but outer compression method \
+                 is {} (expected method 99)",
+                outer_method.label(),
+            ),
+        }));
+    }
+
+    let mut wrapper = AesDecryptReader::new(
+        compressed,
+        params.password,
+        params.extra,
+        params.compressed_size,
+        entry_name,
+    )
+    .map_err(|e| aes_io_to_entry_decode(e, entry_name))?;
+
+    // Dispatch on the *inner* method — the AES extra's
+    // `actual_method` is what the AES layer wraps.
+    let inner_method = params.extra.actual_method;
+    let result =
+        decompress_unencrypted_entry(inner_method, &mut wrapper, sink, entry_name, None, progress);
+
+    // The wrapper's internal trailer-verify runs automatically when
+    // the inner decoder reads to EOF (STORED, DEFLATE via
+    // `read_to_end`). For zstd — whose stream decoder may stop at
+    // end-of-frame before draining the source — `finalize` drains
+    // the rest and verifies. Idempotent if already finalized.
+    if let Err(io_err) = wrapper.finalize() {
+        // The wrapper's IO error (most often
+        // `IntegrityCheckFailed`) takes precedence over any
+        // generic Read failure that surfaced from the inner
+        // decoder if the inner one didn't already surface an
+        // encryption error. Surface the encryption error
+        // specifically.
+        if let Some(enc) = downcast_encryption_error(&io_err) {
+            return Err(EntryDecodeError::Zip(ZipError::Encryption(enc.clone())));
+        }
+        // Non-encryption IO failure during finalize (truncated
+        // source); preserve the encrypted-archive context.
+        if let Ok(bytes_so_far) = result {
+            // If the inner decompress succeeded but finalize
+            // failed, we still report failure.
+            let _ = bytes_so_far;
+        }
+        return Err(EntryDecodeError::Read {
+            entry_name: entry_name.to_string(),
+            source: io_err,
+        });
+    }
+
+    // Inner-decoder error: re-extract any embedded encryption
+    // error so it surfaces with the precise zip-layer message.
+    match result {
+        Ok(n) => Ok(n),
+        Err(EntryDecodeError::Read { entry_name, source }) => {
+            if let Some(enc) = downcast_encryption_error(&source) {
+                return Err(EntryDecodeError::Zip(ZipError::Encryption(enc.clone())));
+            }
+            Err(EntryDecodeError::Read { entry_name, source })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Map an [`std::io::Error`] that came out of [`AesDecryptReader`]
+/// onto an [`EntryDecodeError`]. The wrapper signals encryption
+/// failures by wrapping an [`EncryptionError`] inside the io error;
+/// non-encryption io errors (short reads, etc.) keep their
+/// `EntryDecodeError::Read` shape.
+fn aes_io_to_entry_decode(e: std::io::Error, entry_name: &str) -> EntryDecodeError {
+    if let Some(enc) = downcast_encryption_error(&e) {
+        return EntryDecodeError::Zip(ZipError::Encryption(enc.clone()));
+    }
+    EntryDecodeError::Read {
+        entry_name: entry_name.to_string(),
+        source: e,
     }
 }
 
