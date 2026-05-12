@@ -86,6 +86,11 @@ pub struct FileEntry {
     /// all volumes in input order — directly consumable by the §3
     /// pipeline's [`crate::download::multi_url::MultiPartSource`]
     /// without further translation.
+    ///
+    /// For multi-volume continuation entries this is the offset of
+    /// the entry's **first** segment (in the volume that carries
+    /// the leading file header). Additional segments are in
+    /// [`Self::extra_segments`].
     pub data_offset: u64,
     /// Compressed-data length in bytes (i.e. the file header's
     /// `data_size`). For unencrypted STORED entries this equals
@@ -94,7 +99,27 @@ pub struct FileEntry {
     /// the data area to a 16-byte boundary so AES-CBC can decrypt
     /// it block-aligned; the [`FileEncryptionRecord`] on the entry
     /// signals the padding semantics.
+    ///
+    /// For multi-volume continuation entries this is the size of
+    /// the entry's **first** segment only — i.e. the `data_size`
+    /// on the leading file header that carries `FHD_SPLIT_AFTER`.
+    /// Additional segments' sizes live in [`Self::extra_segments`];
+    /// the entry's total on-disk packed size is
+    /// `packed_size + extra_segments.iter().map(|s| s.packed_size).sum::<u64>()`.
     pub packed_size: u64,
+    /// Trailing segments for entries whose data spans more than
+    /// one volume (`docs/PLAN_multivolume_archives.md` §2d). Empty
+    /// for entries that fit in a single volume.
+    ///
+    /// Each [`EntrySegment`] records the byte offset (in the
+    /// global concatenated-volume coordinate space) and length of
+    /// one of the entry's continuation file headers' data areas.
+    /// Segments are stored in archive order (i.e. volume order);
+    /// concatenating their bytes (in order, starting from the
+    /// leading segment described by [`Self::data_offset`] /
+    /// [`Self::packed_size`]) reconstructs the entry's full
+    /// compressed (or plaintext, for STORED) payload.
+    pub extra_segments: Vec<EntrySegment>,
     /// Parsed encryption record from the file-header extra area,
     /// when the entry's data is per-file-encrypted (the extra area
     /// carries a type-1 record). `None` for unencrypted entries.
@@ -102,6 +127,18 @@ pub struct FileEntry {
     /// header itself; the data area may or may not also be encrypted
     /// via this field).
     pub encryption: Option<FileEncryptionRecord>,
+}
+
+/// One segment of a multi-volume entry's data area. See
+/// [`FileEntry::extra_segments`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct EntrySegment {
+    /// Absolute byte offset of this segment's data area in the
+    /// global concatenated-volume byte space.
+    pub data_offset: u64,
+    /// Size of this segment's data area, in bytes (the segment's
+    /// file-header `data_size`).
+    pub packed_size: u64,
 }
 
 /// Walk a single RAR5 buffer and produce the [`ArchiveSummary`].
@@ -143,19 +180,23 @@ pub fn walk_archive(buf: &[u8]) -> Result<ArchiveSummary, RarError> {
 ///   `EndArchive` header carrying `more_volumes = true`, and the
 ///   final volume's `EndArchive` clears the bit.
 ///
-/// Until `docs/PLAN_multivolume_archives.md` §2d, any file header
-/// carrying `FHD_SPLIT_BEFORE` or `FHD_SPLIT_AFTER` surfaces
-/// [`RarError::UnsupportedFeature`] naming the entry. §2d teaches
-/// the walker to fold those into a single logical entry.
+/// `FHD_SPLIT_AFTER` / `FHD_SPLIT_BEFORE` headers fold into one
+/// [`FileEntry`] whose [`FileEntry::extra_segments`] records the
+/// continuation segments' offsets and sizes
+/// (`docs/PLAN_multivolume_archives.md` §2d). The spec requires
+/// the spanning entry's name, unpacked size, and (when present)
+/// CRC32 to match across all of its file headers; the walker
+/// surfaces [`RarError::CorruptHeader`] when a continuation's
+/// metadata disagrees with the leading header.
 ///
 /// # Errors
 ///
 /// - [`RarError::CorruptHeader`] if `volumes` is empty.
 /// - [`RarError::BadSignature`] / [`RarError::UnsupportedFormatVersion`]
 ///   from [`parse_signature`] on any volume.
-/// - [`RarError::UnsupportedFeature`] for file headers with
-///   `FHD_SPLIT_*` set (§2b), archive-encryption headers (type 4),
-///   or unknown header types missing `SKIP_IF_UNKNOWN`.
+/// - [`RarError::UnsupportedFeature`] for archive-encryption
+///   headers (type 4) or unknown header types missing
+///   `SKIP_IF_UNKNOWN`.
 /// - [`RarError::CorruptHeader`] / [`RarError::Truncated`] /
 ///   [`RarError::HeaderCrc32Mismatch`] from per-header parsers.
 /// - [`RarError::CorruptHeader`] (`reason = "volume ends before
@@ -181,6 +222,14 @@ pub fn walk_archive_multivolume(volumes: &[&[u8]]) -> Result<ArchiveSummary, Rar
     };
     let mut saw_first_main = false;
     let mut volume_base: u64 = 0;
+    // §2d: when a file header sets SPLIT_AFTER but not SPLIT_BEFORE,
+    // the entry continues into the next volume; we stash the index
+    // into `summary.entries` of the leading entry so the matching
+    // SPLIT_BEFORE header in the next volume can append its data
+    // segment instead of pushing a fresh entry. Cleared after the
+    // matching SPLIT_BEFORE-without-SPLIT_AFTER is observed (i.e.
+    // the entry's trailing segment).
+    let mut pending_split_entry: Option<usize> = None;
     for (vol_idx, buf) in volumes.iter().copied().enumerate() {
         let is_last_vol = vol_idx + 1 == volumes.len();
         let sig_size = parse_signature(buf)?;
@@ -255,32 +304,8 @@ pub fn walk_archive_multivolume(volumes: &[&[u8]]) -> Result<ArchiveSummary, Rar
                 }
                 HeaderType::File => {
                     let file = parse_file_header(&header, &buf[cursor..])?;
-                    if header.header_flags & (hdr_flags::SPLIT_BEFORE | hdr_flags::SPLIT_AFTER) != 0
-                    {
-                        // §2b rejects multi-volume file continuation.
-                        // §2d will fold matching SPLIT_AFTER /
-                        // SPLIT_BEFORE pairs across volumes into one
-                        // logical entry and remove this gate.
-                        let direction = match (
-                            header.header_flags & hdr_flags::SPLIT_BEFORE != 0,
-                            header.header_flags & hdr_flags::SPLIT_AFTER != 0,
-                        ) {
-                            (true, true) => "spans (continues from prior volume into next)",
-                            (true, false) => "continues from prior volume",
-                            (false, true) => "continues into next volume",
-                            (false, false) => unreachable!(),
-                        };
-                        return Err(RarError::UnsupportedFeature {
-                            feature: format!(
-                                "multi-volume file continuation: entry {:?} in \
-                                 volume {} {direction} (RAR5 FHD_SPLIT_*); \
-                                 cross-volume entry stitching not yet \
-                                 implemented in peel",
-                                file.name,
-                                vol_idx + 1
-                            ),
-                        });
-                    }
+                    let split_before = header.header_flags & hdr_flags::SPLIT_BEFORE != 0;
+                    let split_after = header.header_flags & hdr_flags::SPLIT_AFTER != 0;
                     let packed_size = header.data_size.unwrap_or(0);
                     let data_offset = header_archive_offset + header.total_header_bytes as u64;
                     let method = file.compression.method();
@@ -298,12 +323,91 @@ pub fn walk_archive_multivolume(volumes: &[&[u8]]) -> Result<ArchiveSummary, Rar
                         extra,
                         header.archive_offset + header.extra_offset_in_input as u64,
                     )?;
-                    summary.entries.push(FileEntry {
-                        header: file,
-                        data_offset,
-                        packed_size,
-                        encryption,
-                    });
+                    if split_before {
+                        // §2d continuation. Match against the
+                        // pending leading entry and append the
+                        // segment.
+                        let leading_idx =
+                            pending_split_entry.ok_or_else(|| RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "file {:?} carries FHD_SPLIT_BEFORE but no \
+                                     matching FHD_SPLIT_AFTER preceded it",
+                                    file.name
+                                ),
+                            })?;
+                        let leading = &summary.entries[leading_idx];
+                        if leading.header.name != file.name {
+                            return Err(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "multi-volume continuation file {:?} does \
+                                     not match preceding split entry {:?}",
+                                    file.name, leading.header.name
+                                ),
+                            });
+                        }
+                        if leading.header.unpacked_size != file.unpacked_size {
+                            return Err(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "multi-volume continuation {:?} declares \
+                                     unpacked_size={}, leading segment had {}",
+                                    file.name, file.unpacked_size, leading.header.unpacked_size
+                                ),
+                            });
+                        }
+                        // WinRAR populates the file-header `crc32`
+                        // field with the *per-segment* Pack-CRC32
+                        // for SPLIT continuation headers — not a
+                        // cumulative whole-file checksum. Drop the
+                        // leading segment's `crc32` once we know the
+                        // entry spans volumes so the sink does not
+                        // try to verify a partial checksum against
+                        // the assembled output. The walker's spec
+                        // contract is name + unpacked_size match
+                        // across segments; whole-file integrity for
+                        // spanning entries falls back to the
+                        // BLAKE2sp extra-record subtype (or nothing
+                        // when neither is present).
+                        summary.entries[leading_idx].header.crc32 = None;
+                        summary.entries[leading_idx]
+                            .extra_segments
+                            .push(EntrySegment {
+                                data_offset,
+                                packed_size,
+                            });
+                        if !split_after {
+                            // Trailing segment — clear the pending
+                            // marker so the next file header in this
+                            // (or a later) volume starts a fresh
+                            // entry.
+                            pending_split_entry = None;
+                        }
+                    } else {
+                        if pending_split_entry.is_some() {
+                            return Err(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "file {:?} does not carry FHD_SPLIT_BEFORE but \
+                                     a prior file's FHD_SPLIT_AFTER is still \
+                                     pending continuation",
+                                    file.name
+                                ),
+                            });
+                        }
+                        let new_entry = FileEntry {
+                            header: file,
+                            data_offset,
+                            packed_size,
+                            extra_segments: Vec::new(),
+                            encryption,
+                        };
+                        summary.entries.push(new_entry);
+                        if split_after {
+                            pending_split_entry = Some(summary.entries.len() - 1);
+                        }
+                    }
                 }
                 HeaderType::Service => {
                     // Skipped: comments, recovery records,
@@ -381,6 +485,16 @@ pub fn walk_archive_multivolume(volumes: &[&[u8]]) -> Result<ArchiveSummary, Rar
                     archive_offset: volume_base,
                     reason: "cumulative volume size overflows u64".to_string(),
                 })?;
+    }
+    if let Some(idx) = pending_split_entry {
+        let name = summary.entries[idx].header.name.clone();
+        return Err(RarError::CorruptHeader {
+            archive_offset: volume_base,
+            reason: format!(
+                "file {name:?} carries FHD_SPLIT_AFTER on its last segment but \
+                 no continuation volume was supplied"
+            ),
+        });
     }
     Ok(summary)
 }

@@ -62,52 +62,59 @@ fn read_volume(name: &str) -> Vec<u8> {
 }
 
 #[test]
-fn walk_first_volume_alone_surfaces_split_diagnostic() {
-    // §2a / §2b interplay: the committed multi.part1.rar carries a
-    // small entry and the leading slice of a spanning entry
-    // (FHD_SPLIT_AFTER). The walker now traverses the first
-    // volume's headers and, on reaching the spanning entry's file
-    // header, surfaces an UnsupportedFeature naming the entry — a
-    // strictly more specific diagnostic than the pre-§2b
-    // "multi-volume archive (volume N)" label, which only told the
-    // user the archive *was* multi-volume rather than *what*
-    // peel didn't yet handle about it.
+fn walk_first_volume_alone_surfaces_volume_set_mismatch_after_2d() {
+    // The committed multi.part1.rar's EOA carries `more_volumes`
+    // — feeding only the first volume to the single-buffer
+    // `walk_archive` entry point now surfaces VolumeSetMismatch,
+    // not a SPLIT diagnostic (§2d's split-folding is lenient
+    // enough that the leading SPLIT_AFTER header is accepted
+    // and the missing continuation surfaces at EOA time).
     let archive = read_volume("multi.part1.rar");
     let err = walk_archive(&archive).expect_err("first-volume-only walk must surface a diagnostic");
     match err {
-        RarError::UnsupportedFeature { feature } => {
+        RarError::VolumeSetMismatch { detail } => {
             assert!(
-                feature.contains("multi-volume file continuation")
-                    && feature.contains("big.bin")
-                    && feature.contains("continues into next volume"),
-                "unexpected feature label: {feature}"
+                detail.contains("more_volumes=true") && detail.contains("not supplied"),
+                "unexpected detail: {detail}"
             );
         }
-        other => panic!("expected UnsupportedFeature, got {other:?}"),
+        other => panic!("expected VolumeSetMismatch, got {other:?}"),
     }
 }
 
 #[test]
-fn walk_full_set_of_real_volumes_surfaces_split_diagnostic_at_first_split() {
-    // The committed three-volume real fixture's `big.bin` entry
-    // spans every volume. Until §2d teaches the walker to fold
-    // matching SPLIT_AFTER / SPLIT_BEFORE pairs into one logical
-    // entry, walking the full set still surfaces a precise
-    // UnsupportedFeature naming the entry in volume 1.
+fn walk_full_set_of_real_volumes_folds_spanning_entry() {
+    // §2d: the committed three-volume real fixture has `big.bin`
+    // spanning all three volumes. `walk_archive_multivolume`
+    // returns a single FileEntry whose `extra_segments` records
+    // the continuation slices in volumes 2 and 3, and whose
+    // header.crc32 has been cleared (WinRAR writes per-segment
+    // Pack-CRC32, not a cumulative whole-file checksum).
     let v1 = read_volume("multi.part1.rar");
     let v2 = read_volume("multi.part2.rar");
     let v3 = read_volume("multi.part3.rar");
-    let err = walk_archive_multivolume(&[&v1[..], &v2[..], &v3[..]])
-        .expect_err("real fixture set spans entries; §2b rejects SPLIT");
-    match err {
-        RarError::UnsupportedFeature { feature } => {
-            assert!(
-                feature.contains("multi-volume file continuation") && feature.contains("big.bin"),
-                "unexpected feature label: {feature}"
-            );
-        }
-        other => panic!("expected UnsupportedFeature, got {other:?}"),
-    }
+    let summary = walk_archive_multivolume(&[&v1[..], &v2[..], &v3[..]])
+        .expect("real fixture walks cleanly after §2d");
+    assert_eq!(summary.entries.len(), 2);
+    let small = &summary.entries[0];
+    assert_eq!(small.header.name, "small.txt");
+    assert!(small.extra_segments.is_empty());
+
+    let big = &summary.entries[1];
+    assert_eq!(big.header.name, "big.bin");
+    assert_eq!(big.header.unpacked_size, 35_000);
+    assert_eq!(big.extra_segments.len(), 2, "big.bin spans 3 volumes");
+    assert!(
+        big.header.crc32.is_none(),
+        "spanning entry crc32 must be cleared because WinRAR writes per-segment Pack-CRC32"
+    );
+    let total_packed: u64 = big.packed_size
+        + big
+            .extra_segments
+            .iter()
+            .map(|s| s.packed_size)
+            .sum::<u64>();
+    assert_eq!(total_packed, 35_000, "STORED: total packed == unpacked");
 }
 
 #[test]
@@ -338,12 +345,12 @@ fn pipeline_extracts_three_non_spanning_volumes() {
 }
 
 #[test]
-fn pipeline_rejects_split_entry_with_precise_diagnostic() {
-    // The committed real fixture's `big.bin` spans every volume.
-    // Until §2d, the pipeline must surface a precise
-    // UnsupportedFeature naming the entry — not a generic parse
-    // failure — when its walker encounters the leading
-    // FHD_SPLIT_AFTER header.
+fn pipeline_extracts_real_stored_spanning_entry() {
+    // §2d STORED end-to-end: the committed three-volume fixture
+    // ships a spanning `big.bin` entry (35 000 bytes of 'X'). The
+    // pipeline walks the volume set, folds the three SPLIT
+    // segments into one logical entry, and concatenates their
+    // bytes into a byte-identical output file.
     let v1 = read_volume("multi.part1.rar");
     let v2 = read_volume("multi.part2.rar");
     let v3 = read_volume("multi.part3.rar");
@@ -351,7 +358,7 @@ fn pipeline_rejects_split_entry_with_precise_diagnostic() {
     let (bytes, volume_starts) = concat_with_starts(&volumes);
     let total_size = bytes.len() as u64;
 
-    let tmp = tempdir("pipeline_split_reject");
+    let tmp = tempdir("pipeline_split_stored");
     let sparse_path = tmp.path().join("archive.bin");
     let sparse = SparseFile::open_or_create(&sparse_path, total_size).expect("sparse");
     sparse
@@ -382,7 +389,7 @@ fn pipeline_rejects_split_entry_with_precise_diagnostic() {
         sparse_fd: sparse.as_fd(),
         progress_state: None,
         password_source: None,
-        password_label: "test://split-reject",
+        password_label: "test://split-stored",
     };
 
     let out_dir = tmp.path().join("out");
@@ -390,12 +397,16 @@ fn pipeline_rejects_split_entry_with_precise_diagnostic() {
     let mut sink = RarSink::new(&out_dir).expect("rar sink");
     let puncher = NoopPuncher::new();
 
-    let err = pipeline
+    let stats = pipeline
         .run(&mut sink, &puncher, RarResumeState::default(), |_| Ok(()))
-        .expect_err("§2c rejects SPLIT entries");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("multi-volume file continuation") && msg.contains("big.bin"),
-        "unexpected error: {msg}"
-    );
+        .expect("multi-volume STORED-SPLIT extraction succeeds");
+    assert_eq!(stats.entries_extracted, 2);
+
+    let got_small = std::fs::read(out_dir.join("small.txt")).expect("read small.txt");
+    let expected_small: Vec<u8> = b"Hello from multivol\n".repeat(50);
+    assert_eq!(got_small, expected_small);
+
+    let got_big = std::fs::read(out_dir.join("big.bin")).expect("read big.bin");
+    let expected_big = vec![b'X'; 35_000];
+    assert_eq!(got_big, expected_big);
 }

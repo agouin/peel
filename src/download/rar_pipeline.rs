@@ -435,6 +435,13 @@ impl<'a> RarPipeline<'a> {
         // parsed volume `i`'s main archive header; encountering a
         // second one in the same volume is malformed input.
         let mut saw_volume_main_for_idx: Option<usize> = None;
+        // §2d split-folding state. When a file header sets
+        // FHD_SPLIT_AFTER without FHD_SPLIT_BEFORE we record the
+        // index of the leading entry in `entries` so the next
+        // volume's matching FHD_SPLIT_BEFORE header can append a
+        // continuation segment. Cleared by the trailing segment
+        // (FHD_SPLIT_BEFORE without FHD_SPLIT_AFTER).
+        let mut pending_split_entry: Option<usize> = None;
         // Set after parsing HEAD_CRYPT: subsequent headers are
         // AES-256-CBC encrypted under this key, each prefixed by
         // its own 16-byte IV.
@@ -521,35 +528,10 @@ impl<'a> RarPipeline<'a> {
                 HeaderType::File => {
                     let file =
                         parse_file_header(&header, local_buf).map_err(RarPipelineError::Rar)?;
-                    if header.header_flags
-                        & (crate::rar::format::hdr_flags::SPLIT_BEFORE
-                            | crate::rar::format::hdr_flags::SPLIT_AFTER)
-                        != 0
-                    {
-                        // §2c rejects multi-volume file continuation.
-                        // §2d teaches the walker + extractor to fold
-                        // matching SPLIT_AFTER / SPLIT_BEFORE pairs
-                        // across volumes into one logical entry.
-                        let direction = match (
-                            header.header_flags & crate::rar::format::hdr_flags::SPLIT_BEFORE != 0,
-                            header.header_flags & crate::rar::format::hdr_flags::SPLIT_AFTER != 0,
-                        ) {
-                            (true, true) => "spans (continues from prior volume into next)",
-                            (true, false) => "continues from prior volume",
-                            (false, true) => "continues into next volume",
-                            (false, false) => unreachable!(),
-                        };
-                        return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
-                            feature: format!(
-                                "multi-volume file continuation: entry {:?} in \
-                                 volume {} {direction} (RAR5 FHD_SPLIT_*); \
-                                 cross-volume entry stitching not yet \
-                                 implemented in peel",
-                                file.name,
-                                current_vol_idx + 1
-                            ),
-                        }));
-                    }
+                    let split_before =
+                        header.header_flags & crate::rar::format::hdr_flags::SPLIT_BEFORE != 0;
+                    let split_after =
+                        header.header_flags & crate::rar::format::hdr_flags::SPLIT_AFTER != 0;
                     let method = file.compression.method();
                     if method > 5 {
                         // 6 / 7 are reserved by the format spec; rejecting
@@ -583,12 +565,81 @@ impl<'a> RarPipeline<'a> {
                         header.archive_offset + header.extra_offset_in_input as u64,
                     )
                     .map_err(RarPipelineError::Rar)?;
-                    entries.push(FileEntry {
-                        header: file,
-                        data_offset,
-                        packed_size,
-                        encryption,
-                    });
+                    if split_before {
+                        // §2d continuation: match against the
+                        // pending leading entry and append the
+                        // segment.
+                        let leading_idx = pending_split_entry.ok_or_else(|| {
+                            RarPipelineError::Rar(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "file {:?} carries FHD_SPLIT_BEFORE but \
+                                         no matching FHD_SPLIT_AFTER preceded it",
+                                    file.name
+                                ),
+                            })
+                        })?;
+                        let leading = &entries[leading_idx];
+                        if leading.header.name != file.name {
+                            return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "multi-volume continuation file {:?} does \
+                                     not match preceding split entry {:?}",
+                                    file.name, leading.header.name
+                                ),
+                            }));
+                        }
+                        if leading.header.unpacked_size != file.unpacked_size {
+                            return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "multi-volume continuation {:?} declares \
+                                     unpacked_size={}, leading segment had {}",
+                                    file.name, file.unpacked_size, leading.header.unpacked_size
+                                ),
+                            }));
+                        }
+                        // See [`crate::rar::archive`] §2d note —
+                        // WinRAR sets the file-header `crc32` field
+                        // to the per-segment Pack-CRC32 on
+                        // continuation headers; clear the leading
+                        // entry's crc32 so the sink does not try to
+                        // verify a partial checksum against the
+                        // assembled output.
+                        entries[leading_idx].header.crc32 = None;
+                        entries[leading_idx].extra_segments.push(
+                            crate::rar::archive::EntrySegment {
+                                data_offset,
+                                packed_size,
+                            },
+                        );
+                        if !split_after {
+                            pending_split_entry = None;
+                        }
+                    } else {
+                        if pending_split_entry.is_some() {
+                            return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "file {:?} does not carry FHD_SPLIT_BEFORE \
+                                     but a prior file's FHD_SPLIT_AFTER is \
+                                     still pending continuation",
+                                    file.name
+                                ),
+                            }));
+                        }
+                        entries.push(FileEntry {
+                            header: file,
+                            data_offset,
+                            packed_size,
+                            extra_segments: Vec::new(),
+                            encryption,
+                        });
+                        if split_after {
+                            pending_split_entry = Some(entries.len() - 1);
+                        }
+                    }
                 }
                 HeaderType::Service => {
                     // Skip past header + data area.
@@ -835,19 +886,15 @@ impl<'a> RarPipeline<'a> {
     {
         let data_offset = entry.data_offset;
         let packed_size = entry.packed_size;
-        let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
-            RarPipelineError::Rar(RarError::CorruptHeader {
-                archive_offset: data_offset,
-                reason: "entry data range overflows u64".to_string(),
-            })
-        })?;
+        let segments = entry_data_segments(entry);
+        let is_split = !entry.extra_segments.is_empty();
 
-        // Steer the scheduler toward this entry's range.
+        // Steer the scheduler toward the leading segment. Per-
+        // segment waits below ensure the rest land before we read.
         self.cursor.store(data_offset, Ordering::Release);
         if let Some(p) = self.progress_state {
             p.set_bytes_decoded_input(data_offset);
         }
-        self.wait_for_range(data_offset, data_end)?;
 
         let method = entry.header.compression.method();
         let is_encrypted = entry.encryption.is_some();
@@ -897,11 +944,16 @@ impl<'a> RarPipeline<'a> {
             // don't carry payload). Verified at parse time. Punch
             // anything that managed to reserve space (defensive — usually
             // packed_size == 0).
-            let punched = if packed_size > 0 {
-                self.punch_range(puncher, data_offset, data_end)?
-            } else {
-                0
-            };
+            let mut punched = 0u64;
+            for (seg_off, seg_size) in &segments {
+                if *seg_size > 0 {
+                    punched = punched.saturating_add(self.punch_range(
+                        puncher,
+                        *seg_off,
+                        seg_off + seg_size,
+                    )?);
+                }
+            }
             callback(&RarPipelineEvent::EntryFinished {
                 index: idx,
                 name: entry.header.name.clone(),
@@ -913,6 +965,16 @@ impl<'a> RarPipeline<'a> {
         }
 
         if let Some(enc) = entry.encryption.as_ref() {
+            if is_split {
+                return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                    feature: format!(
+                        "per-file encrypted entry {:?} spans volume boundary; \
+                         encrypted multi-volume entry continuation is not yet \
+                         supported in peel",
+                        entry.header.name
+                    ),
+                }));
+            }
             // Per-file encryption: derive the entry's key (sharing
             // the cached password across all encrypted entries) and
             // stream-decrypt the data area in 64-KiB chunks. The
@@ -922,6 +984,13 @@ impl<'a> RarPipeline<'a> {
             // (compressed).
             let keys = self.resolve_password_and_keys(enc, &entry.header.name, password_cache)?;
             let mut cbc = Rar5CbcStream::new(&keys.aes_key, enc.iv);
+            let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
+                RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: data_offset,
+                    reason: "entry data range overflows u64".to_string(),
+                })
+            })?;
+            self.wait_for_range(data_offset, data_end)?;
 
             if method == 0 {
                 self.copy_encrypted_stored_to_sink(
@@ -953,31 +1022,73 @@ impl<'a> RarPipeline<'a> {
         } else if method == 0 {
             // Stream the entry's data bytes from the sparse file
             // into the sink. STORED is a passthrough so
-            // packed_size == unpacked_size; we copy directly.
-            // Resume picks up at the sink's `resume_offset` without
-            // re-reading the prefix from the source — the sink
-            // already replayed the on-disk file to seed its hashes.
-            let copy_start = data_offset.saturating_add(effective_resume_offset);
-            let mut cursor_in_entry = copy_start;
+            // packed_size == unpacked_size; we copy each segment in
+            // order. Resume picks up at the sink's `resume_offset`
+            // without re-reading the prefix from the source — the
+            // sink already replayed the on-disk file to seed its
+            // hashes.
+            let mut skip_remaining = effective_resume_offset;
             let mut buf = vec![0u8; 64 * 1024];
-            while cursor_in_entry < data_end {
-                let want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
-                self.sparse
-                    .read_exact_at(ByteOffset::new(cursor_in_entry), &mut buf[..want])
-                    .map_err(RarPipelineError::Sparse)?;
-                sink.write_entry(&buf[..want])
-                    .map_err(RarPipelineError::Sink)?;
-                cursor_in_entry = cursor_in_entry.saturating_add(want as u64);
-                if let Some(p) = self.progress_state {
-                    p.set_bytes_decoded_input(cursor_in_entry);
+            for (seg_off, seg_size) in &segments {
+                let seg_end = seg_off.checked_add(*seg_size).ok_or_else(|| {
+                    RarPipelineError::Rar(RarError::CorruptHeader {
+                        archive_offset: *seg_off,
+                        reason: "segment data range overflows u64".to_string(),
+                    })
+                })?;
+                // Wait for the segment's bytes to land before
+                // reading. The scheduler cursor below steers
+                // workers toward the current segment.
+                self.cursor.store(*seg_off, Ordering::Release);
+                self.wait_for_range(*seg_off, seg_end)?;
+
+                if skip_remaining >= *seg_size {
+                    // Entire segment lies before the resume offset
+                    // — already on disk, the sink replayed its
+                    // prefix to seed hashes. Step over the segment
+                    // without re-reading.
+                    skip_remaining -= seg_size;
+                    continue;
                 }
-                callback(&RarPipelineEvent::InEntryProgress {
-                    index: idx,
-                    bytes_written: sink.current_entry_offset(),
-                })
-                .map_err(RarPipelineError::Aborted)?;
+                let copy_start = seg_off.saturating_add(skip_remaining);
+                skip_remaining = 0;
+                let mut cursor_in_seg = copy_start;
+                while cursor_in_seg < seg_end {
+                    let want = (seg_end - cursor_in_seg).min(buf.len() as u64) as usize;
+                    self.sparse
+                        .read_exact_at(ByteOffset::new(cursor_in_seg), &mut buf[..want])
+                        .map_err(RarPipelineError::Sparse)?;
+                    sink.write_entry(&buf[..want])
+                        .map_err(RarPipelineError::Sink)?;
+                    cursor_in_seg = cursor_in_seg.saturating_add(want as u64);
+                    if let Some(p) = self.progress_state {
+                        p.set_bytes_decoded_input(cursor_in_seg);
+                    }
+                    callback(&RarPipelineEvent::InEntryProgress {
+                        index: idx,
+                        bytes_written: sink.current_entry_offset(),
+                    })
+                    .map_err(RarPipelineError::Aborted)?;
+                }
             }
         } else {
+            if is_split {
+                return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                    feature: format!(
+                        "compressed entry {:?} spans volume boundary; \
+                         multi-volume RAR5-decoder continuation is not yet \
+                         supported in peel",
+                        entry.header.name
+                    ),
+                }));
+            }
+            let data_end = data_offset.checked_add(packed_size).ok_or_else(|| {
+                RarPipelineError::Rar(RarError::CorruptHeader {
+                    archive_offset: data_offset,
+                    reason: "entry data range overflows u64".to_string(),
+                })
+            })?;
+            self.wait_for_range(data_offset, data_end)?;
             self.decompress_entry_to_sink(
                 idx,
                 entry,
@@ -993,7 +1104,11 @@ impl<'a> RarPipeline<'a> {
 
         let _finalize: EntryFinalize = sink.end_entry().map_err(RarPipelineError::Sink)?;
 
-        let punched = self.punch_range(puncher, data_offset, data_end)?;
+        let mut punched = 0u64;
+        for (seg_off, seg_size) in &segments {
+            punched =
+                punched.saturating_add(self.punch_range(puncher, *seg_off, seg_off + seg_size)?);
+        }
         callback(&RarPipelineEvent::EntryFinished {
             index: idx,
             name: entry.header.name.clone(),
@@ -2210,6 +2325,20 @@ impl<'a> RarPipeline<'a> {
 /// [`MAX_DICT_BYTES`] (256 MiB — the round-one cap from
 /// `PLAN_rar5_decoder.md` §B1) and surface a precise diagnostic
 /// for selectors that overflow.
+/// Enumerate the (data_offset, packed_size) tuples covering an
+/// entry's data area in archive order. Single-volume entries
+/// yield one tuple; multi-volume entries yield the leading
+/// segment first, followed by [`FileEntry::extra_segments`] in
+/// volume order.
+fn entry_data_segments(entry: &FileEntry) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(1 + entry.extra_segments.len());
+    out.push((entry.data_offset, entry.packed_size));
+    for seg in &entry.extra_segments {
+        out.push((seg.data_offset, seg.packed_size));
+    }
+    out
+}
+
 fn dict_capacity_for(compression: &crate::rar::format::CompressionInfo) -> Result<usize, String> {
     let selector = compression.dict_size_selector();
     if selector > 14 {
