@@ -3044,6 +3044,16 @@ fn run_rar(
         chunk_size,
         poll_interval: config.reader_poll_interval,
         initial_header_window: 64 * 1024,
+        // Single-volume HTTP archives go through this code path
+        // unchanged; multi-volume support
+        // (`docs/PLAN_multivolume_archives.md` §2c) lights up when
+        // the coordinator builds the pipeline against a
+        // MultiPartSource carrying multiple volume parts and
+        // forwards the per-volume offsets here. That wiring lands
+        // alongside §6 (CLI surface) — for now the field stays
+        // empty so the pipeline behaves identically to the
+        // pre-§2c single-volume path.
+        volume_starts: Vec::new(),
     };
     let pipeline = RarPipeline {
         config: pipeline_cfg,

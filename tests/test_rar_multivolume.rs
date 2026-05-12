@@ -25,15 +25,24 @@
 //!   slice (`FHD_SPLIT_BEFORE` only) + the `EndArchive` marker.
 
 #![cfg(feature = "rar")]
+#![cfg(unix)]
 
 #[path = "support/mod.rs"]
 mod support;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use peel::bitmap::ChunkBitmap;
+use peel::download::{RarPipeline, RarPipelineConfig, RarResumeState, SparseFile};
+use peel::punch::NoopPuncher;
 use peel::rar::archive::{walk_archive, walk_archive_multivolume};
 use peel::rar::format::arc_flags;
 use peel::rar::RarError;
+use peel::sink::RarSink;
+use peel::types::{ByteOffset, ChunkIndex};
 
 use support::rar_fixtures::{
     build_end_of_archive_with_flags, build_file_header, build_main_header, build_rar5_multivolume,
@@ -206,4 +215,187 @@ fn walk_multivolume_rejects_volume_number_mismatch() {
         }
         other => panic!("expected VolumeSetMismatch, got {other:?}"),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// §2c: RarPipeline drives multi-volume input end-to-end (no SPLIT)
+// ─────────────────────────────────────────────────────────────────
+
+/// Make a temp directory that cleans itself up on drop.
+fn tempdir(label: &str) -> CleanupDir {
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("peel_rar_mv_{label}_{pid}_{nanos}_{n}"));
+    std::fs::create_dir_all(&path).expect("create temp dir");
+    CleanupDir(path)
+}
+
+struct CleanupDir(PathBuf);
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+impl CleanupDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// Assemble a concatenated byte buffer of `volumes` and a parallel
+/// `volume_starts` vector recording where each volume begins in
+/// the global byte space.
+fn concat_with_starts(volumes: &[Vec<u8>]) -> (Vec<u8>, Vec<u64>) {
+    let mut bytes = Vec::new();
+    let mut starts = Vec::with_capacity(volumes.len());
+    for v in volumes {
+        starts.push(bytes.len() as u64);
+        bytes.extend_from_slice(v);
+    }
+    (bytes, starts)
+}
+
+#[test]
+fn pipeline_extracts_three_non_spanning_volumes() {
+    // §2c demo: drive the pipeline against a hand-built 3-volume
+    // archive whose three entries each fit inside their volume
+    // (no SPLIT). The pipeline walker must accept the per-volume
+    // signature + main archive headers, jump across EOA-with-
+    // more_volumes transitions, and extract each entry to disk.
+    let payload_a = b"alpha payload\n".to_vec();
+    let payload_b = vec![0x42u8; 4096];
+    let payload_c = b"gamma\n".to_vec();
+    let per_volume = vec![
+        vec![RarEntrySpec::stored("a.txt", payload_a.clone())],
+        vec![RarEntrySpec::stored("b.bin", payload_b.clone())],
+        vec![RarEntrySpec::stored("nested/c.txt", payload_c.clone())],
+    ];
+    let volumes = build_rar5_multivolume(&per_volume);
+    let (bytes, volume_starts) = concat_with_starts(&volumes);
+    let total_size = bytes.len() as u64;
+
+    // SparseFile holding the full multi-volume concatenation.
+    let tmp = tempdir("pipeline_3vol");
+    let sparse_path = tmp.path().join("archive.bin");
+    let sparse = SparseFile::open_or_create(&sparse_path, total_size).expect("sparse");
+    sparse
+        .pwrite_at(ByteOffset::new(0), &bytes)
+        .expect("seed sparse");
+
+    // Bitmap with everything already complete: the pipeline only
+    // reads; in this direct test we pre-fill rather than running a
+    // scheduler.
+    let chunk_size: u64 = 64 * 1024;
+    let num_chunks = total_size.div_ceil(chunk_size) as u32;
+    let bitmap = ChunkBitmap::new(num_chunks);
+    bitmap.complete_range(ChunkIndex::new(0), ChunkIndex::new(num_chunks));
+
+    let cursor = Arc::new(AtomicU64::new(0));
+    let download_done = Arc::new(AtomicBool::new(true));
+    let download_outcome = Arc::new(Mutex::new(None));
+
+    let pipeline = RarPipeline {
+        config: RarPipelineConfig {
+            total_size,
+            chunk_size,
+            poll_interval: Duration::from_millis(1),
+            initial_header_window: 64 * 1024,
+            volume_starts: volume_starts.clone(),
+        },
+        sparse: &sparse,
+        bitmap: &bitmap,
+        cursor: &cursor,
+        download_done: &download_done,
+        download_outcome: &download_outcome,
+        sparse_fd: sparse.as_fd(),
+        progress_state: None,
+        password_source: None,
+        password_label: "test://multivolume",
+    };
+
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).expect("mkdir out");
+    let mut sink = RarSink::new(&out_dir).expect("rar sink");
+    let puncher = NoopPuncher::new();
+
+    let stats = pipeline
+        .run(&mut sink, &puncher, RarResumeState::default(), |_| Ok(()))
+        .expect("multi-volume pipeline run");
+
+    assert_eq!(stats.entries_extracted, 3);
+
+    let got_a = std::fs::read(out_dir.join("a.txt")).expect("read a.txt");
+    assert_eq!(got_a, payload_a);
+    let got_b = std::fs::read(out_dir.join("b.bin")).expect("read b.bin");
+    assert_eq!(got_b, payload_b);
+    let got_c = std::fs::read(out_dir.join("nested/c.txt")).expect("read c.txt");
+    assert_eq!(got_c, payload_c);
+}
+
+#[test]
+fn pipeline_rejects_split_entry_with_precise_diagnostic() {
+    // The committed real fixture's `big.bin` spans every volume.
+    // Until §2d, the pipeline must surface a precise
+    // UnsupportedFeature naming the entry — not a generic parse
+    // failure — when its walker encounters the leading
+    // FHD_SPLIT_AFTER header.
+    let v1 = read_volume("multi.part1.rar");
+    let v2 = read_volume("multi.part2.rar");
+    let v3 = read_volume("multi.part3.rar");
+    let volumes = vec![v1, v2, v3];
+    let (bytes, volume_starts) = concat_with_starts(&volumes);
+    let total_size = bytes.len() as u64;
+
+    let tmp = tempdir("pipeline_split_reject");
+    let sparse_path = tmp.path().join("archive.bin");
+    let sparse = SparseFile::open_or_create(&sparse_path, total_size).expect("sparse");
+    sparse
+        .pwrite_at(ByteOffset::new(0), &bytes)
+        .expect("seed sparse");
+
+    let chunk_size: u64 = 64 * 1024;
+    let num_chunks = total_size.div_ceil(chunk_size) as u32;
+    let bitmap = ChunkBitmap::new(num_chunks);
+    bitmap.complete_range(ChunkIndex::new(0), ChunkIndex::new(num_chunks));
+
+    let cursor = Arc::new(AtomicU64::new(0));
+    let download_done = Arc::new(AtomicBool::new(true));
+    let download_outcome = Arc::new(Mutex::new(None));
+    let pipeline = RarPipeline {
+        config: RarPipelineConfig {
+            total_size,
+            chunk_size,
+            poll_interval: Duration::from_millis(1),
+            initial_header_window: 64 * 1024,
+            volume_starts: volume_starts.clone(),
+        },
+        sparse: &sparse,
+        bitmap: &bitmap,
+        cursor: &cursor,
+        download_done: &download_done,
+        download_outcome: &download_outcome,
+        sparse_fd: sparse.as_fd(),
+        progress_state: None,
+        password_source: None,
+        password_label: "test://split-reject",
+    };
+
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).expect("mkdir out");
+    let mut sink = RarSink::new(&out_dir).expect("rar sink");
+    let puncher = NoopPuncher::new();
+
+    let err = pipeline
+        .run(&mut sink, &puncher, RarResumeState::default(), |_| Ok(()))
+        .expect_err("§2c rejects SPLIT entries");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("multi-volume file continuation") && msg.contains("big.bin"),
+        "unexpected error: {msg}"
+    );
 }

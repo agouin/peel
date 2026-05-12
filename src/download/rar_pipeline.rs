@@ -110,6 +110,14 @@ pub struct RarPipelineConfig {
     /// large enough for the common case (RAR5 file headers tend
     /// to be a few hundred bytes including the file name).
     pub initial_header_window: u64,
+    /// Byte offsets in the sparse file where each volume begins,
+    /// in input order. Length = number of volumes; the first
+    /// entry is always 0. Empty means single-volume input (treated
+    /// equivalently to `vec![0]`). The walker uses the table to
+    /// jump past per-volume signature + main archive headers when
+    /// an end-of-archive marker carries `more_volumes`
+    /// (`docs/PLAN_multivolume_archives.md` §2c).
+    pub volume_starts: Vec<u64>,
 }
 
 impl Default for RarPipelineConfig {
@@ -119,6 +127,7 @@ impl Default for RarPipelineConfig {
             chunk_size: 0,
             poll_interval: Duration::from_millis(5),
             initial_header_window: 64 * 1024,
+            volume_starts: Vec::new(),
         }
     }
 }
@@ -412,7 +421,20 @@ impl<'a> RarPipeline<'a> {
         let mut cursor: u64 = sig_size;
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut solid = false;
-        let mut saw_main = false;
+        // Multi-volume state (`docs/PLAN_multivolume_archives.md`
+        // §2c). For single-volume input `volume_starts` is empty
+        // and `num_volumes == 1`; the EOA branch breaks out of the
+        // walker on the lone marker. For multi-volume input the
+        // EOA-with-more_volumes branch advances `current_vol_idx`,
+        // jumps `cursor` to `volume_starts[current_vol_idx]`,
+        // re-validates the next volume's RAR5 signature, and lets
+        // the loop continue into the next volume's main header.
+        let num_volumes = self.config.volume_starts.len().max(1);
+        let mut current_vol_idx: usize = 0;
+        // `saw_volume_main_for_idx == Some(i)` means we've already
+        // parsed volume `i`'s main archive header; encountering a
+        // second one in the same volume is malformed input.
+        let mut saw_volume_main_for_idx: Option<usize> = None;
         // Set after parsing HEAD_CRYPT: subsequent headers are
         // AES-256-CBC encrypted under this key, each prefixed by
         // its own 16-byte IV.
@@ -449,29 +471,85 @@ impl<'a> RarPipeline<'a> {
             let header = parse_generic_header(local_buf, cursor).map_err(RarPipelineError::Rar)?;
             match header.header_type {
                 HeaderType::MainArchive => {
-                    if saw_main {
+                    if saw_volume_main_for_idx == Some(current_vol_idx) {
                         return Err(RarPipelineError::Rar(RarError::CorruptHeader {
                             archive_offset: header.archive_offset,
-                            reason: "second main archive header encountered".to_string(),
+                            reason: format!(
+                                "second main archive header in volume {}",
+                                current_vol_idx + 1
+                            ),
                         }));
                     }
-                    saw_main = true;
+                    saw_volume_main_for_idx = Some(current_vol_idx);
                     let main = parse_main_archive_header(&header, local_buf)
                         .map_err(RarPipelineError::Rar)?;
-                    if main.archive_flags.is_volume() {
-                        let label = match main.volume_number {
-                            Some(n) => format!("multi-volume archive (volume {n})"),
-                            None => "multi-volume archive".to_string(),
-                        };
-                        return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
-                            feature: label,
-                        }));
+                    if current_vol_idx == 0 {
+                        solid = main.archive_flags.is_solid();
+                        if num_volumes > 1 && !main.archive_flags.is_volume() {
+                            return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: "first volume of multi-volume input \
+                                         missing MHD_VOLUME flag"
+                                    .to_string(),
+                            }));
+                        }
+                    } else {
+                        if !main.archive_flags.is_volume() {
+                            return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                                archive_offset: header.archive_offset,
+                                reason: format!(
+                                    "volume {} main header missing MHD_VOLUME flag",
+                                    current_vol_idx + 1
+                                ),
+                            }));
+                        }
+                        if let Some(vn) = main.volume_number {
+                            let expected = current_vol_idx as u64;
+                            if vn != expected {
+                                return Err(RarPipelineError::Rar(RarError::VolumeSetMismatch {
+                                    detail: format!(
+                                        "supplied volume {} carries wire \
+                                             volume_number={vn}; expected \
+                                             {expected} (0-based) for that position",
+                                        current_vol_idx + 1
+                                    ),
+                                }));
+                            }
+                        }
                     }
-                    solid = main.archive_flags.is_solid();
                 }
                 HeaderType::File => {
                     let file =
                         parse_file_header(&header, local_buf).map_err(RarPipelineError::Rar)?;
+                    if header.header_flags
+                        & (crate::rar::format::hdr_flags::SPLIT_BEFORE
+                            | crate::rar::format::hdr_flags::SPLIT_AFTER)
+                        != 0
+                    {
+                        // §2c rejects multi-volume file continuation.
+                        // §2d teaches the walker + extractor to fold
+                        // matching SPLIT_AFTER / SPLIT_BEFORE pairs
+                        // across volumes into one logical entry.
+                        let direction = match (
+                            header.header_flags & crate::rar::format::hdr_flags::SPLIT_BEFORE != 0,
+                            header.header_flags & crate::rar::format::hdr_flags::SPLIT_AFTER != 0,
+                        ) {
+                            (true, true) => "spans (continues from prior volume into next)",
+                            (true, false) => "continues from prior volume",
+                            (false, true) => "continues into next volume",
+                            (false, false) => unreachable!(),
+                        };
+                        return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                            feature: format!(
+                                "multi-volume file continuation: entry {:?} in \
+                                 volume {} {direction} (RAR5 FHD_SPLIT_*); \
+                                 cross-volume entry stitching not yet \
+                                 implemented in peel",
+                                file.name,
+                                current_vol_idx + 1
+                            ),
+                        }));
+                    }
                     let method = file.compression.method();
                     if method > 5 {
                         // 6 / 7 are reserved by the format spec; rejecting
@@ -541,10 +619,70 @@ impl<'a> RarPipeline<'a> {
                     archive_keys = Some(keys);
                 }
                 HeaderType::EndOfArchive => {
-                    let _eof = parse_end_of_archive_header(&header, local_buf)
+                    let eof = parse_end_of_archive_header(&header, local_buf)
                         .map_err(RarPipelineError::Rar)?;
-                    cursor = cursor.saturating_add(header.total_bytes_with_data());
-                    break;
+                    if eof.more_volumes {
+                        // §2c: cross-volume transition. Encrypted
+                        // multi-volume sets are out of scope until a
+                        // dedicated follow-on lands the
+                        // per-volume HEAD_CRYPT re-init.
+                        if archive_keys.is_some() {
+                            return Err(RarPipelineError::Rar(RarError::UnsupportedFeature {
+                                feature: "encrypted multi-volume archives \
+                                          (archive-header encryption + \
+                                          MHD_VOLUME) not yet supported"
+                                    .to_string(),
+                            }));
+                        }
+                        if current_vol_idx + 1 >= num_volumes {
+                            return Err(RarPipelineError::Rar(RarError::VolumeSetMismatch {
+                                detail: format!(
+                                    "supplied volume {} (the last in the set) \
+                                         carries more_volumes=true; additional \
+                                         volumes were not supplied",
+                                    current_vol_idx + 1
+                                ),
+                            }));
+                        }
+                        current_vol_idx += 1;
+                        cursor = self.config.volume_starts[current_vol_idx];
+                        // Wait for the next volume's signature and
+                        // validate it; on success advance past the
+                        // signature so the next loop iteration
+                        // lands on the volume's main header.
+                        self.wait_for_range(cursor, cursor + SIGNATURE_MAGIC.len() as u64)?;
+                        let mut sig_buf = [0u8; SIGNATURE_MAGIC.len()];
+                        self.sparse
+                            .read_exact_at(ByteOffset::new(cursor), &mut sig_buf)
+                            .map_err(RarPipelineError::Sparse)?;
+                        let (kind, sig_len) =
+                            detect_signature(&sig_buf).map_err(RarPipelineError::Rar)?;
+                        if !matches!(kind, SignatureKind::Rar5) {
+                            return Err(RarPipelineError::Rar(RarError::CorruptHeader {
+                                archive_offset: cursor,
+                                reason: format!(
+                                    "volume {} signature is not RAR5",
+                                    current_vol_idx + 1
+                                ),
+                            }));
+                        }
+                        cursor = cursor.saturating_add(sig_len as u64);
+                        continue;
+                    } else {
+                        if current_vol_idx + 1 < num_volumes {
+                            return Err(RarPipelineError::Rar(RarError::VolumeSetMismatch {
+                                detail: format!(
+                                    "supplied volume {} terminates the archive \
+                                         (more_volumes=false) but {} additional \
+                                         volume(s) were supplied beyond it",
+                                    current_vol_idx + 1,
+                                    num_volumes - current_vol_idx - 1
+                                ),
+                            }));
+                        }
+                        cursor = cursor.saturating_add(header.total_bytes_with_data());
+                        break;
+                    }
                 }
                 HeaderType::Other(code) => {
                     if header.header_flags & crate::rar::format::hdr_flags::SKIP_IF_UNKNOWN == 0 {
