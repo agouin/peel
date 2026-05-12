@@ -34,6 +34,10 @@ In this order. Don't skip.
 5. **`docs/OPTIMIZATIONS.md`** — explicitly **out of scope** for now. Read
    only so you don't accidentally implement something from this list and
    bloat the MVP.
+6. **`docs/ENCRYPTION.md`** — supported encryption schemes, the
+   `--password-from` flag, the threat model, and exit code 4. Read before
+   touching anything under `src/crypto/`, `src/secret.rs`, or the
+   per-format encryption code.
 
 ## House rules summary
 
