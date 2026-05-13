@@ -1,11 +1,6 @@
 # peel
 
-<table>
-<tr>
-<td width="240" valign="top">
-<img src="peel.png" alt="peel logo" width="220">
-</td>
-<td valign="top">
+<img src="peel.png" alt="peel logo" width="150" align="left" hspace="24" vspace="6">
 
 **The Swiss Army knife for file downloads and extraction.**
 
@@ -14,6 +9,8 @@ Tired of provisioning disk for *both* the compressed file and its
 extracted contents, only to throw half of it away? Tired of
 restarting a half-finished multi-gigabyte download from scratch
 every time the connection drops or the process gets killed?
+
+<br clear="left">
 
 Point `peel` at a URL and it does the right thing. A plain file?
 You get a parallel, ranged, resumable download with end-to-end
@@ -25,9 +22,7 @@ full size. Either way, a dropped connection, `kill -9`, or power
 loss resumes exactly where it left off, byte-identical to a clean
 run.
 
-</td>
-</tr>
-</table>
+
 
 ## Quick start
 
