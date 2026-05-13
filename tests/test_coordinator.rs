@@ -979,8 +979,9 @@ fn progress_state_counters_advance_during_a_run() {
         finish_called: Arc::clone(&finish_called),
     };
     // Tight render cadence so the test sees several mid-run ticks.
-    let render_handle = spawn_renderer(Arc::clone(&state), renderer, Duration::from_millis(5))
-        .expect("spawn recording renderer");
+    let render_handle =
+        spawn_renderer(Arc::clone(&state), renderer, Duration::from_millis(5), None)
+            .expect("spawn recording renderer");
 
     let mut args = make_args(
         &server,

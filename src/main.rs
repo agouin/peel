@@ -441,6 +441,7 @@ fn main() -> Result<()> {
             Arc::clone(&state),
             TtyRenderer::new(std::io::stderr()),
             Duration::from_millis(100),
+            Some(Arc::clone(&kill_switch)),
         )
         .context("spawning the TTY progress renderer")?
     } else {
@@ -448,6 +449,7 @@ fn main() -> Result<()> {
             Arc::clone(&state),
             LogRenderer::new(),
             Duration::from_secs(2),
+            Some(Arc::clone(&kill_switch)),
         )
         .context("spawning the log progress renderer")?
     };
@@ -568,6 +570,7 @@ fn run_local_dispatch(
             Arc::clone(&state),
             TtyRenderer::new(std::io::stderr()),
             Duration::from_millis(100),
+            Some(Arc::clone(kill_switch)),
         )
         .context("spawning the TTY progress renderer")?
     } else {
@@ -575,6 +578,7 @@ fn run_local_dispatch(
             Arc::clone(&state),
             LogRenderer::new(),
             Duration::from_secs(2),
+            Some(Arc::clone(kill_switch)),
         )
         .context("spawning the log progress renderer")?
     };

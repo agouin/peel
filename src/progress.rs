@@ -1733,6 +1733,15 @@ impl DecodeStepStallDetector {
 /// the thread exits. Callers join the returned handle after
 /// [`ProgressState::mark_done`].
 ///
+/// When `kill_switch` is `Some` and flips to `true`, the renderer
+/// stops drawing **without** emitting a final frame. This is the
+/// SIGINT / SIGTERM path: the signal handler writes a one-line
+/// shutdown notice to stderr right before flipping the switch, and
+/// the TTY renderer's cursor-up redraw would otherwise overwrite that
+/// notice on its next tick (`internal/PLAN_responsiveness.md` §2.3).
+/// Leaving the last frame in place keeps the shutdown message
+/// visible immediately.
+///
 /// A [`StallDetector`] runs in lockstep with the renderer so a frozen
 /// pipeline produces a structured `tracing::warn!` event independent of
 /// the chosen renderer. The interval honors
@@ -1746,6 +1755,7 @@ pub fn spawn_renderer<R>(
     state: Arc<ProgressState>,
     mut renderer: R,
     refresh: Duration,
+    kill_switch: Option<Arc<AtomicBool>>,
 ) -> io::Result<JoinHandle<()>>
 where
     R: ProgressRenderer + 'static,
@@ -1756,6 +1766,9 @@ where
         .spawn(move || {
             let mut detector = StallDetector::from_env(Instant::now());
             let mut step_detector = DecodeStepStallDetector::from_env();
+            let aborting = |ks: &Option<Arc<AtomicBool>>| {
+                ks.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
+            };
             // Tick loop: render, sleep, render, … until done. We do an
             // extra final render after the done flag flips so the user
             // sees the final counters.
@@ -1770,6 +1783,14 @@ where
             // the actual work finished).
             const SLEEP_SLICE: Duration = Duration::from_millis(20);
             loop {
+                // SIGINT/SIGTERM path: the signal handler has already
+                // printed the shutdown notice to stderr; skip the
+                // render so we don't overwrite it. The clean-exit path
+                // (mark_done without kill_switch) still falls through
+                // and emits a final frame below.
+                if aborting(&kill_switch) {
+                    break;
+                }
                 let snap = state.snapshot();
                 let now = Instant::now();
                 renderer.render(&snap);
@@ -1780,7 +1801,7 @@ where
                 }
                 let mut left = refresh;
                 while !left.is_zero() {
-                    if state.is_done() {
+                    if state.is_done() || aborting(&kill_switch) {
                         break;
                     }
                     let slice = left.min(SLEEP_SLICE);
@@ -3747,12 +3768,75 @@ mod tests {
             ticks: Arc::clone(&ticks),
             finish_called: Arc::clone(&finish_called),
         };
-        let handle =
-            spawn_renderer(Arc::clone(&state), renderer, Duration::from_millis(20)).expect("spawn");
+        let handle = spawn_renderer(
+            Arc::clone(&state),
+            renderer,
+            Duration::from_millis(20),
+            None,
+        )
+        .expect("spawn");
         thread::sleep(Duration::from_millis(120));
         state.mark_done();
         handle.join().expect("join");
         assert!(ticks.load(Ordering::Relaxed) >= 2);
+        assert!(finish_called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn spawn_renderer_skips_final_frame_when_kill_switch_fires() {
+        // Models the SIGINT path: the signal handler flips the kill
+        // switch right after writing the shutdown notice. The renderer
+        // must NOT emit any further frame, or the TTY renderer's
+        // cursor-up redraw would clobber that notice.
+        struct CountingRenderer {
+            ticks: Arc<AtomicU64>,
+            finish_called: Arc<AtomicBool>,
+        }
+        impl ProgressRenderer for CountingRenderer {
+            fn render(&mut self, _snap: &ProgressSnapshot) {
+                self.ticks.fetch_add(1, Ordering::Relaxed);
+            }
+            fn finish(&mut self) {
+                self.finish_called.store(true, Ordering::Release);
+            }
+        }
+        let state = ProgressState::new();
+        let kill_switch = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicU64::new(0));
+        let finish_called = Arc::new(AtomicBool::new(false));
+        let renderer = CountingRenderer {
+            ticks: Arc::clone(&ticks),
+            finish_called: Arc::clone(&finish_called),
+        };
+        let handle = spawn_renderer(
+            Arc::clone(&state),
+            renderer,
+            Duration::from_millis(20),
+            Some(Arc::clone(&kill_switch)),
+        )
+        .expect("spawn");
+        // Let a few frames render under normal conditions.
+        thread::sleep(Duration::from_millis(120));
+        let pre_abort = ticks.load(Ordering::Relaxed);
+        assert!(pre_abort >= 2, "expected some ticks before abort");
+        // Flip the kill switch — simulates the signal handler. The
+        // sleep slice in the renderer is 20 ms; give it a few of those
+        // plus the 20 ms refresh tick to wake and observe the switch.
+        kill_switch.store(true, Ordering::Release);
+        thread::sleep(Duration::from_millis(120));
+        let post_abort = ticks.load(Ordering::Relaxed);
+        // At most one extra frame may slip in if the kill switch fires
+        // between the top-of-loop check and the in-sleep check, but it
+        // must NOT keep ticking.
+        assert!(
+            post_abort <= pre_abort + 1,
+            "renderer kept ticking after kill switch: pre={pre_abort} post={post_abort}",
+        );
+        // mark_done is still needed in production to join cleanly; do
+        // the same here so the loop has a deterministic exit even if
+        // the kill-switch break already ran.
+        state.mark_done();
+        handle.join().expect("join");
         assert!(finish_called.load(Ordering::Acquire));
     }
 }
