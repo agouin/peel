@@ -178,6 +178,71 @@ aarch64; keep the scalar path as the fallback. Gate behind the same
 
 ---
 
+### O.RAW.TARBUF TarSink write buffering
+
+**Filed 2026-05-13 from
+[`internal/PLAN_raw_row_throughput.md`](PLAN_raw_row_throughput.md)
+§Deferred.**
+
+**What**: wrap `TarSink`'s per-entry output file in a `BufWriter`
+the same way Phase 1 of `PLAN_raw_row_throughput.md` wrapped
+`RawSink`. The tar-sink writes per entry today, so a many-small-files
+archive pays the same per-entry `write(2)` granularity that
+`RawSink` paid before the wrap; a `BufWriter` collapses each entry's
+writes into one or two syscalls.
+
+**Why deferred**: the raw rows were the named gap; the `tar.gz` /
+`tar.zst` rows the plan checked for "no regression" already sit at
+**0.82×** / **0.52×** without this change. Promote only after a
+profile on a many-small-files corpus shows per-entry sink writes
+load-bearing again.
+
+---
+
+### O.RAW.XXH64SWAR Xxh64 SWAR / SIMD update loop
+
+**Filed 2026-05-13 from
+[`internal/PLAN_raw_row_throughput.md`](PLAN_raw_row_throughput.md)
+Phase 3 (skipped).**
+
+**What**: rewrite `Xxh64::update`'s four-lane stripe processor with
+explicit SWAR / NEON intrinsics to push past LLVM auto-vectorization's
+ceiling on `process_stripe`.
+
+**Why deferred**: the Phase 0 anchor bench
+([`tests/test_bench_hash.rs`](../tests/test_bench_hash.rs)) measured
+peel's existing scalar `Xxh64` at **~23 GiB/s** on M4 Max — well above
+the plan narrative's "current scalar ~3 GB/s" estimate that motivated
+Phase 3 in the first place. LLVM is already auto-vectorizing the
+unrolled four-lane loop. A 3× speedup over 24 GiB/s would land at
+72 GiB/s, which is above realistic memory bandwidth on this
+microarchitecture. Promote only if a profile on a different host or a
+different workload (e.g., x86-64 / AMD Zen, or a sparse-fill payload
+that fits the L1) shows `xxh64::update` load-bearing again.
+
+---
+
+### O.RAW.LINUXIOURING io_uring blocking-write zero-copy on the local raw path
+
+**Filed 2026-05-13 from
+[`internal/PLAN_raw_row_throughput.md`](PLAN_raw_row_throughput.md)
+§Deferred.**
+
+**What**: on Linux, replace the blocking `pwrite` path the `RawSink`
+`BufWriter` ultimately calls with io_uring `IORING_OP_WRITE` submissions
+fed off the decoder's output ring, so the syscall round-trip drops
+out of the bench-grid wall time entirely.
+
+**Why deferred**: macOS raw rows were the named gap; Phase 1's
+1 MiB `BufWriter` plus Phase 2's source-side buffering already
+collapsed the syscall pressure that profiled as the per-row floor.
+Promote only after a Linux raw-row bench shows the blocking `pwrite`
+path is still the binding constraint on that platform — the same
+`splice(2)` / `copy_file_range(2)` posture this plan's §Deferred
+section captured.
+
+---
+
 ## Format support
 
 ### O.6 xz / LZMA decoder

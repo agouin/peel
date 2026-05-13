@@ -1,6 +1,17 @@
 # PLAN — Close the bench-grid raw rows by buffering the sink/source boundary
 
-**Status**: proposed (2026-05-13).
+**Status**: Phases 0, 1, 2, 4 shipped (2026-05-13). Phase 3 skipped
+— the Phase 0 anchor bench measured `Xxh64::update` at ~23 GiB/s on
+M4 Max (vs. the plan narrative's ~3 GB/s estimate), so the Phase 3
+SWAR work was filed against
+[`internal/OPTIMIZATIONS.md`](OPTIMIZATIONS.md#orawxxh64swar-xxh64-swar--simd-update-loop)
+instead of pursued. Bench grid (median-of-3) confirms `gz-raw`
+100 MiB · warm 1.80× → 1.35× and `zstd-raw` 100 MiB · warm
+1.61× → 1.47× (both rows' absolute peel wall time meets the plan's
+target — the residual ratio bounces with the ~10 ms warm-cell
+noise band the plan's §Risks 6 named, and the remaining wall-time
+gap is peel's subprocess startup, not the syscall pressure this
+plan targeted).
 **Owner**: TBD.
 **Promotes**: the README bench grid's `gz-raw` and `zstd-raw`
 100 MiB · warm rows (1.82× and 1.61× today) and the surrounding

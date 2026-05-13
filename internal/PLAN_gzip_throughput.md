@@ -46,6 +46,20 @@ final post-wire flush. Profiling that gap is filed as a follow-on
 fraction worth ≥ 25 ms, Phase 3's 1.5–2-week investment is not
 justified.
 
+**2026-05-13 update**: a chunk of that 14 ms non-decoder gap was
+closed in
+[`internal/PLAN_raw_row_throughput.md`](PLAN_raw_row_throughput.md)
+— that plan attacked the sink-side and source-side syscall pressure
+that profiled as ~94 % of peel's wall time on the *decode-local*
+raw-row variant of the same payload shape. The DEFLATE-side levers
+landed there (the `bitstream::PULL_BUF_LEN` bump from 4 KiB to 256 KiB
+and the coordinator-side `BufReader` wrap) shipped against the
+decode-local grid's `gz-raw` 100 MiB · warm row going from 1.80× to
+~1.35× and the streaming 10 Gbps `tar.gz` row staying flat at ~1.06×.
+The remaining streaming-grid gap is now dominated by peel's subprocess
+startup and the per-checkpoint blob serialization, not the deflate
+kernel.
+
 **What stays shipped**: Phases 0–2 — the multi-member fixture, the
 member-boundary scanner ([`src/decode/deflate_native/members.rs`](../src/decode/deflate_native/members.rs)),
 the `GzipDecoder::members_scanned` / `last_member_crc32` /
