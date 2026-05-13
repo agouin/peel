@@ -69,6 +69,12 @@ Multi-volume archives:
     version,
     about = "Streaming, resumable, space-efficient extractor for compressed archives over HTTP.",
     after_long_help = MULTI_VOLUME_HELP_SECTION,
+    // Invoking `peel` with no arguments at all prints the help text
+    // and exits 0 rather than surfacing the `CliError::NoUrls` path,
+    // which made the bare command look like a stack trace. Passing
+    // any flag (even just `--workers N` with no URL) still flows
+    // through the normal validation and reports `NoUrls` as before.
+    arg_required_else_help = true,
 )]
 #[command(group(
     // The two format-override flags express *different intents*: one

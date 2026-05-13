@@ -1118,6 +1118,16 @@ fn pad_label(label: &str, width: usize) -> String {
 
 impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
     fn render(&mut self, snapshot: &ProgressSnapshot) {
+        // Skip ticks fired before the coordinator has finished
+        // discovery and called `mark_started`. Without this gate the
+        // 100 ms TTY refresh would paint a block of `--.-%` /
+        // `0 B / ?` lines while the HEAD request is in flight; on a
+        // discovery-time failure (404, DNS error) those frames
+        // remain on the user's terminal underneath the error.
+        // Mirrors the `started` check in `LogRenderer::render`.
+        if !snapshot.started {
+            return;
+        }
         let now = Instant::now();
         let lines = self.format_lines(snapshot, now);
         // Each render rewrites the previous block. Strategy:
@@ -2706,6 +2716,39 @@ mod tests {
             (4..=24).contains(&body.len()),
             "expected modest bar in narrow terminal, got {} cells in {l1:?}",
             body.len()
+        );
+    }
+
+    #[test]
+    fn tty_renderer_skips_render_until_started() {
+        // Before `mark_started` (i.e. while discovery is still in
+        // flight), the TTY renderer must not paint anything. Painting
+        // empty bars during the HEAD round-trip leaves a residual
+        // block on the terminal underneath any discovery-time error.
+        let buf: Vec<u8> = Vec::new();
+        let mut r = TtyRenderer::with_bar_width(buf, 12);
+        let snap = ProgressSnapshot {
+            total_size: None,
+            bytes_downloaded: 0,
+            bytes_extracted: 0,
+            extracted_estimate: None,
+            active_workers: 0,
+            total_workers: 0,
+            started: false,
+            done: false,
+            bytes_decoded_input: 0,
+            max_disk_buffer: None,
+            disk_bound: false,
+            decode_step_elapsed: None,
+            parts: Vec::new(),
+            local: false,
+        };
+        r.render(&snap);
+        r.render(&snap);
+        assert!(
+            r.out.is_empty(),
+            "TtyRenderer should emit nothing before started flips true, got {:?}",
+            String::from_utf8_lossy(&r.out)
         );
     }
 
