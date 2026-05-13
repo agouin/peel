@@ -1,23 +1,41 @@
 //! Single-file output sink.
 //!
 //! Every byte fed to a [`RawSink`] is written verbatim to one open
-//! file at the path the constructor was given. There is no framing,
-//! no transformation, and no buffering beyond what the underlying
-//! [`std::fs::File`] does. The right choice when the source decodes
-//! to a single output stream — a plain `.zst` of one file, a `.gz` of
-//! a single tarball that the user wants kept whole, etc.
+//! file at the path the constructor was given. There is no framing
+//! and no transformation. Bytes pass through a 1 MiB write-side
+//! buffer ([`RAW_SINK_BUF_CAPACITY`]) so the decoder's natural
+//! 64-128 KiB output chunks coalesce into one filesystem `write(2)`
+//! per buffer flush — see `internal/PLAN_raw_row_throughput.md`
+//! Phase 1 for the rationale.
 //!
 //! The sink reports [`Sink::is_quiescent`] as `true` unconditionally:
 //! every byte boundary is a valid checkpoint because there is no
-//! parser state to be in the middle of. The coordinator's checkpoints
-//! still need to align with the decoder's frame boundaries, but the
-//! sink imposes no extra constraint.
+//! parser state to be in the middle of. To pair this with the
+//! buffered writes, the sink's [`Sink::flush_durable`] override is
+//! called by the extractor before each checkpoint commit so the
+//! `bytes_written` field of the persisted [`crate::checkpoint::SinkState`]
+//! reflects bytes that have actually reached the kernel.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::sink::{Sink, SinkError};
+
+/// Write-side buffer capacity wrapped around the underlying file.
+///
+/// 1 MiB matches three things at once:
+/// - the streaming decoder's `OUTPUT_CHUNK = 1 MiB` cap, so the
+///   buffer holds at most one `decode_step` worth of output before a
+///   flush;
+/// - the macOS APFS extent granularity (~1 MiB), so the page-cache
+///   write boundary aligns with the filesystem's allocation
+///   boundary;
+/// - the `--max-disk-buffer` default budget the user-named memory
+///   ceiling tracks, so the buffer is comfortably inside that budget.
+///
+/// Selected by `internal/PLAN_raw_row_throughput.md` Phase 1.
+pub const RAW_SINK_BUF_CAPACITY: usize = 1 << 20;
 
 /// Streams every byte to a single output file.
 ///
@@ -30,14 +48,21 @@ pub struct RawSink {
     /// Path the sink was constructed from. Used only for diagnostic
     /// messages — the file's identity is the open descriptor.
     path: PathBuf,
-    /// The file every byte goes to. `Some` while the sink is live;
-    /// taken by [`Sink::close`] to drop and flush the descriptor.
-    file: Option<File>,
-    /// Total bytes successfully written through [`Sink::write`] —
+    /// 1 MiB write-buffered handle to the output file. `Some` while
+    /// the sink is live; taken by [`Sink::close`] to flush and drop
+    /// the descriptor.
+    file: Option<BufWriter<File>>,
+    /// Total bytes successfully accepted by [`Sink::write`] —
     /// initialized to `0` by [`Self::create`] / [`Self::wrap`] and to
     /// the existing offset by [`Self::resume`] so a checkpoint
     /// captured immediately after a resume reflects the correct
     /// already-on-disk byte count.
+    ///
+    /// This counter is incremented at the [`Sink::write`] call site
+    /// (in-buffer), not at the underlying syscall — pair with
+    /// [`Sink::flush_durable`] before persisting a checkpoint so
+    /// the count published in [`crate::checkpoint::SinkState`] is
+    /// known to be on disk rather than in the `BufWriter`.
     bytes_written: u64,
 }
 
@@ -75,7 +100,7 @@ impl RawSink {
     pub fn wrap(path: PathBuf, file: File) -> Self {
         Self {
             path,
-            file: Some(file),
+            file: Some(BufWriter::with_capacity(RAW_SINK_BUF_CAPACITY, file)),
             bytes_written: 0,
         }
     }
@@ -127,9 +152,14 @@ impl RawSink {
 
     /// Return a borrow of the underlying file. Useful for tests that
     /// want to query the descriptor's metadata mid-stream.
+    ///
+    /// Note that the descriptor's reported length lags
+    /// [`Self::bytes_written`] by whatever is currently sitting in
+    /// the 1 MiB `BufWriter`; callers that want a flushed-to-disk
+    /// view should run [`Sink::flush_durable`] first.
     #[must_use]
     pub fn file(&self) -> Option<&File> {
-        self.file.as_ref()
+        self.file.as_ref().map(BufWriter::get_ref)
     }
 
     /// Return the path the sink was constructed from.
@@ -146,6 +176,15 @@ impl Sink for RawSink {
             path: path.clone(),
             source: std::io::Error::other("raw sink already closed"),
         })?;
+        // `BufWriter::write_all` returns an error inline only when an
+        // inner `write(2)` fails *during* the buffered fill (i.e. the
+        // buffer was already full and the spilling write to the file
+        // surfaced an errno) — every other failure mode parks until
+        // the next [`Self::flush_durable`] or [`Sink::close`]. The
+        // contract change is intentional and documented at the
+        // sink-trait level; the checkpoint observer's
+        // `flush_durable` call narrows the deferral window to one
+        // checkpoint cadence (~8 MiB on a 1 GiB run, default config).
         file.write_all(buf).map_err(|source| SinkError::Io {
             path: path.clone(),
             source,
@@ -164,12 +203,36 @@ impl Sink for RawSink {
         }
     }
 
+    /// Drain the 1 MiB write buffer into the underlying file.
+    ///
+    /// The extractor's checkpoint observer calls this immediately
+    /// before [`Sink::sink_state`] is captured, so the
+    /// `bytes_written` field of the persisted checkpoint reflects
+    /// bytes that have reached the kernel rather than bytes that
+    /// are still sitting in this sink's buffer. Without this hook a
+    /// `kill -9` between a checkpoint's `fsync` and the next
+    /// natural `BufWriter` flush would leave the on-disk file short
+    /// of the checkpoint's recorded length, and the resume path
+    /// (which `set_len`s to the recorded length) would *grow* the
+    /// file with zero bytes rather than truncating — bug.
+    fn flush_durable(&mut self) -> Result<(), SinkError> {
+        if let Some(file) = self.file.as_mut() {
+            file.flush().map_err(|source| SinkError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
     fn close(mut self) -> Result<(), SinkError> {
-        // Take the file out so a panic between flush() and the end of
-        // the function still drops the descriptor. `flush` on a plain
-        // `File` is a no-op; we still call it so any future
-        // BufWriter-style wrapper Just Works without revisiting the
-        // close discipline here.
+        // Take the buffered writer out so a panic between flush and
+        // the end of the function still drops the descriptor.
+        // `BufWriter::flush` is the call that surfaces any errno
+        // parked in the buffer since the last successful flush; we
+        // call it explicitly rather than relying on `BufWriter`'s
+        // drop impl, since drop's flush failure is silently
+        // discarded.
         if let Some(mut file) = self.file.take() {
             file.flush().map_err(|source| SinkError::Io {
                 path: self.path.clone(),

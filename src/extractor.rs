@@ -802,6 +802,26 @@ impl Extractor {
                         if !throttled {
                             stats.quiescent_checkpoints =
                                 stats.quiescent_checkpoints.saturating_add(1);
+                            // Drain any sink-side write buffer
+                            // *before* snapshotting `sink_state`, so
+                            // the `bytes_written` count published in
+                            // the checkpoint reflects bytes that
+                            // have actually reached the kernel. Pairs
+                            // with `PLAN_raw_row_throughput.md` Phase
+                            // 1's `RawSink` BufWriter: without this
+                            // call, a kill-9 between the durable
+                            // checkpoint write and the next natural
+                            // buffer flush would leave the on-disk
+                            // file shorter than the checkpoint's
+                            // recorded length, and `RawSink::resume`
+                            // (which `set_len`s up to the recorded
+                            // length) would grow the file with zero
+                            // bytes rather than truncating — a bug.
+                            // Default impl is a no-op for sinks
+                            // whose `write` already hits the page
+                            // cache verbatim (every sink other than
+                            // `RawSink`).
+                            adapter.sink.flush_durable().map_err(ExtractorError::Sink)?;
                             // Phase 2 of
                             // `PLAN_checkpoint_blob_dedup.md`: the
                             // observer (the §10 coordinator) calls

@@ -226,6 +226,27 @@ pub trait Sink: Send {
     /// extraction across kill-resume boundaries.
     fn sink_state(&self) -> SinkState;
 
+    /// Flush any internally-buffered output so the bytes the next
+    /// [`Self::sink_state`] snapshot reports as written are durably
+    /// on disk.
+    ///
+    /// The coordinator calls this before serializing a checkpoint so
+    /// a `kill -9` between checkpoint write and the next buffered
+    /// flush cannot leave the checkpoint claiming bytes that have not
+    /// reached the kernel. Implementations whose `write` already
+    /// hits the page cache verbatim (today: every sink other than
+    /// [`raw::RawSink`] post-`PLAN_raw_row_throughput.md` Phase 1)
+    /// keep the default no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SinkError`] variant matching the deferred IO
+    /// the flush surfaced — for [`raw::RawSink`] this is the
+    /// `BufWriter` flush errno bubbled through the sink's path.
+    fn flush_durable(&mut self) -> Result<(), SinkError> {
+        Ok(())
+    }
+
     /// Finalize the sink.
     ///
     /// Called exactly once on a successful run after every input byte
