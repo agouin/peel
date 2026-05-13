@@ -1,5 +1,12 @@
 # peel
 
+<table>
+<tr>
+<td width="240" valign="top">
+<img src="peel.png" alt="peel logo" width="220">
+</td>
+<td valign="top">
+
 **The Swiss Army knife for file downloads and extraction.**
 
 Sick of downloading an archive just to extract it and delete it?
@@ -18,15 +25,58 @@ full size. Either way, a dropped connection, `kill -9`, or power
 loss resumes exactly where it left off, byte-identical to a clean
 run.
 
-Defaults match what you'd actually type. Simple flags cover the
-rest: add mirrors, cap bandwidth, verify a hash, pin a format,
-choose an IO backend, point at an output directory.
+</td>
+</tr>
+</table>
+
+## Quick start
 
 ```
-peel https://example.com/installer.bin
+# Download + extract to ./dataset/
 peel https://example.com/dataset.tar.zst
-peel localfile.rar
+
+# Extract local archive to ./localarchive/
+peel localarchive.rar
+
+# Download to ./installer.bin (not an archive)
+peel https://example.com/installer.bin
 ```
+
+## Why you want this
+
+**Local workstations.** Pulling a 40 GB `.tar.zst` dataset shouldn't
+require 80 GB free. With `peel`, peak disk usage is roughly
+`extracted_size + a few hundred MB` — not `compressed_size +
+extracted_size`.
+
+**Kubernetes / PVCs.** Loading a database snapshot, ML model bundle, or
+seed dataset into a PersistentVolumeClaim is the canonical case. The
+naive approach forces you to size the PVC for `archive + extracted`,
+then shrink it (or live with the waste) once extraction finishes. PVCs
+don't shrink gracefully, so in practice you over-provision forever.
+`peel` lets you size the PVC for the **extracted** contents plus a
+small download window — which is what you actually need to keep around.
+Drop it into an `initContainer` and the volume is ready by the time
+your workload starts.
+
+**CI runners and ephemeral disks.** Same story: bounded disk, resumable
+on flaky networks, no scratch space gymnastics.
+
+**Streaming `.zip`, `.7z`, and `.rar` over HTTP at all.**
+`curl | unzip`, `curl | 7z x`, and `curl | unrar x` don't work:
+the ZIP central directory lives at the end of the file, the 7z
+SignatureHeader points at a trailer at the end of the file, and
+`unrar` requires `lseek` on its input regardless of where the RAR
+metadata sits — so a stdin-only decoder either has to buffer the
+entire archive before decoding or just refuses to start. The
+canonical workaround (download fully, then extract, then delete)
+defeats the whole point of streaming. `peel` uses a ranged GET
+to fetch the central directory / trailer first (zip / 7z) or
+walks the RAR header chain in stream order (rar5 + legacy
+rar3/rar4), then streams entries (zip, rar) or folders (7z) as
+soon as their bytes arrive while the rest of the archive is
+still in flight — same hole-punching, same resume guarantees as
+the tar formats.
 
 ## What you get
 
@@ -101,42 +151,6 @@ peel localfile.rar
   rates, ETA, active workers, and on-disk source footprint. Falls back
   to periodic `tracing::info!` lines on a non-TTY without any extra
   flag.
-
-## Why you want this
-
-**Local workstations.** Pulling a 40 GB `.tar.zst` dataset shouldn't
-require 80 GB free. With `peel`, peak disk usage is roughly
-`extracted_size + a few hundred MB` — not `compressed_size +
-extracted_size`.
-
-**Kubernetes / PVCs.** Loading a database snapshot, ML model bundle, or
-seed dataset into a PersistentVolumeClaim is the canonical case. The
-naive approach forces you to size the PVC for `archive + extracted`,
-then shrink it (or live with the waste) once extraction finishes. PVCs
-don't shrink gracefully, so in practice you over-provision forever.
-`peel` lets you size the PVC for the **extracted** contents plus a
-small download window — which is what you actually need to keep around.
-Drop it into an `initContainer` and the volume is ready by the time
-your workload starts.
-
-**CI runners and ephemeral disks.** Same story: bounded disk, resumable
-on flaky networks, no scratch space gymnastics.
-
-**Streaming `.zip`, `.7z`, and `.rar` over HTTP at all.**
-`curl | unzip`, `curl | 7z x`, and `curl | unrar x` don't work:
-the ZIP central directory lives at the end of the file, the 7z
-SignatureHeader points at a trailer at the end of the file, and
-`unrar` requires `lseek` on its input regardless of where the RAR
-metadata sits — so a stdin-only decoder either has to buffer the
-entire archive before decoding or just refuses to start. The
-canonical workaround (download fully, then extract, then delete)
-defeats the whole point of streaming. `peel` uses a ranged GET
-to fetch the central directory / trailer first (zip / 7z) or
-walks the RAR header chain in stream order (rar5 + legacy
-rar3/rar4), then streams entries (zip, rar) or folders (7z) as
-soon as their bytes arrive while the rest of the archive is
-still in flight — same hole-punching, same resume guarantees as
-the tar formats.
 
 ## Benchmarks: peel vs `curl | <decompressor> | tar`
 
