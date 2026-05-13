@@ -1379,6 +1379,13 @@ impl LogRenderer {
 
 impl ProgressRenderer for LogRenderer {
     fn render(&mut self, snapshot: &ProgressSnapshot) {
+        // Skip ticks fired before the coordinator has initialized
+        // (totals, workers, parts). Otherwise the very first tick
+        // would emit an all-`0 B` / `unknown` / `workers 0/0` line
+        // that's noise rather than progress.
+        if !snapshot.started {
+            return;
+        }
         let now = Instant::now();
         // Per-part lines first (multi-URL only), then the aggregate
         // — `progress` for single-URL keeps the existing log shape;
