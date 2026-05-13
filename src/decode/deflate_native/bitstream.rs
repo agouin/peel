@@ -48,13 +48,28 @@ use super::error::DeflateError;
 /// for a Huffman code, 13 bits for a distance extra-field).
 pub const MAX_BITS_PER_READ: u32 = 32;
 
-/// Internal pull-buffer size. Sized for "modest syscall amortization,
-/// modest stranded-bytes ceiling": 4 KiB means at most one in-flight
-/// chunk's worth of read-ahead beyond the bit cursor, which keeps the
-/// gap between [`BitReader::byte_position`] and `source.read`'s
-/// high-water mark bounded — important for the puncher floor
-/// convention documented at the module level.
-const PULL_BUF_LEN: usize = 4096;
+/// Internal pull-buffer size.
+///
+/// Sized so the source-side syscall pressure is bounded across the
+/// shapes the production decoder hits. 256 KiB is:
+/// - ~64× fewer source reads than the original 4 KiB on a 1 GiB
+///   STORED-heavy gzip stream (Phase 2 of
+///   `internal/PLAN_raw_row_throughput.md` measured ~262 K
+///   `read(2)` calls reduced to ~4 K);
+/// - 8× the deflate sliding window (32 KiB), so the L1 footprint
+///   of the pull buffer doesn't fight cache lines with the
+///   window or the Huffman tables on the typical M-series L1d
+///   (192 KiB) — the pull buffer sits in L2 and is streamed in
+///   chunks the prefetcher tracks comfortably;
+/// - the macOS/Linux readahead unit on most filesystems, so the
+///   refill `read(2)` syscall is one filesystem-side prefetch
+///   unit rather than dribbling across many.
+///
+/// The puncher floor invariant (the module-level comment) is
+/// unchanged by the bump: bytes pulled ahead of the bit cursor
+/// remain "not yet committed" and the floor still tracks
+/// `byte_position()`.
+const PULL_BUF_LEN: usize = 256 * 1024;
 
 /// LSB-first forward bit reader over a streaming [`Read`] source.
 ///

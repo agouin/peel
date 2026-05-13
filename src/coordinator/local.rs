@@ -40,7 +40,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -759,10 +759,31 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
                 state.set_bytes_decoded_input(decoder_start_offset);
             }
         }
-        match args.progress_state.clone() {
+        // Wrap the source in a 256 KiB `BufReader` so codecs that
+        // pull bytes via `Read::read` (zstd, lz4, xz) don't issue one
+        // syscall per record/field — `internal/PLAN_raw_row_throughput.md`
+        // Phase 2, Lever B. The DEFLATE decoder has its own
+        // `PULL_BUF_LEN` pull-buffer (raised in the same plan) and is
+        // not the binding consumer of this wrapper.
+        //
+        // The buffer is constructed fresh per coordinator entry
+        // (clean or resumed), so its internal state never appears in
+        // a checkpoint. The underlying `File` was already `seek`-ed
+        // to `decoder_start_offset` above, so the wrapped reader's
+        // first read returns bytes from the correct source offset.
+        //
+        // 256 KiB rather than 1 MiB: zstd's largest single block is
+        // 128 KiB so this holds one block plus a few headers; smaller
+        // sizes amortize the per-refill memcpy cost well against the
+        // syscall it saves. `--workers` doesn't multiply this — the
+        // local path is single-threaded — so the absolute memory
+        // ceiling is one buffer per coordinator run.
+        const COORDINATOR_BUFREAD_CAPACITY: usize = 256 * 1024;
+        let base: Box<dyn Read + Send> = match args.progress_state.clone() {
             Some(state) => Box::new(ProgressReader::new(f, state)),
             None => Box::new(f),
-        }
+        };
+        Box::new(BufReader::with_capacity(COORDINATOR_BUFREAD_CAPACITY, base))
     };
 
     // Decoder construction: use the format's resume factory if a
