@@ -27,6 +27,7 @@ pub mod chunk_fingerprints;
 pub mod chunk_policy;
 pub mod mirrors;
 pub mod mmap_region;
+pub mod multi_sparse;
 pub mod multi_url;
 // `rar_pipeline` is gated behind the `rar` feature alongside the
 // rest of the RAR5 module tree (`docs/PLAN_rar.md` §0.5 / §3).
@@ -48,6 +49,7 @@ pub use mirrors::{
     Mirror, MirrorSet, MirrorStats, DEFAULT_MIRROR_EXCLUDE_FOR, DEFAULT_MIRROR_PICK_DEADLINE,
 };
 pub use mmap_region::MmapRegion;
+pub use multi_sparse::{MultiSparse, MultiSparseError, RoutingPuncher};
 pub use multi_url::{
     DispatchSegments, MultiPartSource, MultiPartSourceError, PartDescriptor, PartSegment,
 };
