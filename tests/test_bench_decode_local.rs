@@ -1189,6 +1189,7 @@ fn bench_decode_local_grid() {
     print_host_banner();
     let tiers = pick_tiers();
     let format_list = formats();
+    warmup_binaries(&format_list);
     let mut cells: Vec<Cell> = Vec::with_capacity(format_list.len() * tiers.len() * 2);
     for &tier in &tiers {
         for fmt in &format_list {
@@ -1199,6 +1200,55 @@ fn bench_decode_local_grid() {
         c.print();
     }
     print_summary(&cells);
+}
+
+/// Page-cache prime for `peel` and every reference CLI tool the grid
+/// will invoke. Without this, the first cell of the first tier
+/// (typically `zstd-raw 10 MiB cold`) pays the full dyld + demand-
+/// paging cost of first-invocation on this test process — the
+/// `peel` binary's text pages, the codec library's initializers,
+/// and the reference tool's startup — while every subsequent cold
+/// row finds those pages already resident. That outlier dwarfs the
+/// 10 MiB row's actual decoder work and produces a wall-clock ratio
+/// (32× in early grids) that says nothing about decoder performance.
+///
+/// One full peel + reference iteration per format on a [`TIER_SMALL`]
+/// fixture is sufficient: it exercises every binary the timed grid
+/// will load, plus the per-format codec library, and primes the rar
+/// fixture caches so the timed pass doesn't pay re-encode cost
+/// either. Container rows missing their reference binary (e.g.
+/// `unrar`) are skipped — same gating as [`run_cell`].
+fn warmup_binaries(formats: &[FormatSpec]) {
+    println!("[warmup] priming page cache for peel + reference CLIs ...");
+    let warmup_dir = unique_dir("warmup");
+    let _g = CleanupDir(warmup_dir.clone());
+    for fmt in formats {
+        if fmt.ref_required.iter().any(|t| !tool_present(t)) {
+            continue;
+        }
+        let cell_dir = warmup_dir.join(fmt.label.replace('.', "_"));
+        fs::create_dir_all(&cell_dir).expect("mkdir warmup cell");
+        let fixture = build_fixture(fmt, TIER_SMALL, &cell_dir);
+        let peel_dir = cell_dir.join("peel");
+        fs::create_dir_all(&peel_dir).expect("mkdir peel warmup");
+        let _ = one_peel_iter(
+            fmt,
+            &fixture.source,
+            &fixture.payload,
+            &fixture.entries,
+            &peel_dir,
+        );
+        let ref_dir = cell_dir.join("ref");
+        fs::create_dir_all(&ref_dir).expect("mkdir ref warmup");
+        let _ = one_ref_iter(
+            fmt,
+            &fixture.source,
+            &fixture.payload,
+            &fixture.entries,
+            &ref_dir,
+        );
+    }
+    println!("[warmup] done");
 }
 
 /// One-time banner describing the host so the printed grid is

@@ -347,7 +347,7 @@ Lower is better; **bold** = `peel` is faster than the reference CLI.
 
 | Format | 10 MiB · cold | 10 MiB · warm | 100 MiB · cold | 100 MiB · warm |
 | --- | --- | --- | --- | --- |
-| `zstd-raw`³ | 32.26× | 1.78× | 1.30× | 1.75× |
+| `zstd-raw` | — | 1.78× | 1.30× | 1.75× |
 | `tar.zst` | 1.10× | 1.28× | **0.42×** | **0.49×** |
 | `xz-raw` | **0.96×** | **0.91×** | **0.92×** | **0.91×** |
 | `tar.xz` | **0.88×** | **0.89×** | **0.90×** | **0.91×** |
@@ -363,10 +363,6 @@ Lower is better; **bold** = `peel` is faster than the reference CLI.
 
 Geomean at 100 MiB · warm: **1.06×** across all 13 formats — peel is
 within ~6 % of the reference CLI overall.
-
-³ `zstd-raw 10 MiB · cold` is a per-test-process startup outlier (the
-first peel run in the entire grid pays the dyld + page-fault cost
-that subsequent runs don't); the same row at `warm` is 1.78×.
 
 ### Reading the grid
 
