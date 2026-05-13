@@ -34,7 +34,6 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,8 +49,9 @@ use crate::decode::sevenz::format::{
 use crate::decode::sevenz::header::{
     parse_decoded_header, parse_trailer, Header, StreamsInfo, Trailer,
 };
+use crate::download::multi_sparse::MultiSparse;
 use crate::download::scheduler::{DownloadStats, SchedulerError};
-use crate::download::sparse_file::{SparseFile, SparseFileError};
+use crate::download::sparse_file::SparseFileError;
 use crate::encryption::EncryptionError;
 use crate::hash::crc32::ieee as crc32_ieee;
 use crate::punch::{align_down, align_up, PunchError, PunchHole};
@@ -190,8 +190,11 @@ pub struct SevenzExtractionStats {
 pub struct SevenzPipeline<'a> {
     /// Configuration knobs.
     pub config: SevenzPipelineConfig,
-    /// Sparse file the workers are filling.
-    pub sparse: &'a SparseFile,
+    /// Multi-part sparse landing the workers are filling. Single-URL
+    /// runs supply a one-part [`MultiSparse`] (direct dispatch);
+    /// multi-volume runs route reads, writes, and punches through the
+    /// wrapper (`docs/PLAN_multivolume_archives.md` §7).
+    pub sparse: &'a MultiSparse,
     /// Bitmap recording which chunks are durable.
     pub bitmap: &'a ChunkBitmap,
     /// Steering cursor. Workers preferentially dispatch chunks
@@ -206,8 +209,6 @@ pub struct SevenzPipeline<'a> {
     pub download_done: &'a Arc<AtomicBool>,
     /// Optional outcome the download thread stashes here.
     pub download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
-    /// Borrowed file descriptor for hole punching.
-    pub sparse_fd: BorrowedFd<'a>,
     /// Shared progress state. The streaming reader publishes
     /// `bytes_decoded_input` on each pread so the scheduler's
     /// `max_disk_buffer` throttle measures real lookahead. When
@@ -694,7 +695,7 @@ impl SevenzPipeline<'_> {
 /// scheduler failure surfaces as a typed read error instead of
 /// hanging.
 struct SparseFileSliceReader<'a> {
-    sparse: &'a SparseFile,
+    sparse: &'a MultiSparse,
     bitmap: &'a ChunkBitmap,
     chunk_size: u64,
     download_done: &'a Arc<AtomicBool>,
@@ -718,7 +719,7 @@ struct SparseFileSliceReader<'a> {
 impl<'a> SparseFileSliceReader<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        sparse: &'a SparseFile,
+        sparse: &'a MultiSparse,
         bitmap: &'a ChunkBitmap,
         chunk_size: u64,
         download_done: &'a Arc<AtomicBool>,
@@ -848,6 +849,7 @@ mod tests {
     use std::time::SystemTime;
 
     use crate::bitmap::ChunkBitmap;
+    use crate::download::multi_sparse::MultiSparse;
     use crate::download::sparse_file::SparseFile;
     use crate::punch::NoopPuncher;
 
@@ -880,7 +882,7 @@ mod tests {
     }
 
     type ReadySparse = (
-        SparseFile,
+        MultiSparse,
         Arc<ChunkBitmap>,
         PathBuf,
         Arc<AtomicBool>,
@@ -904,7 +906,13 @@ mod tests {
         let download_done = Arc::new(AtomicBool::new(true));
         let outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>> =
             Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
-        (sparse, bitmap, path, download_done, outcome)
+        (
+            MultiSparse::from_single(sparse),
+            bitmap,
+            path,
+            download_done,
+            outcome,
+        )
     }
 
     /// Encode `value` to the 7z `Number` format. Mirrors the
@@ -1067,7 +1075,6 @@ mod tests {
             cursor: &cursor,
             download_done: &done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "test.7z",

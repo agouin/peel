@@ -43,7 +43,6 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read};
-use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,8 +52,9 @@ use thiserror::Error;
 
 use crate::bitmap::ChunkBitmap;
 use crate::crypto::ct_eq;
+use crate::download::multi_sparse::MultiSparse;
 use crate::download::scheduler::{DownloadStats, SchedulerError};
-use crate::download::sparse_file::{SparseFile, SparseFileError};
+use crate::download::sparse_file::SparseFileError;
 use crate::punch::{align_down, align_up, PunchError, PunchHole};
 use crate::secret::source::PasswordSource;
 use crate::secret::Password;
@@ -312,8 +312,11 @@ pub struct ZipExtractionStats {
 pub struct ZipPipeline<'a> {
     /// Configuration knobs.
     pub config: ZipPipelineConfig,
-    /// Sparse file the workers are filling.
-    pub sparse: &'a SparseFile,
+    /// Multi-part sparse landing the workers are filling. Single-URL
+    /// runs supply a one-part [`MultiSparse`] (direct dispatch);
+    /// multi-volume runs route reads, writes, and punches through the
+    /// wrapper (`docs/PLAN_multivolume_archives.md` §7).
+    pub sparse: &'a MultiSparse,
     /// Bitmap recording which chunks are durable on disk.
     pub bitmap: &'a ChunkBitmap,
     /// Steering cursor the scheduler reads. The pipeline writes
@@ -328,9 +331,6 @@ pub struct ZipPipeline<'a> {
     /// Optional outcome the download thread stashes here. The
     /// pipeline only reads this on the early-termination path.
     pub download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
-    /// Borrowed file descriptor for hole punching. The pipeline
-    /// itself does not write to the sparse file; the workers do.
-    pub sparse_fd: BorrowedFd<'a>,
     /// Shared progress state. The bounded reader publishes
     /// `bytes_decoded_input` on each pread so the scheduler's
     /// `max_disk_buffer` throttle measures real lookahead and
@@ -1141,7 +1141,7 @@ impl<'a> ZipPipeline<'a> {
 /// the cap re-anchors when a new range opens (e.g. moving from
 /// one entry's data range to the next).
 pub struct BoundedSparseReader<'a> {
-    sparse: &'a SparseFile,
+    sparse: &'a MultiSparse,
     bitmap: &'a ChunkBitmap,
     chunk_size: u64,
     cursor: u64,
@@ -1156,7 +1156,7 @@ impl<'a> BoundedSparseReader<'a> {
     /// Wrap `[start, end)` of the sparse file as a `Read` source.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        sparse: &'a SparseFile,
+        sparse: &'a MultiSparse,
         bitmap: &'a ChunkBitmap,
         chunk_size: u64,
         start: u64,
@@ -1184,7 +1184,7 @@ impl<'a> BoundedSparseReader<'a> {
     /// pipeline uses this on the production path.
     #[allow(clippy::too_many_arguments)]
     pub fn with_progress(
-        sparse: &'a SparseFile,
+        sparse: &'a MultiSparse,
         bitmap: &'a ChunkBitmap,
         chunk_size: u64,
         start: u64,
@@ -1291,6 +1291,7 @@ mod tests {
     use std::time::SystemTime;
 
     use crate::bitmap::ChunkBitmap;
+    use crate::download::multi_sparse::MultiSparse;
     use crate::download::sparse_file::SparseFile;
     use crate::punch::NoopPuncher;
     use crate::types::ChunkIndex;
@@ -1406,7 +1407,7 @@ mod tests {
     }
 
     type ReadySparse = (
-        SparseFile,
+        MultiSparse,
         Arc<ChunkBitmap>,
         PathBuf,
         Arc<AtomicBool>,
@@ -1433,7 +1434,13 @@ mod tests {
         let download_done = Arc::new(AtomicBool::new(true));
         let outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>> =
             Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
-        (sparse, bitmap, path, download_done, outcome)
+        (
+            MultiSparse::from_single(sparse),
+            bitmap,
+            path,
+            download_done,
+            outcome,
+        )
     }
 
     #[test]
@@ -1467,7 +1474,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "",
@@ -1531,7 +1537,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "",
@@ -1586,7 +1591,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "",
@@ -1627,7 +1631,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "",
@@ -1673,7 +1676,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "",
@@ -1711,7 +1713,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "",
@@ -1983,7 +1984,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: Some(&pw_source),
             password_label: "test-archive.zip",
@@ -2042,7 +2042,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: Some(&pw_source),
             password_label: "test-archive.zip",
@@ -2091,7 +2090,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: Some(&pw_source),
             password_label: "test-archive.zip",
@@ -2140,7 +2138,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: None,
             password_label: "",
@@ -2204,7 +2201,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: Some(&pw_source),
             password_label: "test-archive.zip",
@@ -2292,7 +2288,6 @@ mod tests {
             cursor: &cursor,
             download_done: &download_done,
             download_outcome: &outcome,
-            sparse_fd: sparse.as_fd(),
             progress_state: None,
             password_source: Some(&pw_source),
             password_label: "test-archive.zip",

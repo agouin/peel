@@ -17,7 +17,8 @@ use std::time::Duration;
 use peel::bitmap::ChunkBitmap;
 use peel::download::{
     chunk_count, discover, discover_multi, discover_with_mirrors, run, ChunkSizePolicy,
-    DownloadMode, MirrorSet, RetryConfig, SchedulerConfig, SchedulerError, SparseFile, WorkerError,
+    DownloadMode, MirrorSet, MultiSparse, RetryConfig, SchedulerConfig, SchedulerError, SparseFile,
+    WorkerError,
 };
 use peel::http::{Client, ClientConfig, Url};
 use peel::types::ChunkIndex;
@@ -336,7 +337,9 @@ fn run_parallel_downloads_full_body_byte_identical() {
 
     let path = temp_path("parallel");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -377,7 +380,9 @@ fn run_parallel_handles_partial_last_chunk() {
 
     let path = temp_path("partial_tail");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -454,7 +459,9 @@ fn run_retries_on_503_then_succeeds() {
     let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
     let path = temp_path("retry_503");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -511,7 +518,9 @@ fn run_chunk_failed_reports_actual_attempt_count() {
     let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
     let path = temp_path("attempts_count");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -600,7 +609,9 @@ fn run_aborts_when_etag_changes_mid_download() {
     let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
     let path = temp_path("etag_change");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -653,7 +664,9 @@ fn run_falls_back_to_single_stream_when_ranges_unsupported() {
     let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
     let path = temp_path("single_stream");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -691,7 +704,9 @@ fn run_skips_chunks_already_marked_complete() {
 
     let path = temp_path("resume");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
 
     // Pre-write the bytes for chunks 0 and 2 into the sparse file (as
     // if a prior run had completed them) and pre-mark them in the
@@ -754,7 +769,9 @@ fn run_dispatches_chunks_starting_at_cursor() {
 
     let path = temp_path("cursor_priority");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     // Cursor starts at chunk 5's byte offset.
     let cursor = AtomicU64::new(5 * chunk_size);
@@ -796,7 +813,9 @@ fn run_rejects_mismatched_bitmap_length() {
     let bitmap = ChunkBitmap::new(5);
     let path = temp_path("bitmap_mismatch");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let cursor = AtomicU64::new(0);
 
     let err = run(
@@ -827,7 +846,9 @@ fn run_rejects_zero_chunk_size() {
     let info = discover(&client, &url(&server, "/")).expect("discover");
     let path = temp_path("zero_chunk");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(0);
     let cursor = AtomicU64::new(0);
     let bad = SchedulerConfig {
@@ -855,7 +876,9 @@ fn run_rejects_zero_workers() {
     let info = discover(&client, &url(&server, "/")).expect("discover");
     let path = temp_path("zero_workers");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(chunk_count(info.total_size, 50).unwrap());
     let cursor = AtomicU64::new(0);
     let bad = SchedulerConfig {
@@ -912,7 +935,9 @@ fn run_with_policy_extracts_byte_identical_output() {
 
     let path = temp_path("adaptive_byte_identical");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -965,7 +990,9 @@ fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
 
     let path = temp_path("adaptive_coalesce");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -1028,7 +1055,9 @@ fn run_without_policy_keeps_one_range_per_chunk() {
 
     let path = temp_path("nonadaptive_baseline");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -1069,7 +1098,9 @@ fn run_with_policy_resume_honors_existing_bitmap() {
 
     let path = temp_path("adaptive_resume");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     // Pre-write the first half of the file and mark those bitmap
     // chunks complete to simulate a resume.
     let half_chunks = total_chunks / 2;
@@ -1135,7 +1166,9 @@ fn scheduler_records_per_chunk_crc32c_when_fingerprints_configured() {
 
     let path = temp_path("crc_records");
     let _g = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let fingerprints = Arc::new(peel::download::ChunkFingerprints::new(total_chunks));
     let cursor = AtomicU64::new(0);
@@ -1189,7 +1222,9 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
 
     let path = temp_path("probe_drift");
     let _g = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
 
     // Pre-mark every chunk as complete and seed the fingerprint
@@ -1276,7 +1311,9 @@ fn probe_completion_does_not_inflate_bytes_downloaded() {
 
     let path = temp_path("probe_no_inflate");
     let _g = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let fingerprints = Arc::new(peel::download::ChunkFingerprints::new(total_chunks));
     let cursor = AtomicU64::new(0);
@@ -1440,7 +1477,9 @@ fn run_routes_chunks_across_two_mirrors() {
     let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
     let path = temp_path("two_mirrors");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
     let scheduler_cfg = SchedulerConfig {
@@ -1523,7 +1562,9 @@ fn run_falls_back_when_one_mirror_dies() {
     let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
     let path = temp_path("one_mirror_dies");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
     let scheduler_cfg = SchedulerConfig {
@@ -1613,7 +1654,9 @@ fn run_completes_after_all_mirrors_recover() {
     let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
     let path = temp_path("all_recover");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
     let scheduler_cfg = SchedulerConfig {
@@ -1655,7 +1698,9 @@ fn run_parallel_with_rate_limiter_extracts_byte_identical() {
 
     let path = temp_path("rate_limit_byte_identical");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -1695,7 +1740,9 @@ fn run_parallel_with_rate_limiter_paces_below_uncapped_rate() {
     let measure = |limiter: Option<Arc<peel::download::RateLimiter>>| -> Duration {
         let path = temp_path("rate_limit_paces");
         let cleanup = CleanupOnDrop(path.clone());
-        let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+        let sparse = MultiSparse::from_single(
+            SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+        );
         let bitmap = ChunkBitmap::new(total_chunks);
         let cursor = AtomicU64::new(0);
         let scheduler_cfg = SchedulerConfig {
@@ -1800,7 +1847,9 @@ fn run_parallel_assembles_three_part_split_archive() {
 
     let path = temp_path("multipart_three");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -1929,7 +1978,9 @@ fn run_clamps_adaptive_coalesce_at_part_boundaries() {
 
     let path = temp_path("multipart_coalesce_clamp");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
 
@@ -2024,7 +2075,9 @@ fn run_parallel_handles_chunks_that_cross_part_boundaries() {
 
     let path = temp_path("multipart_misaligned");
     let _cleanup = CleanupOnDrop(path.clone());
-    let sparse = SparseFile::open_or_create(&path, info.total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
     let bitmap = ChunkBitmap::new(total_chunks);
     let cursor = AtomicU64::new(0);
     let stats = run(

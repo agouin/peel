@@ -46,9 +46,10 @@ use thiserror::Error;
 use super::chunk_fingerprints::ChunkFingerprints;
 use super::chunk_policy::{ChunkSizePolicy, Sample};
 use super::mirrors::{Mirror, MirrorSet};
+use super::multi_sparse::MultiSparse;
 use super::multi_url::{MultiPartSource, MultiPartSourceError};
 use super::rate_limit::{RateLimitedReader, RateLimiter};
-use super::sparse_file::{SparseFile, SparseFileError};
+use super::sparse_file::SparseFileError;
 use super::worker::{
     download_dispatch, ChunkContext, ChunkOutcome, Dispatch, DispatchKind, RetryConfig,
     SourceFingerprint, WorkerError,
@@ -843,7 +844,7 @@ fn fingerprints_agree(primary: &SourceFingerprint, mirror: &SourceFingerprint) -
 pub fn run(
     client: &Client,
     info: &DownloadInfo,
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     cursor: &AtomicU64,
     config: &SchedulerConfig,
@@ -890,7 +891,7 @@ pub fn run(
 fn run_parallel(
     client: &Client,
     info: &DownloadInfo,
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     cursor: &AtomicU64,
     config: &SchedulerConfig,
@@ -1480,7 +1481,7 @@ fn worker_loop(
 fn run_single_stream(
     client: &Client,
     info: &DownloadInfo,
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     config: &SchedulerConfig,
     total_chunks: u32,

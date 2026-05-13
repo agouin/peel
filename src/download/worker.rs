@@ -30,9 +30,10 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::mirrors::{MirrorSet, DEFAULT_MIRROR_PICK_DEADLINE};
+use super::multi_sparse::MultiSparse;
 use super::multi_url::MultiPartSource;
 use super::rate_limit::{RateLimitedReader, RateLimiter};
-use super::sparse_file::{SparseFile, SparseFileError};
+use super::sparse_file::SparseFileError;
 use crate::hash::crc32c::Crc32c;
 use crate::http::range::{parse_content_range, RangeError};
 use crate::http::{Client, ClientError, Headers};
@@ -435,7 +436,7 @@ pub struct ChunkContext<'a> {
     /// per-chunk CRC-32Cs (`PLAN_v2.md` §11).
     pub chunk_size: u64,
     /// Sparse file the chunk's bytes are written into.
-    pub sparse: &'a SparseFile,
+    pub sparse: &'a MultiSparse,
     /// Optional progress sink the worker `fetch_add`s into after
     /// each successful `pwrite_at` (PLAN_v2.md §6). `None` keeps the
     /// worker silent — used by tests that don't drive the renderer.
@@ -980,7 +981,7 @@ fn verify_chunks_enabled() -> bool {
 /// against the in-memory value. Surfaces a mismatch as
 /// [`WorkerError::ChunkVerifyMismatch`] with the chunk-level detail.
 fn verify_on_disk_chunks(
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     dispatch: &Dispatch,
     chunk_size: u64,
     buf: &[u8],
@@ -1172,6 +1173,7 @@ fn verify_fingerprint(
 mod tests {
     use super::*;
 
+    use crate::download::sparse_file::SparseFile;
     use crate::types::{ByteOffset, ByteRange};
 
     fn make_range(start: u64, end_exclusive: u64) -> ByteRange {
@@ -1464,7 +1466,9 @@ mod tests {
         let _g = TmpFileGuard(path.clone());
         let total_size: u64 = 4096;
         let chunk_size: u64 = 1024;
-        let sparse = SparseFile::open_or_create(&path, total_size).expect("sparse");
+        let sparse = MultiSparse::from_single(
+            SparseFile::open_or_create(&path, total_size).expect("sparse"),
+        );
 
         // Write some "genuine" bytes to disk at offset 0..2048.
         let on_disk: Vec<u8> = (0..2048u32).map(|i| (i & 0xFF) as u8).collect();
@@ -1513,7 +1517,9 @@ mod tests {
         let _g = TmpFileGuard(path.clone());
         let total_size: u64 = 2048;
         let chunk_size: u64 = 1024;
-        let sparse = SparseFile::open_or_create(&path, total_size).expect("sparse");
+        let sparse = MultiSparse::from_single(
+            SparseFile::open_or_create(&path, total_size).expect("sparse"),
+        );
         let buf: Vec<u8> = (0..2048u32).map(|i| (i & 0xFF) as u8).collect();
         sparse.pwrite_at(ByteOffset::ZERO, &buf).expect("pwrite");
 

@@ -168,8 +168,8 @@ use crate::download::sevenz_pipeline::{
 };
 use crate::download::{
     chunk_count, discover_with_mirrors, run as run_scheduler, ChunkFingerprints, DownloadInfo,
-    DownloadStats, MirrorSet, ProbeConfig, RetryConfig, SchedulerConfig, SchedulerError,
-    SourceFingerprint, SparseFile, SparseFileError, ZipPipeline, ZipPipelineConfig,
+    DownloadStats, MirrorSet, MultiSparse, ProbeConfig, RetryConfig, SchedulerConfig,
+    SchedulerError, SourceFingerprint, SparseFile, SparseFileError, ZipPipeline, ZipPipelineConfig,
     ZipPipelineError, ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
 };
 use crate::extractor::{
@@ -2383,7 +2383,7 @@ impl CheckpointObserverStats {
 #[allow(clippy::too_many_arguments)]
 fn run_one<S: Sink>(
     extractor: &Extractor,
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     decoder: &mut dyn StreamingDecoder,
     sink: S,
     puncher: &dyn PunchHole,
@@ -2403,8 +2403,15 @@ fn run_one<S: Sink>(
     let mut checkpoints_written: u64 = 0;
     let mut obs_stats = CheckpointObserverStats::default();
 
+    // The Extractor forwards `source_fd` straight to `puncher.punch`.
+    // For single-part runs the first part's fd is the correct target;
+    // for multi-part runs (lit up by §7 Phase 3) `puncher` must
+    // already be a [`crate::download::RoutingPuncher`] that ignores
+    // this fd and dispatches per-part by global offset, so the value
+    // passed here is harmless either way.
+    let source_fd = sparse.parts()[0].as_fd();
     let result = extractor.extract_with_callback(
-        sparse.as_fd(),
+        source_fd,
         decoder,
         sink,
         puncher,
@@ -2576,7 +2583,7 @@ fn run_one<S: Sink>(
 /// [`SinkState::Zip`] instead of `Tar` / `Raw`.
 #[allow(clippy::too_many_arguments)]
 fn run_zip(
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     fingerprints: &ChunkFingerprints,
     cursor: &Arc<AtomicU64>,
@@ -2641,7 +2648,6 @@ fn run_zip(
         cursor,
         download_done,
         download_outcome,
-        sparse_fd: sparse.as_fd(),
         progress_state,
         password_source: config.password_source.as_ref(),
         password_label: requested_url,
@@ -2983,7 +2989,7 @@ fn run_zip(
 #[cfg(feature = "rar")]
 #[allow(clippy::too_many_arguments)]
 fn run_rar(
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     fingerprints: &ChunkFingerprints,
     cursor: &Arc<AtomicU64>,
@@ -3062,7 +3068,6 @@ fn run_rar(
         cursor,
         download_done,
         download_outcome,
-        sparse_fd: sparse.as_fd(),
         progress_state,
         password_source: config.password_source.as_ref(),
         password_label: requested_url,
@@ -3318,7 +3323,7 @@ fn run_rar(
 /// data at the front).
 #[allow(clippy::too_many_arguments)]
 fn run_sevenz(
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     cursor: &Arc<AtomicU64>,
     download_done: &Arc<AtomicBool>,
@@ -3384,7 +3389,6 @@ fn run_sevenz(
         cursor,
         download_done,
         download_outcome,
-        sparse_fd: sparse.as_fd(),
         progress_state,
         password_source: config.password_source.as_ref(),
         password_label: requested_url,
@@ -3576,7 +3580,7 @@ fn build_fingerprints(
 fn run_resume_probe(
     client: &Client,
     info: &DownloadInfo,
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     fingerprints: &ChunkFingerprints,
     chunk_size: u64,
@@ -3718,7 +3722,7 @@ fn run_resume_probe(
 /// - Otherwise: re-checksum the on-disk bytes; mismatch ⇒
 ///   [`CoordinatorError::PartFileCorrupted`].
 fn run_cursor_chunk_audit(
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     fingerprints: &ChunkFingerprints,
     chunk_size: u64,
@@ -4000,6 +4004,22 @@ fn open_sparse(
     total_size: u64,
     config: &CoordinatorConfig,
     io_backend: &Arc<dyn crate::io_backend::IoBackend>,
+) -> Result<MultiSparse, CoordinatorError> {
+    let part = open_sparse_part(path, total_size, config, io_backend)?;
+    Ok(MultiSparse::from_single(part))
+}
+
+/// Open a single per-part [`SparseFile`] for a multi-part run.
+///
+/// Phase 2 of `docs/PLAN_multivolume_archives.md` §7 only constructs
+/// one part per run (the single-URL shape today); phase 3 lights up
+/// the per-volume `open_sources` builder that hands an N-element vec
+/// of these to [`MultiSparse::from_parts`].
+fn open_sparse_part(
+    path: &Path,
+    total_size: u64,
+    config: &CoordinatorConfig,
+    io_backend: &Arc<dyn crate::io_backend::IoBackend>,
 ) -> Result<SparseFile, CoordinatorError> {
     #[cfg(target_os = "linux")]
     if matches!(
@@ -4024,7 +4044,7 @@ fn open_sparse(
 /// memory-mapped, otherwise the platform default
 /// (`fallocate(PUNCH_HOLE)` on Linux, `fcntl(F_PUNCHHOLE)` on macOS,
 /// [`crate::punch::NoopPuncher`] elsewhere).
-fn make_puncher(sparse: &SparseFile) -> Box<dyn PunchHole> {
+fn make_puncher(sparse: &MultiSparse) -> Box<dyn PunchHole> {
     #[cfg(target_os = "linux")]
     if let Some(p) = sparse.make_mmap_puncher() {
         return Box::new(p);
@@ -4211,7 +4231,7 @@ fn duration_nanos_u64(duration: Duration) -> u64 {
 /// scheduler reads `cursor` to bias dispatch toward the chunk the
 /// decoder is about to need.
 pub struct BlockingSparseReader {
-    sparse: Arc<SparseFile>,
+    sparse: Arc<MultiSparse>,
     bitmap: Arc<ChunkBitmap>,
     chunk_size: u64,
     total_size: u64,
@@ -4238,7 +4258,7 @@ pub struct BlockingSparseReader {
 impl BlockingSparseReader {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        sparse: Arc<SparseFile>,
+        sparse: Arc<MultiSparse>,
         bitmap: Arc<ChunkBitmap>,
         chunk_size: u64,
         total_size: u64,
@@ -4508,7 +4528,7 @@ fn select_decoder_factory(
     registry: &DecoderRegistry,
     info: &DownloadInfo,
     config: &CoordinatorConfig,
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     download_done: &Arc<AtomicBool>,
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
@@ -4721,7 +4741,7 @@ pub(crate) fn verify_output_shape_local(
 /// download thread finished before chunk 0 became available.
 #[allow(clippy::too_many_arguments)]
 fn sniff_prefix(
-    sparse: &SparseFile,
+    sparse: &MultiSparse,
     bitmap: &ChunkBitmap,
     chunk_size: u64,
     total_size: u64,
@@ -5175,7 +5195,9 @@ mod tests {
         // touching the bitmap.
         let path = unique_temp("eof");
         let _g = TmpFile(path.clone());
-        let sparse = Arc::new(SparseFile::open_or_create(&path, 64).expect("sparse"));
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 64).expect("sparse"),
+        ));
         let bitmap = Arc::new(ChunkBitmap::new(1));
         let download_done = Arc::new(AtomicBool::new(true));
         let outcome = Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
@@ -5198,7 +5220,9 @@ mod tests {
     fn blocking_reader_reads_complete_chunk() {
         let path = unique_temp("ready");
         let _g = TmpFile(path.clone());
-        let sparse = Arc::new(SparseFile::open_or_create(&path, 16).expect("sparse"));
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 16).expect("sparse"),
+        ));
         sparse
             .pwrite_at(ByteOffset::ZERO, b"abcdefghijklmnop")
             .expect("write");
@@ -5226,7 +5250,9 @@ mod tests {
     fn blocking_reader_errors_when_download_completes_with_missing_chunk() {
         let path = unique_temp("missing");
         let _g = TmpFile(path.clone());
-        let sparse = Arc::new(SparseFile::open_or_create(&path, 32).expect("sparse"));
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
         let bitmap = Arc::new(ChunkBitmap::new(2));
         // Chunk 0 incomplete; download_done set means we should error.
         let download_done = Arc::new(AtomicBool::new(true));
@@ -5255,7 +5281,9 @@ mod tests {
         let _g = TmpFile(path.clone());
         // 32-byte file split into two 16-byte chunks. Chunk 0 is not
         // marked complete, so the reader will spin in the poll loop.
-        let sparse = Arc::new(SparseFile::open_or_create(&path, 32).expect("sparse"));
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
         let bitmap = Arc::new(ChunkBitmap::new(2));
         let download_done = Arc::new(AtomicBool::new(false));
         let outcome = Arc::new(Mutex::new(None));

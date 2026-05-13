@@ -464,6 +464,50 @@ impl MultiSparse {
         Ok(())
     }
 
+    /// Convenience wrapper around [`Self::punch_via`] returning the
+    /// same [`SparseFileError`] the existing [`SparseFile::punch`]
+    /// produces, so callers that previously held a `&SparseFile` can
+    /// swap to `&MultiSparse` without touching their error wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparseFileError::Punch`] wrapping the underlying
+    /// [`PunchError`].
+    pub fn punch(
+        &self,
+        puncher: &dyn PunchHole,
+        offset: ByteOffset,
+        length: u64,
+    ) -> Result<(), SparseFileError> {
+        self.punch_via(puncher, offset, length)
+            .map_err(SparseFileError::Punch)
+    }
+
+    /// Build the matching `madvise(MADV_REMOVE)` puncher for this
+    /// wrapper when *every* part is in `mmap` storage mode. Returns
+    /// `None` otherwise — callers fall back to the platform default
+    /// puncher.
+    ///
+    /// For single-part wrappers this is a straight delegation to
+    /// [`SparseFile::make_mmap_puncher`], so today's
+    /// pwrite/mmap-puncher selection is preserved byte-for-byte.
+    ///
+    /// Multi-part wrappers always return `None` here; the
+    /// per-part mmap puncher needs a routing layer of its own
+    /// (`docs/PLAN_multivolume_archives.md` §7 Phase 3) and trying
+    /// to short-cut it through a single one-mapping puncher would
+    /// silently punch the wrong file for offsets past the first
+    /// part's boundary.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn make_mmap_puncher(&self) -> Option<crate::punch::LinuxPuncher> {
+        if self.parts.len() == 1 {
+            self.parts[0].make_mmap_puncher()
+        } else {
+            None
+        }
+    }
+
     /// Flush pending writes for every part. Per-part `sync_all`
     /// semantics: `fsync(2)` in pwrite mode, `msync(MS_ASYNC)` in
     /// mmap mode (see [`SparseFile::sync_all`]).

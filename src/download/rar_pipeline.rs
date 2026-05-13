@@ -52,7 +52,6 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -66,8 +65,9 @@ use crate::decode::rar_legacy::RarLegacyStreamDecoder;
 use crate::decode::rar_native::dict::MAX_DICT_BYTES;
 use crate::decode::rar_native::RarStreamDecoder;
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
+use crate::download::multi_sparse::MultiSparse;
 use crate::download::scheduler::{DownloadStats, SchedulerError};
-use crate::download::sparse_file::{SparseFile, SparseFileError};
+use crate::download::sparse_file::SparseFileError;
 use crate::encryption::EncryptionError;
 use crate::punch::{align_down, align_up, PunchError, PunchHole};
 use crate::rar::archive::FileEntry;
@@ -323,8 +323,12 @@ struct LegacyEntryRecord {
 pub struct RarPipeline<'a> {
     /// Configuration knobs.
     pub config: RarPipelineConfig,
-    /// Sparse file the workers are filling.
-    pub sparse: &'a SparseFile,
+    /// Multi-part sparse landing the workers are filling. The
+    /// single-volume HTTP run is a one-part [`MultiSparse`] whose
+    /// methods take a fast direct path; the per-volume multi-volume
+    /// shape (`docs/PLAN_multivolume_archives.md` §7) routes reads,
+    /// writes, and punches through the same wrapper.
+    pub sparse: &'a MultiSparse,
     /// Bitmap recording which chunks are durable on disk.
     pub bitmap: &'a ChunkBitmap,
     /// Steering cursor the scheduler reads. The pipeline writes
@@ -338,9 +342,6 @@ pub struct RarPipeline<'a> {
     pub download_done: &'a Arc<AtomicBool>,
     /// Optional scheduler outcome stashed by the download thread.
     pub download_outcome: &'a Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
-    /// Borrowed file descriptor for hole punching. The pipeline
-    /// itself does not write to the sparse file; the workers do.
-    pub sparse_fd: BorrowedFd<'a>,
     /// Shared progress state (`bytes_decoded_input` is published
     /// per-pread so the scheduler's `max_disk_buffer` throttle
     /// can bound the on-disk-but-not-yet-extracted footprint).
@@ -2358,8 +2359,8 @@ impl<'a> RarPipeline<'a> {
             return Ok(0);
         }
         let len = aligned_end - aligned_start;
-        puncher
-            .punch(self.sparse_fd, ByteOffset::new(aligned_start), len)
+        self.sparse
+            .punch_via(puncher, ByteOffset::new(aligned_start), len)
             .map_err(RarPipelineError::Punch)?;
         Ok(len)
     }

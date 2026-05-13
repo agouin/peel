@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use peel::bitmap::ChunkBitmap;
-use peel::download::{RarPipeline, RarPipelineConfig, RarResumeState, SparseFile};
+use peel::download::{MultiSparse, RarPipeline, RarPipelineConfig, RarResumeState, SparseFile};
 use peel::punch::NoopPuncher;
 use peel::rar::archive::{walk_archive, walk_archive_multivolume};
 use peel::rar::format::arc_flags;
@@ -302,7 +302,9 @@ fn pipeline_extracts_three_non_spanning_volumes() {
     // SparseFile holding the full multi-volume concatenation.
     let tmp = tempdir("pipeline_3vol");
     let sparse_path = tmp.path().join("archive.bin");
-    let sparse = SparseFile::open_or_create(&sparse_path, total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&sparse_path, total_size).expect("sparse"),
+    );
     sparse
         .pwrite_at(ByteOffset::new(0), &bytes)
         .expect("seed sparse");
@@ -332,7 +334,6 @@ fn pipeline_extracts_three_non_spanning_volumes() {
         cursor: &cursor,
         download_done: &download_done,
         download_outcome: &download_outcome,
-        sparse_fd: sparse.as_fd(),
         progress_state: None,
         password_source: None,
         password_label: "test://multivolume",
@@ -373,7 +374,9 @@ fn pipeline_extracts_real_stored_spanning_entry() {
 
     let tmp = tempdir("pipeline_split_stored");
     let sparse_path = tmp.path().join("archive.bin");
-    let sparse = SparseFile::open_or_create(&sparse_path, total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&sparse_path, total_size).expect("sparse"),
+    );
     sparse
         .pwrite_at(ByteOffset::new(0), &bytes)
         .expect("seed sparse");
@@ -399,7 +402,6 @@ fn pipeline_extracts_real_stored_spanning_entry() {
         cursor: &cursor,
         download_done: &download_done,
         download_outcome: &download_outcome,
-        sparse_fd: sparse.as_fd(),
         progress_state: None,
         password_source: None,
         password_label: "test://split-stored",
@@ -466,7 +468,9 @@ fn pipeline_extracts_real_compressed_spanning_entries() {
 
     let tmp = tempdir("pipeline_split_compressed");
     let sparse_path = tmp.path().join("archive.bin");
-    let sparse = SparseFile::open_or_create(&sparse_path, total_size).expect("sparse");
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&sparse_path, total_size).expect("sparse"),
+    );
     sparse
         .pwrite_at(ByteOffset::new(0), &bytes)
         .expect("seed sparse");
@@ -492,7 +496,6 @@ fn pipeline_extracts_real_compressed_spanning_entries() {
         cursor: &cursor,
         download_done: &download_done,
         download_outcome: &download_outcome,
-        sparse_fd: sparse.as_fd(),
         progress_state: None,
         password_source: None,
         password_label: "test://split-compressed",

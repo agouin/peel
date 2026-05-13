@@ -2609,7 +2609,9 @@ fn worker_probe_detects_source_drift() {
     let work = unique_dir("worker_probe");
     let _g = CleanupDir(work.clone());
     let part = work.join("part.bin");
-    let sparse = peel::download::SparseFile::open_or_create(&part, total_size).expect("sparse");
+    let sparse = peel::download::MultiSparse::from_single(
+        peel::download::SparseFile::open_or_create(&part, total_size).expect("sparse"),
+    );
 
     let url = peel::http::Url::parse(&format!("{}/data.bin", server.base_url())).expect("url");
     let fingerprint = peel::download::SourceFingerprint {
