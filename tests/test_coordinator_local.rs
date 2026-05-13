@@ -213,10 +213,13 @@ fn local_run_pumps_progress_state_counters() {
         snap.bytes_extracted > 0,
         "extractor must have written some output bytes",
     );
-    // Local mode does not register workers; the renderer just
-    // displays "workers 0/0".
+    // Local mode does not register workers, and `mark_local`
+    // flips the renderer into the local-file shape so the
+    // download / lookahead / workers rows never get painted with
+    // bogus zeros (see `progress.rs`).
     assert_eq!(snap.active_workers, 0);
     assert_eq!(snap.total_workers, 0);
+    assert!(snap.local, "local coordinator must mark progress local");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

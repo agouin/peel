@@ -123,6 +123,14 @@ pub struct ProgressState {
     /// in addition to the aggregate `bytes_downloaded`. Snapshots
     /// expose the per-part view through [`ProgressSnapshot::parts`].
     parts: OnceLock<Vec<PartCounter>>,
+    /// `true` when the source is a local file and the run has no
+    /// download side at all (see [`crate::coordinator::local`]).
+    /// Renderers consult this to suppress the download / lookahead
+    /// / workers rows: those numbers are either bogus (workers
+    /// never registered) or duplicative (`bytes_downloaded` and
+    /// `bytes_decoded_input` are pumped from the same `Read` impl
+    /// and always agree) for a local extraction.
+    local: AtomicBool,
 }
 
 /// Per-part download counters published in [`ProgressSnapshot::parts`].
@@ -163,6 +171,7 @@ impl ProgressState {
             state_anchor: Instant::now(),
             decode_step_started_ns: AtomicU64::new(0),
             parts: OnceLock::new(),
+            local: AtomicBool::new(false),
         })
     }
 
@@ -317,6 +326,15 @@ impl ProgressState {
         self.started.store(true, Ordering::Release);
     }
 
+    /// Mark the run as a local-file extraction (no download side).
+    /// Renderers read this flag (surfaced as
+    /// [`ProgressSnapshot::local`]) to suppress download / lookahead
+    /// / workers rows for runs whose source is already on disk
+    /// (`docs/PLAN_local_file_extract.md` §4).
+    pub fn mark_local(&self) {
+        self.local.store(true, Ordering::Release);
+    }
+
     /// Mark the run as finished. The renderer thread stops on its
     /// next tick.
     pub fn mark_done(&self) {
@@ -420,6 +438,7 @@ impl ProgressState {
             disk_bound: self.disk_bound.load(Ordering::Acquire),
             decode_step_elapsed: self.decode_step_elapsed(),
             parts,
+            local: self.local.load(Ordering::Acquire),
         }
     }
 }
@@ -473,6 +492,14 @@ pub struct ProgressSnapshot {
     /// part count when populated; index N is the same part as
     /// `info.source.parts()[N]`.
     pub parts: Vec<PartProgressSnapshot>,
+    /// `true` when the source is a local file
+    /// (`docs/PLAN_local_file_extract.md` §4). Renderers suppress
+    /// the download / lookahead / workers rows on such runs — the
+    /// counters under those rows are either zero (workers never
+    /// register) or duplicative (`bytes_downloaded` and
+    /// `bytes_decoded_input` track the same source-read cursor),
+    /// so showing them would be confusing rather than informative.
+    pub local: bool,
 }
 
 /// Per-part snapshot row in [`ProgressSnapshot::parts`].
@@ -910,7 +937,18 @@ impl<W: Write + Send> TtyRenderer<W> {
 
         let term_cols = self.columns();
         let bar_cap = self.bar_max_columns.min(MAX_BAR_COLUMNS);
-        let bottleneck = classify_bottleneck(snap, dl_rate, decoded_in_rate);
+        // Local-file runs have no download side
+        // (`docs/PLAN_local_file_extract.md` §4): the network/disk
+        // classifier compares `bytes_downloaded` against
+        // `bytes_decoded_input`, but both counters are pumped from
+        // the same source-read in local mode, so any verdict it
+        // reports is an artifact of the equal-rate deadband. Skip the
+        // classifier entirely so no badge or paint surfaces.
+        let bottleneck = if snap.local {
+            None
+        } else {
+            classify_bottleneck(snap, dl_rate, decoded_in_rate)
+        };
 
         let mut lines: Vec<String> = Vec::with_capacity(snap.parts.len() + 5);
 
@@ -949,9 +987,20 @@ impl<W: Write + Send> TtyRenderer<W> {
         lines.push(format_overall_line(
             snap, percent, term_cols, bar_cap, self.style,
         ));
-        lines.push(format_download_line(snap, dl_rate, bottleneck));
+        // Local-file runs (`docs/PLAN_local_file_extract.md` §4)
+        // suppress the download row and the lookahead row: the
+        // "download" counter is just the decoder's source-read
+        // cursor, the workers tally is always 0/0, and the lookahead
+        // gap is always 0 because both counters are pumped from the
+        // same `Read` impl. Keeping them would surface bogus numbers;
+        // dropping them leaves a tight bar + extract + ETA block.
+        if !snap.local {
+            lines.push(format_download_line(snap, dl_rate, bottleneck));
+        }
         lines.push(format_extract_line(snap, ex_rate, bottleneck));
-        lines.push(format_lookahead_line(snap, bottleneck));
+        if !snap.local {
+            lines.push(format_lookahead_line(snap, bottleneck));
+        }
         lines.push(format_eta_line(eta, self.style, bottleneck));
         lines
     }
@@ -1194,37 +1243,26 @@ impl LogRenderer {
         let decoded_in_rate = self.rate_decoded_in.rate_bytes_per_sec();
         let percent = overall_percent(snap);
         let eta = compute_eta(snap, dl_rate, ex_rate);
-        let bottleneck = classify_bottleneck(snap, dl_rate, decoded_in_rate);
+        // Local-file runs have no download side
+        // (`docs/PLAN_local_file_extract.md` §4); see the parallel
+        // TTY branch for the rationale. Skip the classifier so no
+        // bottleneck tag surfaces.
+        let bottleneck = if snap.local {
+            None
+        } else {
+            classify_bottleneck(snap, dl_rate, decoded_in_rate)
+        };
 
         let pct = percent
             .map(|p| format!("{p:.1}%"))
-            .unwrap_or_else(|| "?".into());
-        let displayed_downloaded = match snap.total_size {
-            Some(t) if t > 0 => snap.bytes_downloaded.min(t),
-            _ => snap.bytes_downloaded,
-        };
-        let downloaded = format_bytes(displayed_downloaded);
-        let total = snap
-            .total_size
-            .map(format_bytes)
             .unwrap_or_else(|| "?".into());
         let extracted = format_bytes(snap.bytes_extracted);
         let est = snap
             .extracted_estimate
             .map(format_bytes)
             .unwrap_or_else(|| "unknown".into());
-        let dl = dl_rate.map(format_rate).unwrap_or_else(|| "—".into());
         let ex = ex_rate.map(format_rate).unwrap_or_else(|| "—".into());
         let eta_s = format_eta(eta);
-        let lookahead = format_bytes(
-            snap.bytes_downloaded
-                .saturating_sub(snap.bytes_decoded_input),
-        );
-        let cap = match snap.max_disk_buffer {
-            Some(c) => format!("{} cap", format_bytes(c)),
-            None => "uncapped".into(),
-        };
-        let decoded_in = format_bytes(snap.bytes_decoded_input);
         // For single-URL runs we keep today's `progress: ...` prefix
         // so log scrapers built against the historical line shape
         // continue to parse. Multi-URL runs change the prefix to
@@ -1236,13 +1274,41 @@ impl LogRenderer {
         } else {
             "progress"
         };
-        let mut line = format!(
-            "{prefix}: {pct}  download {downloaded} / {total} @ {dl}  \
-             extract {extracted} / {est} @ {ex}  \
-             lookahead {lookahead} / {cap}  decoded_in {decoded_in}  \
-             workers {}/{}  ETA {eta_s}",
-            snap.active_workers, snap.total_workers,
-        );
+        let mut line = if snap.local {
+            // Local-file shape: no download / lookahead / workers
+            // fields — every download-side counter is either zero
+            // (workers) or a duplicate of the decoder cursor
+            // (`bytes_downloaded`). The bar + extract + ETA is all
+            // there is to report.
+            format!("{prefix}: {pct}  extract {extracted} / {est} @ {ex}  ETA {eta_s}")
+        } else {
+            let displayed_downloaded = match snap.total_size {
+                Some(t) if t > 0 => snap.bytes_downloaded.min(t),
+                _ => snap.bytes_downloaded,
+            };
+            let downloaded = format_bytes(displayed_downloaded);
+            let total = snap
+                .total_size
+                .map(format_bytes)
+                .unwrap_or_else(|| "?".into());
+            let dl = dl_rate.map(format_rate).unwrap_or_else(|| "—".into());
+            let lookahead = format_bytes(
+                snap.bytes_downloaded
+                    .saturating_sub(snap.bytes_decoded_input),
+            );
+            let cap = match snap.max_disk_buffer {
+                Some(c) => format!("{} cap", format_bytes(c)),
+                None => "uncapped".into(),
+            };
+            let decoded_in = format_bytes(snap.bytes_decoded_input);
+            format!(
+                "{prefix}: {pct}  download {downloaded} / {total} @ {dl}  \
+                 extract {extracted} / {est} @ {ex}  \
+                 lookahead {lookahead} / {cap}  decoded_in {decoded_in}  \
+                 workers {}/{}  ETA {eta_s}",
+                snap.active_workers, snap.total_workers,
+            )
+        };
         if let Some(b) = bottleneck {
             let label = match b {
                 Bottleneck::Disk => "disk",
@@ -2264,6 +2330,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let p = overall_percent(&snap).expect("percent");
         // 250/1000 = 25%, even though download is 50%.
@@ -2286,6 +2353,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let p = overall_percent(&snap).expect("percent");
         assert!((p - 50.0).abs() < 0.01);
@@ -2307,6 +2375,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         assert!(overall_percent(&snap).is_none());
     }
@@ -2327,6 +2396,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         // dl: 500k remaining @ 100kB/s = 5 s; ex: 1.9M remaining @
         // 100kB/s = 19 s. Bottleneck = extract = 19 s.
@@ -2350,6 +2420,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         assert!(compute_eta(&snap, None, None).is_none());
     }
@@ -2430,6 +2501,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         }
     }
 
@@ -2459,6 +2531,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let bar = render_bar(&snap, 8, BarStyle::Ascii);
         assert_eq!(bar.matches('#').count(), 0);
@@ -2508,6 +2581,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -2549,6 +2623,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -2586,6 +2661,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
@@ -2614,6 +2690,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let (l1, _, _, _, _) = r.format_block(&snap, Instant::now());
         let body = ascii_bar_body(&l1);
@@ -2643,6 +2720,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         r.render(&snap);
         r.render(&snap);
@@ -2669,6 +2747,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let line = r.format_line(&snap, Instant::now());
         // Sizes are KiB/MiB-formatted, not raw bytes.
@@ -2695,6 +2774,111 @@ mod tests {
     }
 
     #[test]
+    fn log_renderer_format_line_drops_download_fields_for_local_mode() {
+        // Local-file extractions
+        // (`docs/PLAN_local_file_extract.md` §4) have no download
+        // side. The log line should drop `download X / Y @ Z`,
+        // `lookahead`, `decoded_in`, `workers`, and the bottleneck
+        // tag — every counter on that side is either zero (workers)
+        // or a duplicate of the decoder cursor.
+        let mut r = LogRenderer::new();
+        let snap = ProgressSnapshot {
+            total_size: Some(2 * 1024 * 1024),
+            bytes_downloaded: 1024 * 1024,
+            bytes_extracted: 512 * 1024,
+            extracted_estimate: Some(2 * 1024 * 1024),
+            active_workers: 0,
+            total_workers: 0,
+            started: true,
+            done: false,
+            bytes_decoded_input: 1024 * 1024,
+            max_disk_buffer: None,
+            disk_bound: false,
+            decode_step_elapsed: None,
+            parts: Vec::new(),
+            local: true,
+        };
+        let line = r.format_line(&snap, Instant::now());
+        assert!(
+            !line.contains("download "),
+            "local-mode log line still mentions download: {line:?}"
+        );
+        assert!(
+            !line.contains("lookahead"),
+            "local-mode log line still mentions lookahead: {line:?}"
+        );
+        assert!(
+            !line.contains("decoded_in"),
+            "local-mode log line still mentions decoded_in: {line:?}"
+        );
+        assert!(
+            !line.contains("workers "),
+            "local-mode log line still mentions workers: {line:?}"
+        );
+        assert!(
+            !line.contains("bottleneck"),
+            "local-mode log line still tags bottleneck: {line:?}"
+        );
+        // Extract / percent / ETA still present.
+        assert!(line.contains("extract "), "missing extract: {line:?}");
+        assert!(
+            line.contains("512.0 KiB / 2.0 MiB"),
+            "missing extracted bytes: {line:?}"
+        );
+        assert!(line.contains("ETA"), "missing ETA marker: {line:?}");
+    }
+
+    #[test]
+    fn tty_renderer_drops_download_and_lookahead_lines_for_local_mode() {
+        // The TTY block normally has five lines (bar, download,
+        // extract, lookahead, ETA); local mode drops two of them
+        // (download + lookahead) so the block stays at three rows.
+        let mut r = TtyRenderer::with_bar_width(Vec::<u8>::new(), 12);
+        let snap = ProgressSnapshot {
+            total_size: Some(2000),
+            bytes_downloaded: 1000,
+            bytes_extracted: 500,
+            extracted_estimate: Some(2000),
+            active_workers: 0,
+            total_workers: 0,
+            started: true,
+            done: false,
+            bytes_decoded_input: 1000,
+            max_disk_buffer: None,
+            disk_bound: false,
+            decode_step_elapsed: None,
+            parts: Vec::new(),
+            local: true,
+        };
+        let lines = r.format_lines(&snap, Instant::now());
+        assert_eq!(
+            lines.len(),
+            3,
+            "local-mode block should be 3 lines (bar / extract / ETA), got {lines:?}",
+        );
+        assert!(lines[0].starts_with("peel"), "bar line: {:?}", lines[0]);
+        assert!(
+            lines[1].starts_with("extract"),
+            "expected extract on line 2: {:?}",
+            lines[1],
+        );
+        assert!(
+            lines[2].starts_with("ETA"),
+            "expected ETA on line 3: {:?}",
+            lines[2],
+        );
+        // No row prefixed `download` or `lookahead` survives.
+        assert!(
+            !lines.iter().any(|l| l.starts_with("download")),
+            "download row leaked into local-mode block: {lines:?}",
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("lookahead")),
+            "lookahead row leaked into local-mode block: {lines:?}",
+        );
+    }
+
+    #[test]
     fn log_renderer_format_line_emits_bottleneck_label() {
         let mut r = LogRenderer::new();
         let snap = ProgressSnapshot {
@@ -2711,6 +2895,7 @@ mod tests {
             disk_bound: true,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let line = r.format_line(&snap, Instant::now());
         assert!(line.contains("bottleneck=disk"), "got {line:?}");
@@ -2794,6 +2979,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         // dl = 50 MiB/s, decoded_in = 100 MiB/s. dl < 0.9 * decoded_in.
         let b = classify_bottleneck(&snap, Some(50.0e6), Some(100.0e6));
@@ -2819,6 +3005,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         // dl = 60 MiB/s, decoded_in = 50 MiB/s. decoded_in < 0.9 * dl
         // is false (50 vs 54 — too tight), so widen to make the test
@@ -2843,6 +3030,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         // Within the 10% deadband: dl = 100, decoded_in = 95.
         let b = classify_bottleneck(&snap, Some(100.0e6), Some(95.0e6));
@@ -2878,6 +3066,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         let a = classify_bottleneck(&snap, Some(60.0e6), Some(40.0e6));
         snap.extracted_estimate = Some(10_000_000);
@@ -2904,6 +3093,7 @@ mod tests {
             disk_bound: true,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         r.render(&snap);
         let out = String::from_utf8(r.out).expect("utf-8");
@@ -2935,6 +3125,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         };
         // Drive `format_block` with two samples spanning > min_span
         // (1 s) at the same wall-clock anchor so we don't introduce
@@ -2989,6 +3180,7 @@ mod tests {
                     bytes_downloaded: 0,
                 },
             ],
+            local: false,
         }
     }
 
@@ -3180,6 +3372,7 @@ mod tests {
             disk_bound: false,
             decode_step_elapsed: None,
             parts: Vec::new(),
+            local: false,
         }
     }
 

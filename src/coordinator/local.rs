@@ -713,11 +713,14 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
         // `bytes_extracted` channels the HTTP path uses, but skip
         // every `worker_started` / `worker_finished` / `set_total_workers`
         // call — local mode has one logical reader and no chunked
-        // download grid to render. The renderer shows "workers 0/0"
-        // (harmless) and an ETA driven by the source-read rate
-        // alone.
+        // download grid to render. `mark_local` flips the renderer
+        // into the local-file shape (drops the download row, the
+        // lookahead row, and the workers tally) so the bogus 0/0
+        // worker count and duplicated download counters never reach
+        // the user.
         state.set_total_size(total_size);
         state.mark_started();
+        state.mark_local();
     }
 
     // The decoder reads from the file; the puncher punches the
@@ -1177,6 +1180,18 @@ fn run_random_access_local(
             "destructive mode does not apply to random-access formats; \
              source will be preserved. Drop `-d` to silence this warning.",
         );
+    }
+
+    // Flip the renderer (if any) into the local-file shape before
+    // we hand control to the random-access pipeline. The pipelines
+    // themselves take `progress_state: None`, so no bytes flow into
+    // the shared state from here — but `mark_local` still drops the
+    // bogus "download / workers / lookahead" rows the renderer
+    // would otherwise paint with zeros.
+    if let Some(state) = args.progress_state.as_ref() {
+        state.set_total_size(total_size);
+        state.mark_started();
+        state.mark_local();
     }
 
     fs::create_dir_all(&output_dir).map_err(|source| CoordinatorError::Io {
