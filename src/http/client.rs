@@ -200,6 +200,33 @@ pub enum ClientError {
     RuntimeGone,
 }
 
+impl ClientError {
+    /// True iff retrying the same request could plausibly succeed.
+    ///
+    /// Transport-layer failures (`Io`, `Tls`, `Transport`, `DnsEmpty`)
+    /// and 5xx `UnexpectedStatus` responses are transient. 4xx
+    /// statuses (404, 403, 410, …), config errors (`Url`, `Range`,
+    /// `InvalidServerName`), and protocol violations
+    /// (`MissingLocation`, `TooManyRedirects`) are terminal —
+    /// retrying just burns the retry budget on something that won't
+    /// fix itself.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Io { .. } | Self::Tls { .. } | Self::Transport { .. } | Self::DnsEmpty { .. } => {
+                true
+            }
+            Self::UnexpectedStatus { status, .. } => *status >= 500,
+            Self::Url(_)
+            | Self::Range(_)
+            | Self::InvalidServerName { .. }
+            | Self::MissingLocation { .. }
+            | Self::TooManyRedirects { .. }
+            | Self::RuntimeGone => false,
+        }
+    }
+}
+
 /// Tunable knobs for [`Client`].
 /// Which HTTP version(s) the client may use.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]

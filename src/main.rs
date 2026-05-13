@@ -825,9 +825,9 @@ fn is_retryable_run_error(err: &CoordinatorError) -> bool {
 /// burning retry budget on something that won't fix itself.
 fn scheduler_err_is_retryable(s: &SchedulerError) -> bool {
     match s {
-        SchedulerError::Head { .. } => true,
+        SchedulerError::Head { source, .. } => source.is_retryable(),
         SchedulerError::ChunkFailed { source, .. } => source.is_retryable(),
-        SchedulerError::SingleStream { .. } => true,
+        SchedulerError::SingleStream { source, .. } => source.is_retryable(),
         SchedulerError::SingleStreamBodyLength { .. } => true,
         SchedulerError::BodyIo { .. } => true,
         SchedulerError::SourceChangedDuringDownload { .. } => false,
@@ -892,7 +892,7 @@ fn sleep_with_kill_switch(dur: Duration, kill: &AtomicBool) -> bool {
 mod tests {
     use super::*;
     use peel::download::WorkerError;
-    use peel::http::ClientError;
+    use peel::http::{ClientError, Method};
     use peel::types::ChunkIndex;
 
     fn transport_worker_error() -> WorkerError {
@@ -963,6 +963,51 @@ mod tests {
         let extractor_err = ExtractorError::Decode(decode_err);
         let coord_err = CoordinatorError::Extractor(extractor_err);
         assert!(is_retryable_run_error(&coord_err));
+    }
+
+    #[test]
+    fn scheduler_head_404_is_not_retryable() {
+        // A 404 from HEAD / range-probe discovery is terminal — the
+        // URL is wrong. Retrying just walks the full backoff
+        // schedule before surfacing the same error, leaving the
+        // user staring at a blank progress UI.
+        let err = CoordinatorError::Scheduler(SchedulerError::Head {
+            url: "https://example.test/missing.tar.lz4".into(),
+            source: ClientError::UnexpectedStatus {
+                method: Method::Get,
+                url: "https://example.test/missing.tar.lz4".into(),
+                status: 404,
+            },
+        });
+        assert!(!is_retryable_run_error(&err));
+    }
+
+    #[test]
+    fn scheduler_head_5xx_is_retryable() {
+        // A 503 from HEAD is transient (server overload / gateway
+        // hiccup) and should ride the retry path.
+        let err = CoordinatorError::Scheduler(SchedulerError::Head {
+            url: "https://example.test/snap.tar.lz4".into(),
+            source: ClientError::UnexpectedStatus {
+                method: Method::Head,
+                url: "https://example.test/snap.tar.lz4".into(),
+                status: 503,
+            },
+        });
+        assert!(is_retryable_run_error(&err));
+    }
+
+    #[test]
+    fn scheduler_head_transport_is_retryable() {
+        let err = CoordinatorError::Scheduler(SchedulerError::Head {
+            url: "https://example.test/snap.tar.lz4".into(),
+            source: ClientError::Transport {
+                host: "example.test".into(),
+                port: 443,
+                detail: "connection reset".into(),
+            },
+        });
+        assert!(is_retryable_run_error(&err));
     }
 
     #[test]
