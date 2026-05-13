@@ -1,21 +1,31 @@
 # peel
 
-**Sick of downloading an archive just to extract it and delete it?**
-**Tired of provisioning disk for *both* the compressed file and the
-extracted contents — only to throw ~half of it away?**
-**Tired of restarting a half-finished multi-gigabyte download from
-scratch every time the connection drops or the process gets killed?**
+**The Swiss Army knife for file downloads and extraction.**
 
-`peel` downloads, decompresses, and extracts in a single pass — and
-resumes exactly where it left off after any interruption: dropped
-connection, `kill -9`, power loss, OOM. The compressed bytes never
-fully land on disk: as the decoder consumes them, the download buffer
-is hole-punched out from underneath. Your archive and your extracted
-tree never coexist at full size, and a resumed run produces output
-byte-identical to a clean run.
+Sick of downloading an archive just to extract it and delete it?
+Tired of provisioning disk for *both* the compressed file and its
+extracted contents, only to throw half of it away? Tired of
+restarting a half-finished multi-gigabyte download from scratch
+every time the connection drops or the process gets killed?
+
+Point `peel` at a URL and it does the right thing. A plain file?
+You get a parallel, ranged, resumable download with end-to-end
+integrity checking. An archive? You get the extracted contents,
+streamed through decompression in a single pass, with the
+compressed bytes hole-punched out from underneath as the decoder
+advances, so the archive and its extracted tree never coexist at
+full size. Either way, a dropped connection, `kill -9`, or power
+loss resumes exactly where it left off, byte-identical to a clean
+run.
+
+Defaults match what you'd actually type. Simple flags cover the
+rest: add mirrors, cap bandwidth, verify a hash, pin a format,
+choose an IO backend, point at an output directory.
 
 ```
+peel https://example.com/installer.bin
 peel https://example.com/dataset.tar.zst
+peel localfile.rar
 ```
 
 ## What you get
