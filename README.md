@@ -146,8 +146,11 @@ Same shape, same process-spawn + dynamic-linker cost on both sides;
 no in-process fast path that flatters peel. Payload size scales per
 row so wire-time stays in the 0.2–8 s range (long enough to drown out
 connection setup, short enough that the whole grid finishes in
-~4 minutes). 4 workers, blocking IO backend, in-process mock server
-on loopback. Apple M4 Max / macOS 26.3, single run (variance ≤ 5 %).
+~10 minutes). Workers tuned per column (see grid footnote) by
+sweeping `--workers ∈ {1, 2, 4, 8, 16}` and picking the value with
+the smallest geomean `peel / curl|tool` ratio across the column's
+format rows. Blocking IO backend, in-process mock server on
+loopback. Apple M4 Max / macOS 26.3, single run (variance ≤ 5 %).
 Reproduce with:
 
 ```sh
@@ -158,15 +161,17 @@ cargo test --release --features rar --test test_bench_streaming \
 ### Wall-clock ratio: `peel` ÷ `curl | tool`
 
 Lower is better; **bold** = `peel` is faster than the shell pipe.
+Workers value below each column header is the per-column geomean
+winner of the sweep described above.
 
-| Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
+| Format | 10 Mbps · 8 MiB (w=1) | 100 Mbps · 32 MiB (w=1) | 1 Gbps · 128 MiB (w=4) | 10 Gbps · 256 MiB (w=16) |
 | --- | --- | --- | --- | --- |
-| `tar` | 1.17× | **0.94×** | **0.81×** | **0.94×** |
-| `tar.zst` | 1.12× | **0.95×** | **0.83×** | 1.06× |
-| `tar.gz`¹ | 1.09× | **0.95×** | **0.81×** | 1.29× |
-| `tar.gz·m`² | 1.11× | **0.95×** | **0.83×** | 1.07× |
-| `tar.lz4` | 1.09× | **0.95×** | **0.82×** | 1.06× |
-| `tar.xz` | 1.05× | 1.00× | 1.04× | **0.98×** |
+| `tar` | 1.03× | **0.92×** | **0.83×** | **0.64×** |
+| `tar.zst` | **0.98×** | **0.93×** | **0.82×** | **0.65×** |
+| `tar.gz`¹ | **0.98×** | **0.92×** | **0.82×** | 1.24× |
+| `tar.gz·m`² | **0.97×** | **0.92×** | **0.82×** | 1.15× |
+| `tar.lz4` | **0.98×** | **0.92×** | **0.82×** | **0.75×** |
+| `tar.xz` | 1.00× | **0.93×** | **0.99×** | 1.00× |
 
 ¹ Single-member gzip — the default-`gzip` / `tar -z` shape.
 ² Multi-member gzip (~32 MiB members) — the `pigz` / `gzip a b > c.gz`
@@ -174,32 +179,36 @@ shape. Same baseline pipe (`gzip -d` handles concatenated members per
 RFC 1952 §2.2).
 
 Absolute wall-clock for the 10 Gbps · 256 MiB column, for scale:
-`tar` 0.22 s vs 0.24 s · `tar.zst` 0.25 s vs 0.24 s · `tar.lz4`
-0.25 s vs 0.24 s · `tar.gz` 0.30 s vs 0.24 s · `tar.gz·m` 0.25 s vs
-0.24 s · `tar.xz` 5.70 s vs 5.84 s.
+`tar` 0.16 s vs 0.24 s · `tar.zst` 0.16 s vs 0.24 s · `tar.lz4`
+0.18 s vs 0.24 s · `tar.gz` 0.30 s vs 0.24 s · `tar.gz·m` 0.28 s vs
+0.24 s · `tar.xz` 6.46 s vs 6.48 s.
 
 ### Reading the grid
 
-At 100 Mbps and up to 1 Gbps, `peel` ties or beats the system pipeline
-across every codec. Four parallel ranged GETs put more bandwidth in
-flight than curl's single TCP connection, and that win more than pays
-for the part-file double-hop and checkpoint syncs.
+At 100 Mbps and 1 Gbps, `peel` ties or beats the system pipeline
+across every codec — and at 10 Gbps the cheap codecs (`tar`,
+`tar.zst`, `tar.lz4`) extend the lead to **0.64–0.75×** once the
+column is tuned to `--workers 16`, because 16 in-flight ranged GETs
+saturate the loopback path while curl's single TCP connection idles
+behind its `--limit-rate` token bucket. The single-threaded gzip
+decoder (`tar.gz`, `tar.gz·m`) becomes the bottleneck once the wire
+window shrinks below the codec's decode time, which is why those
+two rows land >1× in the 10 Gbps cell; `internal/PLAN_gzip_throughput.md`
+phase 3 (parallel-member decode) is the regression-gate that fixes
+them.
 
-The 10 Gbps · 256 MiB column flips for the very-cheap codecs (`tar.zst`,
-`tar.lz4`, `tar.gz`) because the wire window collapses to ~240 ms and
-peel's per-process startup (~30 ms of dyld + decoder init) becomes a
-visible share of the wall-clock. The slow-decode rows (`tar.xz`) stay
-flat there: the 5.7 s of xz compute drowns out any process-spawn cost.
-
-The 10 Mbps row is the one place the parallel-GET shape costs more
-than it earns. With 8 MiB of payload, ranged-GET parallelism has
-nothing to amortize over: as the body finishes, workers idle out one
-by one and the last worker drains the token bucket alone, so the
-trailing edge runs below the cap. Add post-wire finalization (final
-checkpoint, manifest, sink fsync) and `peel` lands ~700–1200 ms over
-the 6.7 s wire-time floor; `curl --limit-rate` lands within ~50 ms of
-it. The gap narrows in `tar.xz` where the baseline's slower decoder
-absorbs most of the trailing-edge cost.
+The 10 Mbps and 100 Mbps columns settle on `--workers 1`: with sub-
+gigabit pipes and ≤32 MiB payloads, every extra worker adds
+trailing-edge drain (workers idle out one by one as the body
+finishes; the last worker drains the token bucket alone, below the
+cap) without enough wire-time left to amortize it. Pinning to one
+worker lands `peel` within noise of `curl --limit-rate` at 10 Mbps
+(geomean 0.99× across the column) and ahead of it by ~7–8 % at
+100 Mbps. The `tar` row at 10 Mbps lands slightly slow (1.03×)
+because the tar decoder spends almost no time decoding; the gap is
+post-wire finalization (final checkpoint, manifest, sink fsync). The
+slow-decode `tar.xz` row absorbs more of that finalization into the
+xz compute floor and ties the baseline at every column.
 
 ## Benchmarks: peel vs `curl -O && <extract> && rm`
 
@@ -250,19 +259,21 @@ cargo test --release --features rar --test test_bench_streaming \
 ### Wall-clock ratio: `peel` ÷ `curl -O && <extract> && rm`
 
 Lower is better; **bold** = `peel` is faster than the
-download-then-extract sequence.
+download-then-extract sequence. Same worker-tuning methodology as
+the streaming grid: workers swept ∈ {1, 2, 4, 8, 16} per column,
+geomean winner per column shown in the header.
 
-| Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
+| Format | 10 Mbps · 8 MiB (w=1) | 100 Mbps · 32 MiB (w=1) | 1 Gbps · 128 MiB (w=1) | 10 Gbps · 256 MiB (w=16) |
 | --- | --- | --- | --- | --- |
-| `tar` | 1.09× | **0.93×** | **0.77×** | **0.92×** |
-| `tar.zst` | **0.95×** | **0.93×** | **0.74×** | **0.66×** |
-| `tar.gz` | 1.08× | **0.93×** | **0.74×** | **0.79×** |
-| `tar.lz4` | 1.07× | **0.93×** | **0.76×** | **0.65×** |
-| `tar.xz` | **0.99×** | **0.83×** | **0.77×** | **0.97×** |
-| `zip` | 1.00× | **0.91×** | **0.59×** | **0.24×** |
-| `7z` | 1.06× | **0.95×** | **0.78×** | **0.73×** |
-| `rar5` | 1.03× | **0.95×** | **0.80×** | 1.16× |
-| `rar3` | 1.04× | **0.95×** | **0.90×** | 1.07× |
+| `tar` | 1.02× | **0.91×** | **0.76×** | **0.57×** |
+| `tar.zst` | **0.97×** | **0.90×** | **0.76×** | **0.46×** |
+| `tar.gz` | **0.97×** | **0.90×** | **0.75×** | **0.67×** |
+| `tar.lz4` | **0.97×** | **0.90×** | **0.76×** | **0.48×** |
+| `tar.xz` | **0.96×** | **0.76×** | **0.76×** | **0.96×** |
+| `zip` | **0.97×** | **0.88×** | **0.59×** | **0.20×** |
+| `7z` | **0.97×** | **0.91×** | **0.79×** | **0.58×** |
+| `rar5` | **0.98×** | **0.91×** | **0.78×** | **0.97×** |
+| `rar3` | **0.98×** | **0.92×** | **0.71×** | 1.04× |
 
 ### Reading the grid
 
@@ -272,49 +283,55 @@ is `wire-time + extract-time + rm`. peel saves the trailing extract
 phase outright, and the savings widen with bandwidth: at 1 Gbps and
 above the baseline eats half a second to over a second of trailing
 wall-clock that peel never spends. `tar.xz` shows the slow-decode
-story most cleanly — at 100 Mbps peel is **0.84×** the baseline
+story most cleanly — at 100 Mbps peel is **0.76×** the baseline
 because xz decode runs during the in-flight download instead of after
 it.
 
-The 10 Mbps row sits within 5–16% of the baseline for the same reason
-as the streaming grid above: 8 MiB is too small for parallel ranged
-GETs to amortize, so trailing-edge drain plus post-wire finalization
-land peel up to ~1 s over the wire-time floor.
+With workers tuned per column the 10 Mbps row now ties or beats the
+baseline on every format (geomean **0.98×**). At sub-gigabit rates
+the dnx grid prefers `--workers 1` even more strongly than the
+streaming grid: the baseline pays `wire + extract + rm` while peel
+pays `wire + a few ms of finalization`, so trailing-edge drain on
+multiple ranged GETs would forfeit the extract-overlap win.
+`--workers 1` keeps the token bucket fully utilized through the
+trailing edge and lets the in-flight decode steal the baseline's
+extract phase outright. 1 Gbps still wins at `--workers 1` (the
+extract-overlap savings are large enough that adding parallelism
+to shave the trailing edge isn't worth the drain risk); only at
+10 Gbps does `--workers 16` flip in.
 
 `zip` is the headline. There is no streaming-pipe baseline for
 `.zip`, so this grid is the only fair head-to-head. At 1 Gbps ×
-128 MiB peel finishes in roughly 62 % of the baseline's wall-clock;
-at 10 Gbps × 256 MiB it's a ~3.5× speedup. peel writes each entry to
-its final path as soon as the entry's bytes arrive, while the
-baseline is structurally barred from starting `unzip` until `curl`
-finishes.
+128 MiB peel finishes in roughly 59 % of the baseline's wall-clock;
+at 10 Gbps × 256 MiB it's a ~5× speedup (**0.20×**). peel writes
+each entry to its final path as soon as the entry's bytes arrive,
+while the baseline is structurally barred from starting `unzip`
+until `curl` finishes.
 
 `7z` supports the same single-pass shape: peel beats the baseline at
-every bandwidth from 100 Mbps through 10 Gbps. At 10 Gbps × 256 MiB
-the COPY-coded archive's 256 MiB fits inside a sub-300 ms wire
-window, so the gap narrows to **0.84×** — peel still wins because
-writing each folder's bytes to the final path during the in-flight
-window beats running `7z x` over the full archive after `curl`
-finishes, even when both are very fast.
+every bandwidth from 10 Mbps through 10 Gbps, all the way to
+**0.58×** at the 10 Gbps · 256 MiB cell. The COPY-coded archive's
+256 MiB fits inside a sub-300 ms wire window, but `--workers 16`
+keeps that window full while the baseline still has to run `7z x`
+over the full archive after `curl` finishes.
 
 `rar5` and `rar3` are the new entries. `unrar` requires a seekable
 file (the binary `lseek`s its input regardless of where the metadata
 sits), so a streaming-pipe baseline doesn't exist for them either —
-this grid is the only fair head-to-head. peel ties or beats the
-baseline at every cell from 10 Mbps through 1 Gbps for both formats.
-At the 10 Gbps × 256 MiB cell — where the wire window collapses to
-~0.3 s and per-entry extraction cost dominates — peel still loses
-by ~16% on `rar5` (was 2.48× in the original §3 numbers before §G1's
-STORED-throughput pass; see the local-file decode grid below for
-the per-byte story) and ~7% on `rar3`. The RAR3 row is also doing
-real decode work both sides — `-m3` packs the incompressible bench
-payload through full LZ + RarVM filters, not COPY — so its
-wall-clock floor (~1.8 s) is much higher than the other formats,
-and the relative difference between peel and the baseline shrinks
-correspondingly. peel's parallel-GET-plus-stream shape pays for
-itself everywhere the wire-time is non-trivial, which covers every
-real production scenario. (Both rar rows skip rather than fail when
-`unrar` is missing from `PATH`.)
+this grid is the only fair head-to-head. With per-column worker
+tuning, peel ties or beats the baseline at every cell from 10 Mbps
+through 1 Gbps for both formats, and `rar5` is essentially tied
+(**0.97×**) even at the 10 Gbps · 256 MiB cell where the wire window
+collapses to ~0.3 s and per-entry extraction cost dominates (was
+2.48× in the original §3 numbers before §G1's STORED-throughput
+pass; see the local-file decode grid below for the per-byte story).
+`rar3` lands at 1.04× at 10 Gbps — the only >1.00× rar cell — because
+`-m3` packs the incompressible bench payload through full LZ + RarVM
+filters, not COPY, and the wall-clock floor (~1.9 s) is much higher
+than the other formats. peel's parallel-GET-plus-stream shape pays
+for itself everywhere the wire-time is non-trivial, which covers
+every real production scenario. (Both rar rows skip rather than
+fail when `unrar` is missing from `PATH`.)
 
 ## Benchmarks: peel's decoder vs the reference CLI (local files)
 

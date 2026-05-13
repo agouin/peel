@@ -1498,6 +1498,12 @@ fn diag_plain_tar_io_backends() {
 /// stays near 5 s of network wait — long enough to drown out
 /// connection setup, short enough that the whole grid finishes in a
 /// few minutes.
+///
+/// Worker count is tuned per column: for each rate the bench sweeps
+/// `peel --workers` over [`WORKERS_SWEEP`] across every format row in
+/// the column, then picks the count with the smallest geomean of
+/// `peel / baseline` ratios and re-emits the column using that
+/// value. The chosen worker count is logged after each column.
 #[test]
 #[ignore = "benchmark; opt-in via --ignored"]
 fn bench_throttled_realistic_grid() {
@@ -1530,22 +1536,21 @@ fn bench_throttled_realistic_grid() {
     ];
 
     println!(
-        "[net] {:>10}  {:>9}  {:<8}  {:>9}  {:>13}  {:>6}  tools",
-        "rate", "payload", "format", "peel", "curl|tool", "ratio"
+        "[net] {:>10}  {:>9}  {:<8}  {:>5}  {:>9}  {:>13}  {:>6}  tools",
+        "rate", "payload", "format", "wrk", "peel", "curl|tool", "ratio"
     );
 
     for rate in rates {
         let (archive, entries) = build_tar_payload_sized(rate.payload_bytes);
         let mib = (rate.payload_bytes as f64) / (1024.0 * 1024.0);
+        let mut cells: Vec<CellMeasurement> = Vec::new();
 
         // ---- plain tar -------------------------------------------------
         if tool_present("tar") {
-            run_throttled_case(
+            cells.push(measure_throttled_case(
                 rate,
-                mib,
                 "tar",
                 "curl|tar",
-                &archive,
                 &archive,
                 &entries,
                 "bundle.tar",
@@ -1556,19 +1561,17 @@ fn bench_throttled_realistic_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.zst ---------------------------------------------------
         if tool_present("tar") && tool_present("zstd") {
             let body = encode_zstd(&archive);
-            run_throttled_case(
+            cells.push(measure_throttled_case(
                 rate,
-                mib,
                 "tar.zst",
                 "curl|zstd|tar",
                 &body,
-                &archive,
                 &entries,
                 "bundle.tar.zst",
                 |dir| {
@@ -1578,19 +1581,17 @@ fn bench_throttled_realistic_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.xz ----------------------------------------------------
         if tool_present("tar") && tool_present("xz") {
             let body = encode_xz(&archive);
-            run_throttled_case(
+            cells.push(measure_throttled_case(
                 rate,
-                mib,
                 "tar.xz",
                 "curl|xz|tar",
                 &body,
-                &archive,
                 &entries,
                 "bundle.tar.xz",
                 |dir| {
@@ -1600,19 +1601,17 @@ fn bench_throttled_realistic_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.gz (single-member, default-`gzip` shape) -------------
         if tool_present("tar") && tool_present("gzip") {
             let body = encode_gzip(&archive);
-            run_throttled_case(
+            cells.push(measure_throttled_case(
                 rate,
-                mib,
                 "tar.gz",
                 "curl|gzip|tar",
                 &body,
-                &archive,
                 &entries,
                 "bundle.tar.gz",
                 |dir| {
@@ -1622,7 +1621,7 @@ fn bench_throttled_realistic_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.gz (multi-member, `pigz`/concat shape) ---------------
@@ -1643,13 +1642,11 @@ fn bench_throttled_realistic_grid() {
             let n_members = pick_gz_member_count(rate.payload_bytes);
             if n_members >= 2 {
                 let body = encode_gzip_multi_member(&archive, n_members);
-                run_throttled_case(
+                cells.push(measure_throttled_case(
                     rate,
-                    mib,
                     "tar.gz·m",
                     "curl|gzip|tar",
                     &body,
-                    &archive,
                     &entries,
                     "bundle.tar.gz",
                     |dir| {
@@ -1659,20 +1656,18 @@ fn bench_throttled_realistic_grid() {
                             dir = shell_quote(dir),
                         )
                     },
-                );
+                ));
             }
         }
 
         // ---- tar.lz4 (uncompressed frame; framing-only test) ----------
         if tool_present("tar") && tool_present("lz4") {
             let body = encode_lz4_uncompressed_frame(&archive);
-            run_throttled_case(
+            cells.push(measure_throttled_case(
                 rate,
-                mib,
                 "tar.lz4",
                 "curl|lz4|tar",
                 &body,
-                &archive,
                 &entries,
                 "bundle.tar.lz4",
                 |dir| {
@@ -1682,8 +1677,10 @@ fn bench_throttled_realistic_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
+
+        emit_column("net", rate, mib, &cells);
     }
 }
 
@@ -1727,13 +1724,19 @@ fn diag_throttled_10mbps_tar_worker_sweep() {
             c.max_bandwidth_bps = Some(rate_bps);
             c
         }),
+        ("workers=1, adaptive=on (tuned 10 Mbps)", |_, rate_bps| {
+            let mut c = coord_config();
+            c.workers = 1;
+            c.max_bandwidth_bps = Some(rate_bps);
+            c
+        }),
         ("workers=2, adaptive=on               ", |_, rate_bps| {
             let mut c = coord_config();
             c.workers = 2;
             c.max_bandwidth_bps = Some(rate_bps);
             c
         }),
-        ("workers=4, adaptive=on (current grid)", |_, rate_bps| {
+        ("workers=4, adaptive=on               ", |_, rate_bps| {
             let mut c = coord_config();
             c.workers = 4;
             c.max_bandwidth_bps = Some(rate_bps);
@@ -1821,18 +1824,95 @@ struct Rate {
     payload_bytes: usize,
 }
 
+/// Worker counts the throttled grids sweep per column. The bench
+/// picks the value with the smallest geomean of `peel / baseline`
+/// across that column's format rows.
+const WORKERS_SWEEP: &[u32] = &[1, 2, 4, 8, 16];
+
+/// One bench row's worth of timings: baseline measured once, peel
+/// measured once per workers value in [`WORKERS_SWEEP`].
+struct CellMeasurement {
+    format_label: &'static str,
+    tools_label: &'static str,
+    base_secs: f64,
+    peel_secs_by_workers: Vec<f64>,
+}
+
+impl CellMeasurement {
+    fn ratio_at(&self, idx: usize) -> f64 {
+        self.peel_secs_by_workers[idx] / self.base_secs.max(1e-9)
+    }
+}
+
+/// Pick the index into [`WORKERS_SWEEP`] with the lowest geomean
+/// `peel / baseline` ratio across `cells`. Returns `(idx, geomean)`.
+/// Empty cell lists return `(0, 1.0)` — the grid loop guards against
+/// this anyway (no rows means no emit).
+fn pick_best_workers(cells: &[CellMeasurement]) -> (usize, f64) {
+    if cells.is_empty() {
+        return (0, 1.0);
+    }
+    let mut best_idx = 0;
+    let mut best_score = f64::INFINITY;
+    for i in 0..WORKERS_SWEEP.len() {
+        let log_sum: f64 = cells.iter().map(|c| c.ratio_at(i).ln()).sum();
+        let geomean = (log_sum / cells.len() as f64).exp();
+        if geomean < best_score {
+            best_score = geomean;
+            best_idx = i;
+        }
+    }
+    (best_idx, best_score)
+}
+
+/// Emit one column of the throttled grid using the per-column-best
+/// workers value. Prints every workers candidate's geomean as a
+/// preamble, then the per-format rows at the winning workers.
+fn emit_column(tag: &str, rate: &Rate, payload_mib: f64, cells: &[CellMeasurement]) {
+    if cells.is_empty() {
+        return;
+    }
+    let (best_idx, _) = pick_best_workers(cells);
+    let best_workers = WORKERS_SWEEP[best_idx];
+    // Sweep summary: one log line listing every workers value's
+    // geomean for this column, so the chosen value is auditable.
+    let mut summary = format!("[{tag}] {} workers sweep:", rate.label);
+    for (i, &w) in WORKERS_SWEEP.iter().enumerate() {
+        let log_sum: f64 = cells.iter().map(|c| c.ratio_at(i).ln()).sum();
+        let geomean = (log_sum / cells.len() as f64).exp();
+        let marker = if i == best_idx { "*" } else { " " };
+        summary.push_str(&format!(" w={w}{marker}{geomean:.3}"));
+    }
+    println!("{summary}");
+
+    for c in cells {
+        let peel_s = c.peel_secs_by_workers[best_idx];
+        let base_s = c.base_secs;
+        let ratio = peel_s / base_s.max(1e-9);
+        println!(
+            "[{tag}] {rate_lbl:>10}  {payload:>6.1} MiB  {fmt:<8}  {wrk:>5}  {peel:>7.3}s  {base:>11.3}s  {ratio:>5.2}x  {tools}",
+            rate_lbl = rate.label,
+            payload = payload_mib,
+            fmt = c.format_label,
+            wrk = best_workers,
+            peel = peel_s,
+            base = base_s,
+            ratio = ratio,
+            tools = c.tools_label,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_throttled_case(
+fn measure_throttled_case(
     rate: &Rate,
-    payload_mib: f64,
-    format_label: &str,
-    tools_label: &str,
+    format_label: &'static str,
+    tools_label: &'static str,
     body: &[u8],
-    archive: &[u8],
     entries: &[(String, Vec<u8>)],
     suffix: &str,
     baseline_pipeline: impl Fn(&std::path::Path) -> String,
-) {
+) -> CellMeasurement {
     let server = MockServer::start(ok_handler(body.to_vec()));
     let url = format!("{}/{suffix}", server.base_url());
 
@@ -1842,16 +1922,19 @@ fn run_throttled_case(
     // pay process-spawn + dynamic-linker cost on every run, and
     // measuring peel through the same shape keeps the comparison
     // honest.
-    let work_p = unique_dir(&format!("net_{format_label}_peel"));
-    let _g_p = CleanupDir(work_p.clone());
-    let peel_elapsed = run_peel_subprocess(&url, &work_p, Some(rate.bytes_per_sec));
-    // Sanity-check the on-disk tree: the bench is unsafe if peel
-    // silently produced wrong output. The exact byte count is not
-    // checked here (peel surfaces `bytes_out` only through its
-    // stderr stats line); `assert_dir_matches` re-derives the
-    // expected bodies and compares them.
-    let _ = archive;
-    assert_dir_matches(&work_p, entries);
+    let mut peel_secs_by_workers = Vec::with_capacity(WORKERS_SWEEP.len());
+    for &workers in WORKERS_SWEEP {
+        let work_p = unique_dir(&format!("net_{format_label}_peel_w{workers}"));
+        let _g_p = CleanupDir(work_p.clone());
+        let peel_elapsed = run_peel_subprocess_with_workers(
+            &url,
+            &work_p,
+            Some(rate.bytes_per_sec),
+            Some(workers),
+        );
+        assert_dir_matches(&work_p, entries);
+        peel_secs_by_workers.push(peel_elapsed.as_secs_f64());
+    }
 
     // ---- curl|tool ----
     let work_b = unique_dir(&format!("net_{format_label}_curl"));
@@ -1860,18 +1943,12 @@ fn run_throttled_case(
     let base_elapsed = time_pipeline(&url, &pipeline);
     assert_dir_matches(&work_b, entries);
 
-    let peel_s = peel_elapsed.as_secs_f64();
-    let base_s = base_elapsed.as_secs_f64();
-    println!(
-        "[net] {rate:>10}  {payload:>6.1} MiB  {fmt:<8}  {peel:>7.3}s  {base:>11.3}s  {ratio:>5.2}x  {tools}",
-        rate = rate.label,
-        payload = payload_mib,
-        fmt = format_label,
-        peel = peel_s,
-        base = base_s,
-        ratio = peel_s / base_s.max(1e-9),
-        tools = tools_label,
-    );
+    CellMeasurement {
+        format_label,
+        tools_label,
+        base_secs: base_elapsed.as_secs_f64(),
+        peel_secs_by_workers,
+    }
 }
 
 /// Spawn the `peel` CLI binary and time it.
@@ -1884,7 +1961,12 @@ fn run_throttled_case(
 /// are captured and surfaced on non-zero exit so a regression in
 /// the binary's wiring fails the bench loudly rather than silently
 /// producing zero-time rows.
-fn run_peel_subprocess(url: &str, output_dir: &Path, bytes_per_sec: Option<u64>) -> Duration {
+fn run_peel_subprocess_with_workers(
+    url: &str,
+    output_dir: &Path,
+    bytes_per_sec: Option<u64>,
+    workers: Option<u32>,
+) -> Duration {
     let exe = env!("CARGO_BIN_EXE_peel");
     let mut cmd = Command::new(exe);
     cmd.arg(url)
@@ -1898,6 +1980,9 @@ fn run_peel_subprocess(url: &str, output_dir: &Path, bytes_per_sec: Option<u64>)
     cmd.arg("--no-auto-discover");
     if let Some(bps) = bytes_per_sec {
         cmd.arg("--max-bandwidth").arg(bps.to_string());
+    }
+    if let Some(w) = workers {
+        cmd.arg("--workers").arg(w.to_string());
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2012,19 +2097,19 @@ fn bench_throttled_download_then_extract_grid() {
     ];
 
     println!(
-        "[dnx] {:>10}  {:>9}  {:<8}  {:>9}  {:>13}  {:>6}  tools",
-        "rate", "payload", "format", "peel", "curl+extract", "ratio"
+        "[dnx] {:>10}  {:>9}  {:<8}  {:>5}  {:>9}  {:>13}  {:>6}  tools",
+        "rate", "payload", "format", "wrk", "peel", "curl+extract", "ratio"
     );
 
     for rate in rates {
         let (archive, entries) = build_tar_payload_sized(rate.payload_bytes);
         let mib = (rate.payload_bytes as f64) / (1024.0 * 1024.0);
+        let mut cells: Vec<CellMeasurement> = Vec::new();
 
         // ---- plain tar -------------------------------------------------
         if tool_present("tar") {
-            run_throttled_dnx_case(
+            cells.push(measure_throttled_dnx_case(
                 rate,
-                mib,
                 "tar",
                 "curl+tar",
                 &archive,
@@ -2038,15 +2123,14 @@ fn bench_throttled_download_then_extract_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.zst ---------------------------------------------------
         if tool_present("tar") && tool_present("zstd") {
             let body = encode_zstd(&archive);
-            run_throttled_dnx_case(
+            cells.push(measure_throttled_dnx_case(
                 rate,
-                mib,
                 "tar.zst",
                 "curl+zstd+tar",
                 &body,
@@ -2060,15 +2144,14 @@ fn bench_throttled_download_then_extract_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.xz ----------------------------------------------------
         if tool_present("tar") && tool_present("xz") {
             let body = encode_xz(&archive);
-            run_throttled_dnx_case(
+            cells.push(measure_throttled_dnx_case(
                 rate,
-                mib,
                 "tar.xz",
                 "curl+xz+tar",
                 &body,
@@ -2082,15 +2165,14 @@ fn bench_throttled_download_then_extract_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.gz (single-member) ------------------------------------
         if tool_present("tar") && tool_present("gzip") {
             let body = encode_gzip(&archive);
-            run_throttled_dnx_case(
+            cells.push(measure_throttled_dnx_case(
                 rate,
-                mib,
                 "tar.gz",
                 "curl+gzip+tar",
                 &body,
@@ -2104,15 +2186,14 @@ fn bench_throttled_download_then_extract_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- tar.lz4 (uncompressed frame) ------------------------------
         if tool_present("tar") && tool_present("lz4") {
             let body = encode_lz4_uncompressed_frame(&archive);
-            run_throttled_dnx_case(
+            cells.push(measure_throttled_dnx_case(
                 rate,
-                mib,
                 "tar.lz4",
                 "curl+lz4+tar",
                 &body,
@@ -2126,7 +2207,7 @@ fn bench_throttled_download_then_extract_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- zip (STORED entries) --------------------------------------
@@ -2139,9 +2220,8 @@ fn bench_throttled_download_then_extract_grid() {
                 .map(|(n, b)| ZipEntrySpec::stored(n.clone(), b.clone()))
                 .collect();
             let body = build_zip(&zip_entries);
-            run_throttled_dnx_case(
+            cells.push(measure_throttled_dnx_case(
                 rate,
-                mib,
                 "zip",
                 "curl+unzip",
                 &body,
@@ -2155,7 +2235,7 @@ fn bench_throttled_download_then_extract_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- 7z (COPY-coded) -------------------------------------------
@@ -2169,9 +2249,8 @@ fn bench_throttled_download_then_extract_grid() {
                 .map(|(n, b)| (n.as_str(), b.clone()))
                 .collect();
             let body = build_copy_sevenz(&pairs);
-            run_throttled_dnx_case(
+            cells.push(measure_throttled_dnx_case(
                 rate,
-                mib,
                 "7z",
                 "curl+7z",
                 &body,
@@ -2187,7 +2266,7 @@ fn bench_throttled_download_then_extract_grid() {
                         dir = shell_quote(dir),
                     )
                 },
-            );
+            ));
         }
 
         // ---- rar5 + rar3 (STORED) --------------------------------------
@@ -2204,9 +2283,8 @@ fn bench_throttled_download_then_extract_grid() {
                 if rar5_encoder_present() {
                     let body = ensure_rar5_stored(&entries, rate.payload_bytes);
                     let unrar = unrar.clone();
-                    run_throttled_dnx_case(
+                    cells.push(measure_throttled_dnx_case(
                         rate,
-                        mib,
                         "rar5",
                         "curl+unrar",
                         &body,
@@ -2224,14 +2302,13 @@ fn bench_throttled_download_then_extract_grid() {
                                 unrar = unrar,
                             )
                         },
-                    );
+                    ));
                 }
                 if rar3_encoder_present() {
                     let body = ensure_rar3_stored(&entries, rate.payload_bytes);
                     let unrar = unrar.clone();
-                    run_throttled_dnx_case(
+                    cells.push(measure_throttled_dnx_case(
                         rate,
-                        mib,
                         "rar3",
                         "curl+unrar",
                         &body,
@@ -2246,37 +2323,47 @@ fn bench_throttled_download_then_extract_grid() {
                                 unrar = unrar,
                             )
                         },
-                    );
+                    ));
                 }
             }
         }
+
+        emit_column("dnx", rate, mib, &cells);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_throttled_dnx_case(
+fn measure_throttled_dnx_case(
     rate: &Rate,
-    payload_mib: f64,
-    format_label: &str,
-    tools_label: &str,
+    format_label: &'static str,
+    tools_label: &'static str,
     body: &[u8],
     entries: &[(String, Vec<u8>)],
     suffix: &str,
     baseline_pipeline: impl Fn(&std::path::Path, &std::path::Path) -> String,
-) {
+) -> CellMeasurement {
     let server = MockServer::start(ok_handler(body.to_vec()));
     let url = format!("{}/{suffix}", server.base_url());
 
     // ---- peel (CLI subprocess) ----
-    // Same rationale as `run_throttled_case`: spawning the built
+    // Same rationale as `measure_throttled_case`: spawning the built
     // binary keeps the comparison honest against the curl-based
     // baselines (which also pay process-spawn cost). The
-    // `peel_subprocess` helper handles `--max-bandwidth`, stderr
-    // capture, and non-zero-exit panics.
-    let work_p = unique_dir(&format!("dnx_{format_label}_peel"));
-    let _g_p = CleanupDir(work_p.clone());
-    let peel_elapsed = run_peel_subprocess(&url, &work_p, Some(rate.bytes_per_sec));
-    assert_dir_matches(&work_p, entries);
+    // `peel_subprocess` helper handles `--max-bandwidth`,
+    // `--workers`, stderr capture, and non-zero-exit panics.
+    let mut peel_secs_by_workers = Vec::with_capacity(WORKERS_SWEEP.len());
+    for &workers in WORKERS_SWEEP {
+        let work_p = unique_dir(&format!("dnx_{format_label}_peel_w{workers}"));
+        let _g_p = CleanupDir(work_p.clone());
+        let peel_elapsed = run_peel_subprocess_with_workers(
+            &url,
+            &work_p,
+            Some(rate.bytes_per_sec),
+            Some(workers),
+        );
+        assert_dir_matches(&work_p, entries);
+        peel_secs_by_workers.push(peel_elapsed.as_secs_f64());
+    }
 
     // ---- curl -O && extract && rm ----
     let work_b = unique_dir(&format!("dnx_{format_label}_baseline"));
@@ -2288,18 +2375,12 @@ fn run_throttled_dnx_case(
     let base_elapsed = time_pipeline(&url, &pipeline);
     assert_dir_matches(&extract_dir, entries);
 
-    let peel_s = peel_elapsed.as_secs_f64();
-    let base_s = base_elapsed.as_secs_f64();
-    println!(
-        "[dnx] {rate:>10}  {payload:>6.1} MiB  {fmt:<8}  {peel:>7.3}s  {base:>11.3}s  {ratio:>5.2}x  {tools}",
-        rate = rate.label,
-        payload = payload_mib,
-        fmt = format_label,
-        peel = peel_s,
-        base = base_s,
-        ratio = peel_s / base_s.max(1e-9),
-        tools = tools_label,
-    );
+    CellMeasurement {
+        format_label,
+        tools_label,
+        base_secs: base_elapsed.as_secs_f64(),
+        peel_secs_by_workers,
+    }
 }
 
 // ---- shell quoting (POSIX single-quote) -------------------------------
