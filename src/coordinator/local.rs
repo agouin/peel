@@ -1447,7 +1447,21 @@ fn run_rar_local(
         chunk_size,
         poll_interval: Duration::from_millis(1),
         initial_header_window: 64 * 1024,
-        volume_starts: Vec::new(),
+        // Mirrors the HTTP path in `coordinator::run_rar`: per-volume
+        // start offsets thread the walker's cursor across the
+        // signature + main header at every EOA-with-more_volumes
+        // boundary (`docs/PLAN_multivolume_archives.md` §2c). Local
+        // mode still owns the single-source pipeline today
+        // (multi-volume local entry routes through
+        // `discover_local` + the multi-part driver), but the
+        // wiring is symmetric so a future caller that hands the
+        // local pipeline a multi-part `MultiSparse` does not
+        // silently re-introduce the single-buffer bug.
+        volume_starts: if sparse.part_count() > 1 {
+            sparse.part_start_offsets().to_vec()
+        } else {
+            Vec::new()
+        },
     };
     let pipeline = RarPipeline {
         config: pipeline_cfg,

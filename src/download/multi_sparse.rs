@@ -175,6 +175,20 @@ impl MultiSparse {
         &self.parts
     }
 
+    /// Global offset where each part begins, in part order. Length
+    /// equals [`Self::part_count`]; `[0]` is always 0 and each
+    /// successive entry equals the prefix sum of preceding parts'
+    /// sizes. Equivalent to dropping the trailing total from the
+    /// internal `boundaries` vec.
+    ///
+    /// Used by the RAR multi-volume walker
+    /// (`docs/PLAN_multivolume_archives.md` §2c) to jump the cursor
+    /// across volume boundaries on `EOA-with-more_volumes`.
+    #[must_use]
+    pub fn part_start_offsets(&self) -> &[u64] {
+        &self.boundaries[..self.parts.len()]
+    }
+
     /// Find the part holding `global_offset`. Returns
     /// `Some((part_index, in_part_offset))` for any
     /// `global_offset < total_size()`. Out-of-bound offsets return
@@ -644,6 +658,20 @@ mod tests {
         assert_eq!(m.locate(350), Some((2, 0)));
         assert_eq!(m.locate(999), Some((2, 649)));
         assert_eq!(m.locate(1000), None);
+    }
+
+    #[test]
+    fn part_start_offsets_matches_prefix_sums() {
+        // Single-part wrapper: one entry, always [0].
+        let one = MultiSparse::from_single(sparse("solo", 4096));
+        assert_eq!(one.part_start_offsets(), &[0]);
+        // Three-part wrapper: offsets are the prefix sums of part
+        // sizes, in part order — same shape as the rar walker's
+        // `volume_starts` (`download::rar_pipeline::RarPipelineConfig`).
+        let three =
+            MultiSparse::from_parts(vec![sparse("a", 100), sparse("b", 250), sparse("c", 650)])
+                .expect("ok");
+        assert_eq!(three.part_start_offsets(), &[0, 100, 350]);
     }
 
     #[test]

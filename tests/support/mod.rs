@@ -9,6 +9,15 @@
 
 pub mod h2c_server;
 pub mod mock_server;
+// CLI-subprocess harness for `tests/test_cli_*.rs`: spawns the real
+// `peel` binary so the argv → CoordinatorConfig wiring and exit-code
+// contract are under test (the in-process integration suite only
+// exercises the library API).
+pub mod peel_cli;
+// Shared `unique_dir` / `CleanupDir` scratch-directory helpers
+// promoted out of individual integration test files so the CLI
+// subprocess tests share a single convention.
+pub mod work;
 // Gated behind the `rar` Cargo feature: the fixture builder
 // references `peel::rar::format::*`, which only exists when the
 // feature is on (`docs/PLAN_rar.md` §0.5).

@@ -433,20 +433,14 @@ wall-clock numbers you get the full feature set:
 
 ## Usage
 
-> **Migration (2026-05):** `-C/--output-dir` was removed. The single
-> `-o/--output-file` flag now accepts either a file or a directory
-> path; a trailing `/` (or an existing directory at the path) means
-> "directory output." Replace `-C foo/` with `-o foo/`. Passing
-> `-C` produces a hard error pointing at the new flag.
-
 ```sh
-# Stream a tar archive into a directory (trailing slash forces dir)
-peel https://example.com/linux-6.x.tar.xz -o ./linux/
-
 # No -o? Default extract dir is the URL basename with known
 # archive/compression suffixes stripped, in the current working
 # directory: this lands the contents in ./linux-6.x
 peel https://example.com/linux-6.x.tar.xz
+
+# Stream a tar archive into a directory (trailing slash forces dir)
+peel https://example.com/linux-6.x.tar.xz -o ./linux/
 
 # Bare compressed file → single output file
 peel https://example.com/model.bin.zst -o ./model.bin

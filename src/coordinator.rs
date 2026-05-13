@@ -3088,16 +3088,20 @@ fn run_rar(
         chunk_size,
         poll_interval: config.reader_poll_interval,
         initial_header_window: 64 * 1024,
-        // Single-volume HTTP archives go through this code path
-        // unchanged; multi-volume support
-        // (`docs/PLAN_multivolume_archives.md` §2c) lights up when
-        // the coordinator builds the pipeline against a
-        // MultiPartSource carrying multiple volume parts and
-        // forwards the per-volume offsets here. That wiring lands
-        // alongside §6 (CLI surface) — for now the field stays
-        // empty so the pipeline behaves identically to the
-        // pre-§2c single-volume path.
-        volume_starts: Vec::new(),
+        // `docs/PLAN_multivolume_archives.md` §2c: when the run is
+        // multi-part (one volume per part, laid out across the
+        // `.peel.part.NNN` sidecars by §7), the walker must jump the
+        // cursor across each volume's signature + main header on
+        // EOA-with-more_volumes. The offsets are the prefix sums of
+        // each part's logical size — exactly what
+        // `MultiSparse::part_start_offsets` returns. Single-volume
+        // input keeps the empty default so the walker takes the
+        // pre-§2c single-buffer path.
+        volume_starts: if sparse.part_count() > 1 {
+            sparse.part_start_offsets().to_vec()
+        } else {
+            Vec::new()
+        },
     };
     let pipeline = RarPipeline {
         config: pipeline_cfg,
