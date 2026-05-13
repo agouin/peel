@@ -101,6 +101,7 @@ fn coord_config() -> CoordinatorConfig {
         keep_archive: None,
         strict_format: false,
         password_source: None,
+        multi_part_storage: false,
     }
 }
 

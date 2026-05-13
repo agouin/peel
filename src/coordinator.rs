@@ -384,6 +384,23 @@ pub struct CoordinatorConfig {
     /// [`PasswordSource::load`]: crate::secret::source::PasswordSource::load
     /// [`PasswordSource::is_interactive`]: crate::secret::source::PasswordSource::is_interactive
     pub password_source: Option<crate::secret::source::PasswordSource>,
+
+    /// Land each source part in its own `.peel.part.NNN` sidecar
+    /// rather than concatenating every part's bytes into a single
+    /// `.peel.part` file (`docs/PLAN_multivolume_archives.md` §7).
+    ///
+    /// Default `false`: every existing single-URL and multi-URL
+    /// byte-concat run keeps the one-sparse-file layout. The
+    /// multi-volume code path (lit up by `peel name.partN.rar`
+    /// auto-discovery in §6 / §7 Phase 5) flips this to `true` so
+    /// hole-punching can release blocks of each volume's `.peel.part`
+    /// independently and a fully-extracted volume's sidecar can be
+    /// deleted without touching the rest of the set.
+    ///
+    /// When `true` and the run resolves a single-part source, the
+    /// coordinator silently falls back to the one-sparse-file layout
+    /// — the flag is a permissive opt-in, not a hard requirement.
+    pub multi_part_storage: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -411,6 +428,7 @@ impl Default for CoordinatorConfig {
             keep_archive: None,
             strict_format: false,
             password_source: None,
+            multi_part_storage: false,
         }
     }
 }
@@ -569,6 +587,18 @@ pub enum CoordinatorError {
     /// Building the HTTP client failed.
     #[error("HTTP client setup failed")]
     Client(#[source] ClientError),
+
+    /// Two configuration options conflict and cannot be satisfied
+    /// together (for example, `--no-extract` plus multi-part
+    /// storage, where there is no single rename target for the N
+    /// source-part files; see
+    /// `docs/PLAN_multivolume_archives.md` §7 cleanup notes).
+    #[error("conflicting options: {detail}")]
+    ConflictingOptions {
+        /// Operator-facing description of which combination
+        /// conflicted and why peel refused.
+        detail: String,
+    },
 
     /// The download scheduler failed.
     #[error("download failed")]
@@ -1013,10 +1043,51 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     // 1.3 GiB CRC vec). The cross-boundary worker is the right
     // alternative.
 
-    let part_path = sidecar_path(&output, &config, ".peel.part");
+    // Multi-part sidecar layout (`docs/PLAN_multivolume_archives.md`
+    // §7): when `multi_part_storage` is on and the source has more
+    // than one part, each part lands in its own
+    // `<anchor>.peel.part.NNN`. Single-part runs keep the existing
+    // `<anchor>.peel.part` location.
+    let part_count_for_layout = if config.multi_part_storage {
+        info.source.parts().len()
+    } else {
+        1
+    };
+    if part_count_for_layout > 1 {
+        // The cleanup phase renames `.peel.part` to the final output
+        // for `--no-extract` and `--keep-archive`. Multi-part runs
+        // have N source-part files — there's no single byte stream
+        // to rename to a single output path, so refuse the combo
+        // up front rather than silently dropping every part past
+        // the first. (`docs/PLAN_multivolume_archives.md` §7
+        // explicitly scopes multi-volume to "extract the contents";
+        // the keep-archive UX for multi-volume needs its own
+        // round-trip design.)
+        if config.no_extract {
+            return Err(CoordinatorError::ConflictingOptions {
+                detail:
+                    "--no-extract is incompatible with multi-part storage; multi-volume archives \
+                     have N source files and no single byte stream to keep."
+                        .into(),
+            });
+        }
+        if config.keep_archive.is_some() {
+            return Err(CoordinatorError::ConflictingOptions {
+                detail:
+                    "--keep-archive is incompatible with multi-part storage; multi-volume archives \
+                     have N source files and no single rename target."
+                        .into(),
+            });
+        }
+    }
+    let part_paths =
+        multi_part_sidecar_paths(&output, &config, part_count_for_layout, ".peel.part");
+    let part_path = part_paths[0].clone();
     let ckpt_path = sidecar_path(&output, &config, ".peel.ckpt");
 
-    ensure_parent_dir(&part_path)?;
+    for p in &part_paths {
+        ensure_parent_dir(p)?;
+    }
     ensure_parent_dir(&ckpt_path)?;
     if let OutputTarget::Dir(d) = &output {
         fs::create_dir_all(d).map_err(|source| CoordinatorError::Io {
@@ -1034,7 +1105,18 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         // probe catches the resulting CRC drift later, but with a
         // misleading "source changed" message; this earlier check
         // surfaces the real cause (sidecars out of sync) up front.
-        validate_part_file(&ckpt_path, &part_path, info.total_size)?;
+        if part_count_for_layout == 1 {
+            validate_part_file(&ckpt_path, &part_path, info.total_size)?;
+        } else {
+            // Multi-part layout: every `.peel.part.NNN` must be at
+            // its part's exact size. A missing or truncated part
+            // breaks the same invariant the single-part audit
+            // checks (bitmap claims durable for chunks whose bytes
+            // are gone).
+            for (idx, part) in info.source.parts().iter().enumerate() {
+                validate_part_file(&ckpt_path, &part_paths[idx], part.size)?;
+            }
+        }
     }
 
     // `docs/PLAN_download_modes.md` §5: detect mode drift between
@@ -1108,12 +1190,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     // when starting fresh or resuming a pre-§11 checkpoint.
     let fingerprints = Arc::new(build_fingerprints(total_chunks, &resume_plan)?);
 
-    let sparse = Arc::new(open_sparse(
-        &part_path,
-        info.total_size,
-        &config,
-        &io_backend,
-    )?);
+    let (sparse_value, _per_part_paths) = open_sources(&info, &output, &config, &io_backend)?;
+    let sparse = Arc::new(sparse_value);
 
     // §11 resume verification: when resuming with non-empty
     // per-chunk fingerprints, pick a random already-complete chunk
@@ -1941,7 +2019,13 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             source,
         })?;
     } else {
-        fs::remove_file(&part_path).ok();
+        // Single-part runs delete `<anchor>.peel.part`; multi-part
+        // runs delete every `<anchor>.peel.part.NNN`. Either way the
+        // clean-completion sweep frees the source bytes; the
+        // checkpoint goes next.
+        for p in &part_paths {
+            fs::remove_file(p).ok();
+        }
     }
     fs::remove_file(&ckpt_path).ok();
     fs::remove_file(crate::checkpoint::tmp_path_for(&ckpt_path)).ok();
@@ -3999,22 +4083,6 @@ fn snapshot_hash_state(
 /// hardware, with no observed downside on filesystems that don't
 /// support `MADV_REMOVE` (the puncher degrades to noop the same way
 /// it does on the pwrite path).
-fn open_sparse(
-    path: &Path,
-    total_size: u64,
-    config: &CoordinatorConfig,
-    io_backend: &Arc<dyn crate::io_backend::IoBackend>,
-) -> Result<MultiSparse, CoordinatorError> {
-    let part = open_sparse_part(path, total_size, config, io_backend)?;
-    Ok(MultiSparse::from_single(part))
-}
-
-/// Open a single per-part [`SparseFile`] for a multi-part run.
-///
-/// Phase 2 of `docs/PLAN_multivolume_archives.md` §7 only constructs
-/// one part per run (the single-URL shape today); phase 3 lights up
-/// the per-volume `open_sources` builder that hands an N-element vec
-/// of these to [`MultiSparse::from_parts`].
 fn open_sparse_part(
     path: &Path,
     total_size: u64,
@@ -4044,7 +4112,27 @@ fn open_sparse_part(
 /// memory-mapped, otherwise the platform default
 /// (`fallocate(PUNCH_HOLE)` on Linux, `fcntl(F_PUNCHHOLE)` on macOS,
 /// [`crate::punch::NoopPuncher`] elsewhere).
-fn make_puncher(sparse: &MultiSparse) -> Box<dyn PunchHole> {
+fn make_puncher(sparse: &Arc<MultiSparse>) -> Box<dyn PunchHole> {
+    let base = make_base_puncher(sparse);
+    if sparse.part_count() <= 1 {
+        return base;
+    }
+    // Multi-part runs need every `punch` call routed to the matching
+    // per-part fd. The platform puncher's `fd` argument becomes the
+    // routing puncher's wrapped target; the caller-supplied `fd`
+    // arrives at the wrapper and is dropped on the floor.
+    Box::new(crate::download::RoutingPuncher::new(
+        Arc::clone(sparse),
+        base,
+    ))
+}
+
+/// Construct the platform-default base puncher for `sparse` —
+/// mmap-mode on Linux when every part is mmap-backed, fallocate on
+/// every other Unix-pwrite combination, [`crate::punch::NoopPuncher`]
+/// elsewhere. The multi-part routing wrapper in [`make_puncher`]
+/// sits on top of whatever this returns.
+fn make_base_puncher(sparse: &MultiSparse) -> Box<dyn PunchHole> {
     #[cfg(target_os = "linux")]
     if let Some(p) = sparse.make_mmap_puncher() {
         return Box::new(p);
@@ -4120,6 +4208,88 @@ fn sidecar_path(output: &OutputTarget, config: &CoordinatorConfig, suffix: &str)
     let mut name = basename.into_os_string();
     name.push(suffix);
     parent.join(PathBuf::from(name))
+}
+
+/// Compute the per-part sidecar paths for a multi-part run
+/// (`docs/PLAN_multivolume_archives.md` §7).
+///
+/// For `count == 1` returns a one-element vec whose single path
+/// matches today's [`sidecar_path`] output, so the on-disk shape for
+/// single-URL runs is unchanged. For `count > 1` produces
+/// `<anchor>.peel.part.NNN`, zero-padded to the width of `count` (so
+/// a 5-volume set lays out as `.peel.part.001` .. `.peel.part.005`
+/// and a 999-volume set goes three digits wide too — sort order
+/// matches volume order).
+fn multi_part_sidecar_paths(
+    output: &OutputTarget,
+    config: &CoordinatorConfig,
+    count: usize,
+    base_suffix: &str,
+) -> Vec<PathBuf> {
+    assert!(count > 0, "multi_part_sidecar_paths called with count == 0");
+    if count == 1 {
+        return vec![sidecar_path(output, config, base_suffix)];
+    }
+    // Minimum width 3 keeps the canonical multi-volume naming
+    // (`peel.part.001`) even when the volume count is small.
+    let width = part_index_width(count);
+    (1..=count)
+        .map(|idx| {
+            let suffix = format!("{base_suffix}.{idx:0width$}", width = width);
+            sidecar_path(output, config, &suffix)
+        })
+        .collect()
+}
+
+/// Zero-pad width for a multi-part sidecar's numeric suffix. Minimum 3
+/// so a small volume set still reads as the canonical
+/// `.peel.part.001` rather than `.peel.part.1`.
+fn part_index_width(count: usize) -> usize {
+    let mut digits = 0usize;
+    let mut n = count;
+    while n > 0 {
+        digits += 1;
+        n /= 10;
+    }
+    digits.max(3)
+}
+
+/// Build the [`MultiSparse`] for this run, opening one sparse per
+/// source part when `config.multi_part_storage` and
+/// `info.source.len() > 1` agree that the multi-part layout applies.
+///
+/// Returns the wrapper plus the per-part sidecar paths the caller
+/// uses for cleanup / resume validation. For single-part runs the
+/// returned vec has length 1 and matches today's
+/// `<anchor>.peel.part` location, so existing callers keep their
+/// shape.
+fn open_sources(
+    info: &DownloadInfo,
+    output: &OutputTarget,
+    config: &CoordinatorConfig,
+    io_backend: &Arc<dyn crate::io_backend::IoBackend>,
+) -> Result<(MultiSparse, Vec<PathBuf>), CoordinatorError> {
+    let parts = info.source.parts();
+    let multi = config.multi_part_storage && parts.len() > 1;
+    let count = if multi { parts.len() } else { 1 };
+    let paths = multi_part_sidecar_paths(output, config, count, ".peel.part");
+    for p in &paths {
+        ensure_parent_dir(p)?;
+    }
+    if !multi {
+        let single = open_sparse_part(&paths[0], info.total_size, config, io_backend)?;
+        return Ok((MultiSparse::from_single(single), paths));
+    }
+    let mut sparse_parts = Vec::with_capacity(parts.len());
+    for (idx, part) in parts.iter().enumerate() {
+        let s = open_sparse_part(&paths[idx], part.size, config, io_backend)?;
+        sparse_parts.push(s);
+    }
+    let ms = MultiSparse::from_parts(sparse_parts).map_err(|e| CoordinatorError::Io {
+        path: paths[0].clone(),
+        source: std::io::Error::other(format!("MultiSparse::from_parts failed: {e}")),
+    })?;
+    Ok((ms, paths))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), CoordinatorError> {
@@ -5174,6 +5344,47 @@ mod tests {
         let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
         let part = sidecar_path(&output, &cfg, ".peel.part");
         assert_eq!(part, PathBuf::from("/var/peel/work/out.bin.peel.part"));
+    }
+
+    /// `docs/PLAN_multivolume_archives.md` §7 Phase 3: single-part
+    /// runs preserve the historical `.peel.part` filename (no number
+    /// suffix), so existing single-URL sidecars and checkpoints
+    /// keep their on-disk shape.
+    #[test]
+    fn multi_part_sidecar_paths_single_part_matches_legacy() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let v = multi_part_sidecar_paths(&output, &cfg, 1, ".peel.part");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], PathBuf::from("/tmp/peel_test/out.bin.peel.part"));
+    }
+
+    /// Phase 3 layout: multi-part runs append a zero-padded numeric
+    /// suffix. Minimum 3 digits even for small volume counts so the
+    /// canonical multi-volume naming is consistent.
+    #[test]
+    fn multi_part_sidecar_paths_three_part_layout() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let v = multi_part_sidecar_paths(&output, &cfg, 3, ".peel.part");
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], PathBuf::from("/tmp/peel_test/out.bin.peel.part.001"));
+        assert_eq!(v[1], PathBuf::from("/tmp/peel_test/out.bin.peel.part.002"));
+        assert_eq!(v[2], PathBuf::from("/tmp/peel_test/out.bin.peel.part.003"));
+    }
+
+    /// Wider padding kicks in only when the count itself crosses
+    /// three digits — a 999-volume set is still `.001` .. `.999`,
+    /// 1000 becomes `.0001`. Sort order matches volume order, which
+    /// is what an `ls` of the workdir relies on.
+    #[test]
+    fn multi_part_sidecar_paths_width_scales_past_999() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/x"));
+        let v = multi_part_sidecar_paths(&output, &cfg, 1234, ".peel.part");
+        assert_eq!(v.len(), 1234);
+        assert_eq!(v[0], PathBuf::from("/tmp/x.peel.part.0001"));
+        assert_eq!(v[1233], PathBuf::from("/tmp/x.peel.part.1234"));
     }
 
     #[test]

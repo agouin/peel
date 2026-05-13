@@ -117,6 +117,7 @@ fn coord_config(chunk_size: u64) -> CoordinatorConfig {
         max_bandwidth_bps: None,
         max_disk_buffer: None,
         password_source: None,
+        multi_part_storage: false,
         no_extract: false,
         keep_archive: None,
         strict_format: false,

@@ -551,29 +551,35 @@ impl MultiSparse {
 /// Single-part wrappers fall back to a direct passthrough — the
 /// puncher's `fd` argument is the one part's own fd in that case, so
 /// the routing layer is a no-op.
-pub struct RoutingPuncher<'a> {
+///
+/// Owned-Arc shape (not borrows) so the wrapper can be packaged into a
+/// `Box<dyn PunchHole>` for the existing coordinator/pipeline plumbing
+/// that hands one puncher down to every layer.
+pub struct RoutingPuncher {
     /// The multi-part sparse this routes against.
-    sparse: &'a MultiSparse,
+    sparse: std::sync::Arc<MultiSparse>,
     /// The platform puncher every per-part call dispatches through.
-    inner: &'a dyn PunchHole,
+    inner: Box<dyn PunchHole>,
 }
 
-impl<'a> RoutingPuncher<'a> {
-    /// Wrap `inner` so that `punch` calls route via `sparse`.
+impl RoutingPuncher {
+    /// Wrap `inner` so that `punch` calls route per-part via `sparse`.
+    /// Cloning the `Arc` is cheap; the wrapper owns its share for the
+    /// duration of the run.
     #[must_use]
-    pub fn new(sparse: &'a MultiSparse, inner: &'a dyn PunchHole) -> Self {
+    pub fn new(sparse: std::sync::Arc<MultiSparse>, inner: Box<dyn PunchHole>) -> Self {
         Self { sparse, inner }
     }
 }
 
-impl PunchHole for RoutingPuncher<'_> {
+impl PunchHole for RoutingPuncher {
     fn punch(
         &self,
         _fd: BorrowedFd<'_>,
         offset: ByteOffset,
         length: u64,
     ) -> Result<(), PunchError> {
-        self.sparse.punch_via(self.inner, offset, length)
+        self.sparse.punch_via(self.inner.as_ref(), offset, length)
     }
 
     fn block_size_hint(&self) -> u64 {
@@ -728,15 +734,14 @@ mod tests {
     /// is the dispatch shape, not the underlying syscall.
     #[test]
     fn routing_puncher_single_part_passthrough() {
-        let m = MultiSparse::from_single(sparse("single_route", 4096));
-        let p = NoopPuncher::new();
-        let rp = RoutingPuncher::new(&m, &p);
+        let m = std::sync::Arc::new(MultiSparse::from_single(sparse("single_route", 4096)));
+        let rp = RoutingPuncher::new(std::sync::Arc::clone(&m), Box::new(NoopPuncher::new()));
         // The fd argument is ignored by the routing puncher; pass
         // stdout's fd as a deliberate sentinel.
         let stdout = std::io::stdout();
         rp.punch(stdout.as_fd(), ByteOffset::new(1024), 1024)
             .expect("route");
-        assert_eq!(rp.block_size_hint(), p.block_size_hint());
+        assert_eq!(rp.block_size_hint(), NoopPuncher::new().block_size_hint());
     }
 
     /// Two-part routing: a single `RoutingPuncher::punch` against a
@@ -746,10 +751,10 @@ mod tests {
     /// cross-boundary range is the only branch that would).
     #[test]
     fn routing_puncher_multi_part_dispatch() {
-        let m =
-            MultiSparse::from_parts(vec![sparse("rp_a", 4096), sparse("rp_b", 4096)]).expect("ok");
-        let p = NoopPuncher::new();
-        let rp = RoutingPuncher::new(&m, &p);
+        let m = std::sync::Arc::new(
+            MultiSparse::from_parts(vec![sparse("rp_a", 4096), sparse("rp_b", 4096)]).expect("ok"),
+        );
+        let rp = RoutingPuncher::new(m, Box::new(NoopPuncher::new()));
         let stdout = std::io::stdout();
         rp.punch(stdout.as_fd(), ByteOffset::new(3072), 3072)
             .expect("route");

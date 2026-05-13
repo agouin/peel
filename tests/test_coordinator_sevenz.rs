@@ -100,6 +100,7 @@ fn coord_config(chunk_size: u64, max_disk_buffer: Option<u64>) -> CoordinatorCon
         keep_archive: None,
         strict_format: false,
         password_source: None,
+        multi_part_storage: false,
     }
 }
 

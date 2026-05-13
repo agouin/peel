@@ -1395,6 +1395,7 @@ impl Cli {
                 keep_archive,
                 strict_format: self.strict_format,
                 password_source,
+                multi_part_storage: false,
             },
             client,
             registry: DecoderRegistry::with_defaults(),
