@@ -1,6 +1,6 @@
 //! Integration tests for the §1 magic-byte format-detection path.
 //!
-//! Phase A §1 of `docs/PLAN_v2.md` extends the [`DecoderRegistry`] with
+//! Phase A §1 of `internal/PLAN_v2.md` extends the [`DecoderRegistry`] with
 //! a magic-byte map and teaches the coordinator to combine suffix and
 //! magic detection into a single resolution policy. The four scenarios
 //! encoded below mirror the four cases the plan's demo specifies:
@@ -427,7 +427,7 @@ fn detection_forced_format_unknown_name_errors_cleanly() {
 
 #[test]
 fn detection_no_signal_with_strict_format_returns_no_decoder() {
-    // `docs/PLAN_download_modes.md` §4: with `strict_format=true`
+    // `internal/PLAN_download_modes.md` §4: with `strict_format=true`
     // the historical behaviour holds — both lookups miss, the
     // coordinator surfaces `NoDecoder` rather than falling through
     // to download-only mode.

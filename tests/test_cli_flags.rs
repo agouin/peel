@@ -128,7 +128,7 @@ fn sha256_match_succeeds() {
 fn sha256_mismatch_exits_nonzero_and_not_4() {
     // Mismatched sha is a generic integrity failure, not a password
     // problem; must surface as exit 1, never 4 (which would confuse
-    // scripts that re-prompt on 4 per docs/ENCRYPTION.md).
+    // scripts that re-prompt on 4 per internal/ENCRYPTION.md).
     let entries: Vec<(&str, &[u8])> = vec![("one.txt", b"sha should mismatch\n")];
     let tar = build_simple_archive(&entries);
     let body = encode_gzip(&tar);

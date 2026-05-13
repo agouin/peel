@@ -1,6 +1,6 @@
 //! Range-coder primitives for the liblzma-port decoder.
 //!
-//! Phase 1 of [`docs/PLAN_xz_liblzma_port.md`](../../../../docs/PLAN_xz_liblzma_port.md).
+//! Phase 1 of [`internal/PLAN_xz_liblzma_port.md`](../../../../internal/PLAN_xz_liblzma_port.md).
 //! Mirror of liblzma's `range_decoder.h` (~185 lines): a small
 //! [`RangeDecoder`] state struct plus a set of `macro_rules!`
 //! primitives ([`rc_normalize!`], [`rc_if_0!`], [`rc_update_0!`],
@@ -10,7 +10,7 @@
 //!
 //! # Why macros, not functions
 //!
-//! Phase A of [`PLAN_xz_liblzma_deep_dive.md`](../../../../docs/PLAN_xz_liblzma_deep_dive.md)
+//! Phase A of [`PLAN_xz_liblzma_deep_dive.md`](../../../../internal/old/PLAN_xz_liblzma_deep_dive.md)
 //! showed that liblzma's hot-loop register discipline depends on
 //! the C preprocessor literally inlining `rc_normalize` /
 //! `rc_if_0` / `rc_update_*` / `rc_bit` at every call site so

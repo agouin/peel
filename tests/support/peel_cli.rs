@@ -3,7 +3,7 @@
 //! Spawns the real `peel` binary (resolved through Cargo's
 //! `CARGO_BIN_EXE_peel` env var, set by the test runner) so the argv →
 //! [`peel::coordinator::CoordinatorConfig`] wiring, the exit-code
-//! contract documented in `docs/ENCRYPTION.md`, and the user-facing
+//! contract documented in `internal/ENCRYPTION.md`, and the user-facing
 //! stderr shape are all under test — not just the in-process API
 //! exercised by `tests/test_coordinator_*.rs`.
 //!
@@ -12,7 +12,7 @@
 //! introduces a new vetted crate for a use case the existing bench
 //! tests already cover with `Command::output()` (see
 //! [`tests/test_bench_streaming.rs`] §`run_peel_subprocess`). The
-//! dependency policy in `docs/ENGINEERING_STANDARDS.md` §2.2 prefers
+//! dependency policy in `internal/ENGINEERING_STANDARDS.md` §2.2 prefers
 //! reusing the std-lib primitive when adequate.
 
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub struct PeelCmd {
 ///
 /// `code` is the process's exit code; `-1` represents "terminated by a
 /// signal" (matches [`std::process::ExitStatus::code`] returning
-/// `None`). The encryption-error contract in `docs/ENCRYPTION.md`
+/// `None`). The encryption-error contract in `internal/ENCRYPTION.md`
 /// §Exit-codes guarantees `4` for `PasswordIncorrect`/`PasswordMissing`
 /// and `0` for clean success; everything else surfaces as `1`.
 pub struct PeelOutput {

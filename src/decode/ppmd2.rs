@@ -4,7 +4,7 @@
 //! (a.k.a. PPMd7 in the LZMA SDK), the algorithm used by:
 //!
 //! - **Legacy RAR (RAR3 / RAR4)** for `m=4` and `m=5` entries
-//!   — the first consumer of this module (`docs/PLAN_rar3.md` §B).
+//!   — the first consumer of this module (`internal/PLAN_rar3.md` §B).
 //! - **7z** for the PPMd method (today surfaced as
 //!   [`crate::sevenz::SevenzError::UnsupportedMethod`]; once §B
 //!   stabilises, the 7z pipeline can wire the same decoder in).
@@ -16,7 +16,7 @@
 //! algorithmically (RAR5 dropped PPMd) but live next to each other
 //! because the RAR pipeline dispatches between them per entry.
 //!
-//! # Round-one phasing (`docs/PLAN_rar3.md` §B)
+//! # Round-one phasing (`internal/PLAN_rar3.md` §B)
 //!
 //! 1. **§B0** — range coder ([`range_dec`]). Bit-level entropy
 //!    primitive every layer above depends on. Self-contained,

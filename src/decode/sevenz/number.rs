@@ -2,10 +2,10 @@
 //!
 //! Reference: 7-Zip's `DOC/7zFormat.txt`. There is no formal RFC;
 //! the parsers here are hand-rolled per
-//! `docs/ENGINEERING_STANDARDS.md` §2.1, the same posture taken
-//! for tar (`docs/PLAN.md` §7.3) and zip (`docs/PLAN_v2.md` §5).
+//! `internal/ENGINEERING_STANDARDS.md` §2.1, the same posture taken
+//! for tar (`internal/PLAN.md` §7.3) and zip (`internal/PLAN_v2.md` §5).
 //!
-//! Every later phase of `docs/PLAN_7z_support.md` composes these
+//! Every later phase of `internal/PLAN_7z_support.md` composes these
 //! primitives — getting them right once, with property tests,
 //! beats catching off-by-ones in §3 / §4.
 //!
@@ -75,7 +75,7 @@ pub fn parse_number(input: &[u8]) -> Result<(u64, &[u8]), SevenzError> {
 /// `DOC/7zFormat.txt` (e.g. `0x00` = `End`, `0x01` = `Header`,
 /// `0x04` = `MainStreamsInfo`, `0x05` = `FilesInfo`,
 /// `0x06` = `PackInfo`, `0x17` = `EncodedHeader`); the typed
-/// dispatch lives in §3 of `docs/PLAN_7z_support.md`. This
+/// dispatch lives in §3 of `internal/PLAN_7z_support.md`. This
 /// primitive only validates that the byte exists.
 ///
 /// # Errors
@@ -170,7 +170,7 @@ pub fn parse_bit_vector(input: &[u8], n: usize) -> Result<(Vec<bool>, &[u8]), Se
 /// code unit. This primitive decodes one such string, advancing
 /// the cursor *past* the terminator.
 ///
-/// Sanitization (per `docs/PLAN_7z_support.md` §1.5, mirroring the
+/// Sanitization (per `internal/PLAN_7z_support.md` §1.5, mirroring the
 /// rules in [`crate::sink`]'s `TarSink` / `ZipSink`):
 ///
 /// - Reject invalid UTF-16LE.

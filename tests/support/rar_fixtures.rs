@@ -287,7 +287,7 @@ pub fn build_rar5_encrypted_header(entries: &[RarEntrySpec]) -> Vec<u8> {
 
 // ─────────────────────────────────────────────────────────────────
 // Per-file encryption fixture builder
-// (`docs/PLAN_archive_encryption.md` §4 follow-on)
+// (`internal/PLAN_archive_encryption.md` §4 follow-on)
 // ─────────────────────────────────────────────────────────────────
 
 /// One STORED entry whose data area is to be AES-256-CBC encrypted
@@ -569,7 +569,7 @@ pub fn build_rar4_magic_only() -> Vec<u8> {
 // The legacy archive format uses fixed-layout little-endian headers
 // with a CRC-16 (low 16 of CRC-32 IEEE) prefix. See
 // `peel::rar::legacy::format` for the parser side and
-// `docs/PLAN_rar3.md` §A1 for the layout.
+// `internal/PLAN_rar3.md` §A1 for the layout.
 
 const LEGACY_HEAD_FLAG_LONG_BLOCK: u16 = 0x8000;
 const LEGACY_BASE_BLOCK_LEN: usize = 7;

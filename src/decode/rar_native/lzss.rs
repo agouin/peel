@@ -75,7 +75,7 @@
 //!   time. The dispatcher returns the `is_last_block` flag so
 //!   the caller knows when to stop.
 //! - Multi-volume continuation, encryption, solid-archive
-//!   carry-over — all out of scope per `docs/PLAN_rar5_decoder.md`.
+//!   carry-over — all out of scope per `internal/PLAN_rar5_decoder.md`.
 
 use thiserror::Error;
 

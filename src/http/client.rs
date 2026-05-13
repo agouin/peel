@@ -26,7 +26,7 @@
 //!
 //! Redirects, `UnexpectedStatus` checks, and the per-request timeout
 //! live in this module — those are the reasons the boundary in
-//! `docs/ENGINEERING_STANDARDS.md` §2.3 stops at `legacy::Client`,
+//! `internal/ENGINEERING_STANDARDS.md` §2.3 stops at `legacy::Client`,
 //! not higher.
 
 use std::io;

@@ -1,5 +1,5 @@
 //! FIPS 197 AES-128 / AES-192 / AES-256 block cipher core
-//! (`docs/PLAN_archive_encryption.md` §2). The CTR and CBC modes
+//! (`internal/PLAN_archive_encryption.md` §2). The CTR and CBC modes
 //! layered on top live in [`super::aes_modes`].
 //!
 //! # Constant-time discipline
@@ -9,7 +9,7 @@
 //! lookup is a 256-byte memory access whose address depends on
 //! input bytes, and modern CPUs cache it. A cache-timing attacker
 //! co-located on the same physical core can recover key material;
-//! see the threat model in `docs/PLAN_archive_encryption.md` §7.
+//! see the threat model in `internal/PLAN_archive_encryption.md` §7.
 //! Hardware AES (AES-NI) via a runtime probe is on the roadmap
 //! (plan §2 "out of scope" note); when it lands, this module stays
 //! as the software fallback.

@@ -3,7 +3,7 @@
 //! Reproduces — without the full coordinator/RAR pipeline — the timing
 //! window first observed in `tests/test_coordinator_rar.rs::
 //! crash_resume_mid_entry_produces_identical_output` after the §F1
-//! checkpoint-format change. See `docs/PLAN_macos_puncher_race.md` for
+//! checkpoint-format change. See `internal/PLAN_macos_puncher_race.md` for
 //! the full hypothesis.
 //!
 //! Two tests:
@@ -72,7 +72,7 @@ const ITERATIONS: u32 = 1024;
 extern "C" {
     /// `ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)`.
     /// Declared by hand here — the project's dependency policy bars `libc`
-    /// (`docs/ENGINEERING_STANDARDS.md` §2.2). Darwin uses 64-bit `off_t`
+    /// (`internal/ENGINEERING_STANDARDS.md` §2.2). Darwin uses 64-bit `off_t`
     /// unconditionally on 64-bit targets.
     fn pwrite(fd: i32, buf: *const u8, count: usize, offset: i64) -> isize;
 }
@@ -320,7 +320,7 @@ fn macos_puncher_under_pwrite_contention_never_einvals() {
     assert_eq!(
         unsupported_count, 0,
         "MacosPuncher must not surface EINVAL/ENOTSUP on APFS under pwrite contention; \
-         see docs/PLAN_macos_puncher_race.md"
+         see internal/PLAN_macos_puncher_race.md"
     );
 }
 

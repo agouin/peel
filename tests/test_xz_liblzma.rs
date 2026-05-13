@@ -1,4 +1,4 @@
-//! Phase 6 of [`docs/PLAN_xz_liblzma_port.md`](../docs/PLAN_xz_liblzma_port.md):
+//! Phase 6 of [`internal/PLAN_xz_liblzma_port.md`](../internal/PLAN_xz_liblzma_port.md):
 //! differential test suite for the public
 //! [`peel::decode::xz_liblzma::Decoder`] type. Phase F.6 retired
 //! `xz_native` so the differential reference is now `xz2` only.

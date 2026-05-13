@@ -506,7 +506,7 @@ MiB/s delta on both fixtures.
 - IPC on Linux x86-64 improves by ≥ 0.05 (a quarter-instruction
   per cycle on the inner loop).
 - Differential corpus byte-identical.
-- The asm dump of `decode_literal` (committed to `docs/profiles/`
+- The asm dump of `decode_literal` (committed to `internal/profiles/`
   as a regression artifact) shows no `panic_bounds_check` calls
   in the inner loop.
 

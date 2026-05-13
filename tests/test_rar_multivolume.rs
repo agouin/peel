@@ -1,5 +1,5 @@
 //! Integration tests for RAR5 multi-volume support
-//! (`docs/PLAN_multivolume_archives.md` §2).
+//! (`internal/PLAN_multivolume_archives.md` §2).
 //!
 //! Sub-phases are layered onto the same on-disk fixture set in
 //! `tests/fixtures/rar5_multivolume/` (real archives produced by

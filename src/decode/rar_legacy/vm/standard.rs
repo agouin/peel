@@ -1,6 +1,6 @@
 //! Standard filter set for legacy RAR (RAR3 / RAR4) RarVM.
 //!
-//! `docs/PLAN_rar3.md` §C2a. WinRAR's RAR3 encoder emits one of
+//! `internal/PLAN_rar3.md` §C2a. WinRAR's RAR3 encoder emits one of
 //! five fixed bytecode programs to invoke each of its standard
 //! filters (DELTA / E8 / E8E9 / RGB / AUDIO); decoders recognise
 //! the program via a 64-bit fingerprint (libarchive's

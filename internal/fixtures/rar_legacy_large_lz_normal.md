@@ -1,7 +1,7 @@
 # Fixture: `tests/fixtures/rar_legacy/large_lz_normal.{rar,bin}`
 
 Reproducibility recipe for the §F1 Goldilocks crash-resume fixture
-(`docs/PLAN_rar3.md` §F1, `tests/test_coordinator_rar3.rs`).
+(`internal/PLAN_rar3.md` §F1, `tests/test_coordinator_rar3.rs`).
 
 ## What it is
 

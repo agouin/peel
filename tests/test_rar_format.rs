@@ -75,7 +75,7 @@ fn walk_solid_archive_flips_solid_flag() {
 
 #[test]
 fn walk_first_volume_in_isolation_succeeds_when_no_more_volumes_follow() {
-    // After `docs/PLAN_multivolume_archives.md` §2b the walker no
+    // After `internal/PLAN_multivolume_archives.md` §2b the walker no
     // longer rejects `MHD_VOLUME` archives at the main header. A
     // self-contained single buffer whose end-of-archive header
     // clears the `more_volumes` flag is treated like any other
@@ -127,7 +127,7 @@ fn walk_first_volume_with_more_volumes_flag_surfaces_volume_set_mismatch() {
 fn walk_archive_encryption_header_rejects_with_encryption_label() {
     // Archive-header encryption (HEAD_CRYPT) currently surfaces a
     // unified [`EncryptionError::UnsupportedCipher`] until the
-    // walker-side header-stream wrapping lands (`docs/PLAN_archive_encryption.md`
+    // walker-side header-stream wrapping lands (`internal/PLAN_archive_encryption.md`
     // §4). Per-file encryption is supported separately via the file
     // header's encryption extra record.
     let entries = vec![RarEntrySpec::stored("locked.txt", b"x".to_vec())];

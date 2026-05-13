@@ -1,7 +1,7 @@
 //! CRC-64/XZ (ECMA-182, reflected) — the variant the .xz Block
 //! Check uses when `Check ID = 0x04`.
 //!
-//! Phase 5 of `docs/PLAN_xz_block_decoder.md` calls for "a new
+//! Phase 5 of `internal/PLAN_xz_block_decoder.md` calls for "a new
 //! small module mirroring the SHA-256 module's style." This
 //! module's API shape — `Crc64::new` / `update` / `finalize` —
 //! matches [`super::crc32::Crc32`] and [`super::sha256::Sha256`]
@@ -18,7 +18,7 @@
 //!   reflected CRC-32 above and `liblzma`.)
 //! - Reflected input / reflected output: yes.
 //!
-//! Hand-rolled per `docs/ENGINEERING_STANDARDS.md` §2.1; the
+//! Hand-rolled per `internal/ENGINEERING_STANDARDS.md` §2.1; the
 //! lookup tables are `const`-folded at compile time.
 //!
 //! # Inner loop: slicing-by-16
@@ -29,7 +29,7 @@
 //! for generic polynomials" 2009). Going from N=8 to N=16 cuts
 //! per-iteration loop overhead in half, which on the M4 Max moves
 //! the 1 GiB microbench from 3.9× to ~5× over byte-by-byte. Phase
-//! 1 of [`docs/PLAN_xz_decoder_optimization.md`] uses this to
+//! 1 of [`internal/PLAN_xz_decoder_optimization.md`] uses this to
 //! close the ~7 % of `xz_native` decode self-time the byte-by-byte
 //! loop was claiming.
 
@@ -236,7 +236,7 @@ mod tests {
     /// Reference byte-at-a-time CRC-64/XZ — the previous production
     /// inner loop, kept here as the differential oracle for the
     /// slicing-by-8 path. Phase 1 of
-    /// `docs/PLAN_xz_decoder_optimization.md` requires every commit
+    /// `internal/PLAN_xz_decoder_optimization.md` requires every commit
     /// to be byte-identical to slicing-by-1.
     fn xz_byte_by_byte(data: &[u8]) -> u64 {
         let mut state = !0u64;

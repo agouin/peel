@@ -328,7 +328,7 @@ fn resume_after_clean_run_under_tight_cap_is_idempotent() {
 }
 
 // ---------------------------------------------------------------
-// AES-256-CBC encryption tests (`docs/PLAN_archive_encryption.md` §5)
+// AES-256-CBC encryption tests (`internal/PLAN_archive_encryption.md` §5)
 // ---------------------------------------------------------------
 
 /// Write `password` to a temporary file with mode 0600 and return

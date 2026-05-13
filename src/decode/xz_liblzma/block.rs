@@ -14,7 +14,7 @@
 //!   (filter ID `0x21`) with a 1-byte properties field encoding a
 //!   dictionary size ≤ 64 MiB. BCJ pre-filters and `dict_size > 64
 //!   MiB` are out of scope per
-//!   `docs/PLAN_xz_block_decoder.md` §Scope.
+//!   `internal/PLAN_xz_block_decoder.md` §Scope.
 //! - Parse the LZMA2 chunk control byte at the head of the
 //!   compressed payload. Phase 1 understands uncompressed-with-reset
 //!   (`0x01`), uncompressed-no-reset (`0x02`), and end-of-stream
@@ -404,7 +404,7 @@ pub fn parse_lzma2_chunk_header(input: &[u8]) -> Result<Lzma2ChunkHeader, XzErro
 /// - [`XzError::LzmaInvalidProperties`] if `byte >= 225`.
 /// - [`XzError::LzmaLcLpTooLarge`] if the decoded `lc + lp > 4`.
 ///   Round-one rejects this per
-///   `docs/PLAN_xz_block_decoder.md` §Scope.
+///   `internal/PLAN_xz_block_decoder.md` §Scope.
 pub fn decode_lzma_properties(byte: u8) -> Result<(u8, u8, u8), XzError> {
     if byte >= 9 * 5 * 5 {
         return Err(XzError::LzmaInvalidProperties(byte));

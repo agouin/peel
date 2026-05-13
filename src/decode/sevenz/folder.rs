@@ -1,6 +1,6 @@
 //! Single-folder streaming decoder.
 //!
-//! Implements §6 of `docs/PLAN_7z_support.md`. Given a parsed
+//! Implements §6 of `internal/PLAN_7z_support.md`. Given a parsed
 //! [`super::header::Folder`] (linear coder chain) and the
 //! folder's packed bytes, [`FolderDecoder::decode`] runs the
 //! chain and feeds the decoded substream bytes into a
@@ -371,7 +371,7 @@ fn coder_err_to_sevenz(e: CoderError) -> SevenzError {
         }
         // Encryption coder surfaces directly through the unified
         // SevenzError::Encryption variant
-        // (`docs/PLAN_archive_encryption.md` §5 / §6) — the shared
+        // (`internal/PLAN_archive_encryption.md` §5 / §6) — the shared
         // EncryptionError type makes ZIP / RAR / 7z encryption
         // refusals match on the same shape.
         CoderError::Encryption(inner) => SevenzError::Encryption(inner),

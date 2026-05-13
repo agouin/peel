@@ -2,4 +2,7 @@
 .DS_Store
 *.swp
 .claude/
-docs/bench-results/
+internal/bench-results/
+internal/profiles/
+internal/old/
+docs/book/

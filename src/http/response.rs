@@ -6,7 +6,7 @@
 //! lived here before the hyper migration are gone. Wire framing is
 //! now hyper's job; this module's role is to translate hyper types
 //! into the synchronous shapes the rest of the codebase consumes,
-//! per the boundary rule in `docs/ENGINEERING_STANDARDS.md` §2.3.
+//! per the boundary rule in `internal/ENGINEERING_STANDARDS.md` §2.3.
 //!
 //! Code outside `http::client` constructs `Status` / `Headers` only
 //! via the [`Client`](super::client::Client), and consumes

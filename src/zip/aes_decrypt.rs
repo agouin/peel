@@ -1,5 +1,5 @@
 //! WinZip AES (AE-1 / AE-2) decryption for ZIP entries
-//! (`docs/PLAN_archive_encryption.md` §3).
+//! (`internal/PLAN_archive_encryption.md` §3).
 //!
 //! # Wire layout
 //!

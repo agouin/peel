@@ -1,7 +1,7 @@
 //! Decoder state types — Phase 1 skeleton (no `lzma_decode_port`
 //! body yet).
 //!
-//! Phase 1 of [`docs/PLAN_xz_liblzma_port.md`](../../../../docs/PLAN_xz_liblzma_port.md).
+//! Phase 1 of [`internal/PLAN_xz_liblzma_port.md`](../../../../internal/PLAN_xz_liblzma_port.md).
 //! Mirror of liblzma's `lzma_decoder.c` decoder-state shape.
 //! Phase 3 fills in the giant `lzma_decode_port` function that
 //! drives this state via the [`super::range_coder`] macros.
@@ -27,7 +27,7 @@
 //! `Lzma1Decoder` instance. The existing
 //! `xz_native::probs::LzmaProbs` sizes-on-construct via
 //! `Box<[u16]>`; Phase A of
-//! [`PLAN_xz_liblzma_deep_dive.md`](../../../../docs/PLAN_xz_liblzma_deep_dive.md)
+//! [`PLAN_xz_liblzma_deep_dive.md`](../../../../internal/old/PLAN_xz_liblzma_deep_dive.md)
 //! identified the fat-pointer + heap-pointer chase as part of the
 //! per-iteration register pressure that fixed-size arrays
 //! eliminate.

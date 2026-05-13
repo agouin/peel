@@ -1,4 +1,4 @@
-//! Phase 7 of [`docs/PLAN_xz_liblzma_port.md`](../docs/PLAN_xz_liblzma_port.md):
+//! Phase 7 of [`internal/PLAN_xz_liblzma_port.md`](../internal/PLAN_xz_liblzma_port.md):
 //! the **full differential corpus** for the public
 //! [`peel::decode::xz_liblzma::Decoder`].
 //!
@@ -330,4 +330,4 @@ fn diff_random_100_across_presets() {
 // fuzz adds adversarial inputs (corrupt bytes, truncations, and
 // pathological compressed-payload shapes) that random-seed
 // generation rarely hits. Filed against
-// `docs/PLAN_xz_liblzma_port.md`'s Phase F TODO list.
+// `internal/PLAN_xz_liblzma_port.md`'s Phase F TODO list.

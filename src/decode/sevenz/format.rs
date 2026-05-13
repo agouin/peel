@@ -1,8 +1,8 @@
 //! 7z header / footer wire-format parsers.
 //!
-//! Hand-rolled per `docs/ENGINEERING_STANDARDS.md` §2.1, the same
-//! posture taken for tar (`docs/PLAN.md` §7.3) and zip
-//! (`docs/PLAN_v2.md` §5). Every parser is pure: input goes in as
+//! Hand-rolled per `internal/ENGINEERING_STANDARDS.md` §2.1, the same
+//! posture taken for tar (`internal/PLAN.md` §7.3) and zip
+//! (`internal/PLAN_v2.md` §5). Every parser is pure: input goes in as
 //! a byte slice, output comes out as a typed struct, and no IO
 //! happens here. The second-pipeline driver (§8) does the ranged
 //! downloads and feeds the right bytes to the right parser.

@@ -12,7 +12,7 @@
 //!   payload, repeated `block_size` times).
 //! - Reject `Compressed_Block` with a deliberate "not yet
 //!   implemented" placeholder per
-//!   `docs/PLAN_zstd_block_decoder.md` §Phase 1; the literals +
+//!   `internal/PLAN_zstd_block_decoder.md` §Phase 1; the literals +
 //!   sequences stack lands in Phases 3-5.
 //!
 //! # Spec gotcha worth highlighting (RFC 8478 §3.1.1.2.2)
@@ -27,7 +27,7 @@
 //! containing an RLE block. The Phase 0 spike's [Appendix A]
 //! caught this; tests below pin the asymmetry.
 //!
-//! [Appendix A]: ../../../../docs/PLAN_zstd_block_decoder.md
+//! [Appendix A]: ../../../../internal/PLAN_zstd_block_decoder.md
 
 use super::error::ZstdError;
 

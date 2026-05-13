@@ -1,0 +1,33 @@
+[book]
+title = "peel"
+description = "Streaming, resumable, space-efficient extractor for compressed archives over HTTP."
+authors = ["Andrew Gouin"]
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/agouin/peel"
+edit-url-template = "https://github.com/agouin/peel/edit/main/docs/{path}"
+site-url = "/peel/"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
+
+[output.html.playground]
+runnable = false
+editable = false

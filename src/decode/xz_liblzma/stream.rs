@@ -61,7 +61,7 @@ pub const MAX_MULTIBYTE_LEN: usize = 9;
 ///
 /// Larger dictionaries are rejected at Block Header parse time so
 /// the resume blob in Phase 6 stays bounded — see
-/// `docs/PLAN_xz_block_decoder.md` §Scope.
+/// `internal/PLAN_xz_block_decoder.md` §Scope.
 pub const DICT_SIZE_CAP: u64 = 64 * 1024 * 1024;
 
 /// Stream Check IDs the round-one decoder recognises.

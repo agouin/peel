@@ -1,5 +1,5 @@
 //! Parsing and loading of `--password-from <SOURCE>`
-//! (`docs/PLAN_archive_encryption.md` §1).
+//! (`internal/PLAN_archive_encryption.md` §1).
 //!
 //! [`PasswordSource`] is the parsed form of the user's
 //! `--password-from` argument. The CLI parses the source once at

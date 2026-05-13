@@ -1,4 +1,4 @@
-//! Phase 4 of [`docs/PLAN_xz_liblzma_port.md`](../docs/PLAN_xz_liblzma_port.md):
+//! Phase 4 of [`internal/PLAN_xz_liblzma_port.md`](../internal/PLAN_xz_liblzma_port.md):
 //! the **gating bench**.
 //!
 //! Drives the new [`peel::decode::xz_liblzma::decoder::lzma_decode_port`]
@@ -27,7 +27,7 @@
 //!
 //! # Phase 4 exit criterion
 //!
-//! Per [`docs/PLAN_xz_liblzma_port.md`] §Phase 4 exit decision:
+//! Per [`internal/PLAN_xz_liblzma_port.md`] §Phase 4 exit decision:
 //! - **Both fixtures ≤ 1.10×** (peel-port within 10 % of xz2):
 //!   proceed to Phase 5.
 //! - **Either fixture > 1.10×**: stop the plan; report findings.

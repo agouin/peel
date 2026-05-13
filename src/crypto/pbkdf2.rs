@@ -1,6 +1,6 @@
 //! PBKDF2-HMAC (RFC 8018 §5.2) generic over any
 //! [`crate::crypto::BlockHash`]
-//! (`docs/PLAN_archive_encryption.md` §2).
+//! (`internal/PLAN_archive_encryption.md` §2).
 //!
 //! Two instantiations are used by peel today:
 //!

@@ -1,5 +1,5 @@
 //! Password handling for encrypted archives
-//! (`docs/PLAN_archive_encryption.md` §1).
+//! (`internal/PLAN_archive_encryption.md` §1).
 //!
 //! This module exists to keep raw passphrase bytes inside one auditable
 //! perimeter. Two types do the work:
@@ -18,7 +18,7 @@
 //! # Threat model
 //!
 //! The plan's threat model
-//! (`docs/PLAN_archive_encryption.md` §7) explicitly does not protect
+//! (`internal/PLAN_archive_encryption.md` §7) explicitly does not protect
 //! against an attacker with read access to `/proc/<pid>/mem`, the swap
 //! device, or the process's argv. We minimise the in-memory lifetime of
 //! the password (drop zeroises) and refuse to accept it on the command

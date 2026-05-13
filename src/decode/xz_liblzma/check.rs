@@ -2,7 +2,7 @@
 //! that runs alongside Block decompression and gets compared
 //! against the trailer at Block end.
 //!
-//! Phase 5 of `docs/PLAN_xz_block_decoder.md`. The .xz Stream
+//! Phase 5 of `internal/PLAN_xz_block_decoder.md`. The .xz Stream
 //! Flags carry one of four Check IDs (`None` / `CRC32` / `CRC64`
 //! / `SHA-256`); the Block trailer (after Block Padding) is the
 //! corresponding hash over the decompressed Block bytes. Phase 1

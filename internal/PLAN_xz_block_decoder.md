@@ -23,7 +23,7 @@ Block** for the entire input, identical in shape to default `zstd`'s
 - A `kill -9` mid-extraction restarts from byte 0.
 
 This is the same failure mode the zstd plan
-(`docs/PLAN_zstd_block_decoder.md`) addressed, with the same root
+(`internal/PLAN_zstd_block_decoder.md`) addressed, with the same root
 cause: liblzma exposes no per-chunk hook and `xz2` does not surface
 mid-Block state.
 

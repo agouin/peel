@@ -6,7 +6,7 @@
 //! whole class of bugs (passing a chunk index where an offset was expected)
 //! at compile time. Arithmetic uses `checked_*` operations so overflow is
 //! explicit rather than silent — see
-//! `docs/ENGINEERING_STANDARDS.md` §3.3.
+//! `internal/ENGINEERING_STANDARDS.md` §3.3.
 
 use std::fmt;
 
@@ -273,7 +273,7 @@ mod tests {
 
     /// Tiny linear-congruential generator used to drive the property-style
     /// tests. Hand-rolled rather than pulling in a PRNG crate (see the
-    /// dependency policy in `docs/ENGINEERING_STANDARDS.md` §2).
+    /// dependency policy in `internal/ENGINEERING_STANDARDS.md` §2).
     struct Lcg(u64);
 
     impl Lcg {

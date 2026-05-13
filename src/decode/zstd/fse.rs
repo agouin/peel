@@ -51,7 +51,7 @@
 //! that count is `3`, it reads 2 more bits and continues until a
 //! value `< 3` terminates.
 //!
-//! See `docs/PLAN_zstd_block_decoder.md` Appendix A for the Phase 0
+//! See `internal/PLAN_zstd_block_decoder.md` Appendix A for the Phase 0
 //! spike memo that flagged the FSE parser as the trickiest single
 //! piece in the whole spec.
 

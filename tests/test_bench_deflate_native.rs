@@ -1,7 +1,7 @@
 //! Phase 0 throughput-only benchmark fixture for the hand-rolled
 //! gzip / DEFLATE decoder ([`peel::decode::deflate_native`]).
 //!
-//! Phase 0 of [`docs/PLAN_gzip_throughput.md`]. Goal: lock in a baseline
+//! Phase 0 of [`internal/PLAN_gzip_throughput.md`]. Goal: lock in a baseline
 //! decode-only throughput number for the production gzip path on both
 //! single-member (default-`gzip`) and multi-member (`pigz` / concat)
 //! shapes, so each later phase of that plan can record an unambiguous
@@ -239,7 +239,7 @@ fn bench_archive(archive: &[u8], compressed: &[u8], label: &str) -> Duration {
 // ---- benches ---------------------------------------------------------
 
 /// 256 MiB single-member tar.gz — the regression-gate fixture for
-/// [`docs/PLAN_gzip_throughput.md`]. Same shape as the
+/// [`internal/PLAN_gzip_throughput.md`]. Same shape as the
 /// `10 Gbps · 256 MiB` cell of the README's `bench_throttled_realistic_grid`.
 #[test]
 #[ignore = "benchmark; opt-in via --ignored"]
@@ -255,7 +255,7 @@ fn bench_deflate_native_tar_gz_256mib_single_member_w1() {
 
 /// 256 MiB 8-member tar.gz — the `pigz -B 32M`-equivalent shape, and
 /// the regression-gate fixture for the parallel-member work in
-/// Phase 3 of [`docs/PLAN_gzip_throughput.md`]. At W=1 the throughput
+/// Phase 3 of [`internal/PLAN_gzip_throughput.md`]. At W=1 the throughput
 /// is expected to match the single-member row above within 5 % (the
 /// per-member framing overhead is small relative to the deflate
 /// body); larger gaps indicate per-member init cost that Phase 3's
@@ -299,7 +299,7 @@ fn bench_deflate_native_tar_gz_256mib_multi_member_w1() {
 /// If this fires above 20 %, Phase 3's "fresh `GzipDecoder` per
 /// worker" assumption is pricier than expected; either the framing
 /// path needs trimming or the parallel model needs a smaller-grained
-/// task partition (see `docs/PLAN_gzip_throughput.md` Phase 3).
+/// task partition (see `internal/PLAN_gzip_throughput.md` Phase 3).
 #[test]
 #[ignore = "benchmark; opt-in via --ignored"]
 fn bench_deflate_native_tar_gz_256mib_w1_member_overhead_bounded() {
@@ -332,15 +332,15 @@ fn bench_deflate_native_tar_gz_256mib_w1_member_overhead_bounded() {
          differs from single-member ({single_mibps:.1} MiB/s) by {delta_pct:.2}% > {gate_pct:.1}%. \
          Per-member framing overhead is taking too large a share of decode time; Phase 3's \
          parallel-speedup model needs a tighter task partition or a leaner per-worker init \
-         (see `docs/PLAN_gzip_throughput.md` Phase 3)."
+         (see `internal/PLAN_gzip_throughput.md` Phase 3)."
     );
 }
 
 /// CRC-32/IEEE throughput over a 64 KiB L1-hot buffer iterated to
-/// ~1 GiB of total work. Phase 1 of [`docs/PLAN_gzip_throughput.md`]:
+/// ~1 GiB of total work. Phase 1 of [`internal/PLAN_gzip_throughput.md`]:
 /// the gzip per-member trailer's running CRC32 was ~7 % of decode
 /// self-time at slicing-by-1 (mirrors the xz CRC64 share Phase 1 of
-/// [`docs/PLAN_xz_decoder_optimization.md`] recovered). Slicing-by-16
+/// [`internal/PLAN_xz_decoder_optimization.md`] recovered). Slicing-by-16
 /// must clear ≥ 5× speedup vs. byte-by-byte on the *same* hardware
 /// to gate this phase's exit.
 ///

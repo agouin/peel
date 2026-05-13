@@ -39,7 +39,7 @@
 
 The same sequencing discipline as `PLAN.md` / `PLAN_v2.md` applies:
 each phase ends with a runnable demo, and §N+1 does not begin until
-§N's demo passes. Standards (`docs/ENGINEERING_STANDARDS.md`) and
+§N's demo passes. Standards (`internal/ENGINEERING_STANDARDS.md`) and
 agent rules (`AGENTS.md`) are unchanged.
 
 ---

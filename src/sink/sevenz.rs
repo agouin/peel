@@ -1,6 +1,6 @@
 //! Per-file on-disk sink for the 7z pipeline.
 //!
-//! Implements §7 of `docs/PLAN_7z_support.md`. Mirrors
+//! Implements §7 of `internal/PLAN_7z_support.md`. Mirrors
 //! [`crate::sink::zip::ZipSink`]'s shape but is driven by
 //! [`crate::decode::sevenz::folder::FolderSink`] (begin /
 //! write / end *substream*) rather than the per-entry
@@ -366,7 +366,7 @@ impl FolderSink for SevenzSink {
         // "all bytes for completed folders are on disk *before*
         // the checkpoint write makes them visible to a future
         // resume," which the upcoming `flush_folder` hook (a
-        // `O.32f` follow-up to `docs/PLAN_7z_support.md` §9)
+        // `O.32f` follow-up to `internal/PLAN_7z_support.md` §9)
         // handles at folder boundaries via a single batched
         // fsync, not per-substream.
         let _ = state.file;

@@ -9,7 +9,7 @@
 //!   `unsupported RAR feature: encryption` line on stderr and
 //!   exits 1.
 //!
-//! This is the §1 milestone marker per `docs/PLAN_rar.md` §1: the
+//! This is the §1 milestone marker per `internal/PLAN_rar.md` §1: the
 //! demo runs without any §3 pipeline / §4 decoder code.
 
 #![cfg(feature = "rar")]

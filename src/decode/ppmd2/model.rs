@@ -1,7 +1,7 @@
 //! PPMd-II / PPMd7 model and decode loop.
 //!
 //! Hand-rolled port of LZMA SDK's `Ppmd7.c` model layer. Round-one
-//! (`docs/PLAN_rar3.md` §B2) lands the model in three sub-phases:
+//! (`internal/PLAN_rar3.md` §B2) lands the model in three sub-phases:
 //!
 //! 1. **§B2a (this file's first commit)** — types, lookup tables,
 //!    [`Model::new`] / [`Model::restart`], and the SEE-table init.
@@ -2268,7 +2268,7 @@ mod differential_7z_tests {
     //!
     //! 7z PPMd is Igor Pavlov's PPMd7 (LZMA SDK) variant — the same
     //! algorithm and range-coder framing this module's decode loop
-    //! targets. `docs/PLAN_rar3.md` §B3 explains why we use 7z here
+    //! targets. `internal/PLAN_rar3.md` §B3 explains why we use 7z here
     //! rather than `rar a -m5`: modern rar 7.x cannot produce
     //! RAR3-format archives, and the RAR-variant range coder is
     //! deferred to Phase C.

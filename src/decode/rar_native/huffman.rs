@@ -1,6 +1,6 @@
 //! Canonical Huffman decoder for the RAR5 LZSS layer.
 //!
-//! Round-one of `docs/PLAN_rar5_decoder.md` (§A2) ships the
+//! Round-one of `internal/PLAN_rar5_decoder.md` (§A2) ships the
 //! format-agnostic canonical decoder: input is a slice of per-symbol
 //! code lengths, output is a [`HuffTable`] that maps the next bits
 //! off [`super::bits::BitReader`] to a `(symbol, length)` pair via a

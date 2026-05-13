@@ -7,7 +7,7 @@
 //!
 //! - [`walk_archive`] takes a single byte buffer containing one
 //!   self-contained archive (single-volume or, after
-//!   `docs/PLAN_multivolume_archives.md` §2, the first volume of a
+//!   `internal/PLAN_multivolume_archives.md` §2, the first volume of a
 //!   set when the caller only has the first volume in hand).
 //! - [`walk_archive_multivolume`] takes an ordered slice of volume
 //!   buffers and stitches them into one [`ArchiveSummary`] whose
@@ -27,7 +27,7 @@
 //!   [`crate::rar::RarError::UnsupportedFeature`].
 //!
 //! Multi-volume support layers in by sub-phase
-//! (`docs/PLAN_multivolume_archives.md` §2). §2b lands the
+//! (`internal/PLAN_multivolume_archives.md` §2). §2b lands the
 //! per-volume walk but rejects file headers carrying
 //! `FHD_SPLIT_BEFORE` / `FHD_SPLIT_AFTER` with a precise
 //! [`RarError::UnsupportedFeature`] naming the affected entry — the
@@ -108,7 +108,7 @@ pub struct FileEntry {
     /// `packed_size + extra_segments.iter().map(|s| s.packed_size).sum::<u64>()`.
     pub packed_size: u64,
     /// Trailing segments for entries whose data spans more than
-    /// one volume (`docs/PLAN_multivolume_archives.md` §2d). Empty
+    /// one volume (`internal/PLAN_multivolume_archives.md` §2d). Empty
     /// for entries that fit in a single volume.
     ///
     /// Each [`EntrySegment`] records the byte offset (in the
@@ -151,7 +151,7 @@ pub struct EntrySegment {
 /// When `buf` is the first volume of a multi-volume set and any
 /// entry spans into a following volume, the walker surfaces
 /// [`RarError::UnsupportedFeature`] naming the affected entry (per
-/// `docs/PLAN_multivolume_archives.md` §2b). Callers that hold the
+/// `internal/PLAN_multivolume_archives.md` §2b). Callers that hold the
 /// rest of the volumes route through [`walk_archive_multivolume`].
 ///
 /// # Errors
@@ -183,7 +183,7 @@ pub fn walk_archive(buf: &[u8]) -> Result<ArchiveSummary, RarError> {
 /// `FHD_SPLIT_AFTER` / `FHD_SPLIT_BEFORE` headers fold into one
 /// [`FileEntry`] whose [`FileEntry::extra_segments`] records the
 /// continuation segments' offsets and sizes
-/// (`docs/PLAN_multivolume_archives.md` §2d). The spec requires
+/// (`internal/PLAN_multivolume_archives.md` §2d). The spec requires
 /// the spanning entry's name, unpacked size, and (when present)
 /// CRC32 to match across all of its file headers; the walker
 /// surfaces [`RarError::CorruptHeader`] when a continuation's

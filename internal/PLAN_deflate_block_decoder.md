@@ -34,9 +34,9 @@ The dominant real-world shapes are exactly the worst case for both:
 Decode-from-zero on resume gets us about **1 GiB/7 s** at miniz_oxide
 throughput. The autoresume target is ≤ 1 minute, so we miss it once
 the compressed payload exceeds ~9 GiB. This is the same failure mode
-the zstd plan fixed for `.tar.zst` (`docs/PLAN_zstd_block_decoder.md`)
+the zstd plan fixed for `.tar.zst` (`internal/PLAN_zstd_block_decoder.md`)
 and the xz plan fixed for `.tar.xz`
-(`docs/PLAN_xz_block_decoder.md`). Same root cause: the upstream
+(`internal/PLAN_xz_block_decoder.md`). Same root cause: the upstream
 library exposes no mid-stream hook; the on-wire format itself
 *does* have a usable restart point (the deflate-block boundary,
 RFC 1951 §3.2.3) but it is not surfaced through any C-shim API we

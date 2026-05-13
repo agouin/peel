@@ -1,7 +1,7 @@
 //! Zstandard ([RFC 8478]) streaming decoder.
 //!
 //! Hand-rolled, pure-Rust implementation. Phase 8 of
-//! `docs/PLAN_zstd_block_decoder.md` swapped this in as the production
+//! `internal/PLAN_zstd_block_decoder.md` swapped this in as the production
 //! path; the upstream `zstd` crate is now only a dev-dependency for
 //! differential tests.
 //!
@@ -800,7 +800,7 @@ mod tests {
 
     /// Helper: assemble a single-segment, no-checksum frame from a
     /// list of (last_block, block_type, block_size, payload-on-wire)
-    /// tuples. The Phase 0 spike (`docs/PLAN_zstd_block_decoder.md`
+    /// tuples. The Phase 0 spike (`internal/PLAN_zstd_block_decoder.md`
     /// Appendix A) used the same shape.
     fn build_frame(content_size: u64, has_checksum: bool, blocks: &[Block]) -> Vec<u8> {
         let mut frame = Vec::new();
@@ -1277,7 +1277,7 @@ mod tests {
     // streaming decoder should round-trip arbitrary payloads
     // byte-identical to the upstream `zstd` crate. These tests
     // are the Phase 5 exit criterion (per
-    // `docs/PLAN_zstd_block_decoder.md`).
+    // `internal/PLAN_zstd_block_decoder.md`).
 
     fn round_trip_via_native(payload: &[u8], level: i32) {
         let compressed = ::zstd::encode_all(payload, level).expect("encode");

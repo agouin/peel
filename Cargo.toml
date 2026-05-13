@@ -19,7 +19,7 @@ path = "src/lib.rs"
 name = "peel"
 path = "src/main.rs"
 
-# §1 demo binary for `docs/PLAN_rar.md`. Reads a local RAR5 file and
+# §1 demo binary for `internal/PLAN_rar.md`. Reads a local RAR5 file and
 # prints the entry list + archive flags. Gated behind the `rar`
 # feature so `cargo build --no-default-features` doesn't try to
 # compile against the (then-absent) walker module.
@@ -32,13 +32,13 @@ required-features = ["rar"]
 # Default feature set. Includes `rar` so a `cargo build` with no flags
 # produces the standard `peel` binary. Distros / users who want to
 # shave the RAR5 decoder out of the binary build with
-# `--no-default-features`. See `docs/PLAN_rar.md` §0.5 for the
+# `--no-default-features`. See `internal/PLAN_rar.md` §0.5 for the
 # rationale (post-resolution, the rationale is binary size and
 # modular gating of the §4 decoder rollout — the OSI-licensing
 # concern that originally motivated this flag evaporated when §0.1
 # resolved to hand-roll).
 default = ["rar"]
-# RAR5 archive support (`docs/PLAN_rar.md`). When disabled, the
+# RAR5 archive support (`internal/PLAN_rar.md`). When disabled, the
 # crate still registers `.rar` and the RAR5 magic against a
 # diagnostic-only factory, so the user sees a precise "compiled
 # without `rar` feature" error rather than "unknown format".
@@ -46,13 +46,13 @@ rar = []
 
 [dependencies]
 thiserror = "2"
-# TLS dependencies are pre-approved per docs/ENGINEERING_STANDARDS.md §2.4.
+# TLS dependencies are pre-approved per internal/ENGINEERING_STANDARDS.md §2.4.
 # `ring` is the crypto backend; `tls12` and `tls13` cover the protocol versions
 # we need; `std` enables the blocking-IO `rustls::StreamOwned` adapter we use
 # from `http::client`.
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
-# Compression backends, pre-approved per docs/ENGINEERING_STANDARDS.md §2.2.
+# Compression backends, pre-approved per internal/ENGINEERING_STANDARDS.md §2.2.
 # zstd-encoded ZIP entries (`src/zip/decode.rs`) decode through the
 # upstream `zstd` crate's streaming reader API; the streaming
 # `.tar.zst` / `.zst` decoder is hand-rolled in `src/decode/zstd/`
@@ -60,7 +60,7 @@ webpki-roots = "0.26"
 # decoders, dictionary builder, etc.) are not needed and would expand
 # the audit surface for no gain.
 zstd = { version = "0.13", default-features = false }
-# lz4 frame-format decompression backend (PLAN_v2.md §4 / docs/ENGINEERING_STANDARDS.md §2.2).
+# lz4 frame-format decompression backend (PLAN_v2.md §4 / internal/ENGINEERING_STANDARDS.md §2.2).
 # Pure Rust. We consume only the block-layer API (`block::decompress_into`)
 # and parse the LZ4 Frame Format ourselves to keep the wire-level surface
 # stable; the default `frame` feature pulls a `twox-hash` dep we don't
@@ -68,18 +68,18 @@ zstd = { version = "0.13", default-features = false }
 # input from triggering panics inside the block decompressor.
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
-# docs/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
+# internal/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }
 # Application-level error reporting at the binary boundary, pre-approved
-# per docs/ENGINEERING_STANDARDS.md §2.2 / §3.2.
+# per internal/ENGINEERING_STANDARDS.md §2.2 / §3.2.
 anyhow = "1"
-# Structured logging, pre-approved per docs/ENGINEERING_STANDARDS.md §2.2 /
+# Structured logging, pre-approved per internal/ENGINEERING_STANDARDS.md §2.2 /
 # §10. The `progress::LogRenderer` (PLAN_v2.md §6) emits non-TTY progress
 # as `tracing::info!` events; the binary boundary configures a subscriber
 # that writes those events to stderr.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
-# HTTP client stack (PLAN_v2.md §3 / docs/ENGINEERING_STANDARDS.md §2.2 / §2.3).
+# HTTP client stack (PLAN_v2.md §3 / internal/ENGINEERING_STANDARDS.md §2.2 / §2.3).
 # All confined to `http::client`; the boundary rule from §2.3 forbids
 # imports of these crates outside that module. Feature sets are kept
 # minimal: hyper itself only `client` + `http1` + `http2`; hyper-util
@@ -97,7 +97,7 @@ http-body-util = { version = "0.1", default-features = false }
 bytes = { version = "1", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "macros", "sync"] }
 
-# io_uring file-IO backend (PLAN_v2.md §7 / docs/ENGINEERING_STANDARDS.md §2.2).
+# io_uring file-IO backend (PLAN_v2.md §7 / internal/ENGINEERING_STANDARDS.md §2.2).
 # Linux-only target dep so non-Linux builds stay clean. We use the
 # crate's sync API (`Submitter::submit_and_wait` on a dedicated IO
 # thread); no async runtime is added. The runtime probe in
@@ -110,12 +110,12 @@ io-uring = { version = "0.7", default-features = false }
 [dev-dependencies]
 # Dev-only reference implementation used by `hash::sha256` tests to
 # cross-check the hand-rolled SHA-256 against a battle-tested upstream
-# (`PLAN_v2.md` §10 / `docs/ENGINEERING_STANDARDS.md` §2.2). The
+# (`PLAN_v2.md` §10 / `internal/ENGINEERING_STANDARDS.md` §2.2). The
 # runtime binary does not link `sha2`.
 sha2 = "0.10"
 # Dev-only reference implementation used by `hash::blake2sp` tests to
 # cross-check the hand-rolled BLAKE2sp against a battle-tested
-# upstream (`docs/PLAN_rar.md` §2). RAR5 file-data integrity uses
+# upstream (`internal/PLAN_rar.md` §2). RAR5 file-data integrity uses
 # BLAKE2sp (parallel BLAKE2s, 8 lanes); the upstream `blake2` crate
 # stays at `dev-dependencies` scope so the runtime binary doesn't
 # link it. Same precedent as `sha2` for SHA-256.
@@ -123,14 +123,14 @@ blake2 = "0.10"
 # Dev-only: liblzma binding kept for the differential test suite in
 # `tests/test_xz_native.rs` (encodes fixtures with `xz2`, decodes with
 # both xz2 and the hand-rolled decoder, byte-compares). Phase 7 of
-# `docs/PLAN_xz_block_decoder.md` swapped `xz2` out of the runtime
+# `internal/PLAN_xz_block_decoder.md` swapped `xz2` out of the runtime
 # decode path; it stays here so the differential corpus keeps a real
 # liblzma reference implementation in the loop.
 xz2 = "0.1"
 # Dev-only: pure-Rust DEFLATE / gzip codec used to encode round-trip
 # fixtures for the `decode::deflate_native` differential tests and
 # the `zip::decode` round-trip tests. Phase 9a of
-# `docs/PLAN_deflate_block_decoder.md` swapped the production
+# `internal/PLAN_deflate_block_decoder.md` swapped the production
 # DEFLATE / gzip / zip-DEFLATE paths off this crate; it stays here
 # so the differential corpus keeps a real `miniz_oxide` reference
 # implementation in the loop. `rust_backend` selects the pure-Rust
@@ -146,14 +146,14 @@ hyper = { version = "1", default-features = false, features = ["server"] }
 # Dev-only reference implementations used by `src/crypto/` tests and
 # `tests/test_crypto_diff.rs` to cross-check the hand-rolled SHA-1,
 # HMAC, and PBKDF2 against battle-tested upstreams
-# (`docs/PLAN_archive_encryption.md` §2). Same precedent as `sha2`
+# (`internal/PLAN_archive_encryption.md` §2). Same precedent as `sha2`
 # and `blake2` above: the runtime binary does not link these.
 sha1 = "0.10"
 hmac = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # Dev-only AES reference for the AES / AES-CTR / AES-CBC
 # differential cross-check
-# (`docs/PLAN_archive_encryption.md` §2 / `tests/test_crypto_diff.rs`).
+# (`internal/PLAN_archive_encryption.md` §2 / `tests/test_crypto_diff.rs`).
 aes = "0.8"
 ctr = "0.9"
 cbc = "0.1"

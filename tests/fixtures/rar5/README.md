@@ -25,6 +25,6 @@ they're safe to redistribute.
   [`tests/test_rar_decoder_resume.rs`](../../test_rar_decoder_resume.rs)
   via an `#[ignore]`'d test that activates when the gap is
   closed. Source / fix plan:
-  [`docs/PLAN_rar5_multi_block_decode.md`](../../../docs/PLAN_rar5_multi_block_decode.md).
+  [`internal/PLAN_rar5_multi_block_decode.md`](../../../internal/PLAN_rar5_multi_block_decode.md).
   Regenerate with
   `python3 -c 'import sys; sys.stdout.buffer.write(b"X"*27*2_500_000)' > p27-fails.txt && rar a -ma5 -m5 -tsm- -tsa- -tsc- -ep multi_block_p27.rar p27-fails.txt`.

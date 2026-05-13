@@ -343,7 +343,7 @@ fn crash_resume_mid_entry_produces_identical_output() {
 ///
 /// Unblocked by the multi-block decode fix that landed in
 /// `src/decode/rar_native/{stream,lzss}.rs` per
-/// `docs/PLAN_rar5_multi_block_decode.md`'s "Resolution" note.
+/// `internal/PLAN_rar5_multi_block_decode.md`'s "Resolution" note.
 /// Until that fix, the decoder underran the bitstream by 2 bits
 /// at each block seam; the entry never reached EOF and this
 /// test couldn't possibly pass.

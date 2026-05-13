@@ -1,7 +1,7 @@
 //! Fuzz target: legacy RAR (RAR3 / RAR4) RarVM filter declaration
 //! parser + standard-filter dispatcher.
 //!
-//! `docs/PLAN_rar3.md` §C2c. The §C2a/§C2b parser is the first
+//! `internal/PLAN_rar3.md` §C2c. The §C2a/§C2b parser is the first
 //! place in `rar_legacy` where attacker-controlled bytecode
 //! (the `symbol 257` filter-declaration payload) feeds a state
 //! machine that allocates, validates a fingerprint, and routes
@@ -27,7 +27,7 @@
 //!   (zero channels, RGB bad params, E8 too short) must fire
 //!   before any memory access.
 //!
-//! Required per `docs/ENGINEERING_STANDARDS.md` §5.2 — extends
+//! Required per `internal/ENGINEERING_STANDARDS.md` §5.2 — extends
 //! the §C2 deliverable from "decode-only standard filters" to
 //! "decode-only standard filters that don't panic on adversarial
 //! input". The fuzzer's invariant is **no panics, no

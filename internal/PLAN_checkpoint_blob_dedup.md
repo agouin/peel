@@ -1011,7 +1011,7 @@ Fast-format reference rows (`tar`, `tar.zst`, `tar.lz4`) stayed
   with prose noting the `PLAN_checkpoint_blob_dedup.md` cut and
   pointing at [`PLAN_xz_parallel_block_decode.md`](PLAN_xz_parallel_block_decode.md)
   as the next-step toward ≤ 1×.
-- [`docs/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) `O.34` added as
+- [`internal/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) `O.34` added as
   "delivered" record; `O.35` filed as the next-step backlog
   entry for HW-accelerated `Checkpoint` body hash (the residual
   ~8.5 ms / ckpt is now the scalar fnv1a64; expected ~5–7 ms /

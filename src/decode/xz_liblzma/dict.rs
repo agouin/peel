@@ -1,6 +1,6 @@
 //! Sliding-window dictionary for the liblzma-port decoder.
 //!
-//! Phase 2 of [`docs/PLAN_xz_liblzma_port.md`](../../../../docs/PLAN_xz_liblzma_port.md).
+//! Phase 2 of [`internal/PLAN_xz_liblzma_port.md`](../../../../internal/PLAN_xz_liblzma_port.md).
 //! Mirror of liblzma's `lz_decoder.h` `lzma_dict` struct + the
 //! inline `dict_get` / `dict_put` / `dict_repeat` / `dict_write`
 //! methods.
@@ -32,7 +32,7 @@
 //!
 //! # No mid-decode resume in round one
 //!
-//! Per [`docs/PLAN_xz_liblzma_port.md`] §Round-one scope, this
+//! Per [`internal/PLAN_xz_liblzma_port.md`] §Round-one scope, this
 //! decoder doesn't snapshot. `pos` only advances; there is no
 //! `reload` / `recent` / `write_recent_into` API like the
 //! existing decoder has. Phase F adds resume support back if
@@ -451,7 +451,7 @@ mod tests {
     //! dicts), the RLE / simple-memcpy / wrap-memcpy three
     //! cases, and the `limit`-saturation early-exit path.
     //!
-    //! Per [`docs/PLAN_xz_liblzma_port.md`] Phase 2 exit
+    //! Per [`internal/PLAN_xz_liblzma_port.md`] Phase 2 exit
     //! criterion: differential corpus byte-identical between
     //! the raw-pointer fast path and the safe reference.
 

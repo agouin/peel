@@ -1,5 +1,5 @@
 //! 7z password key-derivation function
-//! (`docs/PLAN_archive_encryption.md` §2; consumer is §5).
+//! (`internal/PLAN_archive_encryption.md` §2; consumer is §5).
 //!
 //! 7z's `06 F1 07 01` AES-256-CBC coder pins its key derivation to
 //! a bespoke "round-tower" scheme defined in `7zFormat.txt`. It is

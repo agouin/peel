@@ -2,7 +2,7 @@
 //!
 //! ZIP doesn't run through the streaming-decoder loop covered by
 //! `frame_boundary` — its central-directory-at-the-end layout requires a
-//! different pipeline (`docs/PLAN_v2.md` §5). This target fuzzes the
+//! different pipeline (`internal/PLAN_v2.md` §5). This target fuzzes the
 //! three parser entry points that consume archive bytes:
 //!
 //! - `find_eocd` (locate end-of-central-directory in the archive tail),
@@ -12,7 +12,7 @@
 //! The first input byte selects which parser receives the rest, so
 //! libfuzzer can specialize per parser while sharing a corpus directory.
 //!
-//! Required per `docs/ENGINEERING_STANDARDS.md` §5.2 ("frame boundary
+//! Required per `internal/ENGINEERING_STANDARDS.md` §5.2 ("frame boundary
 //! detection") for the ZIP format.
 
 #![no_main]

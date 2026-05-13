@@ -1,5 +1,5 @@
 //! RAR5 encryption primitives and parsers
-//! (`docs/PLAN_archive_encryption.md` §4).
+//! (`internal/PLAN_archive_encryption.md` §4).
 //!
 //! RAR5 supports two distinct encryption shapes:
 //!

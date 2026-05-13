@@ -19,7 +19,7 @@
 //!
 //! `sha2` lives in `[dev-dependencies]` only: tests cross-check this
 //! implementation against it for correctness, but the runtime binary
-//! does not link it (see `docs/ENGINEERING_STANDARDS.md` §2.2).
+//! does not link it (see `internal/ENGINEERING_STANDARDS.md` §2.2).
 //!
 //! # Wire format
 //!
@@ -805,7 +805,7 @@ mod tests {
     }
 
     /// Cross-check 256 random inputs against the `sha2` crate
-    /// (dev-dependency only, per `docs/ENGINEERING_STANDARDS.md` §2.2).
+    /// (dev-dependency only, per `internal/ENGINEERING_STANDARDS.md` §2.2).
     /// FIPS vectors above pin the trivial cases; this catches anything
     /// the canonical vectors miss.
     #[test]

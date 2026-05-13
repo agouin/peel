@@ -3,7 +3,7 @@
 //! Kept thin on purpose: the binary entry point in `main.rs` parses
 //! arguments, calls into [`crate::coordinator::run`], and formats the
 //! result for the terminal. Anything more elaborate (config files,
-//! profiles, …) is deferred per `docs/PLAN.md` §10.2 and the
+//! profiles, …) is deferred per `internal/PLAN.md` §10.2 and the
 //! "do-not-add-CLI-niceties" rule in `AGENTS.md`.
 
 #![cfg(unix)]
@@ -26,7 +26,7 @@ use crate::io_backend::IoBackendChoice;
 use crate::secret::source::PasswordSource;
 
 /// Long-form help appendix shown by `peel --help`
-/// (`docs/PLAN_multivolume_archives.md` §6 step 3). Documents the
+/// (`internal/PLAN_multivolume_archives.md` §6 step 3). Documents the
 /// three multi-volume filename conventions and the three entry
 /// modes (single-seed auto-discovery, explicit positional list,
 /// `@manifest` file).
@@ -82,7 +82,7 @@ Multi-volume archives:
 pub struct Cli {
     /// Source URL(s). One URL is the historical single-source case.
     /// Two or more URLs activate the multi-part split-archive path
-    /// (`docs/PLAN_multi_url_source.md`): the byte-concatenation of
+    /// (`internal/PLAN_multi_url_source.md`): the byte-concatenation of
     /// every URL's body is treated as one logical archive stream,
     /// and the workers fetch all parts in parallel via ranged GETs.
     /// Examples: `peel https://host/x.tar.zst -o out/` or
@@ -98,13 +98,13 @@ pub struct Cli {
     /// A trailing slash forces directory semantics; otherwise the
     /// shape is taken from the URL suffix (or `--format`). The
     /// resolver errors at coordinator entry if the shape and the
-    /// format disagree (`docs/PLAN_download_modes.md` §1).
+    /// format disagree (`internal/PLAN_download_modes.md` §1).
     #[arg(short = 'o', long = "output-file", value_name = "PATH")]
     pub output_file: Option<PathBuf>,
 
     /// Migration stub for the removed `-C/--output-dir` flag.
     /// Hidden from `--help`; any value triggers a hard error pointing
-    /// the user at `-o <path>/` (`docs/PLAN_download_modes.md` §1).
+    /// the user at `-o <path>/` (`internal/PLAN_download_modes.md` §1).
     #[arg(short = 'C', long = "output-dir", value_name = "DIR", hide = true)]
     pub output_dir_migration: Option<PathBuf>,
 
@@ -208,7 +208,7 @@ pub struct Cli {
     /// a `kill -9` and follow-up resume produce a digest
     /// byte-identical to a clean run.
     ///
-    /// Multi-URL runs (`docs/PLAN_multi_url_source.md`): pass
+    /// Multi-URL runs (`internal/PLAN_multi_url_source.md`): pass
     /// `--sha256` either zero times (no verification) or exactly
     /// once per URL, paired by order. The hashes are per-part
     /// digests of each part's bytes — the coordinator verifies each
@@ -274,7 +274,7 @@ pub struct Cli {
     pub workdir: Option<PathBuf>,
 
     /// Keep the source archive on disk alongside the extracted
-    /// output (`docs/PLAN_download_modes.md` §3).
+    /// output (`internal/PLAN_download_modes.md` §3).
     ///
     /// HTTP-source forms:
     ///   * `-k` / `--keep-archive` (bare) — preserve the archive
@@ -309,7 +309,7 @@ pub struct Cli {
     pub keep_archive: Option<String>,
 
     /// Skip extraction; download the source bytes verbatim to a
-    /// single file (`docs/PLAN_download_modes.md` §2).
+    /// single file (`internal/PLAN_download_modes.md` §2).
     ///
     /// The remote object is fetched in parallel via ranged GETs (the
     /// same scheduler / mirror / resume machinery the extract mode
@@ -328,7 +328,7 @@ pub struct Cli {
     pub no_extract: bool,
 
     /// Treat unrecognized formats as a hard error
-    /// (`docs/PLAN_download_modes.md` §4).
+    /// (`internal/PLAN_download_modes.md` §4).
     ///
     /// Default behaviour, when format detection (URL suffix + magic
     /// bytes) cannot identify a registered decoder, is to warn and
@@ -344,7 +344,7 @@ pub struct Cli {
     pub strict_format: bool,
 
     /// Password source for encrypted archives
-    /// (`docs/PLAN_archive_encryption.md` §1).
+    /// (`internal/PLAN_archive_encryption.md` §1).
     ///
     /// Accepts one of:
     ///   * `prompt` — read from `/dev/tty` with echo disabled.
@@ -365,7 +365,7 @@ pub struct Cli {
     pub password_from: Option<String>,
 
     /// Skip multi-volume auto-discovery
-    /// (`docs/PLAN_multivolume_archives.md` §1 / §6).
+    /// (`internal/PLAN_multivolume_archives.md` §1 / §6).
     ///
     /// Normally, when the user passes a single positional URL whose
     /// basename matches one of the recognised multi-volume patterns
@@ -393,7 +393,7 @@ pub struct Cli {
     pub no_auto_discover: bool,
 
     /// Destroy the source archive as extraction proceeds
-    /// (`docs/PLAN_local_file_extract.md` §1).
+    /// (`internal/old/PLAN_local_file_extract.md` §1).
     ///
     /// Local-file mode is non-destructive by default — `peel
     /// abc.tar.xz` extracts into `./abc/` and leaves `abc.tar.xz`
@@ -497,7 +497,7 @@ pub enum CliError {
     Client(#[from] crate::http::ClientError),
 
     /// Multi-volume HTTP auto-discovery
-    /// (`docs/PLAN_multivolume_archives.md` §1) failed against a
+    /// (`internal/PLAN_multivolume_archives.md` §1) failed against a
     /// seed URL that matched a multi-volume pattern. Wraps the
     /// per-pattern diagnostic — `MissingVolume`, `FinalVolumeMissing`,
     /// or a `HEAD`-side network error — so the user knows
@@ -533,7 +533,7 @@ pub enum CliError {
     NoDefaultOutput,
 
     /// `-C/--output-dir` was passed. The flag was removed in favour
-    /// of a unified `-o <PATH>` (`docs/PLAN_download_modes.md` §1);
+    /// of a unified `-o <PATH>` (`internal/PLAN_download_modes.md` §1);
     /// the stub exists only to emit a clear migration error.
     #[error(
         "-C/--output-dir was removed; use -o <PATH> instead \
@@ -544,7 +544,7 @@ pub enum CliError {
     /// `--no-extract` was combined with an extractor-only knob
     /// (`--format`, `--force-format-from-magic`, or
     /// `--punch-threshold`) — these are meaningless when no
-    /// extractor runs (`docs/PLAN_download_modes.md` §2.1).
+    /// extractor runs (`internal/PLAN_download_modes.md` §2.1).
     #[error(
         "--no-extract is incompatible with extractor-only flag `{flag}`: \
          no decoder runs in download-only mode"
@@ -555,7 +555,7 @@ pub enum CliError {
     },
 
     /// `-k=<PATH>` was given but the resolved path already exists
-    /// as a directory (`docs/PLAN_download_modes.md` §3.2). A regular
+    /// as a directory (`internal/PLAN_download_modes.md` §3.2). A regular
     /// file at the path is accepted — the coordinator overwrites it
     /// with a `tracing::warn!`; a directory would be ambiguous and
     /// is rejected at CLI parse time.
@@ -566,7 +566,7 @@ pub enum CliError {
     },
 
     /// `-o <PATH>` and the detected format shape disagree
-    /// (`docs/PLAN_download_modes.md` §1).
+    /// (`internal/PLAN_download_modes.md` §1).
     ///
     /// `shape` is the format's required output shape. For
     /// [`FormatShape::Tree`] the path was an existing regular file;
@@ -584,7 +584,7 @@ pub enum CliError {
     },
 
     /// `--sha256` was given a number of times that does not match
-    /// the URL count (`docs/PLAN_multi_url_source.md` §3 step 2).
+    /// the URL count (`internal/PLAN_multi_url_source.md` §3 step 2).
     /// For a single-URL run, 0 or 1 hash is accepted; for a
     /// multi-URL run, 0 or exactly `urls` hashes is accepted.
     #[error(
@@ -611,7 +611,7 @@ pub enum CliError {
     /// (a peer of the primary URL); multi-URL means "this archive
     /// is split across N URLs" (a sequence of distinct parts). The
     /// two semantics are mutually exclusive — combining them is
-    /// rejected at parse time per `docs/PLAN_multi_url_source.md`
+    /// rejected at parse time per `internal/PLAN_multi_url_source.md`
     /// §3 step 3. A future plan may add per-part mirroring.
     #[error(
         "--mirror is incompatible with multi-URL runs: \
@@ -621,7 +621,7 @@ pub enum CliError {
     MirrorMultipleUrls,
 
     /// A positional argument was a relative or absolute path but no
-    /// regular file exists at it (`docs/PLAN_local_file_extract.md`
+    /// regular file exists at it (`internal/old/PLAN_local_file_extract.md`
     /// §1). Distinct from [`Self::InvalidUrl`]: the input parses as
     /// neither an HTTP URL nor a path to an existing file, and the
     /// "does this file exist" check is the friendlier surface.
@@ -642,7 +642,7 @@ pub enum CliError {
 
     /// The positional arguments mix HTTP URLs and local file paths.
     /// peel rejects the combination at parse time
-    /// (`docs/PLAN_local_file_extract.md` §1): resume semantics for
+    /// (`internal/old/PLAN_local_file_extract.md` §1): resume semantics for
     /// a mixed source list are undefined and the UX gain from
     /// supporting it is nil.
     #[error(
@@ -659,7 +659,7 @@ pub enum CliError {
     /// Multiple local-file positional arguments were given. peel
     /// supports exactly one local source today; multi-file local
     /// archives are deferred to the multi-volume plan
-    /// (`docs/PLAN_local_file_extract.md` Out-of-scope).
+    /// (`internal/old/PLAN_local_file_extract.md` Out-of-scope).
     #[error(
         "local-file mode supports exactly one positional path \
          (got {count}); split-archive local extraction is not yet \
@@ -671,7 +671,7 @@ pub enum CliError {
     },
 
     /// A flag was passed alongside a local-file source but the flag
-    /// is HTTP-only (`docs/PLAN_local_file_extract.md` §1 step 2).
+    /// is HTTP-only (`internal/old/PLAN_local_file_extract.md` §1 step 2).
     /// All download knobs — `--mirror`, `--sha256`, `--workers`,
     /// `--chunk-size`, `--max-bandwidth`, `--max-disk-buffer`,
     /// `--http-version`, `--no-adaptive-chunk-size`,
@@ -688,7 +688,7 @@ pub enum CliError {
     /// `-k=<PATH>` was given alongside a local source. In local
     /// mode the archive already lives at the user-supplied
     /// positional path; the `-k <PATH>` value form is rejected per
-    /// `docs/PLAN_local_file_extract.md` §1 step 3. Bare `-k` in
+    /// `internal/old/PLAN_local_file_extract.md` §1 step 3. Bare `-k` in
     /// local mode is a no-op (local mode preserves the source by
     /// default); pass `-d/--destructive` to hole-punch and delete
     /// the source as extraction proceeds.
@@ -701,7 +701,7 @@ pub enum CliError {
     LocalKeepArchiveWithPath,
 
     /// `--password-from <SOURCE>` did not parse as a valid source
-    /// (`docs/PLAN_archive_encryption.md` §1).
+    /// (`internal/PLAN_archive_encryption.md` §1).
     #[error("--password-from value is not a valid password source")]
     InvalidPasswordSource(#[source] crate::secret::source::PasswordSourceParseError),
 
@@ -721,7 +721,7 @@ pub enum CliError {
     HttpDestructiveConflictsKeepArchive,
 
     /// A `@<path>` manifest sentinel was passed alongside other
-    /// positional URLs (`docs/PLAN_multivolume_archives.md` §6).
+    /// positional URLs (`internal/PLAN_multivolume_archives.md` §6).
     /// The manifest *replaces* the positional list — combining the
     /// two forms is ambiguous (would the manifest entries prepend?
     /// append? overwrite?), so peel refuses to guess.
@@ -732,7 +732,7 @@ pub enum CliError {
     ManifestPositionalConflict,
 
     /// Reading a `@<path>` manifest failed
-    /// (`docs/PLAN_multivolume_archives.md` §6).
+    /// (`internal/PLAN_multivolume_archives.md` §6).
     #[error("failed to read manifest file `{}`", path.display())]
     ManifestReadFailed {
         /// Manifest path passed via `@<path>`.
@@ -743,7 +743,7 @@ pub enum CliError {
     },
 
     /// A `@<path>` manifest contained no non-blank, non-comment
-    /// lines (`docs/PLAN_multivolume_archives.md` §6).
+    /// lines (`internal/PLAN_multivolume_archives.md` §6).
     #[error("manifest file `{}` has no URL/path entries", path.display())]
     ManifestEmpty {
         /// Manifest path passed via `@<path>`.
@@ -752,7 +752,7 @@ pub enum CliError {
 
     /// A positional list of multi-volume names did not form a
     /// contiguous numeric sequence
-    /// (`docs/PLAN_multivolume_archives.md` §6). When every
+    /// (`internal/PLAN_multivolume_archives.md` §6). When every
     /// positional source matches a multi-volume convention of the
     /// same format, the volume numbers must walk `1, 2, 3, …` in
     /// the same order the sources are passed; a gap, a duplicate,
@@ -805,10 +805,10 @@ fn strip_archive_extensions(name: &str) -> &str {
 
 /// Derive the default output directory when neither `-C` nor `-o` is
 /// given: parse the URL, take its basename, strip the multi-volume
-/// volume suffix (`docs/PLAN_multivolume_archives.md` §6 — handles
+/// volume suffix (`internal/PLAN_multivolume_archives.md` §6 — handles
 /// `.part<NN>.rar`, `.7z.<NN>`, `.z<NN>`, `.zip`), fall back to the
 /// `.partNNNN` byte-concat suffix
-/// (`docs/PLAN_multi_url_source.md` §3 step 4) if no volume pattern
+/// (`internal/PLAN_multi_url_source.md` §3 step 4) if no volume pattern
 /// matched, then strip known compression / archive extensions, and
 /// place the result in the current working directory (as a relative
 /// path).
@@ -824,7 +824,7 @@ fn default_output_dir(url: &str) -> Result<PathBuf, CliError> {
 }
 
 /// Strip either a multi-volume volume suffix
-/// (`docs/PLAN_multivolume_archives.md` §6 — `.part<NN>.rar`,
+/// (`internal/PLAN_multivolume_archives.md` §6 — `.part<NN>.rar`,
 /// `.7z.<NN>`, `.z<NN>`, `.zip`) or a byte-concat `.partNNNN`
 /// suffix. Used by the output-name derivation so a seed of
 /// `foo.7z.001` lands at `./foo/` rather than `./foo.7z.001/`,
@@ -888,7 +888,7 @@ fn strip_part_suffix(name: &str) -> &str {
 
 /// Whether a user-supplied path ends in a directory separator. The
 /// CLI uses this as the "user clearly meant a directory" hint for
-/// shape resolution (`docs/PLAN_download_modes.md` §1.1).
+/// shape resolution (`internal/PLAN_download_modes.md` §1.1).
 ///
 /// peel is unix-only (the binary is `#![cfg(unix)]`), so a trailing
 /// `/` is the only separator to check.
@@ -916,7 +916,7 @@ fn path_is_existing_dir(path: &Path) -> bool {
 /// Resolve the user's `-o <PATH>` into an [`OutputTarget`] given the
 /// format `shape` dictated by suffix detection (or `--format`).
 ///
-/// Enforces the resolution rules in `docs/PLAN_download_modes.md`
+/// Enforces the resolution rules in `internal/PLAN_download_modes.md`
 /// §1.1:
 ///
 /// - Tree formats: reject an existing regular file at `path`;
@@ -993,7 +993,7 @@ fn shape_from_url_or_format(
     registry.shape_for_name(depart)
 }
 
-/// Resolve `-k/--keep-archive` (`docs/PLAN_download_modes.md` §3.2)
+/// Resolve `-k/--keep-archive` (`internal/PLAN_download_modes.md` §3.2)
 /// into the final on-disk path where the source archive will be
 /// preserved, or `None` when the flag is absent.
 ///
@@ -1043,7 +1043,7 @@ fn resolve_keep_archive(
 
 /// Derive the default output **file** name when `-o` is not given,
 /// preserving the URL's compression / archive suffix. Used by
-/// `--no-extract` (`docs/PLAN_download_modes.md` §2.1) where the
+/// `--no-extract` (`internal/PLAN_download_modes.md` §2.1) where the
 /// on-disk bytes are the raw remote object — we want
 /// `https://h/foo.tar.zst --no-extract` to land at `./foo.tar.zst`,
 /// not `./foo`. Mirrors [`default_output_dir`] but skips the
@@ -1081,7 +1081,7 @@ fn parse_disk_buffer(input: &str) -> Result<Option<u64>, ParseBandwidthError> {
 }
 
 /// Classification of one positional `<source>` argument
-/// (`docs/PLAN_local_file_extract.md` §1 step 1).
+/// (`internal/old/PLAN_local_file_extract.md` §1 step 1).
 ///
 /// HTTP-shaped strings (anything that [`crate::http::Url::parse`]
 /// accepts — `http://...` and `https://...`) take the
@@ -1099,7 +1099,7 @@ enum SourceClassification {
 }
 
 /// Classify one positional `<source>` argument
-/// (`docs/PLAN_local_file_extract.md` §1 step 1).
+/// (`internal/old/PLAN_local_file_extract.md` §1 step 1).
 ///
 /// The classifier never does network IO; existence checks on the
 /// path are bare `metadata(2)` calls. Heterogeneous lists
@@ -1124,7 +1124,7 @@ fn classify_source(arg: &str) -> Result<SourceClassification, CliError> {
 }
 
 /// Result of a successful multi-volume HTTP discovery pass
-/// (`docs/PLAN_multivolume_archives.md` §1).
+/// (`internal/PLAN_multivolume_archives.md` §1).
 ///
 /// Captures the canonical URL list resolved by
 /// [`crate::multivolume::discover_http`] reshaped into the
@@ -1220,7 +1220,7 @@ fn resolve_multi_volume_http(
 /// Top-level entry from [`Cli::into_dispatch`]: a parsed CLI lands
 /// in one of two pipelines depending on what the positional
 /// `<source>` arguments looked like
-/// (`docs/PLAN_local_file_extract.md` §1).
+/// (`internal/old/PLAN_local_file_extract.md` §1).
 ///
 /// HTTP / HTTPS arguments produce [`Dispatch::Http`], routed via
 /// [`crate::coordinator::run`]. Local file paths produce
@@ -1233,7 +1233,7 @@ pub enum Dispatch {
     /// carries config, client, registry, …) — sizing the bare
     /// variant skews the enum.
     Http(Box<RunArgs>),
-    /// Local-file run (`docs/PLAN_local_file_extract.md`).
+    /// Local-file run (`internal/old/PLAN_local_file_extract.md`).
     /// Non-destructive by default: the source archive is left on
     /// disk untouched. Destructive mode (`-d/--destructive`)
     /// hole-punches the source as the decoder advances and
@@ -1246,13 +1246,13 @@ pub enum Dispatch {
 }
 
 /// Classify every positional argument and reject heterogeneous /
-/// invalid lists (`docs/PLAN_local_file_extract.md` §1 step 1).
+/// invalid lists (`internal/old/PLAN_local_file_extract.md` §1 step 1).
 ///
 /// Returns a uniform [`Vec<SourceClassification>`] that callers
 /// can match against in one pass — every element is the same
 /// variant on success.
 /// Expand a `@<path>` manifest sentinel in a positional URL list
-/// (`docs/PLAN_multivolume_archives.md` §1 step 4 / §6).
+/// (`internal/PLAN_multivolume_archives.md` §1 step 4 / §6).
 ///
 /// When the only positional argument starts with `@`, the rest is
 /// treated as a path to a manifest file containing one URL or
@@ -1306,7 +1306,7 @@ fn expand_manifest_urls(urls: Vec<String>) -> Result<Vec<String>, CliError> {
 
 /// Validate that a positional list of multi-volume names forms a
 /// contiguous numeric sequence
-/// (`docs/PLAN_multivolume_archives.md` §6).
+/// (`internal/PLAN_multivolume_archives.md` §6).
 ///
 /// Skipped (returns `Ok(())`) when:
 /// - The list has only one entry — no sequence to validate.
@@ -1414,7 +1414,7 @@ fn classify_sources(args: &[String]) -> Result<Vec<SourceClassification>, CliErr
 }
 
 /// HTTP-only flags rejected when the positional source is a local
-/// path (`docs/PLAN_local_file_extract.md` §1 step 2).
+/// path (`internal/old/PLAN_local_file_extract.md` §1 step 2).
 ///
 /// Returns the user-facing flag name on the first violation so the
 /// error message names the specific knob the user tried to use.
@@ -1478,7 +1478,7 @@ fn reject_http_only_flags(cli: &Cli) -> Result<(), CliError> {
 
 /// Resolve the user's `-o <PATH>` into an [`OutputTarget`] when the
 /// source is a local file
-/// (`docs/PLAN_local_file_extract.md` §1 step 2).
+/// (`internal/old/PLAN_local_file_extract.md` §1 step 2).
 ///
 /// Mirrors [`build_output_target_explicit`] /
 /// [`build_output_target_unknown_shape`] from the HTTP path: the
@@ -1549,7 +1549,7 @@ impl Cli {
     /// `--sha256 <HEX>` argument failed to parse.
     pub fn into_run_args(self) -> Result<RunArgs, CliError> {
         // Hard cutover migration error for the removed `-C` flag
-        // (`docs/PLAN_download_modes.md` §1). Surfaces *before* URL
+        // (`internal/PLAN_download_modes.md` §1). Surfaces *before* URL
         // and SHA-256 validation so a user passing `-C foo/` doesn't
         // also have to fix other arg shape before seeing the migration
         // hint.
@@ -1558,7 +1558,7 @@ impl Cli {
         }
 
         // `--no-extract` is mutually exclusive with extractor-only
-        // flags (`docs/PLAN_download_modes.md` §2.1). Detect explicit
+        // flags (`internal/PLAN_download_modes.md` §2.1). Detect explicit
         // setting:
         //   * `--format` and `--force-format-from-magic` carry their
         //     own absence sentinel (`None` / `false`) so a default
@@ -1593,7 +1593,7 @@ impl Cli {
             }
         }
 
-        // Manifest expansion (`docs/PLAN_multivolume_archives.md`
+        // Manifest expansion (`internal/PLAN_multivolume_archives.md`
         // §1 step 4 / §6): `peel @volumes.txt` is rewritten into
         // the explicit list of URLs / paths from the manifest
         // before anything else runs against `self.urls`. Idempotent
@@ -1647,7 +1647,7 @@ impl Cli {
             }
         };
 
-        // §1 of `docs/PLAN_download_modes.md`: unified `-o <PATH>`
+        // §1 of `internal/PLAN_download_modes.md`: unified `-o <PATH>`
         // resolver. Determine the format shape from the URL suffix
         // (or `--format` override) and pair it with the user's path
         // to produce a typed [`OutputTarget`]. When the shape is
@@ -1690,7 +1690,7 @@ impl Cli {
                 OutputTarget::Dir(default_output_dir(&primary_url)?)
             }
         };
-        // §3 (`docs/PLAN_download_modes.md`): resolve `-k`/
+        // §3 (`internal/PLAN_download_modes.md`): resolve `-k`/
         // `--keep-archive`. Bare `-k` derives a sibling-of-output
         // path from the URL basename; `-k=<PATH>` uses the explicit
         // path verbatim (validated for "not a directory"). In
@@ -1740,7 +1740,7 @@ impl Cli {
         })?;
 
         // Multi-volume HTTP auto-discovery
-        // (`docs/PLAN_multivolume_archives.md` §1 / §7 Phase 5):
+        // (`internal/PLAN_multivolume_archives.md` §1 / §7 Phase 5):
         // when the user passes a single URL whose basename looks
         // like a multi-volume seed (`foo.part0001.rar`,
         // `foo.7z.001`, `foo.z01` / `foo.zip`), HEAD-probe the
@@ -1810,7 +1810,7 @@ impl Cli {
 
     /// Classify the positional sources and dispatch to either the
     /// HTTP coordinator or the local-file extractor
-    /// (`docs/PLAN_local_file_extract.md` §1).
+    /// (`internal/old/PLAN_local_file_extract.md` §1).
     ///
     /// HTTP sources route through [`Self::into_run_args`]; local
     /// sources go through [`Self::into_local_run_args`]. Mixed
@@ -1838,7 +1838,7 @@ impl Cli {
             return Err(CliError::OutputDirRemoved);
         }
 
-        // Manifest expansion (`docs/PLAN_multivolume_archives.md`
+        // Manifest expansion (`internal/PLAN_multivolume_archives.md`
         // §1 step 4 / §6): `peel @volumes.txt` is rewritten into
         // the explicit list of URLs / paths from the manifest
         // before classification, mirror checking, or downstream
@@ -1886,7 +1886,7 @@ impl Cli {
 
         // Exactly one local source for now. Multi-file local
         // archives are the multi-volume plan's job
-        // (`docs/PLAN_local_file_extract.md` Out-of-scope).
+        // (`internal/old/PLAN_local_file_extract.md` Out-of-scope).
         if classified.len() != 1 {
             return Err(CliError::LocalMultiSource {
                 count: classified.len(),
@@ -1898,7 +1898,7 @@ impl Cli {
         };
 
         // Local mode is non-destructive by default
-        // (`docs/PLAN_local_file_extract.md` §1). `-d/--destructive`
+        // (`internal/old/PLAN_local_file_extract.md` §1). `-d/--destructive`
         // opts into hole-punch + delete-on-success. `-k` is a no-op
         // in local mode (local mode already preserves the source);
         // we still reject the `-k=<PATH>` value form because the
@@ -3377,7 +3377,7 @@ mod tests {
 
     #[test]
     fn strict_format_with_no_extract_errors() {
-        // `docs/PLAN_download_modes.md` §4: combining
+        // `internal/PLAN_download_modes.md` §4: combining
         // `--strict-format` with `--no-extract` is a CLI parse
         // error — detection doesn't run when extraction is
         // skipped, so the strict knob has nothing to be strict

@@ -1,6 +1,6 @@
 //! Legacy (RAR3 / RAR4) wire-format parser.
 //!
-//! Implements `docs/PLAN_rar3.md` §A1 — the hand-rolled header
+//! Implements `internal/PLAN_rar3.md` §A1 — the hand-rolled header
 //! layer for the legacy RAR archive format (WinRAR 1.5–4.x). Sibling
 //! of [`crate::rar::format`]; the two share nothing wire-level
 //! beyond the leading six magic bytes.
@@ -31,7 +31,7 @@
 //!
 //! # Sentinel rejections
 //!
-//! Per `docs/PLAN_rar3.md` §0 round-one surfaces specific
+//! Per `internal/PLAN_rar3.md` §0 round-one surfaces specific
 //! diagnostics for:
 //!
 //! - **Pre-2.9 compression** (`unp_ver < 29`):

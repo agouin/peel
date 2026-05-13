@@ -2,7 +2,7 @@
 //!
 //! Today this module hosts a hand-rolled, FIPS 180-4 SHA-256
 //! implementation with a serializable mid-stream state. See
-//! [`sha256`] for the implementation rationale (`docs/PLAN_v2.md`
+//! [`sha256`] for the implementation rationale (`internal/PLAN_v2.md`
 //! §10) — the short version is that resumable hashing needs the
 //! state to be saveable between runs, and the upstream `sha2` crate
 //! does not expose that without poking at private fields.
@@ -13,7 +13,7 @@
 //!   single [`Sha256`]. For single-URL runs it has exactly one part
 //!   covering `[0, total_size)` and behaves byte-identically to a
 //!   plain hasher with an end-of-stream `verify_digest` call. For
-//!   multi-URL runs (`docs/PLAN_multi_url_source.md` §4) it carries
+//!   multi-URL runs (`internal/PLAN_multi_url_source.md` §4) it carries
 //!   one expected digest per part, finalizes and verifies as the
 //!   stream crosses each part boundary, and fails fast at the part
 //!   that produced the bad bytes — a corrupted part 1 fails before
@@ -31,7 +31,7 @@
 //! `--sha256` CLI flag rather than touching this module directly.
 
 // BLAKE2sp lives behind the `rar` Cargo feature: it's used only by
-// the RAR5 file-data integrity path (`docs/PLAN_rar.md` §2). When
+// the RAR5 file-data integrity path (`internal/PLAN_rar.md` §2). When
 // the feature is disabled the module is excluded entirely so the
 // 250-LOC compression core doesn't ship in the slim binary.
 #[cfg(feature = "rar")]
@@ -72,7 +72,7 @@ pub enum IntegrityError {
         got: String,
     },
 
-    /// A multi-URL run (`docs/PLAN_multi_url_source.md` §4) received
+    /// A multi-URL run (`internal/PLAN_multi_url_source.md` §4) received
     /// bytes for part `part_index` whose SHA-256 did not match the
     /// per-part digest the user supplied. Surfaced *as soon as that
     /// part finishes streaming* so a corrupted part 1 does not waste
@@ -182,7 +182,7 @@ impl StoredError {
 }
 
 /// Part-aware streaming SHA-256 verifier
-/// (`docs/PLAN_multi_url_source.md` §4).
+/// (`internal/PLAN_multi_url_source.md` §4).
 ///
 /// Conceptually a state machine over a sequence of parts. The
 /// active part's bytes accumulate in [`Sha256`]; when the global
@@ -309,7 +309,7 @@ impl IntegrityHasher {
     /// crossing already errored (no point checkpointing a doomed
     /// hash state). Used by single-URL runs today; multi-URL
     /// resume support requires the active part index too and lands
-    /// in `docs/PLAN_multi_url_source.md` §5.
+    /// in `internal/PLAN_multi_url_source.md` §5.
     #[must_use]
     pub fn snapshot_active_serialized(&self) -> Option<[u8; sha256::SERIALIZED_LEN]> {
         if self.error.is_some() {
@@ -319,7 +319,7 @@ impl IntegrityHasher {
     }
 
     /// Active part index. Useful for diagnostics and for the
-    /// upcoming v8 checkpoint format (`docs/PLAN_multi_url_source.md`
+    /// upcoming v8 checkpoint format (`internal/PLAN_multi_url_source.md`
     /// §5) which will serialize this alongside the active hasher.
     #[must_use]
     pub fn active_part_idx(&self) -> usize {
@@ -352,7 +352,7 @@ impl IntegrityHasher {
     }
 
     /// Reconstruct a multi-part hasher from its checkpointed
-    /// snapshot (`docs/PLAN_multi_url_source.md` §5). Parts before
+    /// snapshot (`internal/PLAN_multi_url_source.md` §5). Parts before
     /// `active_part_idx` are treated as already verified; the
     /// active hasher continues from `active`'s mid-stream state.
     /// `bytes_processed` is `prefix_sum(part_sizes[0..idx]) +

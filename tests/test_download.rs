@@ -1936,7 +1936,7 @@ fn discover_multi_single_url_matches_discover() {
     assert_eq!(info.fingerprint.etag.as_deref(), Some("\"v1\""));
 }
 
-/// Phase 2 (`docs/PLAN_multi_url_source.md` §2) demo: with the adaptive
+/// Phase 2 (`internal/PLAN_multi_url_source.md` §2) demo: with the adaptive
 /// chunk-size policy pinned at "coalesce every chunk," a multi-part run
 /// must still emit one ranged GET per part — never a single GET that
 /// would have to cross a part boundary. Without the boundary clamp the

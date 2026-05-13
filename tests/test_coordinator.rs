@@ -404,7 +404,7 @@ fn happy_path_zst_to_file_round_trips_bytes() {
 
 #[test]
 fn no_extract_downloads_raw_bytes_then_renames_into_place() {
-    // `docs/PLAN_download_modes.md` §2 demo: a non-archive remote
+    // `internal/PLAN_download_modes.md` §2 demo: a non-archive remote
     // object should land on disk byte-identical to a `curl`
     // download — no decoder runs, the .peel.part rename moves the
     // assembled bytes into the final path, and the .peel.ckpt is
@@ -476,7 +476,7 @@ fn simple_tar_with_entry(name: &str, payload: &[u8]) -> Vec<u8> {
 
 #[test]
 fn cross_mode_resume_no_extract_to_extract_is_rejected() {
-    // `docs/PLAN_download_modes.md` §5: a `.peel.ckpt` written by
+    // `internal/PLAN_download_modes.md` §5: a `.peel.ckpt` written by
     // a `--no-extract` run must not be silently consumed by a
     // later run that omits the flag. The coordinator surfaces
     // `CheckpointError::ModeMismatch` wrapped in
@@ -549,7 +549,7 @@ fn cross_mode_resume_no_extract_to_extract_is_rejected() {
 
 #[test]
 fn keep_archive_preserves_source_alongside_extracted_output() {
-    // `docs/PLAN_download_modes.md` §3 demo. A `.tar.zst` URL is
+    // `internal/PLAN_download_modes.md` §3 demo. A `.tar.zst` URL is
     // extracted to a directory AND the source archive is preserved
     // at a user-supplied path. The preserved archive's on-disk
     // footprint equals `Content-Length` (no holes punched).
@@ -1493,7 +1493,7 @@ fn zip_to_file_output_is_rejected() {
         coord_config_for_test(4096),
     );
     let err = run(args).expect_err("zip + -o must abort");
-    // Since `docs/PLAN_download_modes.md` §1 added the general
+    // Since `internal/PLAN_download_modes.md` §1 added the general
     // post-detection shape check, a file-shaped output against a
     // tree-shaped format now surfaces as `OutputShapeMismatch`
     // before the zip pipeline's own `ZipNeedsDirectory` guard fires.
@@ -1751,7 +1751,7 @@ fn sha256_mismatch_aborts_with_integrity_error() {
 
 #[test]
 fn multi_url_per_part_sha256_mismatch_fails_at_part_one_boundary() {
-    // Phase 4 demo (`docs/PLAN_multi_url_source.md` §4):
+    // Phase 4 demo (`internal/PLAN_multi_url_source.md` §4):
     // a 3-part run where the user passes a bad hash for part 1
     // must abort *the moment part 1 finishes streaming* — before
     // the decoder spends time on parts 2..N. The bytes themselves
@@ -1892,7 +1892,7 @@ fn multi_url_all_per_part_sha256_match_completes_cleanly() {
 
 #[test]
 fn multi_url_per_part_sha256_kill_then_resume_completes_cleanly() {
-    // Phase 5 demo (`docs/PLAN_multi_url_source.md` §5): kill a
+    // Phase 5 demo (`internal/PLAN_multi_url_source.md` §5): kill a
     // multi-URL run with `--sha256` mid-flight, re-run, and the
     // coordinator must rebuild the per-part
     // [`peel::hash::IntegrityHasher`] state machine from the
@@ -2656,7 +2656,7 @@ fn worker_probe_detects_source_drift() {
 
 #[test]
 fn unrecognized_suffix_with_strict_format_returns_no_decoder() {
-    // `docs/PLAN_download_modes.md` §4: with `strict_format=true`
+    // `internal/PLAN_download_modes.md` §4: with `strict_format=true`
     // the historical behaviour is preserved — an unrecognized
     // suffix surfaces `CoordinatorError::NoDecoder`. The default
     // (without strict-format) now falls through to a download-only
@@ -2682,7 +2682,7 @@ fn unrecognized_suffix_with_strict_format_returns_no_decoder() {
 
 #[test]
 fn unrecognized_suffix_falls_back_to_no_extract() {
-    // `docs/PLAN_download_modes.md` §4 default behaviour: format
+    // `internal/PLAN_download_modes.md` §4 default behaviour: format
     // detection misses, no `--strict-format`, so the coordinator
     // warns and runs as `--no-extract`. The output lands at the
     // URL-basename-derived path (a sibling of the user's `-o`).
@@ -3015,7 +3015,7 @@ fn small_cap_with_drip_server_completes() {
     assert_eq!(out.len(), 8);
 }
 
-/// `docs/PLAN_multivolume_archives.md` §7 Phase 4: with the
+/// `internal/PLAN_multivolume_archives.md` §7 Phase 4: with the
 /// `multi_part_storage` opt-in flipped, a 3-part HTTP run lays bytes
 /// out as `<anchor>.peel.part.NNN` (one sidecar per source part),
 /// extracts byte-identically to a single-`.peel.part` run, and the

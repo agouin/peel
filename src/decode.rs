@@ -23,19 +23,19 @@
 //! Concrete implementations live in submodules:
 //!
 //! - [`zstd`] — hand-rolled pure-Rust zstd decoder
-//!   (`docs/PLAN_zstd_block_decoder.md`) with per-block mid-frame
+//!   (`internal/PLAN_zstd_block_decoder.md`) with per-block mid-frame
 //!   restart points.
 //! - [`identity`] — passthrough decoder for archive formats that have
 //!   no compression layer (uncompressed `.tar`).
 //! - [`xz`] — re-export of [`xz_native`], the hand-rolled pure-
-//!   Rust xz / LZMA decoder (`docs/PLAN_xz_block_decoder.md`)
+//!   Rust xz / LZMA decoder (`internal/PLAN_xz_block_decoder.md`)
 //!   with per-LZMA2-chunk mid-Block restart points.
 //! - [`xz_native`] — implementation of the hand-rolled xz
 //!   decoder. The `xz` re-export is the public surface; only
 //!   tests reach into `xz_native::*` directly.
 //! - [`lz4`] — hand-rolls the LZ4 Frame Format around `lz4_flex`'s
 //!   block-layer API and exposes per-block frame boundaries
-//!   (round-one MVP per `docs/PLAN_v2.md` §4).
+//!   (round-one MVP per `internal/PLAN_v2.md` §4).
 //!
 //! Future formats (`gzip`, anything that fits the protocol) are added
 //! here following the same shape.
@@ -46,7 +46,7 @@
 //! call to give the codec a fresh file handle — every in-tree decoder
 //! takes ownership of its input at construction and keeps it for its
 //! lifetime. This is a deliberate deviation from the trait sketch in
-//! `docs/PLAN.md` §6.1; the contract the *extractor* relies on
+//! `internal/PLAN.md` §6.1; the contract the *extractor* relies on
 //! (bounded steps, monotone `bytes_consumed`, optional
 //! `frame_boundary`) is unchanged.
 //!
@@ -75,7 +75,7 @@ pub mod xz;
 pub mod xz_liblzma;
 pub mod zstd;
 
-// Hand-rolled DEFLATE decoder (`docs/PLAN_deflate_block_decoder.md`).
+// Hand-rolled DEFLATE decoder (`internal/PLAN_deflate_block_decoder.md`).
 // Phase 8 swapped the production gzip path over to this module —
 // `crate::decode::gzip` is now a thin re-export of
 // [`deflate_native::gzip`]. The `flate2` crate stays in runtime
@@ -83,15 +83,15 @@ pub mod zstd;
 // (`src/zip/decode.rs`) still uses it; Phase 9 swaps that too.
 pub mod deflate_native;
 
-// Hand-rolled RAR5 decoder (`docs/PLAN_rar5_decoder.md`). Gated
+// Hand-rolled RAR5 decoder (`internal/PLAN_rar5_decoder.md`). Gated
 // behind the `rar` Cargo feature alongside the rest of the RAR5
-// module tree (`docs/PLAN_rar.md` §0.5). Phase A1 ships the
+// module tree (`internal/PLAN_rar.md` §0.5). Phase A1 ships the
 // MSB-first bitstream reader; subsequent phases land the Huffman /
 // LZSS / filter VM / PPMd-II layers and the integration trait.
 #[cfg(feature = "rar")]
 pub mod rar_native;
 
-// Hand-rolled PPMd-II decoder (`docs/PLAN_rar3.md` §B). Sibling of
+// Hand-rolled PPMd-II decoder (`internal/PLAN_rar3.md` §B). Sibling of
 // `rar_native` so it can be reused by the legacy RAR decoder
 // (§B's first consumer), by hypothetical PPMd-encoded RAR5
 // archives (`O.RAR.PPM5` follow-on), and by 7z's PPMd-II method.
@@ -101,7 +101,7 @@ pub mod rar_native;
 pub mod ppmd2;
 
 // Hand-rolled legacy RAR (RAR3 / RAR4) decompression pipeline
-// (`docs/PLAN_rar3.md` §C). Sibling of `rar_native` and `ppmd2`;
+// (`internal/PLAN_rar3.md` §C). Sibling of `rar_native` and `ppmd2`;
 // the §A2b pipeline dispatches here on the legacy signature.
 // §C0 scaffolds the module entry; subsequent sub-phases land the
 // bitstream / Huffman / dictionary / LZ block dispatcher / RarVM
@@ -344,7 +344,7 @@ pub type DecoderResumeFactory =
     fn(Box<dyn Read + Send>, &[u8], u64) -> Result<Box<dyn StreamingDecoder>, DecodeError>;
 
 /// Shape of the output a format produces, used by the CLI's unified
-/// `-o` resolver (`docs/PLAN_download_modes.md` §1) to validate a
+/// `-o` resolver (`internal/PLAN_download_modes.md` §1) to validate a
 /// user-supplied output path against the format dictated by either
 /// the URL suffix or the magic bytes.
 ///
@@ -477,7 +477,7 @@ impl DecoderRegistry {
     ///   their bytes straight through to [`crate::sink::TarSink`].
     /// - `"xz"` — `.xz` / `.tar.xz` suffixes; magic
     ///   `FD 37 7A 58 5A 00` at offset 0. Round-one frame granularity
-    ///   is per-`Stream` (see `docs/PLAN_v2.md` §3); the resulting
+    ///   is per-`Stream` (see `internal/PLAN_v2.md` §3); the resulting
     ///   decoder hands its bytes straight through to either
     ///   [`crate::sink::RawSink`] (`.xz`) or [`crate::sink::TarSink`]
     ///   (`.tar.xz`) like every other compressed format.
@@ -496,7 +496,7 @@ impl DecoderRegistry {
         // magic identifies the codec, not whether the decoded bytes
         // happen to be tar. The `.tar.<x>` suffix entries are
         // registered as FormatShape::Tree so the unified-`-o`
-        // resolver (`docs/PLAN_download_modes.md` §1) demands a
+        // resolver (`internal/PLAN_download_modes.md` §1) demands a
         // directory output for those URLs without needing to peek
         // through the codec.
         r.register_format(
@@ -555,10 +555,10 @@ impl DecoderRegistry {
         );
         // Mid-frame resume hook: lz4 (per-block), zstd (per-block
         // inside a frame), xz (per-LZMA2-chunk inside a Block,
-        // since Phase 7 of `docs/PLAN_xz_block_decoder.md` swapped
+        // since Phase 7 of `internal/PLAN_xz_block_decoder.md` swapped
         // the wrapper out for the hand-rolled decoder), and gzip
         // (per-deflate-block inside a member, since Phase 8 of
-        // `docs/PLAN_deflate_block_decoder.md` swapped the
+        // `internal/PLAN_deflate_block_decoder.md` swapped the
         // `flate2`-based wrapper for the hand-rolled
         // [`deflate_native::gzip`] backend) all stamp
         // `frame_boundary` at points where a fresh decoder cannot
@@ -583,7 +583,7 @@ impl DecoderRegistry {
             gzip::factory,
         );
         // ZIP doesn't use the streaming-decoder loop — see
-        // `docs/PLAN_v2.md` §5 and `crate::zip::streaming_factory_placeholder`.
+        // `internal/PLAN_v2.md` §5 and `crate::zip::streaming_factory_placeholder`.
         // The registry entry exists so suffix / magic / format-name
         // detection (and the --format / --force-format-from-magic
         // CLI overrides) resolve `.zip` archives the same way the
@@ -614,7 +614,7 @@ impl DecoderRegistry {
             ],
             crate::zip::streaming_factory_placeholder,
         );
-        // 7z (`docs/PLAN_7z_support.md` §10). Same pattern as
+        // 7z (`internal/PLAN_7z_support.md` §10). Same pattern as
         // ZIP — the coordinator dispatches to
         // `crate::download::sevenz_pipeline` before the factory
         // is invoked. Magic is the 6-byte `7z¼¯' \x1c`
@@ -633,7 +633,7 @@ impl DecoderRegistry {
             }],
             crate::sevenz::streaming_factory_placeholder,
         );
-        // RAR (`docs/PLAN_rar.md` §1 + `docs/PLAN_rar3.md` §A2b).
+        // RAR (`internal/PLAN_rar.md` §1 + `internal/PLAN_rar3.md` §A2b).
         // Same shape as ZIP / 7z — the coordinator dispatches to
         // `crate::download::rar_pipeline` before the factory is
         // invoked. Two magics are registered:
@@ -1326,10 +1326,10 @@ mod tests {
     fn registry_with_defaults_registers_resume_factories_for_lz4_zstd_xz_and_gzip() {
         // lz4 (per-block mid-frame), zstd (per-block mid-frame),
         // xz (per-LZMA2-chunk inside a Block, since Phase 7 of
-        // `docs/PLAN_xz_block_decoder.md` swapped the wrapper out
+        // `internal/PLAN_xz_block_decoder.md` swapped the wrapper out
         // for the hand-rolled decoder), and gzip (per-deflate-block
         // inside a member, since Phase 8 of
-        // `docs/PLAN_deflate_block_decoder.md` swapped the
+        // `internal/PLAN_deflate_block_decoder.md` swapped the
         // `flate2`-based wrapper for the hand-rolled
         // [`deflate_native::gzip`] backend) all stamp
         // `frame_boundary` at points whose `decoder_state` blob

@@ -23,21 +23,35 @@ use more than ~300 MB of disk for the compressed side, and survive crashes.
 
 In this order. Don't skip.
 
-1. **`docs/PLAN.md`** — what we're building, in what order. The MVP scope is
+1. **`internal/PLAN.md`** — what we're building, in what order. The MVP scope is
    deliberately tight; resist scope creep.
-2. **`docs/ENGINEERING_STANDARDS.md`** — non-negotiable rules: dependency
+2. **`internal/ENGINEERING_STANDARDS.md`** — non-negotiable rules: dependency
    policy, error handling, unsafe code, formatting, testing thresholds.
-3. **`docs/ENGINEERING_BEST_PRACTICES.md`** — idiomatic Rust patterns,
+3. **`internal/ENGINEERING_BEST_PRACTICES.md`** — idiomatic Rust patterns,
    module structure, concurrency style, what "good" looks like in this repo.
 4. **`AGENTS.md`** — workflow rules for AI coding agents (commit hygiene,
    what to do when stuck, when to ask vs. when to act).
-5. **`docs/OPTIMIZATIONS.md`** — explicitly **out of scope** for now. Read
+5. **`internal/OPTIMIZATIONS.md`** — explicitly **out of scope** for now. Read
    only so you don't accidentally implement something from this list and
    bloat the MVP.
-6. **`docs/ENCRYPTION.md`** — supported encryption schemes, the
+6. **`internal/ENCRYPTION.md`** — supported encryption schemes, the
    `--password-from` flag, the threat model, and exit code 4. Read before
    touching anything under `src/crypto/`, `src/secret.rs`, or the
    per-format encryption code.
+
+## Where docs live
+
+- **`docs/`** — user-facing mdBook source for the GitHub Pages site at
+  <https://agouin.github.io/peel/>. Build with `mdbook build docs`
+  (preview with `mdbook serve docs --open`). When you ship a
+  user-visible feature change — new flag, changed default, format
+  support shift — update the relevant page under `docs/src/` in the
+  same PR.
+- **`internal/`** — engineering docs (PLAN_*.md, ENGINEERING_*.md,
+  OPTIMIZATIONS.md, ENCRYPTION.md, bench-results, fixtures, profiles).
+  Cross-references in source comments and tests use `internal/` paths.
+  `internal/old/` holds untracked PLAN drafts kept out of the main
+  flow.
 
 ## House rules summary
 

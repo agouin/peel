@@ -38,7 +38,7 @@
 //!   platform.
 //!
 //! Other platforms (Windows `FSCTL_SET_ZERO_DATA`) are deferred per
-//! `docs/PLAN.md` §2; the trait is shaped to admit them without changes
+//! `internal/PLAN.md` §2; the trait is shaped to admit them without changes
 //! to its callers.
 //!
 //! # Alignment
@@ -553,7 +553,7 @@ mod macos {
     /// (`F_PUNCHHOLE`). Defined as `99` in Darwin's `<sys/fcntl.h>`
     /// (xnu's `bsd/sys/fcntl.h`). Hard-coded here instead of pulled from
     /// the `libc` crate because `libc` is not on the dependency
-    /// allowlist (`docs/ENGINEERING_STANDARDS.md` §2.2) and the constant
+    /// allowlist (`internal/ENGINEERING_STANDARDS.md` §2.2) and the constant
     /// is part of the stable Darwin ABI.
     const F_PUNCHHOLE: i32 = 99;
 

@@ -224,7 +224,7 @@ fn extracts_multi_frame_zstd_tar_into_directory() {
 /// Single-frame sibling of [`extracts_multi_frame_zstd_tar_into_directory`].
 ///
 /// The default `zstd` CLI emits a single frame for the whole input; per
-/// `docs/PLAN_zstd_block_decoder.md` Phase 9, we need an end-to-end
+/// `internal/PLAN_zstd_block_decoder.md` Phase 9, we need an end-to-end
 /// `.tar.zst` test that confirms the hand-rolled decoder advances
 /// `frame_boundary` *per block* rather than only at end-of-frame.
 /// Without per-block advance the extractor would never observe a
@@ -368,7 +368,7 @@ fn punching_shrinks_or_preserves_source_footprint() {
 /// prove the §"What this project is" guarantee — "never use more than
 /// ~300 MB of disk for the compressed side" — survives even a single
 /// monolithic zstd frame, the production failure mode that motivated
-/// `docs/PLAN_zstd_block_decoder.md`.
+/// `internal/PLAN_zstd_block_decoder.md`.
 struct PeakSamplingPuncher {
     inner: Box<dyn PunchHole>,
     src_path: PathBuf,
@@ -670,7 +670,7 @@ fn fatal_punch_error_aborts_extraction() {
 /// [`extracts_single_frame_zstd_tar_into_directory`]. `xz` CLI
 /// at default settings emits a single Block (and a single
 /// Stream) for any input that fits in dict_size; per
-/// `docs/PLAN_xz_block_decoder.md` Phase 8, this is the shape
+/// `internal/PLAN_xz_block_decoder.md` Phase 8, this is the shape
 /// where the wrapper used to expose only end-of-Stream
 /// `frame_boundary` advances and never punch the source mid-
 /// extraction. The hand-rolled decoder advances per LZMA2 chunk
@@ -730,7 +730,7 @@ fn extracts_single_block_xz_tar_into_directory() {
 ///   3. show a steady release cadence — the resident-block count
 ///      strictly decreases across successive punch calls.
 ///
-/// Phase 8 of `docs/PLAN_xz_block_decoder.md` calls this out as
+/// Phase 8 of `internal/PLAN_xz_block_decoder.md` calls this out as
 /// the user-visible win: before the hand-rolled decoder, this
 /// shape skipped per-block boundaries entirely and the puncher
 /// never advanced. Mirrors the zstd analog
@@ -916,7 +916,7 @@ fn extracts_single_member_tar_gz_into_directory() {
     assert_eq!(stats.bytes_in, combined.len() as u64);
     assert!(stats.bytes_out > 0);
     // Per-member granularity stamps at least the end-of-member
-    // frame boundary; per-deflate-block (`docs/PLAN_deflate_block_decoder.md`
+    // frame boundary; per-deflate-block (`internal/PLAN_deflate_block_decoder.md`
     // Phase 7) stamps every intermediate block boundary too. The
     // small fixture above doesn't force flate2 into multi-block
     // emission, so we only assert ≥ 1 here — the larger
@@ -940,7 +940,7 @@ fn extracts_single_member_tar_gz_into_directory() {
 ///   3. show a steady release cadence — the resident-block count
 ///      strictly decreases across successive punch calls.
 ///
-/// Phase 8 / 10 of `docs/PLAN_deflate_block_decoder.md` calls
+/// Phase 8 / 10 of `internal/PLAN_deflate_block_decoder.md` calls
 /// this out as the user-visible win: before the hand-rolled
 /// decoder, this shape (a real-world `.tar.gz`) skipped per-block
 /// boundaries entirely and the puncher only fired once at

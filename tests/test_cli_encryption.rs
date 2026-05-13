@@ -1,5 +1,5 @@
 //! End-to-end CLI tests for `--password-from` and the exit-code-4
-//! contract documented in `docs/ENCRYPTION.md`.
+//! contract documented in `internal/ENCRYPTION.md`.
 //!
 //! These are the highest-value tests in the CLI suite: the existing
 //! in-process integration tests stuff a [`PasswordSource`] directly
@@ -140,7 +140,7 @@ fn file_password_source_extracts_encrypted_archive() {
 
 #[test]
 fn wrong_password_exits_code_4() {
-    // The headline contract from `docs/ENCRYPTION.md` §Exit codes:
+    // The headline contract from `internal/ENCRYPTION.md` §Exit codes:
     // `PasswordIncorrect` must surface as exit code 4 so scripts can
     // distinguish a retry-able password issue from a generic
     // extraction failure (code 1).
@@ -161,7 +161,7 @@ fn wrong_password_exits_code_4() {
     assert_eq!(
         out.code,
         4,
-        "wrong password should surface as exit 4 per docs/ENCRYPTION.md; \
+        "wrong password should surface as exit 4 per internal/ENCRYPTION.md; \
          got code={}, stderr=\n{}",
         out.code,
         out.stderr_str()

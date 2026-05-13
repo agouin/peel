@@ -1,4 +1,4 @@
-//! Hand-rolled FIPS 180-4 SHA-1 (`docs/PLAN_archive_encryption.md`
+//! Hand-rolled FIPS 180-4 SHA-1 (`internal/PLAN_archive_encryption.md`
 //! §2). SHA-1 is cryptographically broken for collision resistance,
 //! but ZIP-AES (the WinZip "AE-1/AE-2" scheme) pins PBKDF2 and the
 //! file-data HMAC to SHA-1 by format specification. We implement

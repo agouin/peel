@@ -3,7 +3,7 @@
 //! Mirrors the tar/zip fixture builders: integration tests synthesize
 //! archives in code rather than checking binary fixtures into the
 //! repo. Wire-format details follow the 7z layout that
-//! `peel::decode::sevenz::header` parses (`docs/PLAN_7z_support.md`
+//! `peel::decode::sevenz::header` parses (`internal/PLAN_7z_support.md`
 //! §"On-the-wire layout"). Only COPY-coded, plain-Header,
 //! single-folder archives are generated here — that's the minimum
 //! shape the §3-§9 tests in `peel::download::sevenz_pipeline` already

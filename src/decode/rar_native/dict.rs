@@ -4,7 +4,7 @@
 //! the encoder filled with previously-emitted bytes. Unlike DEFLATE
 //! (fixed 32 KiB) the RAR5 file header declares a per-archive
 //! capacity selector, so the dictionary's size is configurable per
-//! entry. Round-one of `docs/PLAN_rar5_decoder.md` (§B1) ships the
+//! entry. Round-one of `internal/PLAN_rar5_decoder.md` (§B1) ships the
 //! ring buffer; §B2 plugs it into the LZSS dispatcher; §C1's filter
 //! VM reads from it via [`Dict::copy_recent_into`]; §F1 serializes
 //! the live tail for resume.

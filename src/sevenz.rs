@@ -4,7 +4,7 @@
 //! the formats `peel` already supports — metadata lives at the tail,
 //! the streaming pipeline ([`crate::decode`]) cannot be used
 //! directly, and a separate "second-pipeline" driver
-//! (`docs/PLAN_v2.md` §5 / `docs/PLAN_7z_support.md` §8) is the
+//! (`internal/PLAN_v2.md` §5 / `internal/PLAN_7z_support.md` §8) is the
 //! right shape. It also inherits ZIP's "many compression methods,
 //! scope what we ship" discipline.
 //!
@@ -12,7 +12,7 @@
 //! (a `Folder` groups multiple files into one decoded stream),
 //! coder chains (e.g. LZMA → BCJ → ...), commonly compressed
 //! headers ("EncodedHeader"), and no formal RFC. See
-//! `docs/PLAN_7z_support.md` for the full design and the
+//! `internal/PLAN_7z_support.md` for the full design and the
 //! round-one feature list.
 //!
 //! # Layout
@@ -27,7 +27,7 @@
 //!
 //! # Round-one scope
 //!
-//! See `docs/PLAN_7z_support.md` §"What round-one deliberately
+//! See `internal/PLAN_7z_support.md` §"What round-one deliberately
 //! does *not* include" for the full list. The summary:
 //!
 //! - **Supported coders**: `COPY`, `DEFLATE`, `LZMA`, `LZMA2`.
@@ -50,7 +50,7 @@ use std::io::Read;
 use crate::decode::{DecodeError, StreamingDecoder};
 
 /// Format name [`crate::decode::DecoderRegistry::with_defaults`]
-/// registers 7z under (`docs/PLAN_7z_support.md` §10). The
+/// registers 7z under (`internal/PLAN_7z_support.md` §10). The
 /// coordinator pre-checks the resolved factory against this
 /// constant and dispatches to
 /// [`crate::download::sevenz_pipeline`] instead of invoking the

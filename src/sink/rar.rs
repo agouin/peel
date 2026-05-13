@@ -30,7 +30,7 @@
 //!
 //! # Resume
 //!
-//! Per `docs/PLAN_rar.md` §3 step 4, the checkpoint records
+//! Per `internal/PLAN_rar.md` §3 step 4, the checkpoint records
 //! `current_entry_offset` for the in-flight entry. The pipeline
 //! drives resume by calling [`Self::begin_entry_resume`] which
 //! truncates the existing on-disk file to `resume_at`, re-reads the

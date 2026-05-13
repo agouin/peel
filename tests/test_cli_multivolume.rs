@@ -1,5 +1,5 @@
 //! Integration tests for the CLI's multi-volume HTTP auto-discovery
-//! wiring (`docs/PLAN_multivolume_archives.md` §7 Phase 5).
+//! wiring (`internal/PLAN_multivolume_archives.md` §7 Phase 5).
 //!
 //! The discovery primitive itself is exercised by
 //! [`tests/test_multivolume_discovery.rs`]; this file pins the
@@ -144,7 +144,7 @@ fn cli_explicit_additional_urls_disable_auto_discovery() {
     // about parts. Multi-part storage stays off; the legacy
     // single-`.peel.part` byte-concat layout drives the run. This
     // preserves multi-URL byte-concat semantics
-    // (`docs/PLAN_multi_url_source.md`) byte-for-byte.
+    // (`internal/PLAN_multi_url_source.md`) byte-for-byte.
     let server = presence_server(&[
         // The CLI never probes here because additional_urls is
         // non-empty before the discovery branch runs.

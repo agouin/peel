@@ -168,7 +168,7 @@ fully OSI. Concrete consequences:
   unchanged for §1–§3.
 - §4's sketch (built around an `unrar` wrapper) is invalidated. §4
   is spun out into a new sibling sub-plan
-  `docs/PLAN_rar5_decoder.md` modeled on
+  `internal/PLAN_rar5_decoder.md` modeled on
   `PLAN_zstd_block_decoder.md` and `PLAN_xz_block_decoder.md` —
   multi-phase, each phase with its own demo, with the same
   differential-test discipline (encode fixtures with a known-correct

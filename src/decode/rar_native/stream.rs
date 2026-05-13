@@ -1,7 +1,7 @@
 //! `RarStreamDecoder` — `StreamingDecoder` adapter that drives the
 //! [`super::lzss::LzssDecoder`] over an entry's compressed bytes.
 //!
-//! Per `docs/PLAN_rar5_decoder.md` §E1 this is the integration
+//! Per `internal/PLAN_rar5_decoder.md` §E1 this is the integration
 //! seam: the layers committed in §A1/§A2/§B1/§B2/§C1 produce
 //! `decode_block`-shaped primitives; this module wraps them in
 //! the bounded-step / `bytes_consumed` / `frame_boundary` contract
@@ -91,7 +91,7 @@ pub struct RarStreamDecoder {
     /// block's bitstream as **lookahead** for the LZSS dispatcher's
     /// peek_bits — see [`Self::BLOCK_LOOKAHEAD_BYTES`] and the
     /// libarchive parity discussion in
-    /// `docs/PLAN_rar5_multi_block_decode.md`. Replayed at the
+    /// `internal/PLAN_rar5_multi_block_decode.md`. Replayed at the
     /// start of the next [`Self::read_block`] call so the next
     /// block's prologue parses normally; never re-pulled from
     /// `src`. Empty between block reads.
@@ -318,7 +318,7 @@ impl RarStreamDecoder {
         // Non-last blocks: pull lookahead so the dispatcher can
         // peek past the block boundary into the next block's
         // prologue bytes (libarchive parity, see
-        // `docs/PLAN_rar5_multi_block_decode.md`). Whatever we
+        // `internal/PLAN_rar5_multi_block_decode.md`). Whatever we
         // pull goes into both `block` (for the dispatcher to see)
         // and `prepend_buf` (so the next prologue read sees the
         // same bytes). For the last block we don't bother — the

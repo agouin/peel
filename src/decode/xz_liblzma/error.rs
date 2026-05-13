@@ -1,13 +1,13 @@
 //! Local error type for the liblzma-port decoder.
 //!
-//! Phase 1 of [`docs/PLAN_xz_liblzma_port.md`](../../../../docs/PLAN_xz_liblzma_port.md).
+//! Phase 1 of [`internal/PLAN_xz_liblzma_port.md`](../../../../internal/PLAN_xz_liblzma_port.md).
 //! Mirrors the structure of [`super::super::xz_native::error::XzError`]
 //! but is a separate type so the two decoders can evolve
 //! independently. Phase 1 only populates the range-coder /
 //! LZMA-model variants; Stream / Block / LZMA2 variants land in
 //! Phase 6.
 //!
-//! Per `docs/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
+//! Per `internal/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
 //! documentation; structured variants beat opaque `io::Error`
 //! payloads at debug time.
 //!

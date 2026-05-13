@@ -2,8 +2,8 @@
 //! the shared sparse-file pipeline.
 //!
 //! Mirrors the second-pipeline architecture used by ZIP and 7z
-//! (`docs/PLAN_v2.md` §5 / `docs/PLAN_7z_support.md` §8 /
-//! `docs/PLAN_rar.md` §3) but with RAR5's simpler layout: the
+//! (`internal/PLAN_v2.md` §5 / `internal/PLAN_7z_support.md` §8 /
+//! `internal/PLAN_rar.md` §3) but with RAR5's simpler layout: the
 //! archive header is at offset 0 and per-entry data immediately
 //! follows each file header. There is no central-directory
 //! trailing-fetch dance — we walk forward, header by header, from
@@ -11,7 +11,7 @@
 //!
 //! Round-one §3 ships STORED-method (`compression method = 0`)
 //! extraction. The hand-rolled RAR5 decoder lands in §4 via
-//! `docs/PLAN_rar5_decoder.md` and plugs into the same per-entry
+//! `internal/PLAN_rar5_decoder.md` and plugs into the same per-entry
 //! flow described below.
 //!
 //! # Workflow
@@ -116,7 +116,7 @@ pub struct RarPipelineConfig {
     /// equivalently to `vec![0]`). The walker uses the table to
     /// jump past per-volume signature + main archive headers when
     /// an end-of-archive marker carries `more_volumes`
-    /// (`docs/PLAN_multivolume_archives.md` §2c).
+    /// (`internal/PLAN_multivolume_archives.md` §2c).
     pub volume_starts: Vec<u64>,
 }
 
@@ -326,7 +326,7 @@ pub struct RarPipeline<'a> {
     /// Multi-part sparse landing the workers are filling. The
     /// single-volume HTTP run is a one-part [`MultiSparse`] whose
     /// methods take a fast direct path; the per-volume multi-volume
-    /// shape (`docs/PLAN_multivolume_archives.md` §7) routes reads,
+    /// shape (`internal/PLAN_multivolume_archives.md` §7) routes reads,
     /// writes, and punches through the same wrapper.
     pub sparse: &'a MultiSparse,
     /// Bitmap recording which chunks are durable on disk.
@@ -349,7 +349,7 @@ pub struct RarPipeline<'a> {
     /// path.
     pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
     /// Password source for encrypted archives
-    /// (`docs/PLAN_archive_encryption.md` §4). `None` means peel
+    /// (`internal/PLAN_archive_encryption.md` §4). `None` means peel
     /// has no password to offer; an encrypted entry then surfaces
     /// [`EncryptionError::PasswordMissing`] before any data flows.
     /// Resolved (loaded into a [`crate::secret::Password`]) lazily
@@ -403,7 +403,7 @@ impl<'a> RarPipeline<'a> {
         let (kind, sig_len) = detect_signature(&sig_buf).map_err(RarPipelineError::Rar)?;
         let sig_size = sig_len as u64;
         if matches!(kind, SignatureKind::Legacy) {
-            // Hand off to the legacy walker. `docs/PLAN_rar3.md`
+            // Hand off to the legacy walker. `internal/PLAN_rar3.md`
             // §A2b: round-one supports STORED-method (`m=0`) legacy
             // entries end-to-end; `m≥1` surfaces a precise
             // `UnsupportedFeature` naming the version + method, and
@@ -422,7 +422,7 @@ impl<'a> RarPipeline<'a> {
         let mut cursor: u64 = sig_size;
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut solid = false;
-        // Multi-volume state (`docs/PLAN_multivolume_archives.md`
+        // Multi-volume state (`internal/PLAN_multivolume_archives.md`
         // §2c). For single-volume input `volume_starts` is empty
         // and `num_volumes == 1`; the EOA branch breaks out of the
         // walker on the lone marker. For multi-volume input the
@@ -1697,7 +1697,7 @@ impl<'a> RarPipeline<'a> {
     ///
     /// Mirrors [`Self::run`] in shape but uses the legacy header
     /// parsers from [`crate::rar::legacy::format`]. Round-one
-    /// (`docs/PLAN_rar3.md` §A2b) supports STORED-method (`m=0`,
+    /// (`internal/PLAN_rar3.md` §A2b) supports STORED-method (`m=0`,
     /// wire byte `0x30`) entries end-to-end; compressed methods
     /// surface a precise [`RarError::UnsupportedFeature`] naming
     /// the version + method byte and the decoder lands in
@@ -2020,7 +2020,7 @@ impl<'a> RarPipeline<'a> {
     ///
     /// Mirrors the structure of [`Self::decompress_entry_to_sink`]
     /// (the RAR5 compressed path) but uses
-    /// [`RarLegacyStreamDecoder`] (`docs/PLAN_rar3.md` §E1) over the
+    /// [`RarLegacyStreamDecoder`] (`internal/PLAN_rar3.md` §E1) over the
     /// in-memory compressed payload. Round-one buffers the entry's
     /// full `packed_size` before constructing the decoder; Phase G
     /// (`O.RAR.STREAMING_DECOMPRESS`) lifts this to a chunk-by-
@@ -2029,7 +2029,7 @@ impl<'a> RarPipeline<'a> {
     ///
     /// `resume_decoder_state` carries the saved
     /// [`RarLegacyStreamDecoder`] snapshot blob when this entry was
-    /// in flight at the previous checkpoint (`docs/PLAN_rar3.md`
+    /// in flight at the previous checkpoint (`internal/PLAN_rar3.md`
     /// §F1). When `Some`, the sink uses `begin_entry_resume` to
     /// replay the on-disk prefix and seed its running CRC, and
     /// the decoder is constructed via [`RarLegacyStreamDecoder::resume`]

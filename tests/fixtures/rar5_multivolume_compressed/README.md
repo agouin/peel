@@ -2,7 +2,7 @@
 
 Real RAR5 multi-volume archives with the standard RAR5 algorithm
 (method 3, "normal") produced by WinRAR 7.22 for
-`docs/PLAN_multivolume_archives.md` §2d (compressed-SPLIT support).
+`internal/PLAN_multivolume_archives.md` §2d (compressed-SPLIT support).
 
 ## Layout
 

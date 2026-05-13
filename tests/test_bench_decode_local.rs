@@ -7,10 +7,10 @@
 //! into both sides; this one strips it out so the per-format ratios
 //! reflect the decoder kernel alone.
 //!
-//! Plan: [`docs/PLAN_decoder_throughput_vs_cli.md`]. This file
+//! Plan: [`internal/old/PLAN_decoder_throughput_vs_cli.md`]. This file
 //! corresponds to §1 (scaffold), §2 (fixture size sweep), and §3
 //! (cold vs. warm cache isolation). §5's "next optimisation queue"
-//! summary lands in `docs/bench-results/` after a real grid run on
+//! summary lands in `internal/bench-results/` after a real grid run on
 //! the primary benchmark host — that's an operator task, not
 //! something the bench source produces directly.
 //!
@@ -20,7 +20,7 @@
 //! ([`test_bench_streaming.rs`], [`test_bench_deflate_native.rs`],
 //! [`test_bench_xz_liblzma.rs`], [`test_bench_rar_smoke.rs`]) uses
 //! the same on-demand pattern — `#[ignore]`'d tests invoked
-//! explicitly, results archived under `docs/bench-results/`. A
+//! explicitly, results archived under `internal/bench-results/`. A
 //! per-PR smoke gate is non-trivial CI infrastructure to add (the
 //! plan calls out "the CI overhead is non-trivial and the value is
 //! 'catch regressions before they bake in,' which can also be
@@ -93,7 +93,7 @@ use support::zip_fixtures::{build_zip, ZipEntrySpec};
 
 // ---- size tiers -------------------------------------------------------
 
-/// Approximate compressed-size targets per tier (`docs/PLAN_decoder_throughput_vs_cli.md` §2).
+/// Approximate compressed-size targets per tier (`internal/old/PLAN_decoder_throughput_vs_cli.md` §2).
 /// The numbers are *raw* payload sizes; the on-the-wire size after
 /// compression varies per format, but the LCG-generated payload is
 /// near-incompressible (matching the streaming bench's
@@ -391,7 +391,7 @@ fn assert_file_matches(path: &Path, body: &[u8]) {
 
 /// `getrusage(2)` wrapper that returns user + system CPU time as a
 /// single [`Duration`]. Declared inline because the project's
-/// dependency policy bars `libc` (`docs/ENGINEERING_STANDARDS.md`
+/// dependency policy bars `libc` (`internal/ENGINEERING_STANDARDS.md`
 /// §2.2); same precedent as the `fallocate` / `pwrite` declarations
 /// in `src/punch.rs` and `tests/test_punch_race_macos.rs`.
 mod rusage {
@@ -591,7 +591,7 @@ enum Shape {
     /// directory tree; the encoder takes the named entry list
     /// directly rather than a single byte buffer. Peel's local
     /// path routes these through the per-format pipelines
-    /// (`docs/PLAN_local_file_extract.md` §2 step 5).
+    /// (`internal/old/PLAN_local_file_extract.md` §2 step 5).
     Container,
 }
 
@@ -1014,7 +1014,7 @@ fn one_ref_iter(
 ///
 /// Cold = one fresh run each side. Warm = a throw-away warm-up run
 /// followed by the timed run (see
-/// `docs/PLAN_decoder_throughput_vs_cli.md` §3 step 1; we follow
+/// `internal/old/PLAN_decoder_throughput_vs_cli.md` §3 step 1; we follow
 /// the plan's "run the decoder twice, drop the first" simplification
 /// rather than running a full N-sample median, which materially
 /// inflates wall-clock cost on the 1 GiB tier with no signal gain
@@ -1145,7 +1145,7 @@ fn geometric_mean(cells: &[&Cell]) -> f64 {
     (log_sum / n as f64).exp()
 }
 
-/// Print the medium-tier warm-cache summary `docs/PLAN_decoder_throughput_vs_cli.md` §5
+/// Print the medium-tier warm-cache summary `internal/old/PLAN_decoder_throughput_vs_cli.md` §5
 /// will consume: one line per format, plus a final geometric-mean
 /// row. This is the "ranking" deliverable — the row with the
 /// highest ratio is the optimisation target.
@@ -1252,7 +1252,7 @@ fn warmup_binaries(formats: &[FormatSpec]) {
 }
 
 /// One-time banner describing the host so the printed grid is
-/// reproducible (`docs/PLAN_decoder_throughput_vs_cli.md` §"Hard
+/// reproducible (`internal/old/PLAN_decoder_throughput_vs_cli.md` §"Hard
 /// constraints": "every run records the host CPU, kernel, and tool
 /// versions"). Best-effort: missing commands surface as `<unknown>`
 /// rather than failing the run.

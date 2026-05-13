@@ -1,5 +1,5 @@
 //! Multi-part source: N URLs whose byte-concatenation is one logical
-//! archive stream (`docs/PLAN_multi_url_source.md` §1).
+//! archive stream (`internal/PLAN_multi_url_source.md` §1).
 //!
 //! Each part is a self-contained HTTP object with its own `Content-Length`,
 //! `ETag`, and (optionally) per-part SHA-256 expectation. A
@@ -19,7 +19,7 @@
 //!
 //! The single-URL case is the `parts.len() == 1` case; existing pipeline
 //! code constructs a one-element source and routes through the same
-//! seam (`docs/PLAN_multi_url_source.md` §1 step 2).
+//! seam (`internal/PLAN_multi_url_source.md` §1 step 2).
 
 #![cfg(unix)]
 
@@ -45,7 +45,7 @@ pub struct PartDescriptor {
     pub fingerprint: SourceFingerprint,
     /// Expected SHA-256 of the part's bytes, if the user passed
     /// `--sha256` for it. Verified at the part-end boundary by
-    /// `docs/PLAN_multi_url_source.md` §4.
+    /// `internal/PLAN_multi_url_source.md` §4.
     pub expected_sha256: Option<[u8; 32]>,
 }
 

@@ -25,7 +25,7 @@
 //! RARLAB public release) under Docker `linux/amd64` emulation,
 //! with `-mcT-` to disable PPMd and `-mcX+` to force each
 //! standard filter. See `tests/fixtures/rar_legacy/README.md`
-//! for the encode recipe and `docs/PLAN_rar3.md` §C2b for the
+//! for the encode recipe and `internal/PLAN_rar3.md` §C2b for the
 //! corpus-sourcing rationale.
 
 #![cfg(feature = "rar")]

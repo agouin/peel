@@ -10,7 +10,7 @@
 //!
 //! # Why a local type
 //!
-//! Following `docs/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
+//! Following `internal/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
 //! documentation. A "bad windowLog" or "reserved block type" is far
 //! more useful in test assertions and tracing fields than the
 //! generic `std::io::Error::other(...)` we'd otherwise stuff into
@@ -88,7 +88,7 @@ pub enum ZstdError {
     /// `Compressed_Block` reached a block whose decoding the
     /// hand-rolled decoder hasn't yet been taught. Used as a
     /// deliberate Phase-1 placeholder per
-    /// `docs/PLAN_zstd_block_decoder.md` §Phase 1; removed in
+    /// `internal/PLAN_zstd_block_decoder.md` §Phase 1; removed in
     /// Phase 5 once sequence execution lands.
     #[error("zstd: compressed block decoding not yet implemented")]
     CompressedBlockUnimplemented,

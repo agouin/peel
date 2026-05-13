@@ -10,7 +10,7 @@
 //! that the coordinator, download workers, and extractor update directly.
 //!
 //! Errors at the binary boundary are wrapped via [`anyhow`] per
-//! `docs/ENGINEERING_STANDARDS.md` §3.2.
+//! `internal/ENGINEERING_STANDARDS.md` §3.2.
 
 #![cfg(unix)]
 #![warn(unused, clippy::all)]
@@ -314,7 +314,7 @@ fn install_graceful_watchdog(deadline: Duration, cleanup_done: Arc<AtomicBool>) 
 /// failed" code 1.
 ///
 /// Implements the exit-code routing described in
-/// `docs/PLAN_archive_encryption.md` §6.
+/// `internal/PLAN_archive_encryption.md` §6.
 fn password_exit_code_required(err: &anyhow::Error) -> bool {
     let mut current: &(dyn StdError + 'static) = err.as_ref();
     loop {
@@ -374,7 +374,7 @@ fn main() -> Result<()> {
     let http_banner = http_version_banner(cli.http_version.into());
     let dispatch = cli.into_dispatch().context("parsing CLI arguments")?;
 
-    // Local-file mode (`docs/PLAN_local_file_extract.md`) skips
+    // Local-file mode (`internal/old/PLAN_local_file_extract.md`) skips
     // every HTTP-side knob — no scheduler retries, no
     // multi-attempt rebuild, no mirror state. Handle it before
     // setting up the HTTP-flavored renderer scaffolding.
@@ -487,7 +487,7 @@ fn main() -> Result<()> {
         }
         Err(other) => {
             let wrapped = anyhow::Error::from(other).context("running peel");
-            // §6 of `docs/PLAN_archive_encryption.md`: surface a
+            // §6 of `internal/PLAN_archive_encryption.md`: surface a
             // wrong-password / missing-password failure as exit code
             // 4 so scripts can distinguish it from the generic
             // "extraction failed" code 1. The error chain may wrap
@@ -528,7 +528,7 @@ fn main() -> Result<()> {
 }
 
 /// Drive the local-file extractor
-/// (`docs/PLAN_local_file_extract.md`). Mirrors the HTTP path's
+/// (`internal/old/PLAN_local_file_extract.md`). Mirrors the HTTP path's
 /// renderer / IO-backend / kill-switch wiring but skips the
 /// download-side retry loop entirely: a local extraction either
 /// completes or surfaces a clean error.

@@ -744,7 +744,7 @@ Phase F closes the low-bandwidth gap and unlocks
 crash-resume parity with `xz_native`.
 
 **Phase F follow-on plan**:
-[`docs/PLAN_xz_liblzma_phase_f.md`](PLAN_xz_liblzma_phase_f.md).
+[`internal/old/PLAN_xz_liblzma_phase_f.md`](PLAN_xz_liblzma_phase_f.md).
 
 **Decisions inherited into Phase F** (per user direction
 during Phase 9):
@@ -905,7 +905,7 @@ projection from the current 4–6×.
 - [`PLAN_xz_decoder_optimization.md`](PLAN_xz_decoder_optimization.md)
   — predecessor plan whose Phase 2 is the as-shipped
   baseline.
-- [`docs/profiles/liblzma_vs_peel_inner_loop.md`](profiles/liblzma_vs_peel_inner_loop.md)
+- [`internal/profiles/liblzma_vs_peel_inner_loop.md`](profiles/liblzma_vs_peel_inner_loop.md)
   — Phase A's deliverable; documents the structural shapes
   this plan ports.
 - liblzma sources (vendored via `lzma-sys 0.1.20` at
@@ -956,7 +956,7 @@ low-bandwidth cells regress slightly because Phase 6's
 that.
 
 **Follow-on plan**:
-[`docs/PLAN_xz_liblzma_phase_f.md`](PLAN_xz_liblzma_phase_f.md)
+[`internal/old/PLAN_xz_liblzma_phase_f.md`](PLAN_xz_liblzma_phase_f.md)
 — Sequence-resume arms, true streaming I/O, multi-Block
 support, checkpoint blob format, resume_factory, and the
 migration commit that retires `xz_native`.

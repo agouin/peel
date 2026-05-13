@@ -1,5 +1,5 @@
 //! AES-CTR and AES-CBC mode wrappers
-//! (`docs/PLAN_archive_encryption.md` §2). Layered on top of any
+//! (`internal/PLAN_archive_encryption.md` §2). Layered on top of any
 //! [`AesBlockCipher`] from [`super::aes`].
 //!
 //! # Modes

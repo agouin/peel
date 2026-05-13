@@ -176,7 +176,7 @@ fn encode_gzip(payload: &[u8]) -> Vec<u8> {
 /// all decode it back to `payload`).
 ///
 /// This is the on-the-wire shape `pigz` / `gzip a b > c.gz` produces.
-/// Phase 0 of `docs/PLAN_gzip_throughput.md`: the round-one parallel-
+/// Phase 0 of `internal/PLAN_gzip_throughput.md`: the round-one parallel-
 /// member decoder targets exactly this shape; baseline `gzip -d` does
 /// not parallelize across members but does decode them sequentially,
 /// so the same baseline pipe row applies.
@@ -959,7 +959,7 @@ fn diag_plain_tar_breakdown() {
 
 // ---- diagnostic: tar.xz pipeline overhead breakdown ------------------
 
-/// Phase 0b of `docs/PLAN_xz_throughput.md`. Same shape as
+/// Phase 0b of `internal/old/PLAN_xz_throughput.md`. Same shape as
 /// `diag_plain_tar_breakdown` above but on the tar.xz fixture, and
 /// with two extra columns and one extra variant aimed at
 /// pinpointing the ~14× pipeline-overhead gap that Phase 0
@@ -1155,7 +1155,7 @@ fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
     }
 }
 
-/// Phase 0 of `docs/PLAN_streaming_hot_lane_throughput.md`: run the
+/// Phase 0 of `internal/old/PLAN_streaming_hot_lane_throughput.md`: run the
 /// same hot-lane configuration matrix across the streaming tar-family
 /// formats and print a source/download/extraction breakdown.
 ///
@@ -1626,7 +1626,7 @@ fn bench_throttled_realistic_grid() {
         }
 
         // ---- tar.gz (multi-member, `pigz`/concat shape) ---------------
-        // Phase 0 of `docs/PLAN_gzip_throughput.md`: this row exists so
+        // Phase 0 of `internal/PLAN_gzip_throughput.md`: this row exists so
         // the README grid can show "tar.gz · multi" alongside the
         // single-member row once parallel-member decode lands. The
         // baseline pipe is the same `gzip -d` (handles concatenated
@@ -2162,7 +2162,7 @@ fn bench_throttled_download_then_extract_grid() {
         // Same story as zip: no streaming-pipe baseline exists; peel
         // turns "download fully then extract" into "extract while
         // downloading" via the second-pipeline driver
-        // (`docs/PLAN_7z_support.md` §8).
+        // (`internal/PLAN_7z_support.md` §8).
         if tool_present("7z") {
             let pairs: Vec<(&str, Vec<u8>)> = entries
                 .iter()

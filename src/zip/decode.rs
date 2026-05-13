@@ -1,13 +1,13 @@
 //! Per-entry decoder dispatcher for the ZIP pipeline.
 //!
-//! Round-one supports three compression methods (`docs/PLAN_v2.md`
+//! Round-one supports three compression methods (`internal/PLAN_v2.md`
 //! §5):
 //!
 //! - **STORED (0)** — passthrough; bytes flow from source to sink
 //!   verbatim.
 //! - **DEFLATE (8)** — RFC 1951 raw deflate via the hand-rolled
 //!   [`crate::decode::deflate_native::Decoder`]. Phase 9a of
-//!   `docs/PLAN_deflate_block_decoder.md` swapped this off
+//!   `internal/PLAN_deflate_block_decoder.md` swapped this off
 //!   `flate2`'s `miniz_oxide` backend; the entry's compressed
 //!   bytes are buffered into an owned [`std::io::Cursor`] before
 //!   handoff so the existing `'static`-source decoder API works
@@ -135,7 +135,7 @@ pub type InEntryProgressCallback<'a> =
     &'a mut dyn FnMut(u64, Option<Vec<u8>>) -> std::io::Result<()>;
 
 /// Per-entry AES decryption parameters
-/// (`docs/PLAN_archive_encryption.md` §3).
+/// (`internal/PLAN_archive_encryption.md` §3).
 ///
 /// When threaded into [`decompress_entry_with_resume`], the source
 /// reader is wrapped in an [`AesDecryptReader`] before the inner
@@ -159,7 +159,7 @@ pub struct AesDecryptParams<'a> {
 }
 
 /// Per-entry ZipCrypto decryption parameters
-/// (`docs/PLAN_archive_encryption.md` §3b).
+/// (`internal/PLAN_archive_encryption.md` §3b).
 ///
 /// When threaded into [`decompress_entry_with_resume`], the source
 /// reader is wrapped in a [`ZipCryptoReader`] (which consumes the
@@ -486,7 +486,7 @@ fn aes_io_to_entry_decode(e: std::io::Error, entry_name: &str) -> EntryDecodeErr
 ///
 /// Memory peak per call is the entry's *remaining* compressed size
 /// (compressed_size minus `resume.source_byte_offset`); Phase 11
-/// of `docs/PLAN_deflate_block_decoder.md` may swap this for a
+/// of `internal/PLAN_deflate_block_decoder.md` may swap this for a
 /// streaming variant once real-world archives need it.
 fn decompress_deflate_entry_with_resume<R: Read>(
     mut compressed: R,

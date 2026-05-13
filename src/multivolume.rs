@@ -1,5 +1,5 @@
 //! Multi-volume archive discovery
-//! (`docs/PLAN_multivolume_archives.md` §1).
+//! (`internal/PLAN_multivolume_archives.md` §1).
 //!
 //! Given a single seed source — a URL or a local file path — resolve
 //! the full ordered set of sibling volumes for one of three

@@ -1,7 +1,7 @@
 //! Progress tracking primitives shared between the writers (download
 //! workers, extractor, ZIP pipeline) and the renderer thread.
 //!
-//! Per `docs/PLAN_v2.md` §6, `peel` exposes a multi-field progress UI:
+//! Per `internal/PLAN_v2.md` §6, `peel` exposes a multi-field progress UI:
 //! compressed bytes downloaded out of total, decompressed bytes
 //! extracted, rolling 5-second download/extract rates, ETA, and active
 //! worker count. The pieces fit together so that writers stay
@@ -116,7 +116,7 @@ pub struct ProgressState {
     /// running, so this is the reachable signal during a true wedge).
     decode_step_started_ns: AtomicU64,
     /// Per-part counters for multi-URL split-source runs
-    /// (`docs/PLAN_multi_url_source.md`). Initialized once by the
+    /// (`internal/PLAN_multi_url_source.md`). Initialized once by the
     /// coordinator after discovery via [`Self::set_parts`]; left
     /// unset for runs that never hit that path. When set, workers
     /// credit per-part bytes via [`Self::add_downloaded_to_part`]
@@ -176,7 +176,7 @@ impl ProgressState {
     }
 
     /// Initialize the per-part counters
-    /// (`docs/PLAN_multi_url_source.md`). Call once after discovery.
+    /// (`internal/PLAN_multi_url_source.md`). Call once after discovery.
     /// Subsequent calls are silently ignored — `OnceLock` semantics —
     /// so the same coordinator can [`Self::reset_for_retry`] and
     /// re-init only on a brand-new state instance. `parts` carries
@@ -330,7 +330,7 @@ impl ProgressState {
     /// Renderers read this flag (surfaced as
     /// [`ProgressSnapshot::local`]) to suppress download / lookahead
     /// / workers rows for runs whose source is already on disk
-    /// (`docs/PLAN_local_file_extract.md` §4).
+    /// (`internal/old/PLAN_local_file_extract.md` §4).
     pub fn mark_local(&self) {
         self.local.store(true, Ordering::Release);
     }
@@ -486,14 +486,14 @@ pub struct ProgressSnapshot {
     /// watchdog cannot reach).
     pub decode_step_elapsed: Option<Duration>,
     /// Per-part view of the download counters
-    /// (`docs/PLAN_multi_url_source.md`). Empty for runs that did
+    /// (`internal/PLAN_multi_url_source.md`). Empty for runs that did
     /// not call [`ProgressState::set_parts`] — single-URL runs
     /// historically take this path. Length matches the discovered
     /// part count when populated; index N is the same part as
     /// `info.source.parts()[N]`.
     pub parts: Vec<PartProgressSnapshot>,
     /// `true` when the source is a local file
-    /// (`docs/PLAN_local_file_extract.md` §4). Renderers suppress
+    /// (`internal/old/PLAN_local_file_extract.md` §4). Renderers suppress
     /// the download / lookahead / workers rows on such runs — the
     /// counters under those rows are either zero (workers never
     /// register) or duplicative (`bytes_downloaded` and
@@ -785,7 +785,7 @@ pub struct TtyRenderer<W: Write + Send> {
     last_lines_emitted: usize,
     /// Per-part rate buffers, one per discovered part. Allocated
     /// lazily on the first non-empty snapshot
-    /// (`docs/PLAN_multi_url_source.md` progress UI). `Vec::is_empty()`
+    /// (`internal/PLAN_multi_url_source.md` progress UI). `Vec::is_empty()`
     /// means "not yet seen multi-URL data" — single-URL runs leave it
     /// empty for the entire run.
     rate_parts: Vec<RateBuffer>,
@@ -793,7 +793,7 @@ pub struct TtyRenderer<W: Write + Send> {
 
 /// Maximum number of per-part rows the TTY renderer prints before
 /// collapsing the tail into a `... + N more` summary
-/// (`docs/PLAN_multi_url_source.md` progress UI). Sized so a 24-row
+/// (`internal/PLAN_multi_url_source.md` progress UI). Sized so a 24-row
 /// xterm shows every row plus the 5-line aggregate footer for
 /// realistic Arbitrum-shaped inventories (≤ 5 parts) and most
 /// long-tail manifests, while still bounding output for pathological
@@ -879,7 +879,7 @@ impl<W: Write + Send> TtyRenderer<W> {
     ///
     /// Single-URL (or pre-discovery) snapshots emit exactly the
     /// historical 5 lines. Multi-URL snapshots
-    /// (`docs/PLAN_multi_url_source.md` progress UI) emit one row per
+    /// (`internal/PLAN_multi_url_source.md` progress UI) emit one row per
     /// part *above* the 5-line aggregate footer; rows past
     /// [`MAX_PART_ROWS`] are collapsed into a `... + N more` line.
     pub fn format_block(
@@ -938,7 +938,7 @@ impl<W: Write + Send> TtyRenderer<W> {
         let term_cols = self.columns();
         let bar_cap = self.bar_max_columns.min(MAX_BAR_COLUMNS);
         // Local-file runs have no download side
-        // (`docs/PLAN_local_file_extract.md` §4): the network/disk
+        // (`internal/old/PLAN_local_file_extract.md` §4): the network/disk
         // classifier compares `bytes_downloaded` against
         // `bytes_decoded_input`, but both counters are pumped from
         // the same source-read in local mode, so any verdict it
@@ -987,7 +987,7 @@ impl<W: Write + Send> TtyRenderer<W> {
         lines.push(format_overall_line(
             snap, percent, term_cols, bar_cap, self.style,
         ));
-        // Local-file runs (`docs/PLAN_local_file_extract.md` §4)
+        // Local-file runs (`internal/old/PLAN_local_file_extract.md` §4)
         // suppress the download row and the lookahead row: the
         // "download" counter is just the decoder's source-read
         // cursor, the workers tally is always 0/0, and the lookahead
@@ -1045,7 +1045,7 @@ fn part_row_bar_columns(term_cols: usize, label_width: usize) -> usize {
 }
 
 /// Format one per-part progress row
-/// (`docs/PLAN_multi_url_source.md` progress UI). Layout:
+/// (`internal/PLAN_multi_url_source.md` progress UI). Layout:
 ///
 /// ```text
 /// [================  ]   64.5%  pruned.tar.part0001  165.0 GiB / 256.0 GiB  @ 12.0 MiB/s
@@ -1139,7 +1139,7 @@ impl<W: Write + Send> ProgressRenderer for TtyRenderer<W> {
         //
         // The block height can change between ticks: the first tick
         // before discovery has zero parts, the second tick has N
-        // parts (`docs/PLAN_multi_url_source.md` progress UI). When
+        // parts (`internal/PLAN_multi_url_source.md` progress UI). When
         // the new block is *shorter* than the previous one we'd
         // leave stale rows visible below; emit a clear-to-EOL on
         // each leftover row (then move back up) so the dropped tail
@@ -1196,7 +1196,7 @@ pub struct LogRenderer {
     rate_ex: RateBuffer,
     rate_decoded_in: RateBuffer,
     /// Per-part rate buffers, allocated lazily on first non-empty
-    /// snapshot (`docs/PLAN_multi_url_source.md` progress UI). Empty
+    /// snapshot (`internal/PLAN_multi_url_source.md` progress UI). Empty
     /// for single-URL runs.
     rate_parts: Vec<RateBuffer>,
 }
@@ -1244,7 +1244,7 @@ impl LogRenderer {
         let percent = overall_percent(snap);
         let eta = compute_eta(snap, dl_rate, ex_rate);
         // Local-file runs have no download side
-        // (`docs/PLAN_local_file_extract.md` §4); see the parallel
+        // (`internal/old/PLAN_local_file_extract.md` §4); see the parallel
         // TTY branch for the rationale. Skip the classifier so no
         // bottleneck tag surfaces.
         let bottleneck = if snap.local {
@@ -1419,7 +1419,7 @@ pub const DEFAULT_STALL_WARN_INTERVAL: Duration = Duration::from_secs(30);
 /// every healthy run. The two counters that *can't* legitimately stop
 /// advancing for 30 s in the middle of an extraction are the decoder
 /// and sink — and those are exactly the ones the snapshot-restore pod
-/// stall ([`docs/PLAN_responsiveness.md`]) showed pinned at zero.
+/// stall ([`internal/PLAN_responsiveness.md`]) showed pinned at zero.
 #[derive(Debug)]
 pub struct StallDetector {
     warn_interval: Duration,
@@ -2776,7 +2776,7 @@ mod tests {
     #[test]
     fn log_renderer_format_line_drops_download_fields_for_local_mode() {
         // Local-file extractions
-        // (`docs/PLAN_local_file_extract.md` §4) have no download
+        // (`internal/old/PLAN_local_file_extract.md` §4) have no download
         // side. The log line should drop `download X / Y @ Z`,
         // `lookahead`, `decoded_in`, `workers`, and the bottleneck
         // tag — every counter on that side is either zero (workers)
@@ -3147,7 +3147,7 @@ mod tests {
         assert!(l2.contains("\x1b[36m"));
     }
 
-    // ---- per-part display (`docs/PLAN_multi_url_source.md`) -------
+    // ---- per-part display (`internal/PLAN_multi_url_source.md`) -------
 
     fn three_part_snapshot() -> ProgressSnapshot {
         ProgressSnapshot {

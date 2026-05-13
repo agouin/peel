@@ -9,7 +9,7 @@
 //! parser walks (`process_header`, `validate_magic`, `validate_checksum`,
 //! `parse_pax_records`, base-256 numeric parsing, …).
 //!
-//! Required per `docs/ENGINEERING_STANDARDS.md` §5.2 ("frame boundary
+//! Required per `internal/ENGINEERING_STANDARDS.md` §5.2 ("frame boundary
 //! detection") for the tar format.
 
 #![no_main]

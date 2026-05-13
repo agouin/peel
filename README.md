@@ -15,7 +15,7 @@ tree never coexist at full size, and a resumed run produces output
 byte-identical to a clean run.
 
 ```
-peel https://example.com/dataset.tar.zst -o ./out/
+peel https://example.com/dataset.tar.zst
 ```
 
 ## What you get
@@ -32,7 +32,7 @@ peel https://example.com/dataset.tar.zst -o ./out/
   `.rar` — both **RAR5** (STORED + the standard RAR5 algorithm
   at compression methods 1..5, end-to-end through the hand-rolled
   `decode::rar_native` LZSS pipeline plus the RAR-VM standard
-  filters per `docs/PLAN_rar5_decoder.md`) and **legacy
+  filters per `internal/PLAN_rar5_decoder.md`) and **legacy
   RAR3/RAR4** (STORED + LZ-Normal entries through the hand-rolled
   `decode::rar_legacy` pipeline, with RarVM standard filters —
   E8, E8E9, Delta, RGB, Audio — dispatched per entry).
@@ -306,8 +306,8 @@ The 10 Gbps × 256 MiB cell is the one place `unrar` wins outright: at
 that scale the wire window collapses to ~0.3 s and the per-entry
 extraction cost dominates, where RARLAB's mature implementation has
 the edge over the freshly-landed pipelines (RAR5 STORED in
-[`docs/PLAN_rar.md`](docs/PLAN_rar.md) §3 and RAR3 LZ-Normal in
-[`docs/PLAN_rar3.md`](docs/PLAN_rar3.md) Phases B–C). The RAR3 row is
+[`internal/PLAN_rar.md`](internal/PLAN_rar.md) §3 and RAR3 LZ-Normal in
+[`internal/PLAN_rar3.md`](internal/PLAN_rar3.md) Phases B–C). The RAR3 row is
 also doing real decode work both sides — `-m3` packs the
 incompressible bench payload through full LZ + RarVM filters, not
 COPY — so its wall-clock floor (~1.8 s) is much higher than the
@@ -379,7 +379,7 @@ decoding *and* writing entries during what the reference pipeline
 still spends piping `zstd -dc | tar -xf -` between two processes.
 `tar.xz`, `xz-raw`, and `tar` all land near parity (0.90–0.93×):
 that's the LZMA decode floor (peel's
-[`xz_liblzma_phase_f`](docs/PLAN_xz_liblzma_phase_f.md) matches
+[`xz_liblzma_phase_f`](internal/old/PLAN_xz_liblzma_phase_f.md) matches
 `liblzma` per-CPU-cycle) and the bsdtar floor (a memcpy loop).
 
 `zip` is the headline at **0.21×** — peel finishes in 1/5 of the
@@ -390,9 +390,9 @@ per-entry overhead.
 
 The slower-than-1× rows are honest. `gz-raw` at **1.80× warm** is
 peel's hand-rolled DEFLATE decoder
-([`PLAN_decoder_throughput_vs_cli.md`](docs/PLAN_decoder_throughput_vs_cli.md)
+([`PLAN_decoder_throughput_vs_cli.md`](internal/old/PLAN_decoder_throughput_vs_cli.md)
 §5): single-threaded today and waiting on the parallel-member round
-that [`PLAN_gzip_throughput.md`](docs/PLAN_gzip_throughput.md) lays
+that [`PLAN_gzip_throughput.md`](internal/PLAN_gzip_throughput.md) lays
 out. `zstd-raw` at **1.75× warm** is a similar story: the bench
 extracts a single raw zstd frame to one output file, where peel's
 sink fsync + buffer dance shows up against `zstd`'s straight-through
@@ -403,7 +403,7 @@ reference `7z` binary's tight memcpy loop does, with more
 ceremony.
 
 `rar5` at **5.66× warm** is the largest gap on the grid. peel's RAR5
-STORED pipeline ([`docs/PLAN_rar.md`](docs/PLAN_rar.md) §3) is
+STORED pipeline ([`internal/PLAN_rar.md`](internal/PLAN_rar.md) §3) is
 recent and not yet tuned; RARLAB's mature `unrar` has a 10× lead on
 the unwrapped STORED case. `rar3` is a much closer **1.32× warm**
 because the per-entry work is real LZ + RarVM filter decode on both
@@ -586,7 +586,7 @@ MVP complete (2026-04-29). PLAN_v2 round one — multi-format support,
 io_uring file + network, adaptive chunk-sizing, mmap sparse file,
 SHA-256 integrity with resumable hashing, multi-mirror, bandwidth
 limiting, the progress UI — has landed on top. Active work moves back
-to [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) for round two
+to [`internal/OPTIMIZATIONS.md`](internal/OPTIMIZATIONS.md) for round two
 planning.
 
 | | Streaming | Frame-granular resume | Magic-byte detect |
@@ -614,7 +614,7 @@ deflate block via the same 32 KiB-window snapshot used for `.gz`; zstd
 entries resume per zstd block. Encoded into the checkpoint format
 (version 7) under each in-progress entry.
 ⁴ 7z uses a separate per-folder pipeline (the "second-pipeline"
-driver from `docs/PLAN_7z_support.md` §8) because of the
+driver from `internal/PLAN_7z_support.md` §8) because of the
 SignatureHeader → trailer-pointer layout. Round one: COPY, DEFLATE,
 LZMA, and LZMA2 coders; plain `Header` and unencrypted
 `EncodedHeader`; single-volume archives only. Resume granularity is
@@ -626,7 +626,7 @@ like zip / 7z), so peel streams entries to their final paths as
 each entry's data area arrives. STORED method plus the standard
 RAR5 algorithm (compression methods 1..5) both ship via the
 hand-rolled `decode::rar_native` LZSS + RAR-VM filter pipeline
-per `docs/PLAN_rar5_decoder.md`. Non-encrypted, single-volume
+per `internal/PLAN_rar5_decoder.md`. Non-encrypted, single-volume
 only; SFX, AES, and the rarely-used RAR-VM custom-filter slot
 (`O.RAR.CUSTOMFILTER`) are queued.
 ⁶ Mid-entry resume via the §F1 checkpoint blob: a `kill -9` mid-RAR5
@@ -635,7 +635,7 @@ start. Multi-block lookahead state is captured in the blob so resume
 is byte-identical.
 ⁷ Legacy RAR3/RAR4 uses the hand-rolled `decode::rar_legacy` LZ
 pipeline plus the RarVM standard-filter dispatcher (E8, E8E9, Delta,
-RGB, Audio) per `docs/PLAN_rar3.md`. STORED + LZ Normal (`-m3`) in
+RGB, Audio) per `internal/PLAN_rar3.md`. STORED + LZ Normal (`-m3`) in
 round one; the mid-entry checkpoint blob (`PLAN_rar3.md` §F1)
 captures the LZ dictionary state and filter program cache so
 resume is byte-identical. PPMd-II and other filters are queued.
@@ -659,6 +659,23 @@ only way to ship a RAR decoder without inheriting that constraint.
 All future RAR work in this repo must continue the same practice —
 see [`AGENTS.md`](AGENTS.md).
 
+## Documentation
+
+User-facing documentation lives at
+**<https://agouin.github.io/peel/>** (built from
+[`docs/`](docs/) via mdBook). It covers every CLI flag, the format
+matrix, encryption, multi-mirror / multi-volume / multi-part-URL
+workflows, the checkpoint-and-resume model, performance tuning, exit
+codes, and worked examples for Kubernetes init containers, CI
+runners, and Arbitrum snapshot bundles.
+
+To preview locally:
+
+```sh
+cargo install mdbook --locked
+mdbook serve docs --open
+```
+
 ## For contributors and AI agents
 
 Start with [`CLAUDE.md`](CLAUDE.md) (or [`AGENTS.md`](AGENTS.md) — both
@@ -666,15 +683,15 @@ point at the same docs). The full doc set:
 
 - [`CLAUDE.md`](CLAUDE.md) — entry point, house rules summary
 - [`AGENTS.md`](AGENTS.md) — workflow rules for coding agents
-- [`docs/PLAN.md`](docs/PLAN.md) — sequenced MVP plan (complete; kept
+- [`internal/PLAN.md`](internal/PLAN.md) — sequenced MVP plan (complete; kept
   as historical record)
-- [`docs/PLAN_v2.md`](docs/PLAN_v2.md) — round-one post-MVP plan
+- [`internal/PLAN_v2.md`](internal/PLAN_v2.md) — round-one post-MVP plan
   (complete)
-- [`docs/ENGINEERING_STANDARDS.md`](docs/ENGINEERING_STANDARDS.md) —
+- [`internal/ENGINEERING_STANDARDS.md`](internal/ENGINEERING_STANDARDS.md) —
   non-negotiable rules
-- [`docs/ENGINEERING_BEST_PRACTICES.md`](docs/ENGINEERING_BEST_PRACTICES.md)
+- [`internal/ENGINEERING_BEST_PRACTICES.md`](internal/ENGINEERING_BEST_PRACTICES.md)
   — idiomatic patterns
-- [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) — backlog;
+- [`internal/OPTIMIZATIONS.md`](internal/OPTIMIZATIONS.md) — backlog;
   promotions require a successor plan before implementation
 
 ## License

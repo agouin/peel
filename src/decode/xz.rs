@@ -1,6 +1,6 @@
 //! xz / LZMA streaming decoder ([XZ file format]).
 //!
-//! Phase F.6 of `docs/PLAN_xz_liblzma_phase_f.md` swapped the
+//! Phase F.6 of `internal/old/PLAN_xz_liblzma_phase_f.md` swapped the
 //! production xz path from the original hand-rolled
 //! `xz_native` decoder over to the structural port at
 //! [`super::xz_liblzma`]. This module is a thin re-export so

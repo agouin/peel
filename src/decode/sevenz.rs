@@ -6,7 +6,7 @@
 //! second-pipeline driver in `crate::download::sevenz_pipeline`
 //! will plug into.
 //!
-//! # Phase 1 (`docs/PLAN_7z_support.md` §1)
+//! # Phase 1 (`internal/PLAN_7z_support.md` §1)
 //!
 //! Wire-format primitive parsers live in [`number`]: the
 //! variable-length unsigned integer ([`number::parse_number`]),
@@ -17,7 +17,7 @@
 //! phase composes these primitives — getting them right once,
 //! with property tests, beats catching off-by-ones in §3 / §4.
 //!
-//! # Phase 2 (`docs/PLAN_7z_support.md` §2)
+//! # Phase 2 (`internal/PLAN_7z_support.md` §2)
 //!
 //! [`format`] holds the fixed 32-byte
 //! [`format::parse_signature_header`] that reads the
@@ -26,7 +26,7 @@
 //! trailer location the §8 pipeline drives the next ranged GET
 //! against.
 //!
-//! # Phase 3 (`docs/PLAN_7z_support.md` §3)
+//! # Phase 3 (`internal/PLAN_7z_support.md` §3)
 //!
 //! [`header`] decodes the trailer the §2 parser pointed at into
 //! a typed [`header::Header`] / [`header::StreamsInfo`] /
@@ -39,14 +39,14 @@
 //!   running an `EncodedHeader`'s folder through the §6 folder
 //!   decoder; rejects nested encoded headers.
 //!
-//! # Phase 4 (`docs/PLAN_7z_support.md` §4)
+//! # Phase 4 (`internal/PLAN_7z_support.md` §4)
 //!
 //! [`coders`] holds the [`coders::CoderImpl`] dispatch surface
 //! and the round-one COPY / DEFLATE coders. LZMA / LZMA2 land
 //! in §5 and slot into the same [`coders::dispatch`] match arm
 //! without changing any caller.
 //!
-//! # Phase 5 (`docs/PLAN_7z_support.md` §5)
+//! # Phase 5 (`internal/PLAN_7z_support.md` §5)
 //!
 //! [`coders::dispatch`] now resolves `[0x03, 0x01, 0x01]` /
 //! `[0x21]` to runtime LZMA / LZMA2 coders backed by
@@ -54,7 +54,7 @@
 //! exposes new `decode_lzma1_raw` / `decode_lzma2_raw` entry
 //! points the §6 folder decoder will drive once it lands.
 //!
-//! # Phase 6 (`docs/PLAN_7z_support.md` §6)
+//! # Phase 6 (`internal/PLAN_7z_support.md` §6)
 //!
 //! [`folder`] ties §4 + §5 together: [`folder::FolderDecoder`]
 //! takes a parsed [`header::Folder`] (linear coder chain) plus

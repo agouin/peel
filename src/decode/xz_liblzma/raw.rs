@@ -1,7 +1,7 @@
 //! Raw-LZMA / raw-LZMA2 entry points for callers that hand us
 //! a payload buffer directly (no xz Stream / Block framing).
 //!
-//! Added by §5 of `docs/PLAN_7z_support.md`. The 7z coder
+//! Added by §5 of `internal/PLAN_7z_support.md`. The 7z coder
 //! registry ([`crate::decode::sevenz::coders`]) is the first
 //! caller; future callers (a `.lzma`-file decoder, a `.lzma2`-
 //! standalone path) plug in here without changing this module.

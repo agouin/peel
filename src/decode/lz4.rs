@@ -1,6 +1,6 @@
 //! lz4 streaming decoder for the [LZ4 Frame Format].
 //!
-//! Per `docs/PLAN_v2.md` §4 we drive the wire format ourselves and feed
+//! Per `internal/PLAN_v2.md` §4 we drive the wire format ourselves and feed
 //! individual blocks through [`lz4_flex::block::decompress_into`] (the
 //! upstream block-layer API). The frame layer in `lz4_flex` is gated
 //! behind a `frame` feature that pulls a separate hash dependency and
@@ -916,7 +916,7 @@ pub fn resume_factory(
 /// Public surface is the streaming [`Xxh32`] state plus the one-shot
 /// [`xxh32`] free function. A standalone implementation is preferred
 /// to pulling in `twox-hash` (the dep `lz4_flex`'s frame feature uses);
-/// per `docs/ENGINEERING_STANDARDS.md` §2.1 we hand-roll trivial
+/// per `internal/ENGINEERING_STANDARDS.md` §2.1 we hand-roll trivial
 /// primitives whose maintenance cost is dominated by the surrounding
 /// framing rather than the algorithm itself. The reference test
 /// vectors from the [xxHash spec] are encoded in the unit tests.

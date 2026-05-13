@@ -1,5 +1,5 @@
 //! Local-file extraction coordinator
-//! (`docs/PLAN_local_file_extract.md`).
+//! (`internal/old/PLAN_local_file_extract.md`).
 //!
 //! The HTTP-side [`crate::coordinator::run`] is 2.8k lines of
 //! download / fingerprint / bandwidth / mirror state machine.
@@ -84,7 +84,7 @@ use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
 
 /// Arguments for [`run`] — the local-mode counterpart of
 /// [`crate::coordinator::RunArgs`]
-/// (`docs/PLAN_local_file_extract.md` §2).
+/// (`internal/old/PLAN_local_file_extract.md` §2).
 ///
 /// Fields are deliberately a strict subset of the HTTP-side knobs:
 /// no `chunk_size`, no `workers`, no mirror list, no `--sha256`
@@ -106,7 +106,7 @@ pub struct LocalRunArgs {
     /// source archive across the run — no punching, no deletion.
     /// `true` opts into the disk-pressure contract: the source is
     /// punched as the decoder advances and deleted on clean
-    /// completion (`docs/PLAN_local_file_extract.md` §1).
+    /// completion (`internal/old/PLAN_local_file_extract.md` §1).
     pub destructive: bool,
     /// Extractor-side minimum gap between in-loop punch syscalls.
     /// Ignored when [`Self::destructive`] is `false`.
@@ -149,7 +149,7 @@ pub struct LocalRunArgs {
     pub io_backend_resolved: Option<Arc<dyn crate::io_backend::IoBackend>>,
 
     /// Password source for encrypted archives
-    /// (`docs/PLAN_archive_encryption.md` §1). Mirrors
+    /// (`internal/PLAN_archive_encryption.md` §1). Mirrors
     /// [`crate::coordinator::CoordinatorConfig::password_source`]
     /// for the local-mode path; the format-specific pipeline calls
     /// [`crate::secret::source::PasswordSource::load`] when it
@@ -368,7 +368,7 @@ fn note_destructive_pre_flight() {
 }
 
 /// Resume planning surface for [`run`]
-/// (`docs/PLAN_local_file_extract.md` §5).
+/// (`internal/old/PLAN_local_file_extract.md` §5).
 ///
 /// Fresh runs land in [`Self::Fresh`]; runs that found a valid
 /// `.peel.ckpt` on disk land in [`Self::Resume`] with the
@@ -390,7 +390,7 @@ enum LocalResumePlan {
 
 /// Synthetic URL the local-destructive checkpoint stores in its
 /// [`Checkpoint::url`] / [`PartRecord::url`] slots
-/// (`docs/PLAN_local_file_extract.md` §5). The local-mode resume
+/// (`internal/old/PLAN_local_file_extract.md` §5). The local-mode resume
 /// validator strips the `local://` scheme prefix and compares
 /// against the canonicalized source path on disk.
 fn local_url_for(path: &Path) -> String {
@@ -406,7 +406,7 @@ fn path_from_local_url(url: &str) -> Option<PathBuf> {
 }
 
 /// Compute the `.peel.ckpt` path for a local-destructive run
-/// (`docs/PLAN_local_file_extract.md` §5). The default is a
+/// (`internal/old/PLAN_local_file_extract.md` §5). The default is a
 /// sibling of the source archive (`<source>.peel.ckpt`); the
 /// `--workdir` override moves the file to a user-chosen
 /// directory while keeping the basename.
@@ -618,7 +618,7 @@ fn check_sink_state_matches_output(
 }
 
 /// Run the local-file extraction pipeline
-/// (`docs/PLAN_local_file_extract.md` §2 + §5).
+/// (`internal/old/PLAN_local_file_extract.md` §2 + §5).
 ///
 /// # Errors
 ///
@@ -657,7 +657,7 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     // pipelines — they read the user's archive through a
     // [`SparseFile::open_readonly`] wrapped in a [`MultiSparse`]
     // with a fully-marked [`ChunkBitmap`], so the existing
-    // pipelines run unchanged (`docs/PLAN_local_file_extract.md`
+    // pipelines run unchanged (`internal/old/PLAN_local_file_extract.md`
     // §2 step 5).
     if let Some(name) = random_access_format_name(factory, &args.registry) {
         drop(probe_file);
@@ -708,7 +708,7 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     };
 
     if let Some(state) = &args.progress_state {
-        // Local-mode progress UX (`docs/PLAN_local_file_extract.md` §4):
+        // Local-mode progress UX (`internal/old/PLAN_local_file_extract.md` §4):
         // feed the renderer through the same `bytes_downloaded` /
         // `bytes_extracted` channels the HTTP path uses, but skip
         // every `worker_started` / `worker_finished` / `set_total_workers`
@@ -793,7 +793,7 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     };
     decoder.set_source_start_offset(decoder_start_offset);
 
-    // Puncher selection (`docs/PLAN_local_file_extract.md` §2
+    // Puncher selection (`internal/old/PLAN_local_file_extract.md` §2
     // step 3): the non-destructive default forces a NoopPuncher
     // regardless of `--io-backend`; `-d/--destructive` picks the
     // platform default (LinuxPuncher / MacosPuncher / Noop on
@@ -842,7 +842,7 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
 
     // Run the extractor with an observer that persists a
     // `.peel.ckpt` at every persist-eligible quiescent advance
-    // (`docs/PLAN_local_file_extract.md` §5). Destructive mode
+    // (`internal/old/PLAN_local_file_extract.md` §5). Destructive mode
     // attaches the writer; `-k` mode passes a no-op observer.
     let stats: ExtractionStats = match &args.output {
         OutputTarget::File(path) => {
@@ -1009,7 +1009,7 @@ fn build_local_tar_sink(path: &Path, plan: &LocalResumePlan) -> Result<TarSink, 
 
 /// Persistent state the local-destructive checkpoint observer
 /// passes through to every `on_checkpoint` invocation
-/// (`docs/PLAN_local_file_extract.md` §5).
+/// (`internal/old/PLAN_local_file_extract.md` §5).
 ///
 /// The observer captures one shared `Arc<Mutex<…>>` of this
 /// struct rather than threading a pile of small references
@@ -1082,7 +1082,7 @@ fn run_extractor_with_ckpt<S: Sink>(
 /// read: `add_downloaded` and `set_bytes_decoded_input`. Used by
 /// [`run`] to feed the renderer's percent / ETA math when a
 /// shared [`ProgressState`] is attached
-/// (`docs/PLAN_local_file_extract.md` §4).
+/// (`internal/old/PLAN_local_file_extract.md` §4).
 ///
 /// The HTTP path feeds those counters from two distinct sources
 /// (the download scheduler updates `bytes_downloaded`, the
@@ -1131,7 +1131,7 @@ impl<R: Read> Read for ProgressReader<R> {
 const LOCAL_RANDOM_ACCESS_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Drive zip / 7z / rar extraction against a local archive
-/// (`docs/PLAN_local_file_extract.md` §2 step 5).
+/// (`internal/old/PLAN_local_file_extract.md` §2 step 5).
 ///
 /// The trick: the existing per-format pipelines all consume a
 /// [`MultiSparse`] + [`ChunkBitmap`] pair plus a few coordination
@@ -1450,7 +1450,7 @@ fn run_rar_local(
         // Mirrors the HTTP path in `coordinator::run_rar`: per-volume
         // start offsets thread the walker's cursor across the
         // signature + main header at every EOA-with-more_volumes
-        // boundary (`docs/PLAN_multivolume_archives.md` §2c). Local
+        // boundary (`internal/PLAN_multivolume_archives.md` §2c). Local
         // mode still owns the single-source pipeline today
         // (multi-volume local entry routes through
         // `discover_local` + the multi-part driver), but the

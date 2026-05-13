@@ -20,7 +20,7 @@ pub mod peel_cli;
 pub mod work;
 // Gated behind the `rar` Cargo feature: the fixture builder
 // references `peel::rar::format::*`, which only exists when the
-// feature is on (`docs/PLAN_rar.md` §0.5).
+// feature is on (`internal/PLAN_rar.md` §0.5).
 #[cfg(feature = "rar")]
 pub mod rar_fixtures;
 // On-demand fixture cache for the streaming bench grid. Lives behind

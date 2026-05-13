@@ -1,6 +1,6 @@
 //! Integration tests for [`peel::download::SparseFile`].
 //!
-//! The headline test here is the §3 demo from `docs/PLAN.md`: a 1 GiB
+//! The headline test here is the §3 demo from `internal/PLAN.md`: a 1 GiB
 //! sparse file, eight worker threads writing 1 MiB chunks at random
 //! offsets through the `SparseFile` API, with a [`peel::bitmap::ChunkBitmap`]
 //! tracking completion. We check three properties:
@@ -137,7 +137,7 @@ fn out_of_bounds_write_is_rejected_without_growing_file() {
 
 #[test]
 fn parallel_workers_write_a_sparse_file_and_bitmap_reflects_it() {
-    // The §3 demo from docs/PLAN.md: an 8-worker download into a 1 GiB
+    // The §3 demo from internal/PLAN.md: an 8-worker download into a 1 GiB
     // sparse file at random 1 MiB offsets, with a `ChunkBitmap`
     // tracking completion. We verify content correctness, bitmap
     // correctness, and (where the FS supports it) that the on-disk

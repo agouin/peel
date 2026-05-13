@@ -2,7 +2,7 @@
 #
 # Goals:
 #   - Permissive licenses only (the dependency policy in
-#     docs/ENGINEERING_STANDARDS.md is conservative; this enforces it).
+#     internal/ENGINEERING_STANDARDS.md is conservative; this enforces it).
 #   - No known security advisories.
 #   - No unknown registries or git sources.
 
@@ -21,7 +21,7 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     # Mozilla's CA root bundle (shipped by `webpki-roots`, the TLS
-    # trust store approved in `docs/ENGINEERING_STANDARDS.md` §2.4)
+    # trust store approved in `internal/ENGINEERING_STANDARDS.md` §2.4)
     # is published under CDLA-Permissive-2.0. The license is
     # permissive (no copyleft, no patent grant restrictions beyond
     # the data itself) and applies only to the embedded root list.

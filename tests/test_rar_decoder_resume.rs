@@ -39,7 +39,7 @@ const FIXTURE_DICT_CAPACITY: usize = 1024 * 1024;
 
 /// Multi-block regression fixture. See
 /// `tests/fixtures/rar5/README.md` and
-/// `docs/PLAN_rar5_multi_block_decode.md` for the open gap this
+/// `internal/PLAN_rar5_multi_block_decode.md` for the open gap this
 /// pins.
 const MB_FIXTURE: &[u8] = include_bytes!("fixtures/rar5/multi_block_p27.rar");
 const MB_DATA_OFFSET: usize = 70;
@@ -229,8 +229,8 @@ fn resume_rejects_dict_capacity_mismatch() {
 /// [`super::stream::RarStreamDecoder::read_block`] — without
 /// the lookahead the round-one decoder underran the bitstream
 /// by 2 bits at the block-0 boundary. See
-/// `docs/PLAN_rar5_multi_block_decode.md` for the original
-/// diagnosis and `docs/PLAN_rar5_decoder.md` §F2 for the fix
+/// `internal/PLAN_rar5_multi_block_decode.md` for the original
+/// diagnosis and `internal/PLAN_rar5_decoder.md` §F2 for the fix
 /// landing.
 #[test]
 fn multi_block_archive_decodes_byte_identical() {

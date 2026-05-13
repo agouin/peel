@@ -1,5 +1,5 @@
 //! Differential tests for the hand-rolled crypto primitives in
-//! `src/crypto/` (`docs/PLAN_archive_encryption.md` §2).
+//! `src/crypto/` (`internal/PLAN_archive_encryption.md` §2).
 //!
 //! For each primitive we run 1 000+ random inputs through both
 //! peel's hand-rolled implementation and the RustCrypto reference

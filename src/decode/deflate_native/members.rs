@@ -1,6 +1,6 @@
 //! gzip member-boundary scanner.
 //!
-//! Phase 2 of [`docs/PLAN_gzip_throughput.md`]. The plan's parallel
+//! Phase 2 of [`internal/PLAN_gzip_throughput.md`]. The plan's parallel
 //! path needs to know each member's compressed byte range up-front
 //! (so worker N can decode it independently of workers `<N`); gzip
 //! does not carry a trailing index the way xz does, so we have to
@@ -189,7 +189,7 @@ pub fn scan_first_member(source: &[u8]) -> Result<GzMemberRecord, DeflateError> 
 /// position; callers tracking cumulative offsets in a larger stream
 /// adjust externally.
 ///
-/// Phase 3 of [`docs/PLAN_gzip_throughput.md`] uses this in the
+/// Phase 3 of [`internal/PLAN_gzip_throughput.md`] uses this in the
 /// pipelined prefix-sum scanner: the worker decoding member N also
 /// runs `scan_first_member_streaming` over the source's suffix to
 /// produce member N+1's range as a side effect.

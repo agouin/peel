@@ -1,6 +1,6 @@
 //! Hand-rolled, pure-Rust DEFLATE streaming decoder.
 //!
-//! Phases 1–9 of `docs/PLAN_deflate_block_decoder.md`. Phase 8
+//! Phases 1–9 of `internal/PLAN_deflate_block_decoder.md`. Phase 8
 //! swapped this module in as the production gzip path
 //! ([`crate::decode::gzip`] is now a thin re-export of [`gzip`]
 //! below); Phase 9a swapped the production zip-DEFLATE path off
@@ -33,7 +33,7 @@
 //!   byte). Provides `peek_bits` / `consume_bits` / `read_bits` /
 //!   `align_to_byte` / `byte_position`. Pure logic on top of a
 //!   small (4 KiB) pull-buffer; cursor accounting honours the
-//!   floor convention from `docs/PLAN_deflate_block_decoder.md`
+//!   floor convention from `internal/PLAN_deflate_block_decoder.md`
 //!   §Risks 2 (the byte the bit cursor is fractionally inside is
 //!   *not* freeable). Not yet wired into the [`Decoder`] state
 //!   machine — Phase 5 swaps the byte-oriented `read_exact_into`
@@ -85,7 +85,7 @@
 //! byte exactly as the Phase 1 byte-oriented helper did. For
 //! Huffman blocks (BTYPE=01 / Phase 4 BTYPE=10) the floor lags by up
 //! to 1 byte while the bit cursor is fractionally inside a byte; the
-//! `docs/PLAN_deflate_block_decoder.md` §Risks 2 floor convention
+//! `internal/PLAN_deflate_block_decoder.md` §Risks 2 floor convention
 //! pins the contract: bytes the cursor has fully passed are
 //! puncher-safe; the byte the cursor sits inside must stay on disk.
 
@@ -623,7 +623,7 @@ impl StreamingDecoder for Decoder {
 
     fn bytes_consumed(&self) -> ByteOffset {
         // The bit reader's byte-floor is the puncher-safe high-water
-        // mark per `docs/PLAN_deflate_block_decoder.md` §Risks 2:
+        // mark per `internal/PLAN_deflate_block_decoder.md` §Risks 2:
         // bytes strictly before this index are fully consumed; the
         // byte the bit cursor is fractionally inside (only possible
         // mid-Huffman-block) must stay on disk.
@@ -1518,7 +1518,7 @@ mod tests {
     /// Differential against `flate2` at `Compression::default()`
     /// (level 6) on payloads long enough that miniz_oxide reliably
     /// picks BTYPE=10. Required by
-    /// `docs/PLAN_deflate_block_decoder.md` §Phase 4 exit criteria
+    /// `internal/PLAN_deflate_block_decoder.md` §Phase 4 exit criteria
     /// (500 random fixtures).
     #[test]
     fn flate2_round_trip_500_random_dynamic_huffman_fixtures() {

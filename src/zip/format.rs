@@ -1,8 +1,8 @@
 //! ZIP wire-format parsers.
 //!
 //! Hand-rolled per the dependency policy in
-//! `docs/ENGINEERING_STANDARDS.md` §2.1 and the format-audit
-//! preference in `docs/PLAN_v2.md` §5. Every parser is pure: input
+//! `internal/ENGINEERING_STANDARDS.md` §2.1 and the format-audit
+//! preference in `internal/PLAN_v2.md` §5. Every parser is pure: input
 //! goes in as a byte slice, output comes out as a typed struct, and
 //! no IO happens here. Higher layers (the per-entry pipeline) do the
 //! ranged downloads and feed the right bytes to the right parser.
@@ -77,7 +77,7 @@
 //! rejects:
 //!
 //! - `gp_flags` bit 0 set ("encrypted") without a WinZip AES extra
-//!   field (§3 of `docs/PLAN_archive_encryption.md` adds AES support;
+//!   field (§3 of `internal/PLAN_archive_encryption.md` adds AES support;
 //!   PKWARE traditional / "ZipCrypto" stays unsupported until §3b).
 //! - `gp_flags` bit 6 set (PKWARE strong encryption — see
 //!   `is_strong_encrypted`).
@@ -146,7 +146,7 @@ pub enum CompressionMethod {
     Stored,
     /// `8` — DEFLATE (RFC 1951). Decoded via the hand-rolled
     /// [`crate::decode::deflate_native::Decoder`] since Phase 9a
-    /// of `docs/PLAN_deflate_block_decoder.md`.
+    /// of `internal/PLAN_deflate_block_decoder.md`.
     Deflate,
     /// `93` — zstd. Decoded via the existing `zstd` crate binding.
     Zstd,
@@ -211,7 +211,7 @@ impl CompressionMethod {
 }
 
 /// WinZip AES "extra field" header ID
-/// (`docs/PLAN_archive_encryption.md` §3). Carries the AES strength,
+/// (`internal/PLAN_archive_encryption.md` §3). Carries the AES strength,
 /// the AE-1/AE-2 version, and the *actual* compression method (which
 /// replaces method 99 once the AES layer is stripped).
 pub const AES_EXTRA_HEADER_ID: u16 = 0x9901;
@@ -224,7 +224,7 @@ pub const METHOD_CODE_AES_MARKER: u16 = 99;
 /// Parsed WinZip AES extra field (header ID
 /// [`AES_EXTRA_HEADER_ID`]).
 ///
-/// The on-wire layout (`docs/PLAN_archive_encryption.md` §3 step 1):
+/// The on-wire layout (`internal/PLAN_archive_encryption.md` §3 step 1):
 ///
 /// ```text
 ///  0  u16 vendor_version    1 = AE-1 (CRC-of-plaintext preserved)
@@ -477,7 +477,7 @@ pub struct CentralDirectoryEntry {
     /// `..` components.
     pub name: String,
     /// Compression method declared in the central directory; this is
-    /// the value the LFH must agree with (`docs/PLAN_v2.md` §5
+    /// the value the LFH must agree with (`internal/PLAN_v2.md` §5
     /// step 4 cross-validates).
     pub method: CompressionMethod,
     /// General-purpose flag word.
@@ -504,7 +504,7 @@ pub struct CentralDirectoryEntry {
     /// entries.
     pub aes: Option<AesExtra>,
     /// `true` iff the entry uses the legacy PKWARE "ZipCrypto"
-    /// encryption (`docs/PLAN_archive_encryption.md` §3b): general-
+    /// encryption (`internal/PLAN_archive_encryption.md` §3b): general-
     /// purpose flag bit 0 set, NO WinZip AES extra field, NOT bit 6
     /// (PKWARE strong encryption). The decoder pipeline wraps the
     /// entry's raw payload in a [`crate::zip::ZipCryptoReader`] when
@@ -560,7 +560,7 @@ pub struct LocalFileHeader {
     /// CDE's value in [`Self::validate_against`].
     pub aes: Option<AesExtra>,
     /// `true` iff the entry uses the legacy PKWARE "ZipCrypto"
-    /// encryption (`docs/PLAN_archive_encryption.md` §3b). Same
+    /// encryption (`internal/PLAN_archive_encryption.md` §3b). Same
     /// semantics as [`CentralDirectoryEntry::zipcrypto`];
     /// cross-checked against the CDE's value in
     /// [`Self::validate_against`].
@@ -805,7 +805,7 @@ pub fn parse_central_directory(
                 });
             }
         } else if gp_flags.is_encrypted() {
-            // Legacy PKWARE "ZipCrypto" (`docs/PLAN_archive_encryption.md`
+            // Legacy PKWARE "ZipCrypto" (`internal/PLAN_archive_encryption.md`
             // §3b). Insecure but ubiquitous in legacy archives; we
             // decode it and emit a one-shot caveat banner per entry.
             zipcrypto = true;

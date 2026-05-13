@@ -164,9 +164,9 @@
 > shape with register-mask, block-start bias, and
 > program-cache reuse — none of which the single-filter
 > fixtures hit.
-> This plan resolves follow-on `O.RAR4` from `docs/PLAN_rar.md`. It
-> is a sibling sub-plan to `docs/PLAN_rar5_decoder.md` — additive to
-> `docs/PLAN_rar.md`, not a supersession.
+> This plan resolves follow-on `O.RAR4` from `internal/PLAN_rar.md`. It
+> is a sibling sub-plan to `internal/PLAN_rar5_decoder.md` — additive to
+> `internal/PLAN_rar.md`, not a supersession.
 >
 > **Sequencing.** `PLAN_rar.md` §1–§4 plus `PLAN_rar5_decoder.md`
 > Phases A–E must be on `main` first. The hand-rolled RAR5 decoder
@@ -886,7 +886,7 @@ reproducible if a future bug needs the same level of triage.
 >   back over the LZ output in place. Custom (non-standard)
 >   bytecode surfaces `DispatchError::UnsupportedCustomFilter`
 >   with the program's CRC fingerprint + length —
->   `docs/PLAN_rar3.md` §C2-extension owns the future VM
+>   `internal/PLAN_rar3.md` §C2-extension owns the future VM
 >   interpreter for that path, gated on a clean-room reference
 >   becoming available.
 >   [`entry::decode_lz_entry`](../src/decode/rar_legacy/entry.rs)
@@ -922,7 +922,7 @@ reproducible if a future bug needs the same level of triage.
 >   the dispatcher's `BlockBeyondOutput` /
 >   `UnsupportedCustomFilter` / executor-parameter-validation
 >   branches). Approved per
->   `docs/ENGINEERING_STANDARDS.md` §5.2 ("Fuzz tests"); the
+>   `internal/ENGINEERING_STANDARDS.md` §5.2 ("Fuzz tests"); the
 >   `rar_legacy_filter` target is the third format-parser fuzz
 >   target alongside `zip_format` and `tar_sink`.
 >   Custom-bytecode VM interpreter (the original §C2b
@@ -2209,7 +2209,7 @@ silently skipped. `[[bin]]` entry added to
 [`fuzz/Cargo.toml`](../fuzz/Cargo.toml); the `rar` feature
 is now enabled on the fuzz crate's `peel-rs` dep so the
 target compiles. Approved per
-`docs/ENGINEERING_STANDARDS.md` §5.2; this is the third
+`internal/ENGINEERING_STANDARDS.md` §5.2; this is the third
 format-parser fuzz target alongside `zip_format` and
 `tar_sink`.
 
@@ -2448,7 +2448,7 @@ performance numbers.
   multiple drain steps and the tight `checkpoint_min_bytes = 1`
   config lands a mid-entry `CheckpointWritten` well before EOF.
   See
-  [`docs/fixtures/rar_legacy_large_lz_normal.md`](fixtures/rar_legacy_large_lz_normal.md)
+  [`internal/fixtures/rar_legacy_large_lz_normal.md`](fixtures/rar_legacy_large_lz_normal.md)
   for the re-encode recipe.
 
 **Demo**: `cargo test --features rar --lib

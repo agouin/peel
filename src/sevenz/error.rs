@@ -1,6 +1,6 @@
 //! Typed errors for the 7z parser and extraction pipeline.
 //!
-//! Variants are intentionally specific. The `docs/PLAN_7z_support.md`
+//! Variants are intentionally specific. The `internal/PLAN_7z_support.md`
 //! "the user should see 'AES-256 encryption is not supported', not a
 //! generic parse failure" rule motivates [`Self::UnsupportedFeature`]
 //! carrying a free-form name; the rest of the variants distinguish
@@ -18,7 +18,7 @@ use crate::encryption::EncryptionError;
 
 /// Errors produced while parsing or extracting a 7z archive.
 ///
-/// Per `docs/ENGINEERING_STANDARDS.md` §3.1 every variant carries
+/// Per `internal/ENGINEERING_STANDARDS.md` §3.1 every variant carries
 /// enough structured context that the message alone is debuggable.
 #[derive(Debug, Error)]
 pub enum SevenzError {
@@ -89,7 +89,7 @@ pub enum SevenzError {
     /// Encryption-specific failure: missing password, wrong password,
     /// or integrity-tag / CRC mismatch under a successfully derived
     /// key. The shared [`EncryptionError`] enum
-    /// (`docs/PLAN_archive_encryption.md` §6) carries the variant;
+    /// (`internal/PLAN_archive_encryption.md` §6) carries the variant;
     /// this is the 7z-side container.
     #[error("7z encryption: {0}")]
     Encryption(#[source] EncryptionError),

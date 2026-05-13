@@ -1,5 +1,5 @@
 //! PKWARE "ZipCrypto" — the legacy ZIP encryption scheme
-//! (`docs/PLAN_archive_encryption.md` §3b).
+//! (`internal/PLAN_archive_encryption.md` §3b).
 //!
 //! This is the 1989-era ZIP encryption that ships behind general-
 //! purpose flag bit 0 when no WinZip-AES extra field is attached.

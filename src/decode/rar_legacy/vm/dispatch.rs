@@ -1,6 +1,6 @@
 //! Filter-stack dispatch for legacy RAR (RAR3 / RAR4) RarVM.
 //!
-//! `docs/PLAN_rar3.md` §C2b. The LZ entry decoder accumulates a
+//! `internal/PLAN_rar3.md` §C2b. The LZ entry decoder accumulates a
 //! queue of [`FilterDeclaration`]s into a [`FilterStack`] as it
 //! consumes `symbol 257` filter-decl tokens; once LZ decoding
 //! completes (the entry's `unpacked_size` is reached),

@@ -39,7 +39,7 @@
 //!
 //! Everything else — symlinks (`2`), hard links (`1`), device nodes
 //! (`3`/`4`), FIFOs (`6`), PAX global headers (`g`) — is rejected
-//! with [`SinkError::UnsupportedEntry`]. `docs/PLAN.md` §7 explicitly
+//! with [`SinkError::UnsupportedEntry`]. `internal/PLAN.md` §7 explicitly
 //! defers these and `OPTIMIZATIONS.md` tracks them.
 //!
 //! # Path safety

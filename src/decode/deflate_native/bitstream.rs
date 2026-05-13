@@ -28,7 +28,7 @@
 //! of the byte the bit cursor is currently inside (or sitting at the
 //! start of, when `bit_off == 0`).
 //!
-//! The convention `docs/PLAN_deflate_block_decoder.md` §Risks 2
+//! The convention `internal/PLAN_deflate_block_decoder.md` §Risks 2
 //! adopts: the decoder's [`crate::decode::StreamingDecoder::bytes_consumed`]
 //! reports `byte_index` directly. The byte the bit cursor is
 //! fractionally inside is **not** freeable — resume will need to

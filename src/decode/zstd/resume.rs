@@ -1,5 +1,5 @@
 //! Mid-frame resume blob for the hand-rolled zstd decoder
-//! (`docs/PLAN_zstd_block_decoder.md` §Phase 7).
+//! (`internal/PLAN_zstd_block_decoder.md` §Phase 7).
 //!
 //! The streaming decoder pauses at every block boundary inside a
 //! frame and reports a [`crate::decode::StreamingDecoder::decoder_state`]

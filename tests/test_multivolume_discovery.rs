@@ -1,5 +1,5 @@
 //! Integration tests for HTTP-mode multi-volume discovery
-//! (`docs/PLAN_multivolume_archives.md` §1).
+//! (`internal/PLAN_multivolume_archives.md` §1).
 //!
 //! The local-mode discovery path is exercised by unit tests in
 //! `src/multivolume.rs`. HTTP-mode discovery needs the real `peel`

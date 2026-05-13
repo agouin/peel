@@ -1,16 +1,16 @@
 //! Clean-room Rust port of liblzma's xz decoder, structurally
 //! faithful.
 //!
-//! Phase 1 of [`docs/PLAN_xz_liblzma_port.md`](../../../docs/PLAN_xz_liblzma_port.md);
+//! Phase 1 of [`internal/PLAN_xz_liblzma_port.md`](../../../internal/PLAN_xz_liblzma_port.md);
 //! streaming I/O and chunk-level resume added in Phase F of
-//! [`docs/PLAN_xz_liblzma_phase_f.md`](../../../docs/PLAN_xz_liblzma_phase_f.md).
+//! [`internal/old/PLAN_xz_liblzma_phase_f.md`](../../../internal/old/PLAN_xz_liblzma_phase_f.md).
 //! Sibling to [`super::xz_native`]: the existing decoder is the
 //! production path; this module is the rewrite that supersedes
 //! it once Phase F.6 lands the migration commit.
 //!
 //! # Why a parallel module
 //!
-//! [`PLAN_xz_liblzma_deep_dive.md`](../../../docs/PLAN_xz_liblzma_deep_dive.md)
+//! [`PLAN_xz_liblzma_deep_dive.md`](../../../internal/old/PLAN_xz_liblzma_deep_dive.md)
 //! Phase A documented liblzma's hot-loop register discipline and
 //! attributed peel's 1.5× per-byte gap to per-bit memory-store
 //! costs that liblzma's compiled output avoids. Phase C of that
@@ -34,7 +34,7 @@
 //! one Block Header, one LZMA2 chunk, the Index, or the Stream
 //! Footer) and returns. The slurp-first regression at low
 //! bandwidth (Phase 8 cells 10 Mbps / 100 Mbps in
-//! [`PLAN_xz_liblzma_port.md`](../../../docs/PLAN_xz_liblzma_port.md))
+//! [`PLAN_xz_liblzma_port.md`](../../../internal/PLAN_xz_liblzma_port.md))
 //! is gone — read and decode now overlap with the network pull.
 //!
 //! Multi-Block + multi-Stream support landed in Phase F.3.

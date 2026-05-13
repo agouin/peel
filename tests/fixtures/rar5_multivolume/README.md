@@ -1,7 +1,7 @@
 # RAR5 multi-volume test fixtures
 
 Real RAR5 multi-volume archives produced by WinRAR (`rar` 7.22) for
-`docs/PLAN_multivolume_archives.md` §2.
+`internal/PLAN_multivolume_archives.md` §2.
 
 ## Layout
 

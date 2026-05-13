@@ -1,7 +1,7 @@
 //! 7z coder registry: dispatch from parsed
 //! [`super::header::Coder`] to a runtime [`CoderImpl`].
 //!
-//! Implements §4 of `docs/PLAN_7z_support.md` (COPY + DEFLATE)
+//! Implements §4 of `internal/PLAN_7z_support.md` (COPY + DEFLATE)
 //! and provides the dispatch surface §5 plugs LZMA / LZMA2 into.
 //!
 //! The `CoderImpl` trait is object-safe (`&mut dyn Read` source,
@@ -65,7 +65,7 @@ pub enum CoderId {
     /// `[0x21]` — LZMA2 (with its 1-byte `dictSize` prop).
     Lzma2,
     /// `[0x06, 0xF1, 0x07, 0x01]` — AES-256-CBC, the only encryption
-    /// coder defined by the 7z spec (`docs/PLAN_archive_encryption.md`
+    /// coder defined by the 7z spec (`internal/PLAN_archive_encryption.md`
     /// §5). Recognised here so dispatch surfaces a unified
     /// [`EncryptionError`] instead of the generic "unknown coder id"
     /// error; actual decryption requires threading a password through
@@ -177,7 +177,7 @@ pub enum CoderError {
 
     /// The folder includes an encryption coder. Carried by the
     /// shared [`EncryptionError`] enum
-    /// (`docs/PLAN_archive_encryption.md` §6) so callers see the
+    /// (`internal/PLAN_archive_encryption.md` §6) so callers see the
     /// same shape they see for ZIP-AES / RAR5 encryption refusals.
     /// Dispatch returns this when the folder's coder chain
     /// contains the AES-256-CBC id and no password has been

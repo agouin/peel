@@ -1,4 +1,4 @@
-//! Phase F.4 / F.5 of [`docs/PLAN_xz_liblzma_phase_f.md`](../../../../docs/PLAN_xz_liblzma_phase_f.md):
+//! Phase F.4 / F.5 of [`internal/old/PLAN_xz_liblzma_phase_f.md`](../../../../internal/old/PLAN_xz_liblzma_phase_f.md):
 //! checkpoint blob format + serializer + deserializer for the
 //! `xz_liblzma` decoder.
 //!

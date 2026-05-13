@@ -15,7 +15,7 @@
 //!   opaque bytes follow. Decoders are required to skip the whole
 //!   thing transparently.
 //!
-//! Round-one limitations match `docs/PLAN_zstd_block_decoder.md` §Scope:
+//! Round-one limitations match `internal/PLAN_zstd_block_decoder.md` §Scope:
 //!
 //! - **`windowLog > 27`** (windows above 128 MiB) is rejected at
 //!   parse time. Real-world `tar.zst` files don't trip this; the
@@ -24,7 +24,7 @@
 //!   `tar.zst` snapshots produced by the standard `zstd` CLI never
 //!   carry one.
 //!
-//! See `docs/PLAN_zstd_block_decoder.md` Appendix A for the Phase 0
+//! See `internal/PLAN_zstd_block_decoder.md` Appendix A for the Phase 0
 //! spike memo that validated this parser shape against the easy
 //! single-segment + 8-byte-FCS path.
 
@@ -48,7 +48,7 @@ pub const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
 
 /// Largest `windowLog` round-one accepts (128 MiB sliding window).
 ///
-/// Per `docs/PLAN_zstd_block_decoder.md` §Scope, `windowLog > 27`
+/// Per `internal/PLAN_zstd_block_decoder.md` §Scope, `windowLog > 27`
 /// frames (which `zstd --long` can declare on 64-bit hosts up to
 /// 31 / 2 GiB) are rejected with a clean error. Caps the
 /// resume-blob ceiling in Phase 7 at the same 128 MiB.

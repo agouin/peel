@@ -1,5 +1,5 @@
 //! HMAC (RFC 2104) over any [`crate::crypto::BlockHash`]
-//! (`docs/PLAN_archive_encryption.md` §2).
+//! (`internal/PLAN_archive_encryption.md` §2).
 //!
 //! HMAC instantiates with two concrete hashes in this crate:
 //!

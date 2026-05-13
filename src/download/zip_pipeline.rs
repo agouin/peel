@@ -2,12 +2,12 @@
 //! shared sparse-file pipeline.
 //!
 //! The streaming pipeline used by zstd / xz / lz4 / tar archives
-//! (`docs/PLAN.md` §10) walks the source forward, decoder-driven,
+//! (`internal/PLAN.md` §10) walks the source forward, decoder-driven,
 //! punching holes behind a moving cursor. ZIP can't work like that:
 //! the central directory lives at the end of the archive, and per-
 //! entry compressed payloads live at non-contiguous offsets the CD
 //! names. This module is the second pipeline architecture
-//! `docs/PLAN_v2.md` §5 calls for.
+//! `internal/PLAN_v2.md` §5 calls for.
 //!
 //! # Workflow
 //!
@@ -35,7 +35,7 @@
 //! 5. After the last entry, punch the central directory's range.
 //!
 //! Hole punching is per-entry rather than continuous, exactly as
-//! `docs/PLAN_v2.md` §5 step 6 anticipates: less effective than the
+//! `internal/PLAN_v2.md` §5 step 6 anticipates: less effective than the
 //! streaming pipeline's per-frame discipline, but real for very
 //! large entries and graceful elsewhere.
 
@@ -172,7 +172,7 @@ pub struct ZipResumeState {
     /// byte 0, when the entry uses STORED (resumes per-byte
     /// without a blob), or when the prior run wrote the
     /// checkpoint via a pre-v7 format. Phase 9b of
-    /// `docs/PLAN_deflate_block_decoder.md` introduced this field;
+    /// `internal/PLAN_deflate_block_decoder.md` introduced this field;
     /// the resumed pipeline funnels it through
     /// [`crate::decode::deflate_native::resume_factory`] (DEFLATE)
     /// or [`crate::decode::zstd::resume_factory`] (zstd) when the
@@ -227,7 +227,7 @@ pub enum ZipPipelineEvent {
         /// opportunity. `None` for STORED entries (no codec state
         /// to capture), or when the codec has not yet reached a
         /// snapshotable boundary inside the entry. Phase 9b of
-        /// `docs/PLAN_deflate_block_decoder.md`.
+        /// `internal/PLAN_deflate_block_decoder.md`.
         decoder_state: Option<Vec<u8>>,
     },
 }
@@ -315,7 +315,7 @@ pub struct ZipPipeline<'a> {
     /// Multi-part sparse landing the workers are filling. Single-URL
     /// runs supply a one-part [`MultiSparse`] (direct dispatch);
     /// multi-volume runs route reads, writes, and punches through the
-    /// wrapper (`docs/PLAN_multivolume_archives.md` §7).
+    /// wrapper (`internal/PLAN_multivolume_archives.md` §7).
     pub sparse: &'a MultiSparse,
     /// Bitmap recording which chunks are durable on disk.
     pub bitmap: &'a ChunkBitmap,
@@ -339,7 +339,7 @@ pub struct ZipPipeline<'a> {
     /// is never the production path.
     pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
     /// Optional password source for AES-encrypted entries
-    /// (`docs/PLAN_archive_encryption.md` §3). `None` means peel
+    /// (`internal/PLAN_archive_encryption.md` §3). `None` means peel
     /// has no password to offer; encrypted entries surface
     /// [`ZipError::Encryption`] with
     /// [`EncryptionError::PasswordMissing`]. When `Some`, the
@@ -454,7 +454,7 @@ impl<'a> ZipPipeline<'a> {
         sorted_entries.sort_by_key(|(_, e)| e.lfh_offset);
 
         // Password cache for AES-encrypted entries
-        // (`docs/PLAN_archive_encryption.md` §3). Populated lazily
+        // (`internal/PLAN_archive_encryption.md` §3). Populated lazily
         // on the first AES entry the pipeline meets; reused for all
         // subsequent entries. Each entry derives its own
         // verifier from its own salt — a cached password whose
@@ -580,7 +580,7 @@ impl<'a> ZipPipeline<'a> {
         // whole entry sits on disk simultaneously) and the
         // streaming win.
 
-        // Encrypted entries (`docs/PLAN_archive_encryption.md`
+        // Encrypted entries (`internal/PLAN_archive_encryption.md`
         // §3 / §3b): resolve a password upfront, before the source
         // reader is constructed. Verification happens against a
         // fixed prefix read directly from the sparse file (18 bytes
@@ -877,7 +877,7 @@ impl<'a> ZipPipeline<'a> {
     }
 
     /// Resolve a [`Password`] for a ZipCrypto-encrypted entry
-    /// (`docs/PLAN_archive_encryption.md` §3b).
+    /// (`internal/PLAN_archive_encryption.md` §3b).
     ///
     /// Mirrors [`Self::resolve_password_for_entry`] but uses the
     /// ZipCrypto verification primitive instead of PBKDF2 + verifier

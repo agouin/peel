@@ -57,18 +57,18 @@ high-compression-ratio fixture where the decoder becomes the
 binding constraint at the configured wire rate).
 
 **Sub-plans demoted to follow-ons** (filed in
-[`docs/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) when the gating
+[`internal/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) when the gating
 conditions surface):
 - Parallel-member decode (Phase 3 of this plan).
 - DEFLATE inner-loop SIMD / table-driven literal decode.
 - Tail-search member discovery (was a Phase 7 follow-on of this
   plan; trimmed alongside the rest).
 **Sister plans**:
-- [`docs/PLAN_xz_parallel_block_decode.md`](PLAN_xz_parallel_block_decode.md)
+- [`internal/old/PLAN_xz_parallel_block_decode.md`](PLAN_xz_parallel_block_decode.md)
   — same architectural shape (worker pool + ordered output ring +
   per-frame independence), one format over. The infrastructure that
   plan ships is reused here; this plan does **not** rebuild it.
-- [`docs/PLAN_xz_decoder_optimization.md`](PLAN_xz_decoder_optimization.md)
+- [`internal/PLAN_xz_decoder_optimization.md`](PLAN_xz_decoder_optimization.md)
   — Phase 1 of that plan moved CRC64 from byte-by-byte to
   slicing-by-16 (~6.5× microbench, ~7 % of decoder self-time
   recovered). The same lever applies to gzip's CRC32; this plan
@@ -79,7 +79,7 @@ conditions surface):
 The README's bench grid `tar.gz` row at **10 Gbps · 256 MiB**
 sits at **2.86×** vs `curl|gzip|tar` (peel 0.68 s vs 0.24 s).
 Every other fast-codec row at 10 Gbps is now ≤ 1× after
-[`docs/PLAN_checkpoint_cadence_throughput.md`](PLAN_checkpoint_cadence_throughput.md)
+[`internal/old/PLAN_checkpoint_cadence_throughput.md`](PLAN_checkpoint_cadence_throughput.md)
 shipped; gz is the single trailing row.
 
 The current floor:
@@ -259,7 +259,7 @@ Combined target on the README's 256 MiB · 10 Gbps row:
   the same outcome on deflate; the speculative-ceiling items
   (table-driven Huffman, hand-rolled SIMD, hardware CRC32C
   intrinsics for streams that use it) are filed against
-  [`docs/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) for promotion if
+  [`internal/OPTIMIZATIONS.md`](OPTIMIZATIONS.md) for promotion if
   decoder self-time becomes the gating cost again post-Lever-A.
 - **`gunzip`-style standalone gz files (no tar wrapper).** Same
   pipeline; out of scope only because the bench grid is
@@ -685,7 +685,7 @@ multi-member gz fixtures all byte-identical to clean runs.
     multi-member fixtures, which is the dominant `pigz`-output
     shape.
 - File follow-on items in
-  [`docs/OPTIMIZATIONS.md`](OPTIMIZATIONS.md):
+  [`internal/OPTIMIZATIONS.md`](OPTIMIZATIONS.md):
   - Tail-search member discovery (Phase 7 follow-on).
   - DEFLATE inner-loop SIMD / table-driven literal decode.
   - Hardware CRC32-via-`pmull` polynomial folding.
@@ -827,12 +827,12 @@ when the marginal value becomes clear.
 
 - README's "Benchmarks" section, `tar.gz` row at 10 Gbps · 256 MiB
   ([`README.md` L142-L218](../README.md#benchmarks-peel-vs-curl---decompressor---tar)).
-- `docs/PLAN_xz_parallel_block_decode.md` — the architectural
+- `internal/old/PLAN_xz_parallel_block_decode.md` — the architectural
   twin of this plan, one format over. The worker pool, ordered
   output ring, and `BlockFetcher` trait are the same shapes.
-- `docs/PLAN_xz_decoder_optimization.md` Phase 1 — the CRC64
+- `internal/PLAN_xz_decoder_optimization.md` Phase 1 — the CRC64
   slicing-by-16 result this plan ports to CRC32.
-- `docs/PLAN_deflate_block_decoder.md` — the plan that shipped
+- `internal/PLAN_deflate_block_decoder.md` — the plan that shipped
   the hand-rolled `deflate_native` decoder this plan
   parallelizes. The member / deflate-block hierarchy and the
   per-member independence (no cross-member back-references) are

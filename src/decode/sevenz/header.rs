@@ -1,7 +1,7 @@
 //! 7z trailer parser: `Header` / `EncodedHeader` / `StreamsInfo`
 //! / `FilesInfo`.
 //!
-//! Implements §3 of `docs/PLAN_7z_support.md`. The trailer the
+//! Implements §3 of `internal/PLAN_7z_support.md`. The trailer the
 //! [`super::format::SignatureHeader`] points at is decoded into
 //! the typed [`Trailer`] / [`Header`] / [`StreamsInfo`] /
 //! [`FileRecord`] tree the §8 pipeline operates on.

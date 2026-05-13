@@ -7,7 +7,7 @@
 //! size equals the sum of every part's size. For single-URL runs and
 //! for byte-concatenated multi-URL runs that's fine. For multi-volume
 //! archives the plan
-//! (`docs/PLAN_multivolume_archives.md` §7) wants each source volume
+//! (`internal/PLAN_multivolume_archives.md` §7) wants each source volume
 //! to land in its own `.peel.part.<idx>` file so:
 //!
 //! - the puncher can release blocks per volume (per-fd cursors avoid
@@ -34,7 +34,7 @@
 //! everywhere; it degenerates to a one-element `Vec<SparseFile>` and
 //! every dispatch is a direct passthrough. Multi-part construction is
 //! shaped in this file but not wired into the coordinator yet —
-//! `docs/PLAN_multivolume_archives.md` §7 Phase 3 lights that up.
+//! `internal/PLAN_multivolume_archives.md` §7 Phase 3 lights that up.
 
 #![cfg(unix)]
 
@@ -182,7 +182,7 @@ impl MultiSparse {
     /// internal `boundaries` vec.
     ///
     /// Used by the RAR multi-volume walker
-    /// (`docs/PLAN_multivolume_archives.md` §2c) to jump the cursor
+    /// (`internal/PLAN_multivolume_archives.md` §2c) to jump the cursor
     /// across volume boundaries on `EOA-with-more_volumes`.
     #[must_use]
     pub fn part_start_offsets(&self) -> &[u64] {
@@ -508,7 +508,7 @@ impl MultiSparse {
     ///
     /// Multi-part wrappers always return `None` here; the
     /// per-part mmap puncher needs a routing layer of its own
-    /// (`docs/PLAN_multivolume_archives.md` §7 Phase 3) and trying
+    /// (`internal/PLAN_multivolume_archives.md` §7 Phase 3) and trying
     /// to short-cut it through a single one-mapping puncher would
     /// silently punch the wrong file for offsets past the first
     /// part's boundary.

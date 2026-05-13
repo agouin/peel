@@ -420,7 +420,7 @@ pub struct ChunkContext<'a> {
     /// source.unwrap().len() > 1`): the URL routing is decided by
     /// [`Self::source`] instead. The field stays in the context so
     /// the single-URL and single-URL-plus-mirrors code paths remain
-    /// unchanged. The plan (`docs/PLAN_multi_url_source.md` §1
+    /// unchanged. The plan (`internal/PLAN_multi_url_source.md` §1
     /// step 5) keeps `--mirror` and multi-URL mutually exclusive at
     /// config time, so no run ever needs both at once.
     pub mirrors: &'a MirrorSet,
@@ -657,7 +657,7 @@ fn try_once(
         })?;
     let mut buf = vec![0u8; len_usize];
 
-    // Multi-URL routing (`docs/PLAN_multi_url_source.md`): when the
+    // Multi-URL routing (`internal/PLAN_multi_url_source.md`): when the
     // source has more than one part, iterate
     // [`MultiPartSource::dispatch_range`] — typically yields one
     // segment, but a chunk that straddles a part boundary (the
@@ -736,7 +736,7 @@ fn try_once(
 /// construction, disarmed only when every byte has been written and
 /// verified, and refunds on `Drop` otherwise.
 ///
-/// Multi-URL dispatches (`docs/PLAN_multi_url_source.md`) credit
+/// Multi-URL dispatches (`internal/PLAN_multi_url_source.md`) credit
 /// per-part counters separately. The guard tracks each segment's
 /// `(part_idx, bytes)` so a later-segment failure (or a panic
 /// across the dispatch) refunds *every* prior segment as well as
@@ -838,7 +838,7 @@ impl Drop for ProgressRefundGuard<'_> {
 /// - `pwrite_at`s the segment at its global offset.
 ///
 /// `part_idx` attributes the read bytes to the right per-part
-/// counter (`docs/PLAN_multi_url_source.md`). Single-URL runs pass
+/// counter (`internal/PLAN_multi_url_source.md`). Single-URL runs pass
 /// `0` here — the coordinator initialises a one-element parts vec
 /// so the attribution is always valid.
 ///
@@ -904,7 +904,7 @@ fn download_single_segment(
 }
 
 /// Multi-segment fetch for a dispatch whose global range crosses
-/// one or more part boundaries (`docs/PLAN_multi_url_source.md`).
+/// one or more part boundaries (`internal/PLAN_multi_url_source.md`).
 /// Walks [`MultiPartSource::dispatch_range`] and runs
 /// [`download_single_segment`] against each, into the right slice
 /// of the combined buffer. Returns the summed `pwrite_at` wall-clock

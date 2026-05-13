@@ -1,6 +1,6 @@
 //! RAR5 archive support.
 //!
-//! Implementation tracks `docs/PLAN_rar.md`. Round-one ships in
+//! Implementation tracks `internal/PLAN_rar.md`. Round-one ships in
 //! phases:
 //!
 //! 1. **§1** — wire-format scaffolding: hand-rolled vint codec,
@@ -18,7 +18,7 @@
 //!    so this phase exercises the full plumbing without touching the
 //!    decoder.
 //! 4. **§4** — hand-rolled RAR5 decoder (LZSS + PPMd-II + filters)
-//!    per `docs/PLAN_rar5_decoder.md` (the §0.1 hand-roll resolution
+//!    per `internal/PLAN_rar5_decoder.md` (the §0.1 hand-roll resolution
 //!    spawned a sibling sub-plan modeled on
 //!    `PLAN_zstd_block_decoder.md`).
 //!
@@ -33,7 +33,7 @@
 //! coordinator is responsible for dispatching to the pipeline by
 //! name.
 //!
-//! # Round-one scope (`docs/PLAN_rar.md` §0, locked 2026-05-09)
+//! # Round-one scope (`internal/PLAN_rar.md` §0, locked 2026-05-09)
 //!
 //! Supported:
 //!
@@ -76,7 +76,7 @@
 //!   precise "compiled without `rar` feature" diagnostic instead of
 //!   "unknown format".
 //!
-//! See `docs/PLAN_rar.md` §0.5 for the rationale.
+//! See `internal/PLAN_rar.md` §0.5 for the rationale.
 
 #[cfg(feature = "rar")]
 pub mod archive;
@@ -88,7 +88,7 @@ pub mod error;
 pub mod format;
 /// Legacy (RAR3 / RAR4) format support — sibling of [`format`].
 ///
-/// Phase A1 of `docs/PLAN_rar3.md` lands the wire-format parser
+/// Phase A1 of `internal/PLAN_rar3.md` lands the wire-format parser
 /// here. Pipeline dispatch (`parse_signature` enum, walker
 /// integration) follows in §A2; the decoder generations land in
 /// §B / §C.
@@ -112,7 +112,7 @@ use std::io::Read;
 use crate::decode::{DecodeError, StreamingDecoder};
 
 /// Format name [`crate::decode::DecoderRegistry::with_defaults`]
-/// registers RAR under (`docs/PLAN_rar.md` §1). The coordinator
+/// registers RAR under (`internal/PLAN_rar.md` §1). The coordinator
 /// pre-checks the resolved factory against this constant and
 /// (post-§3) dispatches to `crate::download::rar_pipeline` instead
 /// of invoking the streaming decoder loop.
@@ -136,7 +136,7 @@ pub const SIGNATURE_MAGIC: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 
 /// The two formats share the leading six bytes (`Rar!\x1A\x07`) and
 /// diverge at byte 6: legacy is a single zero byte (7-byte magic);
 /// RAR5 is `0x01 0x00` (8-byte magic). Pipeline integration in
-/// `docs/PLAN_rar3.md` §A2 dispatches on this enum.
+/// `internal/PLAN_rar3.md` §A2 dispatches on this enum.
 #[cfg(feature = "rar")]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SignatureKind {
@@ -210,7 +210,7 @@ pub fn detect_signature(buf: &[u8]) -> Result<(SignatureKind, usize), RarError> 
 /// body is the user-facing diagnostic for `.rar` URLs: rather than
 /// "unknown format" they see "this build of `peel` was compiled
 /// without the `rar` feature; rebuild with default features (or
-/// `--features rar`) to extract RAR archives." See `docs/PLAN_rar.md`
+/// `--features rar`) to extract RAR archives." See `internal/PLAN_rar.md`
 /// §0.5.
 ///
 /// # Errors

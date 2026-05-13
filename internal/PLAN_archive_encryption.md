@@ -395,7 +395,7 @@ guarantee on the cryptographic side.
 
 **Sketch**:
 
-1. `docs/ENCRYPTION.md`: list of supported schemes (§3–§5),
+1. `internal/ENCRYPTION.md`: list of supported schemes (§3–§5),
    explicit non-support for ZIP central-directory encryption and
    anything not in the §-table.
 2. Threat model: peel decrypts; it does not authenticate the user
@@ -434,4 +434,4 @@ and the differential cross-check tests are listed.
 5. Coverage thresholds in `ENGINEERING_STANDARDS.md` §5.1 hold for
    every new module under `src/crypto/`, `src/secret.rs`, and the
    modified format modules.
-6. `docs/ENCRYPTION.md` exists and is linked from `CLAUDE.md`.
+6. `internal/ENCRYPTION.md` exists and is linked from `CLAUDE.md`.

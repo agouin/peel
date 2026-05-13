@@ -10,7 +10,7 @@ recorded plaintext.
 
 ## Why 7z, not `rar a -m5`
 
-`docs/PLAN_rar3.md` §B3 originally pitched "encode with `rar a -m5`,
+`internal/PLAN_rar3.md` §B3 originally pitched "encode with `rar a -m5`,
 decode with the §B2 model". Two facts force a different reference:
 
 1. **`rar 7.x` dropped legacy-archive creation.** There is no

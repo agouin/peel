@@ -2,13 +2,13 @@
 //!
 //! Sibling of [`crate::decode::rar_native`] (RAR5 algorithm) and
 //! [`crate::decode::ppmd2`] (PPMd-II model). Round-one scope is
-//! locked in `docs/PLAN_rar3.md` §0: `unp_ver ∈ [29, 36]` (the
+//! locked in `internal/PLAN_rar3.md` §0: `unp_ver ∈ [29, 36]` (the
 //! WinRAR 2.9 / 3.x / 4.x algorithm family — one decoder for the
 //! three generations). Pre-2.9 archives surface
 //! [`crate::rar::RarError::UnsupportedFeature`] at parse time per
 //! §A2's walker.
 //!
-//! # Layering (`docs/PLAN_rar3.md` §C)
+//! # Layering (`internal/PLAN_rar3.md` §C)
 //!
 //! Submodules land one per sub-phase, mirroring the §B
 //! discipline. Empty for now (§C0 scaffolds; first real
@@ -59,7 +59,7 @@
 //!   recognised by libarchive's `crc32(bytecode) | (length <<
 //!   32)` fingerprint shortcut. Memory-only MSB-first bit
 //!   reader + `next_rarvm_number` codec at [`vm::membits`].
-//!   Note: §C2a's round-one listing in `docs/PLAN_rar3.md`
+//!   Note: §C2a's round-one listing in `internal/PLAN_rar3.md`
 //!   mentioned "itanium" — that's an RAR5-era standard filter
 //!   (covered by [`crate::decode::rar_native::filters`]); the
 //!   five WinRAR RAR3 standard filters are

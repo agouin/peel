@@ -24,7 +24,7 @@
 //!
 //! # Resume
 //!
-//! Per `docs/PLAN_v2.md` §5 step 7, the checkpoint records
+//! Per `internal/PLAN_v2.md` §5 step 7, the checkpoint records
 //! `current_entry_offset` for the in-flight entry. The pipeline
 //! drives resume by either:
 //!
@@ -301,7 +301,7 @@ impl ZipSink {
     /// those bytes to seed the running CRC, and leaves the sink
     /// ready to accept writes that pick up at `resume_at`. The
     /// underlying file-IO is codec-agnostic — Phase 9b of
-    /// `docs/PLAN_deflate_block_decoder.md` swapped DEFLATE / zstd
+    /// `internal/PLAN_deflate_block_decoder.md` swapped DEFLATE / zstd
     /// onto this same path via [`Self::begin_entry_resume`]. The
     /// `_stored` suffix is preserved for compatibility with
     /// pre-Phase-9b callers.

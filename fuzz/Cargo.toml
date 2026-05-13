@@ -7,7 +7,7 @@
 #     cargo install cargo-fuzz
 #     cargo +nightly fuzz run <target>
 #
-# Approved per `docs/ENGINEERING_STANDARDS.md` §5.2 ("Fuzz tests
+# Approved per `internal/ENGINEERING_STANDARDS.md` §5.2 ("Fuzz tests
 # (cargo fuzz)"), which calls out HTTP response parsing, checkpoint
 # file parsing, and frame boundary detection as the required
 # coverage areas — one fuzz target per area lives in `fuzz_targets/`.

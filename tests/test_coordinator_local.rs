@@ -1,5 +1,5 @@
 //! Integration tests for `peel::coordinator::local::run`
-//! (`docs/PLAN_local_file_extract.md` §2).
+//! (`internal/old/PLAN_local_file_extract.md` §2).
 //!
 //! These tests exercise the local-file path end-to-end without an
 //! HTTP server: build a compressed archive on disk, hand its path
@@ -229,7 +229,7 @@ fn local_zip_extracts_entry_to_output_dir() {
     // ZIP local-file extraction runs the same pipeline the HTTP
     // path uses, but driven against a `SparseFile::open_readonly`
     // wrap of the user's archive
-    // (`docs/PLAN_local_file_extract.md` §2 step 5).
+    // (`internal/old/PLAN_local_file_extract.md` §2 step 5).
     let dir = unique_dir("local_zip_extract");
     let payload: Vec<u8> = (0..4u32 * 1024).map(|i| i as u8).collect();
     let zip = support::zip_fixtures::build_zip(&[support::zip_fixtures::ZipEntrySpec::stored(

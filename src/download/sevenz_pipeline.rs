@@ -1,6 +1,6 @@
 //! Per-folder extraction driver for 7z archives.
 //!
-//! Implements §8 of `docs/PLAN_7z_support.md`. Sibling to
+//! Implements §8 of `internal/PLAN_7z_support.md`. Sibling to
 //! [`super::zip_pipeline`], same shape: bootstrap by reading
 //! the (small) trailer region, iterate the parsed folders in
 //! archive order, run the §6 folder decoder against the §7
@@ -193,7 +193,7 @@ pub struct SevenzPipeline<'a> {
     /// Multi-part sparse landing the workers are filling. Single-URL
     /// runs supply a one-part [`MultiSparse`] (direct dispatch);
     /// multi-volume runs route reads, writes, and punches through the
-    /// wrapper (`docs/PLAN_multivolume_archives.md` §7).
+    /// wrapper (`internal/PLAN_multivolume_archives.md` §7).
     pub sparse: &'a MultiSparse,
     /// Bitmap recording which chunks are durable.
     pub bitmap: &'a ChunkBitmap,
@@ -217,7 +217,7 @@ pub struct SevenzPipeline<'a> {
     /// for tests but never the production path.
     pub progress_state: Option<&'a Arc<crate::progress::ProgressState>>,
     /// Password source for encrypted folders
-    /// (`docs/PLAN_archive_encryption.md` §5). `None` means peel has
+    /// (`internal/PLAN_archive_encryption.md` §5). `None` means peel has
     /// no password to offer; an encrypted folder then surfaces
     /// [`EncryptionError::PasswordMissing`] before any decryption
     /// work. Resolved (loaded into a [`crate::secret::Password`])

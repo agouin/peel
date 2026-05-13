@@ -125,11 +125,11 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///
 /// - **v1** — `Raw` and `Tar` sink states.
 /// - **v2** — adds the `Zip` sink state for per-entry ZIP extraction
-///   (`docs/PLAN_v2.md` §5). The body layout is otherwise unchanged;
+///   (`internal/PLAN_v2.md` §5). The body layout is otherwise unchanged;
 ///   v2 readers parse v1 files transparently.
 /// - **v3** — appends an optional [`Checkpoint::hash_state`] field
 ///   carrying the serialized SHA-256 state used by `--sha256`
-///   integrity verification (`docs/PLAN_v2.md` §10). v3 readers
+///   integrity verification (`internal/PLAN_v2.md` §10). v3 readers
 ///   parse v1 / v2 files transparently with `hash_state = None`.
 /// - **v4** — appends an optional [`Checkpoint::chunk_crc32c`]
 ///   per-chunk fingerprint vector for `PLAN_v2.md` §11's mid-flight
@@ -152,7 +152,7 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   binaries refuse v6 with [`CheckpointError::UnsupportedVersion`].
 /// - **v7** — extends [`SinkState::Zip`] with an optional opaque
 ///   `current_entry_decoder_state` blob carrying the in-flight zip
-///   entry's codec state (`docs/PLAN_deflate_block_decoder.md`
+///   entry's codec state (`internal/PLAN_deflate_block_decoder.md`
 ///   Phase 9b). v7 readers parse v1..=v6 files transparently
 ///   with `current_entry_decoder_state = None` (which fall through
 ///   to the existing per-entry "restart from byte 0" path for
@@ -160,7 +160,7 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   [`CheckpointError::UnsupportedVersion`].
 /// - **v8** — replaces the legacy `(url, etag, last_modified)` trio
 ///   with a [`Checkpoint::parts`] vec of [`PartRecord`]s, one per
-///   logical part (`docs/PLAN_multi_url_source.md` §5). Single-URL
+///   logical part (`internal/PLAN_multi_url_source.md` §5). Single-URL
 ///   runs write a 1-element vec; multi-URL runs write the full
 ///   list. The optional [`Checkpoint::hash_state`] also carries a
 ///   `u32` `active_part_idx` so resume can rebuild the
@@ -172,11 +172,11 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   [`CheckpointError::UnsupportedVersion`].
 /// - **v9** — adds [`SinkState::Sevenz`] with `folders_completed` +
 ///   optional `current_folder` for the 7z second-pipeline driver
-///   (`docs/PLAN_7z_support.md` §9). Older binaries refuse v9 files
+///   (`internal/PLAN_7z_support.md` §9). Older binaries refuse v9 files
 ///   with [`CheckpointError::UnsupportedVersion`].
 /// - **v10** — adds [`SinkState::Rar`] with `entries_completed`,
 ///   optional `current_entry`, and `current_entry_offset` for the
-///   RAR5 STORED-method pipeline (`docs/PLAN_rar.md` §3). Round-one
+///   RAR5 STORED-method pipeline (`internal/PLAN_rar.md` §3). Round-one
 ///   resume restarts the in-flight entry from
 ///   `current_entry_offset` (the on-disk file is truncated to that
 ///   length and the running BLAKE2sp / CRC-32 are seeded by
@@ -188,7 +188,7 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 /// - **v11** — extends [`SinkState::Rar`] with an optional opaque
 ///   `current_entry_decoder_state` blob carrying the in-flight
 ///   compressed entry's [`crate::decode::rar_native::RarStreamDecoder`]
-///   snapshot (`docs/PLAN_rar5_decoder.md` §F1). v11 readers parse
+///   snapshot (`internal/PLAN_rar5_decoder.md` §F1). v11 readers parse
 ///   v1..=v10 files transparently with the blob set to `None`
 ///   (compressed entries fall through to the existing
 ///   "restart entry from byte 0" path). The format version on
@@ -200,7 +200,7 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///   [`CheckpointError::UnsupportedVersion`].
 ///
 /// **v12** — adds the [`Checkpoint::mode`] field
-/// (`docs/PLAN_download_modes.md` §5) so resume can detect drift
+/// (`internal/PLAN_download_modes.md` §5) so resume can detect drift
 /// between runs that pass different mode flags (e.g. a prior
 /// `--no-extract` checkpoint paired with a later run that omits
 /// the flag). Forward-compat: v11 and earlier read as
@@ -209,12 +209,12 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 ///
 /// **v13** — adds the [`Checkpoint::source_mtime`] trailer for
 /// [`RunMode::LocalDestructive`] runs
-/// (`docs/PLAN_local_file_extract.md` §5). The trailer is written
+/// (`internal/old/PLAN_local_file_extract.md` §5). The trailer is written
 /// only for `LocalDestructive`; every other mode falls through to
 /// the pre-§5 byte-identical layout.
 ///
 /// **v14** — adds a per-[`PartRecord`] `volume_role` tag
-/// (`docs/PLAN_multivolume_archives.md` §5) so a multi-volume
+/// (`internal/PLAN_multivolume_archives.md` §5) so a multi-volume
 /// resume can verify the volume set's shape matches what the
 /// checkpoint was written under. The tag is per-part because each
 /// part of a multi-volume archive is its own self-contained volume
@@ -239,21 +239,21 @@ pub const FORMAT_VERSION: u32 = 14;
 /// kill-switch timing) stable across the §F1 transition.
 const FORMAT_VERSION_RAR_STORED_ONLY: u32 = 10;
 
-/// `docs/PLAN_download_modes.md` §5: format version the writer
+/// `internal/PLAN_download_modes.md` §5: format version the writer
 /// upgrades to when [`Checkpoint::mode`] is anything other than
 /// [`RunMode::Extract`]. Default-mode runs keep writing the
 /// pre-§5 layout (v10 / v11 depending on the SinkState payload)
 /// so byte-identical regression checks pass.
 const FORMAT_VERSION_RUN_MODE: u32 = 12;
 
-/// `docs/PLAN_local_file_extract.md` §5: format version the
+/// `internal/old/PLAN_local_file_extract.md` §5: format version the
 /// writer upgrades to when [`Checkpoint::mode`] is
 /// [`RunMode::LocalDestructive`]. Carries the source-file mtime
 /// trailer so the resume path can defend against a same-size
 /// swap of the underlying archive between runs.
 const FORMAT_VERSION_LOCAL_DESTRUCTIVE: u32 = 13;
 
-/// `docs/PLAN_multivolume_archives.md` §5: format version the
+/// `internal/PLAN_multivolume_archives.md` §5: format version the
 /// writer upgrades to when at least one [`PartRecord`] carries a
 /// non-`None` [`VolumeRole`]. The per-part role byte is appended
 /// for every part in the body (uniformly, so the read loop has a
@@ -270,16 +270,16 @@ const SINK_TAG_RAW: u8 = 0;
 /// Tag for [`SinkState::Tar`] in the on-disk format.
 const SINK_TAG_TAR: u8 = 1;
 /// Tag for [`SinkState::Sevenz`] in the on-disk format. Added in
-/// v9 of the format (`docs/PLAN_7z_support.md` §9).
+/// v9 of the format (`internal/PLAN_7z_support.md` §9).
 const SINK_TAG_SEVENZ: u8 = 3;
 /// Tag for [`SinkState::Zip`] in the on-disk format. Added in v2 of
 /// the checkpoint layout.
 const SINK_TAG_ZIP: u8 = 2;
 /// Tag for [`SinkState::Rar`] in the on-disk format. Added in v10
-/// of the format (`docs/PLAN_rar.md` §3).
+/// of the format (`internal/PLAN_rar.md` §3).
 const SINK_TAG_RAR: u8 = 4;
 
-/// `docs/PLAN_download_modes.md` §5: which top-level mode a
+/// `internal/PLAN_download_modes.md` §5: which top-level mode a
 /// checkpoint was written by, persisted in v12 so resume can
 /// detect a user changing flags between runs and refuse to silently
 /// "forget" extractor or download-only progress.
@@ -293,25 +293,25 @@ pub enum RunMode {
     Extract,
     /// Download-only mode: scheduler fills `.peel.part`, no
     /// decoder runs, the part-file is renamed to the final output
-    /// path on completion (`docs/PLAN_download_modes.md` §2).
+    /// path on completion (`internal/PLAN_download_modes.md` §2).
     NoExtract,
     /// Extract-and-preserve mode: decoder runs and the puncher is
     /// forced to no-op so the source archive stays at its full
     /// `Content-Length`. On completion the `.peel.part` is renamed
     /// to a user-supplied keep-archive path
-    /// (`docs/PLAN_download_modes.md` §3).
+    /// (`internal/PLAN_download_modes.md` §3).
     KeepArchive,
     /// Local-file destructive mode: the user-supplied archive on
     /// disk is progressively hole-punched as the decoder advances
     /// and deleted on clean completion
-    /// (`docs/PLAN_local_file_extract.md` §5). Carries a
+    /// (`internal/old/PLAN_local_file_extract.md` §5). Carries a
     /// `source_mtime` trailer in the on-disk format (v13+) so a
     /// same-size swap between runs is detected on resume.
     LocalDestructive,
 }
 
 /// Run-mode tag for [`RunMode::Extract`] in the on-disk format
-/// (`docs/PLAN_download_modes.md` §5). Implicit for pre-v12
+/// (`internal/PLAN_download_modes.md` §5). Implicit for pre-v12
 /// checkpoints — the deserializer synthesizes the value.
 const RUN_MODE_TAG_EXTRACT: u8 = 0;
 /// Run-mode tag for [`RunMode::NoExtract`].
@@ -321,13 +321,13 @@ const RUN_MODE_TAG_KEEP_ARCHIVE: u8 = 2;
 /// Run-mode tag for [`RunMode::LocalDestructive`]. Added in v13.
 const RUN_MODE_TAG_LOCAL_DESTRUCTIVE: u8 = 3;
 
-/// `docs/PLAN_multivolume_archives.md` §5: which multi-volume
+/// `internal/PLAN_multivolume_archives.md` §5: which multi-volume
 /// archive format a [`PartRecord`] represents one volume of.
 ///
 /// Carried as `Option<VolumeRole>` on [`PartRecord`]; `None` means
 /// "linear byte-concat" — every pre-v14 [`PartRecord`] decodes as
 /// `None`, single-URL runs serialize `None`, and the
-/// multi-URL-source path (`docs/PLAN_multi_url_source.md`) also
+/// multi-URL-source path (`internal/PLAN_multi_url_source.md`) also
 /// serializes `None` because its parts byte-concatenate into one
 /// logical stream rather than each carrying their own format
 /// metadata.
@@ -433,7 +433,7 @@ impl RunMode {
 /// Maximum length of the v5 [`Checkpoint::decoder_state`] blob.
 ///
 /// Sized to accommodate the hand-rolled zstd decoder's resume blob
-/// (`docs/PLAN_zstd_block_decoder.md` Phase 7), which carries a
+/// (`internal/PLAN_zstd_block_decoder.md` Phase 7), which carries a
 /// sliding-window snapshot of up to `MAX_WINDOW_SIZE` (128 MiB at
 /// `windowLog = 27`) plus ~10 KiB of metadata. The lz4 blob is on
 /// the order of 50 bytes; the upper bound is a zstd-only concern.
@@ -475,7 +475,7 @@ pub struct CheckpointWriteTimings {
 /// helpers.
 ///
 /// Variants are specific so callers can decide what to log vs. retry
-/// vs. surface as a hard failure. Per `docs/ENGINEERING_BEST_PRACTICES`
+/// vs. surface as a hard failure. Per `internal/ENGINEERING_BEST_PRACTICES`
 /// §3.1 every variant carries enough structured context that the
 /// `Display` message alone is debuggable.
 #[derive(Debug, Error)]
@@ -562,7 +562,7 @@ pub enum CheckpointError {
         value: u8,
     },
 
-    /// `docs/PLAN_download_modes.md` §5: the on-disk checkpoint
+    /// `internal/PLAN_download_modes.md` §5: the on-disk checkpoint
     /// declares a [`RunMode`] that disagrees with the current run's
     /// mode. Resume would silently lose progress (or attempt the
     /// wrong cleanup), so the resume path surfaces this as a hard
@@ -578,7 +578,7 @@ pub enum CheckpointError {
         new: RunMode,
     },
 
-    /// `docs/PLAN_local_file_extract.md` §5: the local
+    /// `internal/old/PLAN_local_file_extract.md` §5: the local
     /// destructive-mode resume path detected drift between the
     /// checkpoint's view of the source archive and the file
     /// currently on disk — either the source path moved, its
@@ -776,7 +776,7 @@ pub enum SinkState {
     /// it. STORED entries resume from `current_entry_offset`;
     /// DEFLATE / zstd entries resume from `current_entry_offset` *and*
     /// the codec's `current_entry_decoder_state` blob (Phase 9b of
-    /// `docs/PLAN_deflate_block_decoder.md`). When the blob is
+    /// `internal/PLAN_deflate_block_decoder.md`). When the blob is
     /// `None` for a DEFLATE / zstd entry — either because the
     /// checkpoint was captured at byte 0 or the v6 reader couldn't
     /// see it — the pipeline falls back to "restart entry from byte
@@ -803,7 +803,7 @@ pub enum SinkState {
     },
 
     /// State for [`crate::sink::RarSink`] (added in v10 of the
-    /// format, `docs/PLAN_rar.md` §3).
+    /// format, `internal/PLAN_rar.md` §3).
     ///
     /// RAR5 archives are extracted entry-by-entry in archive
     /// order. The checkpoint records which entries are durable on
@@ -853,7 +853,7 @@ pub enum SinkState {
     },
 
     /// State for [`crate::sink::SevenzSink`] (added in v9 of the
-    /// format, `docs/PLAN_7z_support.md` §9).
+    /// format, `internal/PLAN_7z_support.md` §9).
     ///
     /// 7z archives are extracted folder-by-folder in archive
     /// order. The checkpoint records which folders are durable on
@@ -874,7 +874,7 @@ pub enum SinkState {
 }
 
 /// One logical part of a multi-URL split source
-/// (`docs/PLAN_multi_url_source.md` §5). Single-URL runs serialize a
+/// (`internal/PLAN_multi_url_source.md` §5). Single-URL runs serialize a
 /// one-element [`Checkpoint::parts`] vec whose only entry mirrors the
 /// legacy `(url, etag, last_modified, total_size)` fields; multi-URL
 /// runs serialize one record per part.
@@ -899,11 +899,11 @@ pub struct PartRecord {
     /// [`crate::hash::IntegrityHasher`] state machine.
     pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
     /// Multi-volume archive role this part plays, if any
-    /// (`docs/PLAN_multivolume_archives.md` §5).
+    /// (`internal/PLAN_multivolume_archives.md` §5).
     ///
     /// `None` is the linear byte-concat shape — every single-URL
     /// run, every multi-URL run that byte-concatenates into a tar
-    /// (`docs/PLAN_multi_url_source.md`), and every checkpoint
+    /// (`internal/PLAN_multi_url_source.md`), and every checkpoint
     /// written by a pre-v14 binary.
     ///
     /// `Some(role)` identifies which multi-volume format this
@@ -918,7 +918,7 @@ pub struct PartRecord {
 }
 
 /// Active-part hasher snapshot stored in [`Checkpoint::hash_state`]
-/// (`docs/PLAN_multi_url_source.md` §5).
+/// (`internal/PLAN_multi_url_source.md` §5).
 ///
 /// `active_part_idx` is the part the saved hasher state is partway
 /// through; `bytes` is the output of
@@ -945,7 +945,7 @@ pub struct HashState {
 pub struct Checkpoint {
     /// The URL the download is fetching from. Stored verbatim so the
     /// resume path can compare against the URL the user passed on the
-    /// CLI. For multi-URL runs (`docs/PLAN_multi_url_source.md`) this
+    /// CLI. For multi-URL runs (`internal/PLAN_multi_url_source.md`) this
     /// mirrors `parts[0].url` and the full per-part list lives in
     /// [`Self::parts`].
     pub url: String,
@@ -956,7 +956,7 @@ pub struct Checkpoint {
     /// server sent one. For multi-URL runs this mirrors
     /// `parts[0].last_modified`.
     pub last_modified: Option<String>,
-    /// Per-part record list (`docs/PLAN_multi_url_source.md` §5).
+    /// Per-part record list (`internal/PLAN_multi_url_source.md` §5).
     /// Always at least one element. Single-URL runs carry a
     /// one-element vec mirroring the `url`/`etag`/`last_modified`
     /// fields above; multi-URL runs carry one record per
@@ -984,8 +984,8 @@ pub struct Checkpoint {
     /// was taken.
     pub sink_state: SinkState,
     /// Active-part [`crate::hash::IntegrityHasher`] state when
-    /// integrity tracking is on (`docs/PLAN_v2.md` §10 and
-    /// `docs/PLAN_multi_url_source.md` §5), or `None` when the run
+    /// integrity tracking is on (`internal/PLAN_v2.md` §10 and
+    /// `internal/PLAN_multi_url_source.md` §5), or `None` when the run
     /// is not verifying a `--sha256` digest.
     ///
     /// `bytes` are the output of
@@ -1013,21 +1013,21 @@ pub struct Checkpoint {
     pub chunk_crc32c: Option<Vec<u32>>,
     /// Opaque per-decoder resume state captured by the extractor at
     /// the same step the boundary advanced
-    /// (`docs/OPTIMIZATIONS.md` §O.7b). Today this is populated by
+    /// (`internal/OPTIMIZATIONS.md` §O.7b). Today this is populated by
     /// `lz4` for mid-frame block boundaries; every other in-tree
     /// decoder reports `None`. The bytes are decoder-private — the
     /// checkpoint format treats the blob as opaque and only enforces
     /// the [`MAX_DECODER_STATE_LEN`] length cap on decode. Added in
     /// checkpoint format v5; older readers see `None`.
     pub decoder_state: Option<Vec<u8>>,
-    /// `docs/PLAN_download_modes.md` §5: which top-level mode this
+    /// `internal/PLAN_download_modes.md` §5: which top-level mode this
     /// checkpoint was written by. Added in checkpoint format v12;
     /// pre-v12 readers synthesize [`RunMode::Extract`]. Resume
     /// surfaces [`CheckpointError::ModeMismatch`] when the prior
     /// mode and the current run's mode disagree.
     pub mode: RunMode,
 
-    /// `docs/PLAN_local_file_extract.md` §5: the source archive's
+    /// `internal/old/PLAN_local_file_extract.md` §5: the source archive's
     /// `mtime` at the moment the checkpoint was written. Populated
     /// only when [`Self::mode`] is [`RunMode::LocalDestructive`];
     /// [`None`] for every other mode and for pre-v13 checkpoints
@@ -1102,7 +1102,7 @@ impl Checkpoint {
             self.estimated_body_size()
                 .saturating_add(decoder_state_size_hint),
         );
-        // v8 (`docs/PLAN_multi_url_source.md` §5): write the parts
+        // v8 (`internal/PLAN_multi_url_source.md` §5): write the parts
         // vec at the top instead of the legacy `(url, etag,
         // last_modified)` trio. Construction sites that built a
         // [`Checkpoint`] by hand without populating `parts` get a
@@ -1338,7 +1338,7 @@ impl Checkpoint {
             body.push(0);
         }
 
-        // v12 (`docs/PLAN_download_modes.md` §5): the `mode` tag is
+        // v12 (`internal/PLAN_download_modes.md` §5): the `mode` tag is
         // written only when the run is in a non-default mode. The
         // `required_format_version` rule below upgrades the on-disk
         // version in lockstep so older readers cleanly reject the
@@ -1348,7 +1348,7 @@ impl Checkpoint {
             body.push(self.mode.to_tag());
         }
 
-        // v13 (`docs/PLAN_local_file_extract.md` §5): the
+        // v13 (`internal/old/PLAN_local_file_extract.md` §5): the
         // `source_mtime` trailer is written only for
         // [`RunMode::LocalDestructive`]. Layout: a single
         // presence byte, then (if present) an 8-byte i64
@@ -1394,8 +1394,8 @@ impl Checkpoint {
         // names v11 explicitly to keep the lower bound stable
         // (byte-identical writes for the default-mode RAR path).
         const FORMAT_VERSION_RAR_F1: u32 = 11;
-        // v12 (`docs/PLAN_download_modes.md` §5): a non-default
-        // `mode` forces v12. v13 (`docs/PLAN_local_file_extract.md`
+        // v12 (`internal/PLAN_download_modes.md` §5): a non-default
+        // `mode` forces v12. v13 (`internal/old/PLAN_local_file_extract.md`
         // §5): a [`RunMode::LocalDestructive`] run forces v13
         // because the `source_mtime` trailer requires a reader
         // that knows to parse it. Take the max of the mode-driven
@@ -1414,7 +1414,7 @@ impl Checkpoint {
             } => FORMAT_VERSION_RAR_F1,
             _ => FORMAT_VERSION_RAR_STORED_ONLY,
         };
-        // v14 (`docs/PLAN_multivolume_archives.md` §5): any part
+        // v14 (`internal/PLAN_multivolume_archives.md` §5): any part
         // carrying a non-`None` [`VolumeRole`] forces v14 so the
         // reader's `format_version >= 14` dispatch picks up the
         // per-part trailer. The synthesized one-element fallback
@@ -1913,7 +1913,7 @@ impl Checkpoint {
             None
         };
 
-        // v12 (`docs/PLAN_download_modes.md` §5): one trailing tag
+        // v12 (`internal/PLAN_download_modes.md` §5): one trailing tag
         // byte that names the [`RunMode`] this checkpoint was
         // written under. v11-and-earlier readers synthesize
         // [`RunMode::Extract`] — every pre-v12 checkpoint was
@@ -1928,7 +1928,7 @@ impl Checkpoint {
             RunMode::Extract
         };
 
-        // v13 (`docs/PLAN_local_file_extract.md` §5): a
+        // v13 (`internal/old/PLAN_local_file_extract.md` §5): a
         // `source_mtime` trailer is written when (and only when)
         // the mode is [`RunMode::LocalDestructive`]. Read it for
         // local-destructive checkpoints at v13+; default to
@@ -1968,7 +1968,7 @@ impl Checkpoint {
         // into a synthetic single-element `parts[0]` so downstream
         // code (resume validation, snapshot/restore) can treat
         // every checkpoint shape uniformly.
-        // (`docs/PLAN_multi_url_source.md` §5 step 3.)
+        // (`internal/PLAN_multi_url_source.md` §5 step 3.)
         let parts = if format_version >= 8 {
             parts
         } else {
@@ -2624,7 +2624,7 @@ fn read_tar_member_state(cursor: &mut Cursor<'_>) -> Result<TarMemberState, Chec
 }
 
 /// 64-bit FNV-1a hash. Hand-rolled because the dependency policy
-/// (`docs/ENGINEERING_STANDARDS.md` §2) says "anything we can write in
+/// (`internal/ENGINEERING_STANDARDS.md` §2) says "anything we can write in
 /// 50 lines should be written, not depended on" and a checksum used
 /// only for tamper detection on a tiny file does not justify a crate.
 ///
@@ -2952,19 +2952,19 @@ mod tests {
     fn checkpoint_format_version_is_fourteen() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
-        // work (v6), `docs/PLAN_deflate_block_decoder.md` Phase 9b's
+        // work (v6), `internal/PLAN_deflate_block_decoder.md` Phase 9b's
         // zip per-entry decoder-state field (v7),
-        // `docs/PLAN_multi_url_source.md` §5's parts vec +
+        // `internal/PLAN_multi_url_source.md` §5's parts vec +
         // active-part-aware hash state (v8),
-        // `docs/PLAN_7z_support.md` §9's `SinkState::Sevenz`
-        // variant (v9), `docs/PLAN_rar.md` §3's
+        // `internal/PLAN_7z_support.md` §9's `SinkState::Sevenz`
+        // variant (v9), `internal/PLAN_rar.md` §3's
         // `SinkState::Rar` variant (v10),
-        // `docs/PLAN_rar5_decoder.md` §F1's
+        // `internal/PLAN_rar5_decoder.md` §F1's
         // `current_entry_decoder_state` blob (v11),
-        // `docs/PLAN_download_modes.md` §5's [`RunMode`] tag (v12),
-        // `docs/PLAN_local_file_extract.md` §5's
+        // `internal/PLAN_download_modes.md` §5's [`RunMode`] tag (v12),
+        // `internal/old/PLAN_local_file_extract.md` §5's
         // [`RunMode::LocalDestructive`] + `source_mtime` trailer
-        // (v13), and `docs/PLAN_multivolume_archives.md` §5's
+        // (v13), and `internal/PLAN_multivolume_archives.md` §5's
         // per-`PartRecord` [`VolumeRole`] tag (v14) each bumped
         // this when an optional trailer landed. If a future change
         // resets it, this guards against silently dropping the
@@ -3055,7 +3055,7 @@ mod tests {
 
     #[test]
     fn local_destructive_mode_bumps_format_version_to_thirteen() {
-        // §5 (`docs/PLAN_local_file_extract.md`): a
+        // §5 (`internal/old/PLAN_local_file_extract.md`): a
         // [`RunMode::LocalDestructive`] checkpoint carries the
         // `source_mtime` trailer and the writer upgrades the
         // header to v13 so older readers refuse it cleanly.

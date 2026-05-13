@@ -278,7 +278,7 @@ pub enum SchedulerError {
 /// `source.parts()[0]` while `total_size` carries the sum across all
 /// parts. The full per-part data lives in [`Self::source`]; downstream
 /// code that needs to route ranged GETs per part reads from there
-/// (`docs/PLAN_multi_url_source.md` §1).
+/// (`internal/PLAN_multi_url_source.md` §1).
 #[derive(Debug, Clone)]
 pub struct DownloadInfo {
     /// Final URL after redirects (primary part for multi-URL runs).
@@ -574,7 +574,7 @@ fn discover_via_range_probe(client: &Client, url: &Url) -> Result<DownloadInfo, 
 }
 
 /// Discover N parts in parallel and bundle them into a multi-part
-/// [`DownloadInfo`] (`docs/PLAN_multi_url_source.md` §1 step 3).
+/// [`DownloadInfo`] (`internal/PLAN_multi_url_source.md` §1 step 3).
 ///
 /// Each part is HEAD'd independently; the returned info's
 /// `total_size` is the sum of every part's `Content-Length`,
@@ -955,7 +955,7 @@ fn run_parallel(
     // this on every dispatch tick and respawns workers when it dips
     // below `workers`.
     let alive_workers = AtomicU32::new(0);
-    // Multi-URL routing (`docs/PLAN_multi_url_source.md` §1 step 4):
+    // Multi-URL routing (`internal/PLAN_multi_url_source.md` §1 step 4):
     // when the discovered source has more than one part, the worker
     // ignores the mirror set and fetches each chunk from the part
     // containing its global offset. The single-URL case (`len() == 1`)
@@ -1699,7 +1699,7 @@ fn pick_next_dispatch(
     let target = target_chunks.max(1);
     // Walk forward to see how many consecutive chunks we can
     // coalesce. Cap at `target_chunks`, `total_chunks`, and — for
-    // multi-URL runs (`docs/PLAN_multi_url_source.md`) — keep the
+    // multi-URL runs (`internal/PLAN_multi_url_source.md`) — keep the
     // dispatch within one part *for adaptive coalescing*. The first
     // chunk is always included even when its nominal range straddles
     // a part boundary; the worker iterates

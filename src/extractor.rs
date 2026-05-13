@@ -189,7 +189,7 @@ pub struct ExtractorConfig {
     /// [`CheckpointInfo`] allocation, which is load-bearing for
     /// decoders whose `decoder_state()` serializes a non-trivial
     /// sliding window (xz_native: ~8 MiB per call).
-    /// See `docs/PLAN_lazy_decoder_state.md`.
+    /// See `internal/old/PLAN_lazy_decoder_state.md`.
     ///
     /// `0` means "no byte-progress floor" — every quiescent advance
     /// fires the observer. This is the [`Self::default`] so that
@@ -564,7 +564,7 @@ impl Extractor {
     /// [`StreamingDecoder::decoder_state`] invocation that builds the
     /// resume blob. This is load-bearing for decoders whose
     /// `decoder_state()` is non-trivial (xz_native: ~8 MiB per call); see
-    /// `docs/PLAN_lazy_decoder_state.md` for the diagnosis.
+    /// `internal/old/PLAN_lazy_decoder_state.md` for the diagnosis.
     ///
     /// On a successful observer return (`Ok(())`) the extractor advances
     /// hole-punching up to the now-persisted position. On `Err`, the

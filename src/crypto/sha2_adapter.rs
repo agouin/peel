@@ -1,6 +1,6 @@
 //! [`BlockHash`] adapter for the pre-existing
 //! [`crate::hash::sha256::Sha256`] hand-rolled SHA-256
-//! (`docs/PLAN_archive_encryption.md` §2).
+//! (`internal/PLAN_archive_encryption.md` §2).
 //!
 //! The impl lives in a separate file (rather than in `hash::sha256`)
 //! so that module stays focused on its original use case — the

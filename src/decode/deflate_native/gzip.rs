@@ -194,7 +194,7 @@ impl GzipDecoder {
     }
 
     /// Number of gzip members whose trailers have validated cleanly
-    /// since construction. Phase 2 of [`docs/PLAN_gzip_throughput.md`]:
+    /// since construction. Phase 2 of [`internal/PLAN_gzip_throughput.md`]:
     /// the parallel-path entry condition gates on
     /// `members_scanned() >= 2`, and the [`super::members`] scanner
     /// helpers loop until this advances.
@@ -227,7 +227,7 @@ impl GzipDecoder {
     /// Mirror of [`StreamingDecoder::decode_step`] that returns the
     /// internal [`DeflateError`] vocabulary instead of round-tripping
     /// through [`DecodeError`]'s flattened `io::Error::other(...)`.
-    /// Phase 2 of [`docs/PLAN_gzip_throughput.md`]: the
+    /// Phase 2 of [`internal/PLAN_gzip_throughput.md`]: the
     /// [`super::members`] scanner needs the typed variants
     /// (`UnexpectedEof` vs `GzipBadMagic` vs `GzipCrcMismatch`) so
     /// the coordinator can discriminate "retry / wrong format / fail
@@ -546,7 +546,7 @@ impl StreamingDecoder for GzipDecoder {
         // inner so the extractor's quiescent-checkpoint loop
         // fires the puncher at every block boundary within a
         // single-member archive (Phase 10 of
-        // `docs/PLAN_deflate_block_decoder.md`). The blob this
+        // `internal/PLAN_deflate_block_decoder.md`). The blob this
         // wrapper emits at the same checkpoint
         // ([`Self::decoder_state`]) carries the running CRC32 +
         // ISIZE counter the resume needs.
@@ -754,7 +754,7 @@ mod tests {
         );
     }
 
-    /// Phase 0 of `docs/PLAN_gzip_throughput.md`: cross-validate the
+    /// Phase 0 of `internal/PLAN_gzip_throughput.md`: cross-validate the
     /// hand-rolled streaming wrapper against `flate2`'s
     /// `MultiGzDecoder` on an 8-member fixture (the `pigz`/concat
     /// shape the parallel-member work in later phases targets). This
@@ -798,7 +798,7 @@ mod tests {
         );
     }
 
-    /// Phase 2 of `docs/PLAN_gzip_throughput.md`: tighten the
+    /// Phase 2 of `internal/PLAN_gzip_throughput.md`: tighten the
     /// per-member contract. `frame_boundary()` must advance exactly
     /// once per member (no spurious advances within a member's
     /// deflate body — those go through the inner deflate decoder's

@@ -1,7 +1,7 @@
 //! PPMd-II / PPMd7 sub-allocator.
 //!
 //! Custom slab allocator the PPMd model uses for its variable-order
-//! context tree. Round-one (`docs/PLAN_rar3.md` §B1) ships the
+//! context tree. Round-one (`internal/PLAN_rar3.md` §B1) ships the
 //! allocator in isolation; §B2 plugs the context tree and decode
 //! loop on top.
 //!

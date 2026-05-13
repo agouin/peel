@@ -32,18 +32,18 @@
 //!   pipeline rather than via the [`Sink`] trait (ZIP entries arrive
 //!   in discrete, pre-sized chunks rather than as one byte stream),
 //!   but enforces the same path-safety rules and is quiescent
-//!   between entries. See `docs/PLAN_v2.md` §5.
+//!   between entries. See `internal/PLAN_v2.md` §5.
 //!
 //! # Errors
 //!
 //! All implementations return [`SinkError`]. The variants are specific
-//! per `docs/ENGINEERING_BEST_PRACTICES.md` §3.1: a caller looking at a
+//! per `internal/ENGINEERING_BEST_PRACTICES.md` §3.1: a caller looking at a
 //! sink failure can tell whether the failure is in the source archive
 //! (malformed header, bad checksum), in the entry being written
 //! (unsafe path, unsupported type), or in the local environment (IO).
 
 // `rar` lives behind the `rar` Cargo feature alongside the rest of
-// the RAR5 module tree (`docs/PLAN_rar.md` §0.5 / §3).
+// the RAR5 module tree (`internal/PLAN_rar.md` §0.5 / §3).
 #[cfg(feature = "rar")]
 pub mod rar;
 pub mod raw;
@@ -128,7 +128,7 @@ pub enum SinkError {
     /// under the MVP scope (symlinks, hard links, device nodes,
     /// fifos).
     ///
-    /// `docs/PLAN.md` §7 explicitly defers these; this variant lets
+    /// `internal/PLAN.md` §7 explicitly defers these; this variant lets
     /// callers detect the condition without scanning a free-form
     /// message.
     #[error("unsupported tar entry type {type_flag:?} for {entry:?}")]

@@ -756,12 +756,12 @@ attack vector).
 
 ---
 
-## RAR5 follow-ons (filed 2026-05-09 from `docs/PLAN_rar.md`)
+## RAR5 follow-ons (filed 2026-05-09 from `internal/PLAN_rar.md`)
 
-These items were filed when `docs/PLAN_rar.md` §§1–3 landed
+These items were filed when `internal/PLAN_rar.md` §§1–3 landed
 (STORED-method extraction). The hand-rolled standard-RAR5 decoder
 that unblocks the rest is itself a multi-phase sub-plan
-(`docs/PLAN_rar5_decoder.md`); promote items here as that plan
+(`internal/PLAN_rar5_decoder.md`); promote items here as that plan
 makes them tractable.
 
 ### O.RAR.MV Multi-volume RAR archives
@@ -830,7 +830,7 @@ forward-compatible: when the parser surfaces an
 **What**: support archive-defined filters (the RAR5 spec lets
 the encoder ship a custom bytecode filter).
 
-**Why deferred**: see `docs/PLAN_rar5_decoder.md` §C2. `rar a`
+**Why deferred**: see `internal/PLAN_rar5_decoder.md` §C2. `rar a`
 does not emit custom filters by default, so the corpus is
 small. Files alongside the §C/§D lift.
 
@@ -840,7 +840,7 @@ small. Files alongside the §C/§D lift.
 mid-entry decoder snapshot so resume across a PPMd-II block
 boundary produces byte-identical output.
 
-**Why deferred**: see `docs/PLAN_rar5_decoder.md` §F1. The LZSS
+**Why deferred**: see `internal/PLAN_rar5_decoder.md` §F1. The LZSS
 case is straightforward; PPMd-II's context-model state is
 larger and more error-prone to serialize.
 
@@ -849,7 +849,7 @@ larger and more error-prone to serialize.
 **What**: parallel decode within a single entry (or across
 non-solid entries) to reduce wall-clock for big archives.
 
-**Why deferred**: §G of `docs/PLAN_rar5_decoder.md` profiles
+**Why deferred**: §G of `internal/PLAN_rar5_decoder.md` profiles
 the hot paths first; promote this only if profiling shows the
 single-threaded decode bound.
 

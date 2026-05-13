@@ -1,7 +1,7 @@
 //! Legacy RAR (RAR3 / RAR4) RarVM — filter declaration parser +
 //! standard filter set (DELTA / E8 / E8E9 / RGB / AUDIO).
 //!
-//! `docs/PLAN_rar3.md` §C2a deliverable. The LZ dispatcher
+//! `internal/PLAN_rar3.md` §C2a deliverable. The LZ dispatcher
 //! ([`super::lzss::LzDecoder::decode_block`]) surfaces symbol 257
 //! as [`super::lzss::BlockEnd::FilterDecl`]; the caller is then
 //! responsible for reading the filter declaration's flags + size
@@ -40,7 +40,7 @@
 //!   filtered output → LZ output) is the §C2b deliverable, since
 //!   it depends on the full VM interpreter being ready for
 //!   archive-supplied (non-standard) bytecode and on a corpus
-//!   that exercises filters (`docs/PLAN_rar3.md` §C2a's corpus
+//!   that exercises filters (`internal/PLAN_rar3.md` §C2a's corpus
 //!   note: the ssokolow round-one corpus is all PPMd, and the
 //!   bundled `rar 7.22` no longer creates legacy archives, so
 //!   filter-using fixtures are sourced separately when §C2b is
@@ -52,7 +52,7 @@
 //!   the spec allows custom bytecode and §C2b makes that
 //!   reachable.
 //!
-//! # Reuse-vs-fork posture (`docs/PLAN_rar3.md` §C0)
+//! # Reuse-vs-fork posture (`internal/PLAN_rar3.md` §C0)
 //!
 //! Sibling of [`crate::decode::rar_native::filters`] (RAR5
 //! filter VM); no shared code. The two formats both ship DELTA

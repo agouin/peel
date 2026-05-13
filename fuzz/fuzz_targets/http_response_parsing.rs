@@ -3,7 +3,7 @@
 //! header), `Url::parse` (used to validate redirect `Location:` values
 //! and CLI URLs), and `Url::join` (the redirect-resolution path).
 //!
-//! Required per `docs/ENGINEERING_STANDARDS.md` §5.2 ("HTTP response
+//! Required per `internal/ENGINEERING_STANDARDS.md` §5.2 ("HTTP response
 //! parsing").
 
 #![no_main]

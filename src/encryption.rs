@@ -1,5 +1,5 @@
 //! Format-agnostic encryption-layer error type
-//! (`docs/PLAN_archive_encryption.md` §6).
+//! (`internal/PLAN_archive_encryption.md` §6).
 //!
 //! Every encrypted archive format peel supports (ZIP-AES, ZipCrypto,
 //! RAR5, 7z) surfaces decryption failures through the same enum so

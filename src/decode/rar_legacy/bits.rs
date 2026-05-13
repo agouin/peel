@@ -4,7 +4,7 @@
 //! pack bits MSB-first within each byte (the high bit of byte 0
 //! is the first bit on the wire), and both back the reader with
 //! a 64-bit accumulator over an in-memory byte slice. The reuse-
-//! vs-fork decision (`docs/PLAN_rar3.md` §C0) is "fork" — the two
+//! vs-fork decision (`internal/PLAN_rar3.md` §C0) is "fork" — the two
 //! readers do not share an implementation, so each can evolve
 //! against its own format without dragging the other along.
 //!

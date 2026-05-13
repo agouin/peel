@@ -1,5 +1,5 @@
 //! End-to-end CLI tests for multi-volume archives — the `.part<N>.rar`
-//! auto-discovery wiring described in `docs/PLAN_multivolume_archives.md`.
+//! auto-discovery wiring described in `internal/PLAN_multivolume_archives.md`.
 //!
 //! The existing [`tests/test_cli_multivolume.rs`] only covers the
 //! parser surface (`Cli::try_parse_from(...).into_run_args()`) and
@@ -11,7 +11,7 @@
 //! and the extracted tree is byte-compared against the expected
 //! payloads documented in that directory's `README.md`.
 //!
-//! Gated behind the `rar` Cargo feature (per `docs/PLAN_rar.md`
+//! Gated behind the `rar` Cargo feature (per `internal/PLAN_rar.md`
 //! §0.5); without it the runtime decoder refuses RAR5 archives and
 //! these tests would not be meaningful.
 

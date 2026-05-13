@@ -1,5 +1,5 @@
 //! Adaptive chunk-size policy for the download scheduler
-//! (`docs/PLAN_v2.md` §8).
+//! (`internal/PLAN_v2.md` §8).
 //!
 //! The policy observes per-dispatch completion latencies and the
 //! retry rate, and decides whether to grow or shrink the **dispatch

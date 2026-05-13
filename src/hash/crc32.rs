@@ -1,12 +1,12 @@
 //! CRC-32 (IEEE 802.3 / ISO-HDLC) — the variant the .xz Block
 //! Check (`Check ID = 0x01`) and many other formats record.
 //!
-//! Phase 5 of `docs/PLAN_xz_block_decoder.md`. The plan steers
+//! Phase 5 of `internal/PLAN_xz_block_decoder.md`. The plan steers
 //! Block-Check verification at this module: streaming `update`
 //! over decompressed Block bytes, `finalize` at Block end,
 //! compare to the read trailer.
 //!
-//! Hand-rolled per `docs/ENGINEERING_STANDARDS.md` §2.1 ("a
+//! Hand-rolled per `internal/ENGINEERING_STANDARDS.md` §2.1 ("a
 //! 50-line hand-rolled implementation [is preferred over a
 //! crate]"). The lookup table is built once at compile time as a
 //! `const`; the inner loop is the canonical byte-at-a-time

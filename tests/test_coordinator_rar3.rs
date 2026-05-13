@@ -2,7 +2,7 @@
 //! through the second-pipeline coordinator.
 //!
 //! Sister to `test_coordinator_rar.rs` but exercises the legacy
-//! signature path landed in `docs/PLAN_rar3.md` §A2b and the
+//! signature path landed in `internal/PLAN_rar3.md` §A2b and the
 //! compressed-method pipeline wiring landed in §E1. STORED entries
 //! (`m=0`) follow the byte-copy fast path; compressed entries
 //! (`m=1..=5`) route through the `RarLegacyStreamDecoder` adapter

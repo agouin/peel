@@ -53,7 +53,7 @@
 //! ~30 bytes of fixed framing). Three orders of magnitude
 //! smaller than the zstd plan's 128 MiB ceiling; per-checkpoint
 //! write cost is negligible against the existing 8 MiB cadence
-//! floor (`docs/PLAN_deflate_block_decoder.md` §Phase 7
+//! floor (`internal/PLAN_deflate_block_decoder.md` §Phase 7
 //! commentary).
 
 use std::io;

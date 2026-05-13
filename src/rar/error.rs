@@ -1,6 +1,6 @@
 //! Typed errors for the RAR5 parser and extraction pipeline.
 //!
-//! Variants are intentionally specific. The `docs/PLAN_rar.md`
+//! Variants are intentionally specific. The `internal/PLAN_rar.md`
 //! "users see the specific feature, not 'malformed header'" rule
 //! motivates [`Self::UnsupportedFeature`] carrying a free-form name;
 //! the rest of the variants distinguish recoverable framing trouble
@@ -17,7 +17,7 @@ use crate::encryption::EncryptionError;
 
 /// Errors produced while parsing or extracting a RAR5 archive.
 ///
-/// Per `docs/ENGINEERING_BEST_PRACTICES.md` §3.1 every variant
+/// Per `internal/ENGINEERING_BEST_PRACTICES.md` §3.1 every variant
 /// carries enough structured context that the message alone is
 /// debuggable.
 #[derive(Debug, Error)]
@@ -37,7 +37,7 @@ pub enum RarError {
     /// detected version so the diagnostic is specific.
     #[error(
         "unsupported RAR format version {major}.{minor}: this build \
-         supports RAR5 only (see docs/PLAN_rar.md \"What this plan \
+         supports RAR5 only (see internal/PLAN_rar.md \"What this plan \
          deliberately does not include\")"
     )]
     UnsupportedFormatVersion {
@@ -160,7 +160,7 @@ pub enum RarError {
     /// Encryption-specific failure: missing password, wrong password,
     /// or integrity-tag mismatch under a successfully derived key.
     /// The shared [`EncryptionError`] enum
-    /// (`docs/PLAN_archive_encryption.md` §6) carries the variant;
+    /// (`internal/PLAN_archive_encryption.md` §6) carries the variant;
     /// this is the rar-side container.
     #[error("RAR encryption: {0}")]
     Encryption(#[source] EncryptionError),

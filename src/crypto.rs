@@ -1,5 +1,5 @@
 //! Hand-rolled cryptographic primitives for encrypted-archive
-//! decryption (`docs/PLAN_archive_encryption.md` §2).
+//! decryption (`internal/PLAN_archive_encryption.md` §2).
 //!
 //! This module hosts the building blocks every format-specific
 //! decryption path in §3–§5 shares: AES (§2b), HMAC, PBKDF2, SHA-1,
@@ -14,7 +14,7 @@
 //! # Threat model
 //!
 //! See the project-level threat model in
-//! `docs/PLAN_archive_encryption.md` §7. Briefly: we decrypt, we
+//! `internal/PLAN_archive_encryption.md` §7. Briefly: we decrypt, we
 //! don't authenticate the user, and we don't pretend to protect
 //! against an attacker with read access to `/proc/<pid>/mem`. The
 //! one rule we do codify in code is the constant-time comparison

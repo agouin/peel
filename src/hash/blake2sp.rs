@@ -1,10 +1,10 @@
 //! Hand-rolled BLAKE2sp (parallel BLAKE2s, 8 lanes).
 //!
 //! BLAKE2sp is RAR5's file-data integrity hash. It is *not* used
-//! anywhere else in `peel` (`docs/PLAN_v2.md` §10's integrity check
+//! anywhere else in `peel` (`internal/PLAN_v2.md` §10's integrity check
 //! is SHA-256; ZIP and 7z use CRC-32 / BLAKE3 / no-op variants), so
 //! this module ships alongside the rest of the RAR support per
-//! `docs/PLAN_rar.md` §2.
+//! `internal/PLAN_rar.md` §2.
 //!
 //! # Construction
 //!

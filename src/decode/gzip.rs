@@ -1,6 +1,6 @@
 //! gzip streaming decoder (RFC 1952).
 //!
-//! Phase 8 of `docs/PLAN_deflate_block_decoder.md` swapped the old
+//! Phase 8 of `internal/PLAN_deflate_block_decoder.md` swapped the old
 //! `flate2` / `miniz_oxide` wrapper out for the hand-rolled,
 //! pure-Rust implementation in [`super::deflate_native::gzip`].
 //! This file is now a thin re-export so

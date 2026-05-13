@@ -2,7 +2,7 @@
 //! local file header and central directory entry, and the variant the
 //! gzip per-member trailer carries (RFC 1952 §2.3).
 //!
-//! Hand-rolled per `docs/ENGINEERING_STANDARDS.md` §2.1.
+//! Hand-rolled per `internal/ENGINEERING_STANDARDS.md` §2.1.
 //!
 //! The polynomial is the reflected form `0xEDB8_8320` and the
 //! initial / final XOR is `!0u32`, matching what `zlib`'s `crc32`,
@@ -15,11 +15,11 @@
 //! reflected CRCs (Intel "Fast CRC computation for generic polynomials"
 //! 2009). The < 16-byte tail falls back to the byte-at-a-time table.
 //!
-//! Phase 1 of [`docs/PLAN_gzip_throughput.md`] ports this from
+//! Phase 1 of [`internal/PLAN_gzip_throughput.md`] ports this from
 //! [`super::super::hash::crc64`]'s slicing-by-16 path; the gzip
 //! per-member trailer's running CRC32 was ~7 % of decode self-time
 //! at byte-by-byte (mirrors the xz decoder-side CRC64 share Phase 1
-//! of [`docs/PLAN_xz_decoder_optimization.md`] recovered). The exit
+//! of [`internal/PLAN_xz_decoder_optimization.md`] recovered). The exit
 //! gate for that plan's Phase 1 is "≥ 5× scalar throughput
 //! improvement" on the 64 KiB microbench in
 //! [`tests/test_bench_deflate_native.rs`].
@@ -188,7 +188,7 @@ pub fn ieee(data: &[u8]) -> u32 {
 /// [`Crc32`] hasher applies.
 ///
 /// This is the raw inner-loop transform used by the PKWARE
-/// "ZipCrypto" key-update routine (`docs/PLAN_archive_encryption.md`
+/// "ZipCrypto" key-update routine (`internal/PLAN_archive_encryption.md`
 /// §3b): each input byte advances three 32-bit keys, and two of
 /// those advances are exactly one CRC-32 step over a key value whose
 /// initial state is NOT `!0u32` (it's `0x1234_5678` / `0x3456_7890`).
@@ -270,7 +270,7 @@ mod tests {
     /// Reference byte-at-a-time CRC-32/IEEE — the previous production
     /// inner loop, kept here as the differential oracle for the
     /// slicing-by-16 path. Phase 1 of
-    /// [`docs/PLAN_gzip_throughput.md`] requires every commit to be
+    /// [`internal/PLAN_gzip_throughput.md`] requires every commit to be
     /// byte-identical to slicing-by-1.
     fn ieee_byte_by_byte(data: &[u8]) -> u32 {
         let mut state = !0u32;

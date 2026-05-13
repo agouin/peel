@@ -1,5 +1,5 @@
 //! Aggregate bandwidth limiter for the download workers
-//! (`docs/PLAN_v2.md` §14).
+//! (`internal/PLAN_v2.md` §14).
 //!
 //! `peel`'s `--max-bandwidth <RATE>` flag throttles the rate at which
 //! bytes are read off the wire. The limiter is a single token bucket

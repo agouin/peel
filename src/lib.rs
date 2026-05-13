@@ -1,8 +1,8 @@
 //! `peel` — streaming, resumable, space-efficient extraction of compressed
 //! archives downloaded over HTTP.
 //!
-//! See [`docs/PLAN.md`] in the repository for the implementation plan and
-//! [`docs/ENGINEERING_STANDARDS.md`] for the rules every module follows.
+//! See [`internal/PLAN.md`] in the repository for the implementation plan and
+//! [`internal/ENGINEERING_STANDARDS.md`] for the rules every module follows.
 //!
 //! # Layering
 //!
@@ -45,7 +45,7 @@
 //! - [`zip`] — ZIP archive support (parsers, sink, per-entry
 //!   pipeline). ZIP's central-directory-at-the-end design forces a
 //!   different pipeline shape than the streaming decoders in
-//!   [`decode`]; see `docs/PLAN_v2.md` §5.
+//!   [`decode`]; see `internal/PLAN_v2.md` §5.
 //! - [`progress`] — multi-field progress tracking (`PLAN_v2.md` §6):
 //!   shared `ProgressState` updated by writers (workers, extractor,
 //!   ZIP pipeline) plus a TTY / log renderer the binary spawns at
@@ -80,7 +80,7 @@
 //!   path on the blocking backend. The `--io-backend` CLI flag picks
 //!   between `auto` (default; tries uring, falls back to blocking with
 //!   a warning), `blocking`, `uring`, and `mmap`.
-//! - [`rar`] — RAR5 archive support (`docs/PLAN_rar.md`). Round-one
+//! - [`rar`] — RAR5 archive support (`internal/PLAN_rar.md`). Round-one
 //!   ships the hand-rolled framing layer (§1), BLAKE2sp file-data
 //!   integrity (§2), the STORED-method pipeline (§3), and a
 //!   hand-rolled RAR5 decompressor (§4 / `PLAN_rar5_decoder.md`).
@@ -89,8 +89,8 @@
 //!   while still surfacing a precise "compiled without RAR support"
 //!   diagnostic for `.rar` URLs.
 //!
-//! [`docs/PLAN.md`]: https://github.com/agouin/peel/blob/main/docs/PLAN.md
-//! [`docs/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/docs/ENGINEERING_STANDARDS.md
+//! [`internal/PLAN.md`]: https://github.com/agouin/peel/blob/main/internal/PLAN.md
+//! [`internal/ENGINEERING_STANDARDS.md`]: https://github.com/agouin/peel/blob/main/internal/ENGINEERING_STANDARDS.md
 
 #![deny(missing_docs)]
 #![warn(unused, clippy::all)]

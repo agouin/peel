@@ -3,7 +3,7 @@
 //! Sibling of [`crate::decode::rar_native::huffman`]: both modules
 //! materialise an MSB-first canonical Huffman code as a flat
 //! `1 << max_len` lookup table over [`super::bits::BitReader`].
-//! The reuse-vs-fork decision (`docs/PLAN_rar3.md` §C0) keeps the
+//! The reuse-vs-fork decision (`internal/PLAN_rar3.md` §C0) keeps the
 //! two implementations independent — the structure is similar
 //! because both are doing the same job, but the legacy module
 //! ships with its own constants (alphabet sizes, max code length)

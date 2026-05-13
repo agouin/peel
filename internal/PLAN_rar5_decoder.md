@@ -18,15 +18,15 @@
 > archives only, so the compressed-method hot-path profile that
 > §G1 calls for has not yet been collected.
 >
-> **Sequencing.** §1+§2+§3 of `docs/PLAN_rar.md` were on `main`
+> **Sequencing.** §1+§2+§3 of `internal/PLAN_rar.md` were on `main`
 > before §A1 began; the decoder plugs into the same `RarSink` /
 > `rar_pipeline` surfaces those phases shipped.
 
-**Supersedes**: nothing — this is additive to `docs/PLAN_rar.md` §4.
+**Supersedes**: nothing — this is additive to `internal/PLAN_rar.md` §4.
 
 ## Why we're hand-rolling this
 
-§0.1 of `docs/PLAN_rar.md` rejected the `unrar` C++ FFI on
+§0.1 of `internal/PLAN_rar.md` rejected the `unrar` C++ FFI on
 licensing grounds: the unRAR license is non-OSI and
 GPL-incompatible, and `peel` is licensed `MIT OR Apache-2.0`.
 Mainstream Rust BLAKE2sp / RAR5 ref crates don't help —
@@ -35,7 +35,7 @@ pure-Rust RAR ports examined on crates.io 2026-05 covered RAR5
 minimally or not at all.
 
 Hand-rolling is comparable in scope to
-`docs/PLAN_zstd_block_decoder.md` (10 phases, ~12 weeks) but
+`internal/PLAN_zstd_block_decoder.md` (10 phases, ~12 weeks) but
 materially harder: the RAR5 wire format is author-provided by
 RARLAB rather than IETF-standardized, the corpus of public test
 vectors is smaller, and the algorithm has more moving parts

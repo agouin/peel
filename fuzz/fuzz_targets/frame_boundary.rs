@@ -3,7 +3,7 @@
 //! hand-rolled decoder receives the rest, so libfuzzer can specialize
 //! coverage per format while keeping a single corpus directory.
 //!
-//! Required per `docs/ENGINEERING_STANDARDS.md` §5.2 ("frame boundary
+//! Required per `internal/ENGINEERING_STANDARDS.md` §5.2 ("frame boundary
 //! detection").
 
 #![no_main]
@@ -24,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
         0 => decode::zstd::factory,
         1 => decode::gzip::factory,
         2 => decode::lz4::factory,
-        // Phase F.6 of `docs/PLAN_xz_liblzma_phase_f.md`
+        // Phase F.6 of `internal/old/PLAN_xz_liblzma_phase_f.md`
         // retired `xz_native`; `xz_liblzma` is now the sole
         // xz decoder and inherits the existing fuzz contract
         // (no panic, no UB on any adversarial .xz framing).

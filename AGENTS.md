@@ -2,15 +2,15 @@
 
 Workflow rules for AI coding agents (Claude Code, Cursor, Aider, etc.) working
 in this repo. These are about *process*, not code style — for code style see
-`docs/ENGINEERING_STANDARDS.md` and `docs/ENGINEERING_BEST_PRACTICES.md`.
+`internal/ENGINEERING_STANDARDS.md` and `internal/ENGINEERING_BEST_PRACTICES.md`.
 
 ## Before you start a task
 
-1. Read the section of `docs/PLAN.md` that covers what you're about to do.
+1. Read the section of `internal/PLAN.md` that covers what you're about to do.
    Don't work ahead — the plan is sequenced for a reason (earlier modules
    are dependencies of later ones, and earlier modules are easier to verify
    in isolation).
-2. Re-read `docs/ENGINEERING_STANDARDS.md` if it's been more than a few
+2. Re-read `internal/ENGINEERING_STANDARDS.md` if it's been more than a few
    tasks since you last did. The dependency policy in particular is easy
    to forget.
 3. Check the existing code for prior art. If a similar pattern already
@@ -40,7 +40,7 @@ in this repo. These are about *process*, not code style — for code style see
 - Add a runtime dependency not on the allowlist.
 - Introduce `async` runtimes other than the one chosen in the plan.
 - Reformat or "clean up" files unrelated to your task.
-- Commit changes to `docs/PLAN.md` or `docs/ENGINEERING_STANDARDS.md`.
+- Commit changes to `internal/PLAN.md` or `internal/ENGINEERING_STANDARDS.md`.
   These are human-curated.
 
 ## Commit hygiene

@@ -4,7 +4,7 @@ Real-archive fixtures for the §C1g PPMd-entry path's end-to-
 end cross-check. The compressed entry inside each `.rar` file
 is a single `is_ppmd_block = 1` block (the WinRAR `-m5` encoder
 picked PPMd over LZSS for the 12-byte text payload — see the
-§C1e₂ corpus-inspection note in `docs/PLAN_rar3.md`).
+§C1e₂ corpus-inspection note in `internal/PLAN_rar3.md`).
 
 ## Files
 
@@ -125,7 +125,7 @@ synthetic inputs and inherit the same status.
 binaries are still readily available; later 4.x / 5.x / 6.x
 versions emit RAR3 archives too (until RAR 7.0 dropped
 `-ma3`), but `rar 3.93` is the version the §C2b corpus uses
-for reproducibility — see `docs/PLAN_rar3.md` §C2b for the
+for reproducibility — see `internal/PLAN_rar3.md` §C2b for the
 exact encode recipe and Docker `linux/amd64` invocation.
 
 The fifth WinRAR standard filter (`E8E9` — same algorithm as
@@ -164,5 +164,5 @@ tests in
   is the most recent public release that still accepts the
   `-ma4` switch for legacy (RAR4) output; `rar 7.x` only emits
   RAR5. The synthetic payload generation script lives in
-  [`docs/fixtures/rar_legacy_large_lz_normal.md`](../../../docs/fixtures/rar_legacy_large_lz_normal.md)
+  [`internal/fixtures/rar_legacy_large_lz_normal.md`](../../../internal/fixtures/rar_legacy_large_lz_normal.md)
   for re-encode reproducibility.

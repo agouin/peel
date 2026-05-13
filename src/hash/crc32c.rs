@@ -2,7 +2,7 @@
 //! fingerprint by `PLAN_v2.md` §11's mid-flight source-change
 //! detector.
 //!
-//! Hand-rolled per `docs/ENGINEERING_STANDARDS.md` §2.1 (the same
+//! Hand-rolled per `internal/ENGINEERING_STANDARDS.md` §2.1 (the same
 //! reasoning that justifies [`crate::zip::crc32`] applies here): a
 //! ~150-line table-driven implementation comfortably exceeds the
 //! ~100 MiB/s the §11 hot path needs and avoids dragging in another

@@ -30,7 +30,7 @@ pub mod mmap_region;
 pub mod multi_sparse;
 pub mod multi_url;
 // `rar_pipeline` is gated behind the `rar` feature alongside the
-// rest of the RAR5 module tree (`docs/PLAN_rar.md` §0.5 / §3).
+// rest of the RAR5 module tree (`internal/PLAN_rar.md` §0.5 / §3).
 #[cfg(feature = "rar")]
 pub mod rar_pipeline;
 pub mod rate_limit;

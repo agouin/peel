@@ -16,7 +16,7 @@
 //!   invariant.
 //! - Reject `BTYPE=11` (reserved) and surface fixed/dynamic block
 //!   types as deliberate placeholder errors per
-//!   `docs/PLAN_deflate_block_decoder.md` §Phase 1.
+//!   `internal/PLAN_deflate_block_decoder.md` §Phase 1.
 //!
 //! # Bit layout reminder (RFC 1951 §3.1.1)
 //!

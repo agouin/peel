@@ -1,6 +1,6 @@
 //! Legacy (RAR3 / RAR4) archive support.
 //!
-//! Implementation tracks `docs/PLAN_rar3.md`. The legacy archive
+//! Implementation tracks `internal/PLAN_rar3.md`. The legacy archive
 //! format is the on-disk container shipped by WinRAR 1.5–4.x; RARLAB
 //! calls it "RAR 4 archive format", third-party readers more often
 //! call it "RAR3", and the wire-format discriminator is the 7-byte
@@ -8,7 +8,7 @@
 //! `Rar!\x1A\x07\x01\x00`). The two formats share nothing structural
 //! beyond the leading six magic bytes.
 //!
-//! # Round-one scope (`docs/PLAN_rar3.md` §0, locked 2026-05-10)
+//! # Round-one scope (`internal/PLAN_rar3.md` §0, locked 2026-05-10)
 //!
 //! Supported:
 //!
@@ -27,7 +27,7 @@
 //! a generic parse failure):
 //!
 //! - **Pre-2.9 algorithms** (`unp_ver < 29`). Filed as conditional
-//!   §D in `docs/PLAN_rar3.md`. Pre-1.5 archives (no fixed magic)
+//!   §D in `internal/PLAN_rar3.md`. Pre-1.5 archives (no fixed magic)
 //!   are filed as `O.RAR.LEGACY15` and never reach this module.
 //! - **Multi-volume archives** (`MHD_VOLUME`). Surfaced from the
 //!   `MAIN_HEAD` parser the same way the RAR5 path does (filed as

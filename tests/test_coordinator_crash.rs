@@ -712,7 +712,7 @@ mod xxh32_nocrate {
 /// Encode `payload` as a single xz Stream / single Block at the
 /// given preset. Matches the shape of what `xz` CLI emits by
 /// default — one Stream and one Block for any input that fits in
-/// the dictionary. Phase 9 of `docs/PLAN_xz_block_decoder.md`
+/// the dictionary. Phase 9 of `internal/PLAN_xz_block_decoder.md`
 /// uses this to drive crash-resume tests across the per-LZMA2-
 /// chunk frame_boundary cadence; pre-Phase-7 the wrapper crate
 /// would have collapsed every checkpoint to end-of-Stream and
@@ -1129,7 +1129,7 @@ fn random_kill_points_resume_to_identical_tar_output() {
 
 #[test]
 fn random_kill_points_resume_mid_member_tar_zst_misaligned() {
-    // The production shape that motivated `docs/PLAN_zstd_block_decoder.md`:
+    // The production shape that motivated `internal/PLAN_zstd_block_decoder.md`:
     // a single zstd frame wrapping a multi-member tar archive whose
     // member boundaries do not align with the zstd block grid. Pre-
     // Phase-8 the upstream `zstd` crate's `frame_boundary` only fired
@@ -1611,7 +1611,7 @@ fn random_kill_points_resume_to_identical_tar_lz4_output() {
     assert!(failures.is_empty(), "{:?}", *failures);
     // Multi-frame lz4 with one frame per tar member: lz4's
     // per-block `frame_boundary` advances inside each frame
-    // (`docs/OPTIMIZATIONS.md` §O.7b) AND at end-of-frame where
+    // (`internal/OPTIMIZATIONS.md` §O.7b) AND at end-of-frame where
     // `decoder_state = None`. Randomized kill points hit both
     // kinds across 10 trials.
     assert_resume_mode(
@@ -2212,7 +2212,7 @@ fn sha256_match_after_random_kill_points_resume() {
 
 #[test]
 fn random_kill_points_resume_single_block_tar_xz_byte_identical() {
-    // Phase 9 of `docs/PLAN_xz_block_decoder.md`: a single-Block
+    // Phase 9 of `internal/PLAN_xz_block_decoder.md`: a single-Block
     // `.tar.xz` is the dominant production shape (`xz` CLI's
     // default emits one Block per file). Pre-Phase-7 the wrapper
     // exposed only end-of-Stream `frame_boundary` advances, so
@@ -2387,7 +2387,7 @@ fn encode_gzip_multi_member(payload: &[u8], n_members: usize, level: u32) -> Vec
 
 #[test]
 fn random_kill_points_resume_single_member_tar_gz_byte_identical() {
-    // Phase 11 of `docs/PLAN_deflate_block_decoder.md`: a
+    // Phase 11 of `internal/PLAN_deflate_block_decoder.md`: a
     // single-member `.tar.gz` is the dominant production shape
     // (`gzip` / `tar -z` CLI's default). Pre-Phase-7 the
     // `flate2`-based wrapper exposed only end-of-member
@@ -2527,7 +2527,7 @@ fn random_kill_points_resume_single_member_tar_gz_property() {
 
 #[test]
 fn random_kill_points_resume_multi_member_tar_gz_byte_identical() {
-    // Phase 4 of `docs/PLAN_gzip_throughput.md` (narrowed scope):
+    // Phase 4 of `internal/PLAN_gzip_throughput.md` (narrowed scope):
     // pin crash-resume on a multi-member tar.gz fixture (the
     // `pigz` / `gzip a b > c.gz` shape, valid per RFC 1952 §2.2).
     //

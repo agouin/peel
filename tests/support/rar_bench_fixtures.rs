@@ -14,7 +14,7 @@
 //!   `~/Downloads/rar/rar`. Apple Silicon-native; encoding is
 //!   disk-IO-bound. STORED is also the only method peel's RAR5
 //!   pipeline supports today (the hand-rolled compressed-method
-//!   decoder lands per `docs/PLAN_rar5_decoder.md`).
+//!   decoder lands per `internal/PLAN_rar5_decoder.md`).
 //! - **RAR3 LZ Normal** (`-m3` with `-ma4`): `rar 5.0.0` Linux
 //!   x86_64 inside a `linux/amd64` Docker container (Apple Silicon
 //!   runs the binary through Rosetta). `rar 7.x` dropped the

@@ -1,7 +1,7 @@
 # peel fuzz harness
 
 `cargo-fuzz` targets for the parser/decoder surfaces required by
-[`docs/ENGINEERING_STANDARDS.md`](../docs/ENGINEERING_STANDARDS.md) §5.2.
+[`internal/ENGINEERING_STANDARDS.md`](../internal/ENGINEERING_STANDARDS.md) §5.2.
 
 ## Targets
 

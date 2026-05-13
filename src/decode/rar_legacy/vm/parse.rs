@@ -1,6 +1,6 @@
 //! Filter declaration parser for legacy RAR (RAR3 / RAR4) RarVM.
 //!
-//! `docs/PLAN_rar3.md` §C2a. The parser comes in two layers,
+//! `internal/PLAN_rar3.md` §C2a. The parser comes in two layers,
 //! mirroring libarchive's `read_filter` (lines 3641..3688) and
 //! `parse_filter` (lines 3258..3397):
 //!

@@ -1,7 +1,7 @@
 //! `RarLegacyStreamDecoder` — `StreamingDecoder` adapter for
 //! legacy (RAR3 / RAR4) per-entry payloads.
 //!
-//! Per `docs/PLAN_rar3.md` §E1 this is the integration seam: the
+//! Per `internal/PLAN_rar3.md` §E1 this is the integration seam: the
 //! §A2 walker exposes the per-entry compressed range, the §B / §C
 //! decoder layers ship a synchronous
 //! [`super::entry::decode_payload`] that produces the entry's
@@ -17,7 +17,7 @@
 //! synchronous decoder, then drains the resulting decoded buffer to
 //! the caller's sink in `STREAM_CHUNK_BYTES` chunks. This mirrors
 //! the §E1 RAR5 path's "buffer-then-stream" posture
-//! (`docs/PLAN_rar5_decoder.md` §E1) and the analogous buffering in
+//! (`internal/PLAN_rar5_decoder.md` §E1) and the analogous buffering in
 //! the zip / 7z pipelines. The cost is bounded by the file header's
 //! `packed_size` + `unpacked_size`; Phase G's streaming-rework
 //! (`O.RAR.STREAMING_DECOMPRESS`) lifts it to a block-by-block
@@ -25,7 +25,7 @@
 //!
 //! # Mid-entry resume (§F1)
 //!
-//! Phase F (`docs/PLAN_rar3.md` §F1) wires
+//! Phase F (`internal/PLAN_rar3.md` §F1) wires
 //! [`StreamingDecoder::frame_boundary`] and
 //! [`StreamingDecoder::decoder_state_into`]. The round-one
 //! buffer-then-stream shape means the snapshot can be tiny: the

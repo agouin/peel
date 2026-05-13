@@ -1,8 +1,8 @@
 //! RAR5 wire-format parsers.
 //!
 //! Hand-rolled per the dependency policy in
-//! `docs/ENGINEERING_STANDARDS.md` §2.1 and the audit-trail
-//! preference in `docs/PLAN_rar.md` §1. Every parser is pure: input
+//! `internal/ENGINEERING_STANDARDS.md` §2.1 and the audit-trail
+//! preference in `internal/PLAN_rar.md` §1. Every parser is pure: input
 //! goes in as a byte slice, output comes out as a typed struct, and
 //! no IO happens here. Higher layers (the §3 pipeline) drive ranged
 //! reads and feed the right bytes to the right parser.
@@ -47,7 +47,7 @@
 //!
 //! # Sentinel rejections
 //!
-//! Per `docs/PLAN_rar.md` §0, round-one surfaces specific
+//! Per `internal/PLAN_rar.md` §0, round-one surfaces specific
 //! diagnostics for:
 //!
 //! - **RAR4 magic** at offset 0 (7-byte `Rar!\x1A\x07\x00`):

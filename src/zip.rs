@@ -4,7 +4,7 @@
 //! central directory lives at the *end* of the archive — so extraction
 //! cannot start until the trailing region has been downloaded, and
 //! per-entry compressed data is pulled by ranged GET against offsets
-//! recorded in the central directory. `docs/PLAN_v2.md` §5 calls this
+//! recorded in the central directory. `internal/PLAN_v2.md` §5 calls this
 //! out as a "second pipeline architecture" and motivates the layout
 //! split below.
 //!
@@ -12,7 +12,7 @@
 //!
 //! - [`format`] — pure wire-format parsers (EOCD, central-directory
 //!   entries, local file headers). Hand-rolled to mirror the
-//!   tar-parser precedent in [`crate::sink::tar`] (`docs/PLAN.md`
+//!   tar-parser precedent in [`crate::sink::tar`] (`internal/PLAN.md`
 //!   §7.3): the format is small enough that the audit story benefits
 //!   from byte-for-byte visibility, and the upstream `zip` crate
 //!   does not expose the per-entry boundary semantics our extractor
@@ -22,7 +22,7 @@
 //! `decode` (the STORED/DEFLATE/zstd dispatcher), and `pipeline` (the
 //! per-entry download driver).
 //!
-//! # Round-one scope (`docs/PLAN_v2.md` §5, locked 2026-04-29)
+//! # Round-one scope (`internal/PLAN_v2.md` §5, locked 2026-04-29)
 //!
 //! Supported:
 //!
@@ -32,7 +32,7 @@
 //!   in the LFH zeroed; the central directory carries the authoritative
 //!   values).
 //!
-//! Out of scope (filed as `O.8b` in `docs/OPTIMIZATIONS.md`):
+//! Out of scope (filed as `O.8b` in `internal/OPTIMIZATIONS.md`):
 //!
 //! - AES, traditional PKWARE, and any other encryption (general-purpose
 //!   flag bit 0 or bit 6).
@@ -120,7 +120,7 @@ pub fn streaming_factory_placeholder(
 ///   parses but a per-entry CRC32 over decompressed bytes does not
 ///   match the one the central directory recorded.
 ///
-/// Per `docs/ENGINEERING_BEST_PRACTICES.md` §3.1 every variant carries
+/// Per `internal/ENGINEERING_BEST_PRACTICES.md` §3.1 every variant carries
 /// enough structured context that the message alone is debuggable.
 #[derive(Debug, Error)]
 pub enum ZipError {
@@ -216,7 +216,7 @@ pub enum ZipError {
 
     /// Encryption-specific failure: missing password, wrong password,
     /// or HMAC integrity-tag mismatch. The shared
-    /// [`EncryptionError`] enum (`docs/PLAN_archive_encryption.md`
+    /// [`EncryptionError`] enum (`internal/PLAN_archive_encryption.md`
     /// §6) carries the variant; this is the zip-side container.
     #[error("ZIP encryption: {0}")]
     Encryption(#[source] EncryptionError),

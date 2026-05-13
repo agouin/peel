@@ -5,7 +5,7 @@
 //! of the wire-format layer; the §A2b pipeline reuses the same
 //! per-header parsers but streams ranged downloads on top).
 //!
-//! The walker enforces `docs/PLAN_rar3.md` §0 round-one rejections:
+//! The walker enforces `internal/PLAN_rar3.md` §0 round-one rejections:
 //!
 //! - **Multi-volume** (`MHD_VOLUME` set in `MAIN_HEAD`):
 //!   [`crate::rar::RarError::UnsupportedFeature`] = `"multi-volume

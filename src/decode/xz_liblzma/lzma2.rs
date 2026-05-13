@@ -1,6 +1,6 @@
 //! LZMA2 chunk dispatcher for the liblzma-port decoder.
 //!
-//! Phase 5 of [`docs/PLAN_xz_liblzma_port.md`](../../../../docs/PLAN_xz_liblzma_port.md).
+//! Phase 5 of [`internal/PLAN_xz_liblzma_port.md`](../../../../internal/PLAN_xz_liblzma_port.md).
 //! Mirror of liblzma's `lzma2_decoder.c` (~310 lines): parses
 //! LZMA2 chunk control bytes, applies the requested resets to
 //! the [`super::decoder::Lzma1Decoder`] + [`super::dict::LzmaDict`],

@@ -294,7 +294,7 @@ pub struct CoordinatorConfig {
     /// `io_uring` and surfaces a clean error if the kernel does not
     /// support it. Mirrors the `--io-backend` CLI flag.
     pub io_backend: crate::io_backend::IoBackendChoice,
-    /// SHA-256 of the expected source bytes (`docs/PLAN_v2.md` §10).
+    /// SHA-256 of the expected source bytes (`internal/PLAN_v2.md` §10).
     /// When `Some(_)`, the coordinator interposes a
     /// [`crate::hash::HashingReader`] in front of the streaming
     /// decoder, snapshots the in-flight state into every checkpoint,
@@ -308,7 +308,7 @@ pub struct CoordinatorConfig {
     /// of `PLAN_v2.md`.
     pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
     /// Per-part SHA-256 digests for multi-URL runs
-    /// (`docs/PLAN_multi_url_source.md` §3 step 2). Empty for
+    /// (`internal/PLAN_multi_url_source.md` §3 step 2). Empty for
     /// single-URL runs (which use [`Self::expected_sha256`]) or
     /// when no `--sha256` flags were supplied. Otherwise carries
     /// exactly `1 + additional_urls.len()` digests, paired by URL
@@ -342,7 +342,7 @@ pub struct CoordinatorConfig {
     /// `none` to disable).
     pub max_disk_buffer: Option<u64>,
 
-    /// Download-only mode (`docs/PLAN_download_modes.md` §2). When
+    /// Download-only mode (`internal/PLAN_download_modes.md` §2). When
     /// `true`, the coordinator runs the parallel-ranged-HTTP
     /// scheduler, fills `<output>.peel.part`, then renames it to
     /// `<output>` on clean completion. No decoder runs; no holes are
@@ -351,7 +351,7 @@ pub struct CoordinatorConfig {
     pub no_extract: bool,
 
     /// Preserve the source archive on disk after extraction
-    /// (`docs/PLAN_download_modes.md` §3). When `Some(path)`, the
+    /// (`internal/PLAN_download_modes.md` §3). When `Some(path)`, the
     /// extractor pipeline runs as usual but the puncher is forced
     /// to no-op (so the archive stays at its full
     /// `Content-Length`), and the `.peel.part` file is renamed to
@@ -362,7 +362,7 @@ pub struct CoordinatorConfig {
     pub keep_archive: Option<PathBuf>,
 
     /// Treat unrecognized formats as a hard error
-    /// (`docs/PLAN_download_modes.md` §4). When `false` (default),
+    /// (`internal/PLAN_download_modes.md` §4). When `false` (default),
     /// a [`CoordinatorError::NoDecoder`] surfaced by format
     /// detection is downgraded to a warning and the run completes
     /// as if `--no-extract` had been passed (the `.peel.part` file
@@ -371,7 +371,7 @@ pub struct CoordinatorConfig {
     pub strict_format: bool,
 
     /// Password source for encrypted archives
-    /// (`docs/PLAN_archive_encryption.md` §1). `None` (the default)
+    /// (`internal/PLAN_archive_encryption.md` §1). `None` (the default)
     /// means peel has no password to offer; encrypted entries
     /// surface a `PasswordMissing`-style error from the format-
     /// specific pipeline. `Some(source)` is the parsed
@@ -387,7 +387,7 @@ pub struct CoordinatorConfig {
 
     /// Land each source part in its own `.peel.part.NNN` sidecar
     /// rather than concatenating every part's bytes into a single
-    /// `.peel.part` file (`docs/PLAN_multivolume_archives.md` §7).
+    /// `.peel.part` file (`internal/PLAN_multivolume_archives.md` §7).
     ///
     /// Default `false`: every existing single-URL and multi-URL
     /// byte-concat run keeps the one-sparse-file layout. The
@@ -488,7 +488,7 @@ pub struct RunArgs {
     /// mode — see [`Self::additional_urls`].
     pub url: String,
     /// Additional source URLs for multi-part split archives
-    /// (`docs/PLAN_multi_url_source.md`). When empty, this is a
+    /// (`internal/PLAN_multi_url_source.md`). When empty, this is a
     /// single-URL run and behaves exactly as before. When non-empty,
     /// the coordinator runs N parallel HEADs across `[url] ++
     /// additional_urls` via [`crate::download::discover_multi`] and
@@ -592,7 +592,7 @@ pub enum CoordinatorError {
     /// together (for example, `--no-extract` plus multi-part
     /// storage, where there is no single rename target for the N
     /// source-part files; see
-    /// `docs/PLAN_multivolume_archives.md` §7 cleanup notes).
+    /// `internal/PLAN_multivolume_archives.md` §7 cleanup notes).
     #[error("conflicting options: {detail}")]
     ConflictingOptions {
         /// Operator-facing description of which combination
@@ -781,7 +781,7 @@ pub enum CoordinatorError {
     /// passed `--output-file` with a file-shaped path.
     ///
     /// Superseded by [`Self::OutputShapeMismatch`] for the post-
-    /// detection generic check (`docs/PLAN_download_modes.md` §1);
+    /// detection generic check (`internal/PLAN_download_modes.md` §1);
     /// retained because the zip / 7z / rar pipelines still emit it
     /// from their own per-pipeline guards.
     #[error(
@@ -791,7 +791,7 @@ pub enum CoordinatorError {
     ZipNeedsDirectory,
 
     /// The output path's shape and the detected format disagree
-    /// (`docs/PLAN_download_modes.md` §1). Raised after format
+    /// (`internal/PLAN_download_modes.md` §1). Raised after format
     /// detection completes — covers both URL-suffix conflicts the
     /// CLI did not catch and magic-detected formats that flip the
     /// shape away from the user's `-o` path.
@@ -811,7 +811,7 @@ pub enum CoordinatorError {
     Zip(#[source] ZipPipelineError),
 
     /// The 7z parser surfaced a wire-format failure.
-    /// Surfaced via [`run_sevenz`] (`docs/PLAN_7z_support.md`
+    /// Surfaced via [`run_sevenz`] (`internal/PLAN_7z_support.md`
     /// §10).
     #[error("7z format error")]
     Sevenz(#[source] crate::sevenz::SevenzError),
@@ -821,7 +821,7 @@ pub enum CoordinatorError {
     #[error("7z extraction failed")]
     SevenzPipeline(#[source] SevenzPipelineError),
 
-    /// The RAR pipeline failed (`docs/PLAN_rar.md` §3).
+    /// The RAR pipeline failed (`internal/PLAN_rar.md` §3).
     /// Wraps any [`crate::download::RarPipelineError`] variant
     /// (format error, sink failure, sparse / punch IO).
     #[cfg(feature = "rar")]
@@ -848,7 +848,7 @@ pub enum CoordinatorError {
     /// The `--sha256` integrity check failed: either the digest of
     /// the bytes we received did not match the user's expected
     /// digest, or the saved hash state across runs disagreed with
-    /// the current invocation's flags. Per `docs/PLAN_v2.md` §10 we
+    /// the current invocation's flags. Per `internal/PLAN_v2.md` §10 we
     /// surface this as its own variant so the binary can give it a
     /// distinct exit code.
     #[error("integrity check failed")]
@@ -856,7 +856,7 @@ pub enum CoordinatorError {
 
     /// The local-file extractor probed the source filesystem for
     /// `FALLOC_FL_PUNCH_HOLE` support and the kernel/filesystem
-    /// refused (`docs/PLAN_local_file_extract.md` §2). Destructive
+    /// refused (`internal/old/PLAN_local_file_extract.md` §2). Destructive
     /// mode cannot proceed; the user must either pass
     /// `-k/--keep-archive` to skip punching or move the archive to
     /// a supporting filesystem (ext4, xfs, btrfs, tmpfs on Linux;
@@ -932,14 +932,14 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         })
         .collect::<Result<_, _>>()?;
 
-    // Multi-URL split-archive (`docs/PLAN_multi_url_source.md` §3
+    // Multi-URL split-archive (`internal/PLAN_multi_url_source.md` §3
     // step 1): when extra positional URLs were provided, route
     // through [`discover_multi`] over `[primary, ...additional]`
     // instead of the mirror-aware discovery. The CLI already
     // rejects `--mirror` + multi-URL at parse time (§3 step 3).
     //
     // Multi-volume auto-discovery
-    // (`docs/PLAN_multivolume_archives.md` §1 + §6) runs one layer
+    // (`internal/PLAN_multivolume_archives.md` §1 + §6) runs one layer
     // up in [`crate::cli::Cli::into_run_args`]: a single-URL seed
     // whose basename matches a multi-volume pattern is expanded
     // into the resolved volume set via
@@ -975,7 +975,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         // rejects the combination), so the mirror set we build
         // here exists only to keep the scheduler's existing single-
         // URL fallback wiring happy. The worker bypasses it
-        // whenever `info.source.len() > 1` (`docs/PLAN_multi_url_source.md`
+        // whenever `info.source.len() > 1` (`internal/PLAN_multi_url_source.md`
         // §1 step 4); see `try_once`.
         let ms = MirrorSet::single(info.url.clone(), info.fingerprint.clone());
         (info, ms, Vec::new())
@@ -983,7 +983,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     let mirror_set = Arc::new(mirror_set);
     let _ = dropped_mirrors; // surfaced via tracing::warn! inside discover_with_mirrors
 
-    // Multi-URL runs (`docs/PLAN_multi_url_source.md`) keep the
+    // Multi-URL runs (`internal/PLAN_multi_url_source.md`) keep the
     // user's `--chunk-size` even when individual parts are not a
     // multiple of it. The worker's
     // [`crate::download::worker::download_multi_segment`] handles
@@ -997,7 +997,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     // 1.3 GiB CRC vec). The cross-boundary worker is the right
     // alternative.
 
-    // Multi-part sidecar layout (`docs/PLAN_multivolume_archives.md`
+    // Multi-part sidecar layout (`internal/PLAN_multivolume_archives.md`
     // §7): when `multi_part_storage` is on and the source has more
     // than one part, each part lands in its own
     // `<anchor>.peel.part.NNN`. Single-part runs keep the existing
@@ -1013,7 +1013,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         // have N source-part files — there's no single byte stream
         // to rename to a single output path, so refuse the combo
         // up front rather than silently dropping every part past
-        // the first. (`docs/PLAN_multivolume_archives.md` §7
+        // the first. (`internal/PLAN_multivolume_archives.md` §7
         // explicitly scopes multi-volume to "extract the contents";
         // the keep-archive UX for multi-volume needs its own
         // round-trip design.)
@@ -1073,7 +1073,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         }
     }
 
-    // `docs/PLAN_download_modes.md` §5: detect mode drift between
+    // `internal/PLAN_download_modes.md` §5: detect mode drift between
     // the prior run and this one before touching the part-file.
     // Pre-v12 checkpoints decode as [`RunMode::Extract`]; v12
     // carries the writer's mode explicitly. A mismatch surfaces as
@@ -1194,7 +1194,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     if let Some(state) = progress_state.as_ref() {
         state.set_total_size(info.total_size);
         // Per-part labels for the progress UI
-        // (`docs/PLAN_multi_url_source.md`): pull each part's URL
+        // (`internal/PLAN_multi_url_source.md`): pull each part's URL
         // basename and pair it with the discovered size. Single-URL
         // runs populate a one-element vec; the renderer special-
         // cases len==1 to skip the per-part section.
@@ -1373,7 +1373,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     source,
                 })?;
 
-            // `--no-extract` (`docs/PLAN_download_modes.md` §2):
+            // `--no-extract` (`internal/PLAN_download_modes.md` §2):
             // skip the entire decoder / sink / extractor stack and
             // just wait for the download thread to finish. The
             // sparse part-file becomes the final output via a
@@ -1420,7 +1420,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             // wait.
             //
             // The returned `FormatShape` is the second line of
-            // shape-validation defence (`docs/PLAN_download_modes.md`
+            // shape-validation defence (`internal/PLAN_download_modes.md`
             // §1): the CLI resolver pre-validates against URL suffix
             // and `--format`, but a `.bin` URL whose first bytes match
             // zstd magic flips the shape post-CLI. Verify it now,
@@ -1490,7 +1490,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             #[cfg(not(feature = "rar"))]
             let is_rar = false;
 
-            // §3 (`docs/PLAN_download_modes.md`): when `-k` is set
+            // §3 (`internal/PLAN_download_modes.md`): when `-k` is set
             // the user is asking for the source archive on disk, so
             // no holes are punched. Force a NoopPuncher regardless
             // of `--io-backend`; the extractor's `punch_threshold`
@@ -1902,7 +1902,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     // Drop the sparse file so the puncher's borrowed fd is no longer
     // alive. Three cleanup paths apply on clean completion:
     //
-    //   * `--no-extract` (`docs/PLAN_download_modes.md` §2): the
+    //   * `--no-extract` (`internal/PLAN_download_modes.md` §2): the
     //     part file *is* the final output. Rename it into place.
     //   * `-k`/`--keep-archive` (§3): the extractor wrote its tree
     //     through the sink, AND the source archive is preserved.
@@ -2015,7 +2015,7 @@ struct ExtractionOutcome {
     /// Ferried through so [`RunStats::resume_used_decoder_state`]
     /// can be populated.
     used_decoder_state: bool,
-    /// `docs/PLAN_download_modes.md` §4 fallback: when set, format
+    /// `internal/PLAN_download_modes.md` §4 fallback: when set, format
     /// detection failed and the run completed as if `--no-extract`
     /// had been passed. The path is the (URL-basename-derived)
     /// stream-shaped output target the post-scope cleanup should
@@ -2114,7 +2114,7 @@ fn build_resume_plan(
         });
     }
     // Multi-URL parts comparison
-    // (`docs/PLAN_multi_url_source.md` §5 step 4): the part count
+    // (`internal/PLAN_multi_url_source.md` §5 step 4): the part count
     // and per-part `(url, size)` must agree. Per-part fingerprints
     // can drift across runs (a CDN swap legitimately changes
     // `ETag` per part) so we don't reject on those alone — the
@@ -3016,7 +3016,7 @@ fn run_zip(
 }
 
 /// RAR per-entry pipeline driver wired into the coordinator
-/// (`docs/PLAN_rar.md` §3).
+/// (`internal/PLAN_rar.md` §3).
 ///
 /// Mirrors `run_zip`'s shape: per-entry checkpoint cadence,
 /// kill-switch threading, mid-entry progress emission so the
@@ -3088,7 +3088,7 @@ fn run_rar(
         chunk_size,
         poll_interval: config.reader_poll_interval,
         initial_header_window: 64 * 1024,
-        // `docs/PLAN_multivolume_archives.md` §2c: when the run is
+        // `internal/PLAN_multivolume_archives.md` §2c: when the run is
         // multi-part (one volume per part, laid out across the
         // `.peel.part.NNN` sidecars by §7), the walker must jump the
         // cursor across each volume's signature + main header on
@@ -3357,7 +3357,7 @@ fn run_rar(
 }
 
 /// 7z second-pipeline driver wired into the coordinator (`§10`
-/// of `docs/PLAN_7z_support.md`).
+/// of `internal/PLAN_7z_support.md`).
 ///
 /// Mirrors `run_zip`'s shape: per-folder checkpoint cadence,
 /// kill-switch threading, disk-buffer-cap override (7z is
@@ -3691,7 +3691,7 @@ fn run_resume_probe(
     // probing happens later via §11's mid-flight verifier.
     let probe_mirrors =
         crate::download::MirrorSet::single(info.url.clone(), info.fingerprint.clone());
-    // Multi-URL routing for the probe (`docs/PLAN_multi_url_source.md`
+    // Multi-URL routing for the probe (`internal/PLAN_multi_url_source.md`
     // §1 step 4): when the source has more than one part, hand the
     // worker the part list so the probe's ranged GET goes to the
     // *correct* per-part URL with a part-relative `Range` header.
@@ -3976,7 +3976,7 @@ fn build_integrity_hasher(
 
 /// Build the v8 [`crate::checkpoint::PartRecord`] vec for a
 /// checkpoint write from the live [`crate::download::MultiPartSource`]
-/// (`docs/PLAN_multi_url_source.md` §5). Single-URL runs produce a
+/// (`internal/PLAN_multi_url_source.md` §5). Single-URL runs produce a
 /// one-element vec; multi-URL runs record one entry per part. Per-
 /// part expected SHA-256 digests are *not* recorded — the CLI
 /// re-supplies them on resume and the
@@ -4169,7 +4169,7 @@ fn sidecar_path(output: &OutputTarget, config: &CoordinatorConfig, suffix: &str)
 }
 
 /// Compute the per-part sidecar paths for a multi-part run
-/// (`docs/PLAN_multivolume_archives.md` §7).
+/// (`internal/PLAN_multivolume_archives.md` §7).
 ///
 /// For `count == 1` returns a one-element vec whose single path
 /// matches today's [`sidecar_path`] output, so the on-disk shape for
@@ -4273,7 +4273,7 @@ pub(crate) fn filename_from_url(url: &Url) -> Option<String> {
 }
 
 /// Short progress-row label derived from a part URL
-/// (`docs/PLAN_multi_url_source.md`). Falls back to the host when the
+/// (`internal/PLAN_multi_url_source.md`). Falls back to the host when the
 /// URL has no usable basename so the renderer always has something to
 /// print, and caps at 48 columns to keep multi-row TTY blocks tidy on
 /// 80-column terminals.
@@ -4756,7 +4756,7 @@ fn select_decoder_factory(
 }
 
 /// Derive the [`RunMode`] for the current run from
-/// [`CoordinatorConfig`] (`docs/PLAN_download_modes.md` §5).
+/// [`CoordinatorConfig`] (`internal/PLAN_download_modes.md` §5).
 ///
 /// Stamped on every checkpoint the coordinator writes so a
 /// later resume with a different mode surfaces
@@ -4809,7 +4809,7 @@ fn fallback_no_extract_path(info: &DownloadInfo, output: &OutputTarget) -> PathB
 /// Verify that the resolved [`FormatShape`] matches the
 /// [`OutputTarget`] variant the user supplied. Surfaces a typed
 /// [`CoordinatorError::OutputShapeMismatch`] before any pipeline
-/// kicks off (`docs/PLAN_download_modes.md` §1 / §6).
+/// kicks off (`internal/PLAN_download_modes.md` §1 / §6).
 ///
 /// The CLI's unified `-o` resolver pre-validates against suffix and
 /// `--format` lookups, but magic detection can still flip the shape
@@ -5304,7 +5304,7 @@ mod tests {
         assert_eq!(part, PathBuf::from("/var/peel/work/out.bin.peel.part"));
     }
 
-    /// `docs/PLAN_multivolume_archives.md` §7 Phase 3: single-part
+    /// `internal/PLAN_multivolume_archives.md` §7 Phase 3: single-part
     /// runs preserve the historical `.peel.part` filename (no number
     /// suffix), so existing single-URL sidecars and checkpoints
     /// keep their on-disk shape.

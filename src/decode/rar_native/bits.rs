@@ -7,7 +7,7 @@
 //! LSB-first packing (see [`crate::decode::deflate_native::bitstream`])
 //! and matches the convention RAR5's reference decoder uses.
 //!
-//! Round-one of `docs/PLAN_rar5_decoder.md` (§A1) ships an
+//! Round-one of `internal/PLAN_rar5_decoder.md` (§A1) ships an
 //! in-memory reader: the §3 RAR pipeline materialises an entry's
 //! data area in a buffer before invoking the decoder, so we don't
 //! need the streaming-source plumbing the DEFLATE / xz / zstd

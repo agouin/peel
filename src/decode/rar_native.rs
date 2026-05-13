@@ -1,9 +1,9 @@
 //! Hand-rolled RAR5 standard-algorithm decoder.
 //!
-//! Implementation tracks `docs/PLAN_rar5_decoder.md`, the §4
-//! sub-plan of `docs/PLAN_rar.md` that landed when §0.1 resolved
+//! Implementation tracks `internal/PLAN_rar5_decoder.md`, the §4
+//! sub-plan of `internal/PLAN_rar.md` that landed when §0.1 resolved
 //! against the `unrar` C++ FFI on licensing grounds. Round-one of
-//! `docs/PLAN_rar.md` (§§1–3) ships a STORED-method extractor that
+//! `internal/PLAN_rar.md` (§§1–3) ships a STORED-method extractor that
 //! drives the [`crate::sink::RarSink`] surface; this module adds
 //! the standard RAR5 algorithm decoder so `compression
 //! method = 1..5` entries flow through the same per-entry pipeline.
@@ -32,7 +32,7 @@
 //! # Build flag
 //!
 //! Gated behind the `rar` Cargo feature alongside the rest of the
-//! RAR5 module tree (`docs/PLAN_rar.md` §0.5). The `--no-default-features`
+//! RAR5 module tree (`internal/PLAN_rar.md` §0.5). The `--no-default-features`
 //! build does not compile this module.
 
 pub mod bits;

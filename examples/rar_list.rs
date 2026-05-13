@@ -6,7 +6,7 @@
 //! (solid / recovery / locked) and the round-one diagnostic for any
 //! unsupported feature it encounters.
 //!
-//! The demo is the milestone marker for `docs/PLAN_rar.md` §1: at
+//! The demo is the milestone marker for `internal/PLAN_rar.md` §1: at
 //! this point the wire-format layer can open a RAR5 archive and
 //! describe it without invoking the (still-pending) §3 pipeline or
 //! the (still-pending) §4 decoder.

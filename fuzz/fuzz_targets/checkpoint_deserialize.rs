@@ -2,7 +2,7 @@
 //! bytes, and any input it accepts must round-trip identically through
 //! `serialize` → `deserialize`.
 //!
-//! Required per `docs/ENGINEERING_STANDARDS.md` §5.2 ("checkpoint file
+//! Required per `internal/ENGINEERING_STANDARDS.md` §5.2 ("checkpoint file
 //! parsing").
 
 #![no_main]

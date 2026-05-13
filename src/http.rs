@@ -6,7 +6,7 @@
 //! `hyper-util::client::legacy::Client` — redirect handling,
 //! `UnexpectedStatus` checks, the synchronous public API, the
 //! `Read`-shaped body adapter that callers consume — lives in
-//! [`client`]. See `docs/ENGINEERING_STANDARDS.md` §2.3 for the
+//! [`client`]. See `internal/ENGINEERING_STANDARDS.md` §2.3 for the
 //! rationale and §2.5 for how the `tokio` runtime is confined to this
 //! module.
 //!

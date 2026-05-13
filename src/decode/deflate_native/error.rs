@@ -11,7 +11,7 @@
 //!
 //! # Why a local type
 //!
-//! Following `docs/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
+//! Following `internal/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
 //! documentation. "Reserved BTYPE 11 at offset N" or "stored-block
 //! LEN/NLEN mismatch" is far more useful in test assertions and
 //! tracing fields than the generic `std::io::Error::other(...)` we'd

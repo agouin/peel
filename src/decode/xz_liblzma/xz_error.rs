@@ -10,7 +10,7 @@
 //!
 //! # Why a local type
 //!
-//! Per `docs/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
+//! Per `internal/ENGINEERING_BEST_PRACTICES.md` §3.1: errors are
 //! documentation. "Block Header CRC32 mismatch" or "unsupported
 //! filter ID" is far more useful in test assertions and `tracing`
 //! fields than the generic `std::io::Error::other(...)` we'd
@@ -170,7 +170,7 @@ pub enum XzError {
 
     /// An LZMA chunk reached a code path the Phase 1 implementation
     /// hasn't been taught yet. Replaced by the real LZMA decoder in
-    /// Phase 4 of `docs/PLAN_xz_block_decoder.md`.
+    /// Phase 4 of `internal/PLAN_xz_block_decoder.md`.
     #[error("xz: LZMA chunk decoding not yet implemented")]
     LzmaChunkUnimplemented,
 
@@ -198,7 +198,7 @@ pub enum XzError {
     /// Stream Padding (zero-byte alignment between concatenated
     /// Streams) is rejected today, mirroring the wrapper at
     /// `src/decode/xz.rs`. Kept rejected per
-    /// `docs/PLAN_xz_block_decoder.md` §Scope.
+    /// `internal/PLAN_xz_block_decoder.md` §Scope.
     #[error("xz: Stream Padding between concatenated streams is not supported")]
     StreamPaddingUnsupported,
 

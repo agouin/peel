@@ -1,7 +1,7 @@
 //! PPMd-II / PPMd7 range decoder.
 //!
 //! Bit-level entropy primitive shared by every layer of the PPMd
-//! model. Round-one (`docs/PLAN_rar3.md` §B0) shipped decode-only
+//! model. Round-one (`internal/PLAN_rar3.md` §B0) shipped decode-only
 //! 7z-variant support; §C1f adds the RAR-variant init + math
 //! libarchive's PPMd-encoded RAR3 blocks need.
 //!
