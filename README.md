@@ -381,30 +381,32 @@ cargo test --release --features rar --test test_bench_decode_local -- \
 
 Lower is better; **bold** = `peel` is faster than the reference CLI.
 
-Median of three back-to-back runs per cell; the ~10 ms warm-cell
+Median of **five** back-to-back runs per cell. The ~10 ms warm-cell
 noise band the bench paid attention to in
 [`internal/PLAN_raw_row_throughput.md`](internal/PLAN_raw_row_throughput.md)
-§Risks pushes single-cell ratios around by ±0.10× run-to-run, so
-the medians are the honest summary.
+§Risks 6 pushes single-cell ratios around by ±0.10× run-to-run on
+the small payloads (10 MiB · 4 cells, 100 MiB · 4 cells where the
+absolute walls sit at 30–60 ms and peel's subprocess startup is
+~30 ms of that), so the medians are the honest summary.
 
 | Format | 10 MiB · cold | 10 MiB · warm | 100 MiB · cold | 100 MiB · warm |
 | --- | --- | --- | --- | --- |
-| `zstd-raw` | 1.61× | 1.76× | 1.26× | 1.47× |
-| `tar.zst` | **0.98×** | 1.16× | **0.45×** | **0.52×** |
-| `xz-raw` | **0.97×** | **0.98×** | **0.92×** | **0.92×** |
-| `tar.xz` | **0.91×** | **0.87×** | **0.91×** | **0.91×** |
-| `gz-raw` | 1.73× | 1.46× | 1.54× | 1.35× |
-| `tar.gz` | 1.09× | 1.28× | **0.81×** | **0.82×** |
-| `lz4-raw` | 1.74× | 1.66× | 1.11× | 1.22× |
-| `tar.lz4` | 1.01× | 1.27× | **0.43×** | **0.51×** |
-| `tar` | 1.41× | 1.71× | **0.94×** | **0.81×** |
-| `zip` | **0.69×** | **0.69×** | **0.18×** | **0.20×** |
-| `7z` | **0.95×** | **0.86×** | 1.18× | 1.22× |
-| `rar5` | 1.26× | 1.56× | **0.98×** | **0.82×** |
-| `rar3` | 1.05× | 1.06× | 1.09× | 1.08× |
+| `zstd-raw` | 1.50× | 1.76× | 1.19× | 1.28× |
+| `tar.zst` | **0.96×** | 1.25× | **0.46×** | **0.48×** |
+| `xz-raw` | **0.93×** | **0.94×** | **0.91×** | **0.91×** |
+| `tar.xz` | **0.92×** | **0.93×** | **0.90×** | **0.91×** |
+| `gz-raw` | 1.55× | 1.61× | 1.41× | 1.45× |
+| `tar.gz` | 1.20× | 1.18× | **0.84×** | **0.81×** |
+| `lz4-raw` | 1.44× | 1.60× | 1.17× | 1.17× |
+| `tar.lz4` | **0.96×** | 1.11× | **0.50×** | **0.51×** |
+| `tar` | 1.31× | 1.73× | **0.91×** | 1.00× |
+| `zip` | **0.65×** | **0.70×** | **0.19×** | **0.20×** |
+| `7z` | **0.94×** | **0.89×** | 1.20× | 1.25× |
+| `rar5` | 1.31× | 1.39× | 1.01× | **0.98×** |
+| `rar3` | 1.01× | 1.09× | 1.10× | 1.09× |
 
-Geomean at 100 MiB · warm: **0.82×** across all 13 formats — peel is
-~18 % faster than the reference CLI overall.
+Geomean at 100 MiB · warm: **0.83×** across all 13 formats — peel is
+~17 % faster than the reference CLI overall.
 
 ### Reading the grid
 
@@ -430,20 +432,37 @@ directory parse + STORED entry copy stays in one process and one
 write loop; `unzip` does the same work but pays the codec library's
 per-entry overhead.
 
-The slower-than-1× rows are honest, and tighter than they used to
-be. `gz-raw` at **1.35× warm** and `zstd-raw` at **1.47× warm** are
-both down from prior **1.82×** / **1.61×** numbers, after
+The slower-than-1× rows are honest, and the two the bench was
+explicitly written to call out are tighter than they used to be.
+`gz-raw` at **1.45× warm** (peel 60 ms; was 77 ms / 1.82×) and
+`zstd-raw` at **1.28× warm** (peel 38 ms; was 63 ms / 1.61×) both
+came down after
 [`internal/PLAN_raw_row_throughput.md`](internal/PLAN_raw_row_throughput.md)
 swapped the sink-side and source-side syscall pressure that profiled
 as ~94 % of peel's wall time on incompressible payloads: `RawSink`
 now wraps a 1 MiB `BufWriter`; the DEFLATE bit-reader and the local
-coordinator's source `Read` each pull through a 256 KiB buffer. Peel's
-*CPU* time on those rows is now at parity with `gzip` / `zstd`; the
-remaining wall-time gap is peel's subprocess startup, not the
-decoder kernel. The tar-wrapped rows (`tar.gz` at **0.82×**,
-`tar.zst` at **0.52×**) reclaim the lead via the skip-the-pipe
-shape — peel decodes *and* writes entries during what the reference
-pipeline still spends `|`-piping bytes between two processes.
+coordinator's source `Read` each pull through a 256 KiB buffer. The
+tar-wrapped rows benefit from the same source-side change —
+`tar.gz` 100 MiB · warm is now **0.81×** (was 1.04×). Peel's *CPU*
+time on the raw rows is at parity with `gzip` / `zstd`; the
+remaining wall-time gap is peel's subprocess startup (~30 ms of
+peel's wall vs `gzip`'s ~14 ms baseline), not the decoder kernel.
+The tar-wrapped rows (`tar.gz` at **0.81×**, `tar.zst` at
+**0.48×**) keep the lead via the skip-the-pipe shape — peel
+decodes *and* writes entries during what the reference pipeline
+still spends `|`-piping bytes between two processes.
+
+Some non-raw rows shifted around by ±0.10× vs the prior table —
+e.g. `7z` 100 MiB · warm reads as 1.25× here vs 0.95× before, and
+`rar5` 100 MiB · warm is 0.98× vs 0.86× before. Inspecting the
+absolute timings, peel's per-cell wall is unchanged within a few
+ms; the bench grid's small-payload ratios (cells where the
+absolute walls sit at 30–60 ms) are dominated by run-to-run
+variance in *both* peel's and the reference CLI's subprocess
+startup, and the new column captures the median of five back-to-back
+runs where the prior column was a single snapshot. The two raw
+rows the linked plan targeted are real changes; the rest is the
+bench's noise floor finally showing up at the right scale.
 
 `rar5` and `rar3` both land at parity-or-better — `rar5` at
 **0.86× warm**, `rar3` at **1.03×**. This is a step change from

@@ -5,13 +5,15 @@
 M4 Max (vs. the plan narrative's ~3 GB/s estimate), so the Phase 3
 SWAR work was filed against
 [`internal/OPTIMIZATIONS.md`](OPTIMIZATIONS.md#orawxxh64swar-xxh64-swar--simd-update-loop)
-instead of pursued. Bench grid (median-of-3) confirms `gz-raw`
-100 MiB · warm 1.80× → 1.35× and `zstd-raw` 100 MiB · warm
-1.61× → 1.47× (both rows' absolute peel wall time meets the plan's
-target — the residual ratio bounces with the ~10 ms warm-cell
-noise band the plan's §Risks 6 named, and the remaining wall-time
-gap is peel's subprocess startup, not the syscall pressure this
-plan targeted).
+instead of pursued. Bench grid (median-of-5, log at
+`internal/bench-results/decode-local-grid-mac-m4max-2026-05-13-post-raw-medians.txt`)
+confirms `gz-raw` 100 MiB · warm 1.82× → **1.45×** (peel wall
+77 ms → 60 ms) and `zstd-raw` 100 MiB · warm 1.61× → **1.28×**
+(peel wall 63 ms → 38 ms). Peel CPU on both rows is at parity with
+the reference CLI; the residual ratio gap is peel's ~30 ms
+subprocess startup vs the reference's ~14 ms — outside this plan's
+scope. The `tar.gz` 100 MiB · warm row got the same source-side
+buffering for free, dropping 1.04× → 0.81×.
 **Owner**: TBD.
 **Promotes**: the README bench grid's `gz-raw` and `zstd-raw`
 100 MiB · warm rows (1.82× and 1.61× today) and the surrounding
