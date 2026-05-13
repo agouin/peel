@@ -172,6 +172,54 @@ fn http_discover_pattern_not_recognised() {
 }
 
 #[test]
+fn cli_no_auto_discover_skips_head_probes() {
+    // `--no-auto-discover` must short-circuit
+    // [`crate::cli::resolve_multi_volume_http`] before any `HEAD`
+    // probe goes out to the origin. We assert the mock saw zero
+    // requests after [`Cli::into_run_args`] returns.
+    use clap::Parser;
+    use peel::cli::Cli;
+
+    let server = presence_server(&["/foo.7z.001", "/foo.7z.002"]);
+    let seed = url(&server, "/foo.7z.001").to_string();
+    let cli = Cli::try_parse_from([
+        "peel",
+        &seed,
+        "-o",
+        "/tmp/peel-cli-no-auto-discover-out/",
+        "--no-auto-discover",
+    ])
+    .expect("parse");
+    let _args = cli.into_run_args().expect("run args");
+    assert_eq!(
+        server.request_count(),
+        0,
+        "--no-auto-discover should suppress every HEAD probe"
+    );
+}
+
+#[test]
+fn cli_auto_discover_default_walks_siblings() {
+    // Without `--no-auto-discover` a single 7z seed walks the
+    // mock for sibling volumes (HEAD foo.7z.001 success, HEAD
+    // foo.7z.002 success, HEAD foo.7z.003 → 404, stop). The exact
+    // count is two-plus-stop; we just assert it's greater than
+    // zero to validate the default is on.
+    use clap::Parser;
+    use peel::cli::Cli;
+
+    let server = presence_server(&["/foo.7z.001", "/foo.7z.002"]);
+    let seed = url(&server, "/foo.7z.001").to_string();
+    let cli = Cli::try_parse_from(["peel", &seed, "-o", "/tmp/peel-cli-default-discover-out/"])
+        .expect("parse");
+    let _args = cli.into_run_args().expect("run args");
+    assert!(
+        server.request_count() > 0,
+        "auto-discovery should have HEAD-probed the origin"
+    );
+}
+
+#[test]
 fn http_discover_unexpected_status_surfaces() {
     // Server returns 500 instead of 200 / 404; expect a clean error.
     let req_count = Arc::new(AtomicU64::new(0));

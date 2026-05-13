@@ -872,15 +872,6 @@ pub enum CoordinatorError {
         /// the probe.
         path: PathBuf,
     },
-
-    /// Multi-volume discovery
-    /// (`docs/PLAN_multivolume_archives.md` §1) failed on the seed
-    /// source. The seed parsed as a multi-volume name (e.g.
-    /// `foo.7z.001`) but the origin / filesystem reported the
-    /// volume set was inconsistent (missing volume, ZIP final
-    /// volume absent, unexpected HTTP status on a HEAD probe).
-    #[error("multi-volume discovery failed")]
-    Multivolume(#[source] crate::multivolume::MvError),
 }
 
 /// Run the full pipeline.
@@ -941,61 +932,24 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         })
         .collect::<Result<_, _>>()?;
 
-    // Multi-volume auto-discovery
-    // (`docs/PLAN_multivolume_archives.md` §1 + §6). When the user
-    // supplies a single positional URL whose basename matches one
-    // of the recognised multi-volume patterns, expand it into the
-    // full ordered volume set up front. The expanded list is then
-    // routed through the same `discover_multi` path the multi-URL
-    // plan (`PLAN_multi_url_source.md` §3) already supports.
-    //
-    // Auto-discovery is currently gated on
-    // [`crate::multivolume::VolumeKind::SevenZ`] — 7z multi-volume
-    // is a pure byte split, so the existing decode pipeline reads
-    // the concatenated bytes as one logical stream without any
-    // per-volume header-skip work. RAR5
-    // (`docs/PLAN_multivolume_archives.md` §2) and ZIP (§4) need
-    // pipeline-side changes before auto-discovery should run for
-    // them — until those land, users with a multi-volume rar5 /
-    // spanned-zip set pass the volumes explicitly so the existing
-    // pipeline surfaces its current `UnsupportedFeature` rejection
-    // instead of doing N HEAD probes only to fail at decode time.
-    let auto_discovered: Option<Vec<Url>> = if additional_urls.is_empty() {
-        let basename = crate::multivolume::url_basename_for_discovery(&parsed_url);
-        match crate::multivolume::parse_volume_name(basename) {
-            Some(parsed)
-                if parsed.kind == crate::multivolume::VolumeKind::SevenZ
-                    && parsed.volume.is_some() =>
-            {
-                match crate::multivolume::discover_http(&client, &parsed_url) {
-                    Ok(v) if v.len() > 1 => Some(v),
-                    Ok(_) => None,
-                    Err(crate::multivolume::MvError::PatternNotRecognised { .. }) => None,
-                    Err(e) => return Err(CoordinatorError::Multivolume(e)),
-                }
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-
     // Multi-URL split-archive (`docs/PLAN_multi_url_source.md` §3
     // step 1): when extra positional URLs were provided, route
     // through [`discover_multi`] over `[primary, ...additional]`
     // instead of the mirror-aware discovery. The CLI already
     // rejects `--mirror` + multi-URL at parse time (§3 step 3).
-    // Per-part SHA-256 verification (§4) is wired through the
-    // [`crate::hash::IntegrityHasher`] state machine constructed
-    // below — multi-URL fresh runs with `--sha256` succeed; resume
-    // of an in-flight multi-URL run with `--sha256` errors cleanly
-    // until the v8 checkpoint format lands in §5.
-    let (info, mirror_set, dropped_mirrors) = if let Some(all) = auto_discovered {
-        let info =
-            crate::download::discover_multi(&client, &all).map_err(CoordinatorError::Scheduler)?;
-        let ms = MirrorSet::single(info.url.clone(), info.fingerprint.clone());
-        (info, ms, Vec::new())
-    } else if additional_urls.is_empty() {
+    //
+    // Multi-volume auto-discovery
+    // (`docs/PLAN_multivolume_archives.md` §1 + §6) runs one layer
+    // up in [`crate::cli::Cli::into_run_args`]: a single-URL seed
+    // whose basename matches a multi-volume pattern is expanded
+    // into the resolved volume set via
+    // [`crate::cli::resolve_multi_volume_http`], which sets
+    // `additional_urls` and `multi_part_storage` accordingly. By
+    // the time we reach this dispatcher the user's seed has
+    // already been routed to either the single-URL branch (no
+    // multi-volume / discovery skipped) or the multi-URL branch
+    // (expanded set); no coordinator-side discovery is needed.
+    let (info, mirror_set, dropped_mirrors) = if additional_urls.is_empty() {
         let (info, ms, dropped) = discover_with_mirrors(
             &client,
             &parsed_url,

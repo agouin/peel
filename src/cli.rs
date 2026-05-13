@@ -25,12 +25,50 @@ use crate::http::{Client, ClientConfig, HttpVersion, Url, UrlError};
 use crate::io_backend::IoBackendChoice;
 use crate::secret::source::PasswordSource;
 
+/// Long-form help appendix shown by `peel --help`
+/// (`docs/PLAN_multivolume_archives.md` §6 step 3). Documents the
+/// three multi-volume filename conventions and the three entry
+/// modes (single-seed auto-discovery, explicit positional list,
+/// `@manifest` file).
+const MULTI_VOLUME_HELP_SECTION: &str = "\
+Multi-volume archives:
+
+  peel recognises three multi-volume naming conventions and resolves
+  every sibling volume up front (one parallel `HEAD` per volume for
+  HTTP seeds):
+
+    RAR5  <base>.part<N>.rar   e.g. backup.part0001.rar
+    7z    <base>.7z.<NNN>      e.g. snapshot.7z.001
+    ZIP   <base>.z<NN> + <base>.zip   (spanned ZIP: `.zNN` volumes
+          plus a mandatory `.zip` final containing the EOCD)
+
+  Three equivalent invocation modes:
+
+    1. Single seed (auto-discovery):
+       peel https://h/foo.part0001.rar -o out/
+       peel name.7z.001 -o out/
+
+    2. Explicit positional list (volumes must form a contiguous
+       numeric sequence; out-of-order entries are rejected):
+       peel name.part0001.rar name.part0002.rar name.part0003.rar -o out/
+
+    3. Manifest file (one URL or path per line, blank lines and
+       `#` comments ignored):
+       peel @volumes.txt -o out/
+
+  `--no-auto-discover` forces single-source semantics on a seed
+  whose basename happens to match a multi-volume pattern (useful
+  for unrelated `.zip` files or high-latency origins where the
+  HEAD probes are not worth it).
+";
+
 /// Parsed CLI for the `peel` binary.
 #[derive(Debug, Parser)]
 #[command(
     name = "peel",
     version,
-    about = "Streaming, resumable, space-efficient extractor for compressed archives over HTTP."
+    about = "Streaming, resumable, space-efficient extractor for compressed archives over HTTP.",
+    after_long_help = MULTI_VOLUME_HELP_SECTION,
 )]
 #[command(group(
     // The two format-override flags express *different intents*: one
@@ -325,6 +363,34 @@ pub struct Cli {
     /// `env:`, `file:`, or `fd:`.
     #[arg(long = "password-from", value_name = "SOURCE")]
     pub password_from: Option<String>,
+
+    /// Skip multi-volume auto-discovery
+    /// (`docs/PLAN_multivolume_archives.md` §1 / §6).
+    ///
+    /// Normally, when the user passes a single positional URL whose
+    /// basename matches one of the recognised multi-volume patterns
+    /// (`<base>.part<N>.rar`, `<base>.7z.<NNN>`, `<base>.z<NN>` or
+    /// `<base>.zip`), peel HEAD-probes the origin to discover the
+    /// full ordered volume set before any download starts. The
+    /// resolved set is then routed through the multi-part storage
+    /// path the same way an explicit positional URL list would be.
+    ///
+    /// `--no-auto-discover` forces the seed to be treated as a
+    /// single-source URL even when its basename matches a
+    /// multi-volume pattern. Useful when:
+    ///
+    /// - The seed's filename matches one of the conventions but is
+    ///   not actually a multi-volume archive — e.g. an unrelated
+    ///   `.zip` file you do not want peel to probe for `.z01`
+    ///   siblings.
+    /// - Discovery would fan out to many failed HEAD probes against
+    ///   a high-latency origin and the operator already knows the
+    ///   seed is a single source.
+    ///
+    /// Has no effect when the user supplied multiple positional
+    /// URLs — that path already opts out of auto-discovery.
+    #[arg(long = "no-auto-discover", default_value_t = false)]
+    pub no_auto_discover: bool,
 
     /// Destroy the source archive as extraction proceeds
     /// (`docs/PLAN_local_file_extract.md` §1).
@@ -653,6 +719,58 @@ pub enum CliError {
          drop `-d` (HTTP runs are destructive by default) or drop `-k` (to allow it)"
     )]
     HttpDestructiveConflictsKeepArchive,
+
+    /// A `@<path>` manifest sentinel was passed alongside other
+    /// positional URLs (`docs/PLAN_multivolume_archives.md` §6).
+    /// The manifest *replaces* the positional list — combining the
+    /// two forms is ambiguous (would the manifest entries prepend?
+    /// append? overwrite?), so peel refuses to guess.
+    #[error(
+        "`@<file>` manifest must be the only positional argument; pass either a manifest \
+         file or an explicit URL/path list, not both"
+    )]
+    ManifestPositionalConflict,
+
+    /// Reading a `@<path>` manifest failed
+    /// (`docs/PLAN_multivolume_archives.md` §6).
+    #[error("failed to read manifest file `{}`", path.display())]
+    ManifestReadFailed {
+        /// Manifest path passed via `@<path>`.
+        path: PathBuf,
+        /// Underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A `@<path>` manifest contained no non-blank, non-comment
+    /// lines (`docs/PLAN_multivolume_archives.md` §6).
+    #[error("manifest file `{}` has no URL/path entries", path.display())]
+    ManifestEmpty {
+        /// Manifest path passed via `@<path>`.
+        path: PathBuf,
+    },
+
+    /// A positional list of multi-volume names did not form a
+    /// contiguous numeric sequence
+    /// (`docs/PLAN_multivolume_archives.md` §6). When every
+    /// positional source matches a multi-volume convention of the
+    /// same format, the volume numbers must walk `1, 2, 3, …` in
+    /// the same order the sources are passed; a gap, a duplicate,
+    /// or a backwards step rejects the list at parse time.
+    #[error(
+        "multi-volume positional list is out of order: entry {position} should be \
+         volume {expected}, got `{got}`"
+    )]
+    OutOfOrderVolumeList {
+        /// Zero-based index of the first offending positional source.
+        position: usize,
+        /// Volume number expected at that position (the seed's
+        /// volume number `+ position`).
+        expected: u32,
+        /// Basename / URL of the offending entry as the user wrote
+        /// it.
+        got: String,
+    },
 }
 
 /// Compression and archive suffixes stripped when deriving a default
@@ -1133,6 +1251,143 @@ pub enum Dispatch {
 /// Returns a uniform [`Vec<SourceClassification>`] that callers
 /// can match against in one pass — every element is the same
 /// variant on success.
+/// Expand a `@<path>` manifest sentinel in a positional URL list
+/// (`docs/PLAN_multivolume_archives.md` §1 step 4 / §6).
+///
+/// When the only positional argument starts with `@`, the rest is
+/// treated as a path to a manifest file containing one URL or
+/// local path per line. Blank lines and `#`-prefixed comments are
+/// ignored. The expanded list replaces the original.
+///
+/// Combining `@<file>` with extra positional arguments is rejected
+/// — the manifest *is* the positional list, not a prefix or suffix
+/// of one.
+///
+/// Idempotent: a list whose first entry does not start with `@`
+/// returns unchanged. Discovery / classification run on the
+/// expanded list as if the user had typed it directly, so the
+/// downstream code paths (mixed-source detection, sha256-count
+/// validation, multi-volume positional sanity check) all apply.
+///
+/// # Errors
+///
+/// - [`CliError::ManifestPositionalConflict`] when `@<path>` is
+///   paired with extra positional arguments.
+/// - [`CliError::ManifestReadFailed`] when the manifest file
+///   cannot be opened or read.
+/// - [`CliError::ManifestEmpty`] when the manifest contains no
+///   non-blank, non-comment lines.
+fn expand_manifest_urls(urls: Vec<String>) -> Result<Vec<String>, CliError> {
+    let Some(first) = urls.first() else {
+        return Ok(urls);
+    };
+    let Some(rest) = first.strip_prefix('@') else {
+        return Ok(urls);
+    };
+    if urls.len() > 1 {
+        return Err(CliError::ManifestPositionalConflict);
+    }
+    let path = PathBuf::from(rest);
+    let body = std::fs::read_to_string(&path).map_err(|source| CliError::ManifestReadFailed {
+        path: path.clone(),
+        source,
+    })?;
+    let lines: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if lines.is_empty() {
+        return Err(CliError::ManifestEmpty { path });
+    }
+    Ok(lines)
+}
+
+/// Validate that a positional list of multi-volume names forms a
+/// contiguous numeric sequence
+/// (`docs/PLAN_multivolume_archives.md` §6).
+///
+/// Skipped (returns `Ok(())`) when:
+/// - The list has only one entry — no sequence to validate.
+/// - Any entry's basename does not match a multi-volume pattern.
+///   The byte-concat `.partNNNN` suffix and arbitrary tar parts
+///   fall here; the multi-URL plan (`PLAN_multi_url_source.md`)
+///   handles ordering for those.
+/// - Entries match different formats. The plan does not support
+///   mixing formats; if the user wants to interleave a `.7z.001`
+///   with a `.part0001.rar` they will surface a format-mismatch
+///   downstream at decode time, but the CLI does not need to
+///   guess.
+///
+/// When the list *is* a uniform multi-volume set, every entry's
+/// volume number must equal `first.volume + position`. Gaps,
+/// duplicates, and backwards steps surface as
+/// [`CliError::OutOfOrderVolumeList`].
+fn validate_positional_volume_order(args: &[String]) -> Result<(), CliError> {
+    if args.len() < 2 {
+        return Ok(());
+    }
+    let parse = |s: &str| -> Option<crate::multivolume::VolumeName> {
+        let basename = basename_for_validation(s);
+        crate::multivolume::parse_volume_name(basename)
+    };
+    let Some(first) = parse(&args[0]) else {
+        return Ok(());
+    };
+    // ZIP final-volume seeds (`<base>.zip`) carry `volume == None`;
+    // we cannot anchor a numeric sequence on them. The plan models
+    // spanned ZIP as `<base>.z01..z<N>` siblings *plus* a single
+    // `<base>.zip` final — checking that shape is the discovery
+    // walker's job, not the CLI's parse-time sanity check.
+    let Some(first_volume) = first.volume else {
+        return Ok(());
+    };
+    for (idx, arg) in args.iter().enumerate().skip(1) {
+        let Some(parsed) = parse(arg) else {
+            // Mixed multi-volume + non-multi-volume positional list:
+            // not a sequence we should validate.
+            return Ok(());
+        };
+        if parsed.kind != first.kind {
+            // Mixed formats in the positional list — surfaces
+            // downstream; CLI does not adjudicate.
+            return Ok(());
+        }
+        let Some(volume) = parsed.volume else {
+            // A `.zip` final mixed with `.zNN` siblings is the one
+            // shape that legitimately ends a sequence. The exact
+            // placement is the discovery walker's concern; do not
+            // reject here.
+            return Ok(());
+        };
+        let expected = first_volume + idx as u32;
+        if volume != expected {
+            return Err(CliError::OutOfOrderVolumeList {
+                position: idx,
+                expected,
+                got: arg.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort basename extraction for validation: works on both
+/// URLs (split on the last `/`, drop any query) and local paths
+/// (last path component). Cheaper than a full `Url::parse` round-
+/// trip and tolerant of inputs that are not URLs.
+fn basename_for_validation(arg: &str) -> &str {
+    let no_query = match arg.find('?') {
+        Some(i) => &arg[..i],
+        None => arg,
+    };
+    match no_query.rfind('/') {
+        Some(i) => &no_query[i + 1..],
+        None => no_query,
+    }
+}
+
 fn classify_sources(args: &[String]) -> Result<Vec<SourceClassification>, CliError> {
     if args.is_empty() {
         return Err(CliError::NoUrls);
@@ -1338,12 +1593,25 @@ impl Cli {
             }
         }
 
+        // Manifest expansion (`docs/PLAN_multivolume_archives.md`
+        // §1 step 4 / §6): `peel @volumes.txt` is rewritten into
+        // the explicit list of URLs / paths from the manifest
+        // before anything else runs against `self.urls`. Idempotent
+        // — a list whose first entry doesn't start with `@` returns
+        // unchanged. Per `PLAN_multivolume_archives.md` §6, a
+        // positional list of multi-volume names must form a
+        // contiguous numeric sequence; out-of-order or duplicate
+        // numbers are rejected here rather than letting the format
+        // parser surface a confusing decode-time error.
+        let urls = expand_manifest_urls(self.urls)?;
+        validate_positional_volume_order(&urls)?;
+
         // The `num_args = 1..` constraint guarantees at least one
         // URL at parse time; `urls[0]` is the primary part. The
         // explicit fallback below keeps the function defensive
         // against an `into_run_args` caller that constructed `Cli`
         // by hand and skipped clap (the assert path).
-        let mut urls_iter = self.urls.into_iter();
+        let mut urls_iter = urls.into_iter();
         let primary_url = urls_iter.next().ok_or(CliError::NoUrls)?;
         let additional_urls: Vec<String> = urls_iter.collect();
         let multi_part = !additional_urls.is_empty();
@@ -1489,15 +1757,16 @@ impl Cli {
         //   auto-discovery was attempted; specifically
         //   `MissingVolume` / `FinalVolumeMissing` mean the seed
         //   pattern *did* match but the resolved set was incomplete.
-        let (primary_url, additional_urls, multi_part_storage) = if additional_urls.is_empty() {
-            match resolve_multi_volume_http(&client, &primary_url) {
-                Ok(Some(resolved)) => (resolved.primary, resolved.additional, true),
-                Ok(None) => (primary_url, additional_urls, false),
-                Err(e) => return Err(e),
-            }
-        } else {
-            (primary_url, additional_urls, false)
-        };
+        let (primary_url, additional_urls, multi_part_storage) =
+            if additional_urls.is_empty() && !self.no_auto_discover {
+                match resolve_multi_volume_http(&client, &primary_url) {
+                    Ok(Some(resolved)) => (resolved.primary, resolved.additional, true),
+                    Ok(None) => (primary_url, additional_urls, false),
+                    Err(e) => return Err(e),
+                }
+            } else {
+                (primary_url, additional_urls, false)
+            };
 
         Ok(RunArgs {
             url: primary_url,
@@ -1560,7 +1829,7 @@ impl Cli {
     /// [`CliError::LocalKeepArchiveWithPath`] when `-k=<PATH>` is
     /// used in local mode, or any of the variants
     /// [`Self::into_run_args`] surfaces.
-    pub fn into_dispatch(self) -> Result<Dispatch, CliError> {
+    pub fn into_dispatch(mut self) -> Result<Dispatch, CliError> {
         // Hard cutover migration error for the removed `-C` flag
         // — surfaces *before* source classification so a user who
         // is mixing legacy flags still sees the migration hint
@@ -1568,6 +1837,17 @@ impl Cli {
         if self.output_dir_migration.is_some() {
             return Err(CliError::OutputDirRemoved);
         }
+
+        // Manifest expansion (`docs/PLAN_multivolume_archives.md`
+        // §1 step 4 / §6): `peel @volumes.txt` is rewritten into
+        // the explicit list of URLs / paths from the manifest
+        // before classification, mirror checking, or downstream
+        // discovery. Mutate `self.urls` so the later
+        // `into_run_args()` call (HTTP branch) sees the expanded
+        // list without re-expanding (which is a no-op since the
+        // first entry no longer starts with `@`).
+        self.urls = expand_manifest_urls(self.urls)?;
+        validate_positional_volume_order(&self.urls)?;
 
         let classified = classify_sources(&self.urls)?;
         // Disambiguate uniformly. `classify_sources` already
@@ -2689,6 +2969,157 @@ mod tests {
             OutputTarget::Dir(p) => assert_eq!(p, PathBuf::from("archive")),
             OutputTarget::File(_) => panic!("expected Dir target"),
         }
+    }
+
+    // ---- multivolume §6: --no-auto-discover / manifest / order ----------
+
+    #[test]
+    fn no_auto_discover_flag_propagates_to_run_args() {
+        // `--no-auto-discover` must skip the HTTP `HEAD`-probe walk.
+        // We can't easily observe "no HEAD was issued" from
+        // [`into_run_args`] without spinning a mock server (covered
+        // in an integration test below), but we can assert the flag
+        // reaches the parsed struct.
+        let cli = Cli::try_parse_from(["peel", "https://h/foo.7z.001", "--no-auto-discover"])
+            .expect("parse");
+        assert!(cli.no_auto_discover);
+    }
+
+    #[test]
+    fn manifest_file_expands_positional_urls() {
+        // Smoke-test the manifest expansion via the helper; the
+        // full into_run_args path exercises the same code on
+        // dispatch.
+        let dir = std::env::temp_dir().join(format!("peel-manifest-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let manifest = dir.join("vols.txt");
+        std::fs::write(
+            &manifest,
+            "# leading comment\n\
+             https://h/foo.part0001.rar\n\
+             \n\
+             https://h/foo.part0002.rar\n\
+             # trailing comment\n\
+             https://h/foo.part0003.rar\n",
+        )
+        .expect("write");
+        let arg = format!("@{}", manifest.display());
+        let expanded = expand_manifest_urls(vec![arg]).expect("expand");
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded[0], "https://h/foo.part0001.rar");
+        assert_eq!(expanded[2], "https://h/foo.part0003.rar");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_with_extra_positional_args_rejected() {
+        let err = expand_manifest_urls(vec![
+            "@/tmp/vols.txt".to_string(),
+            "https://h/extra.rar".to_string(),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, CliError::ManifestPositionalConflict));
+    }
+
+    #[test]
+    fn manifest_missing_file_surfaces_typed_error() {
+        let err =
+            expand_manifest_urls(vec!["@/definitely-not-a-file-94732".to_string()]).unwrap_err();
+        assert!(matches!(err, CliError::ManifestReadFailed { .. }));
+    }
+
+    #[test]
+    fn manifest_empty_file_surfaces_typed_error() {
+        let dir = std::env::temp_dir().join(format!("peel-manifest-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let manifest = dir.join("vols.txt");
+        std::fs::write(&manifest, "# only comments\n\n").expect("write");
+        let arg = format!("@{}", manifest.display());
+        let err = expand_manifest_urls(vec![arg]).unwrap_err();
+        assert!(matches!(err, CliError::ManifestEmpty { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn positional_volume_list_in_order_accepted() {
+        validate_positional_volume_order(&[
+            "https://h/foo.part0001.rar".into(),
+            "https://h/foo.part0002.rar".into(),
+            "https://h/foo.part0003.rar".into(),
+        ])
+        .expect("contiguous");
+    }
+
+    #[test]
+    fn positional_volume_list_out_of_order_rejected() {
+        let err = validate_positional_volume_order(&[
+            "https://h/foo.part0001.rar".into(),
+            "https://h/foo.part0003.rar".into(),
+            "https://h/foo.part0002.rar".into(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CliError::OutOfOrderVolumeList {
+                position: 1,
+                expected: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn positional_volume_list_gap_rejected() {
+        let err = validate_positional_volume_order(&[
+            "https://h/foo.7z.001".into(),
+            "https://h/foo.7z.003".into(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CliError::OutOfOrderVolumeList {
+                position: 1,
+                expected: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn positional_volume_list_mixed_with_byte_concat_skips_check() {
+        // `.partNNNN` (byte-concat) is *not* a multi-volume name;
+        // parse_volume_name returns None for it. Such a list is
+        // the multi-URL plan's domain and the volume-order check
+        // must not interfere.
+        validate_positional_volume_order(&[
+            "https://h/pruned.tar.part0000".into(),
+            "https://h/pruned.tar.part0001".into(),
+        ])
+        .expect("ok");
+    }
+
+    #[test]
+    fn positional_volume_list_zip_final_no_check_anchor() {
+        // ZIP final-volume seed has no numeric volume, so we can't
+        // anchor a contiguous sequence on it; skipping is the
+        // documented behaviour (discovery walker validates shape
+        // instead).
+        validate_positional_volume_order(&["https://h/foo.zip".into()]).expect("single");
+    }
+
+    #[test]
+    fn into_dispatch_rejects_out_of_order_positional_list() {
+        // End-to-end: a misordered positional list surfaces at
+        // CLI dispatch time with the typed error, not after the
+        // coordinator has done any IO.
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://h/foo.part0001.rar",
+            "https://h/foo.part0003.rar",
+        ])
+        .expect("parse");
+        let err = cli.into_dispatch().err().expect("must error");
+        assert!(matches!(err, CliError::OutOfOrderVolumeList { .. }));
     }
 
     // ---- §2: --no-extract -----------------------------------------------
