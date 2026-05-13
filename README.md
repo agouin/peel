@@ -347,22 +347,22 @@ Lower is better; **bold** = `peel` is faster than the reference CLI.
 
 | Format | 10 MiB · cold | 10 MiB · warm | 100 MiB · cold | 100 MiB · warm |
 | --- | --- | --- | --- | --- |
-| `zstd-raw` | — | 1.78× | 1.30× | 1.75× |
-| `tar.zst` | 1.10× | 1.28× | **0.42×** | **0.49×** |
-| `xz-raw` | **0.96×** | **0.91×** | **0.92×** | **0.91×** |
-| `tar.xz` | **0.88×** | **0.89×** | **0.90×** | **0.91×** |
-| `gz-raw` | 1.85× | 1.51× | 2.02× | 1.80× |
-| `tar.gz` | 1.13× | 1.08× | **0.93×** | 1.17× |
-| `lz4-raw` | 1.59× | 1.55× | 1.28× | 1.23× |
-| `tar.lz4` | **0.94×** | 1.58× | **0.45×** | **0.49×** |
-| `tar` | 1.39× | 1.67× | 1.04× | **0.93×** |
-| `zip` | **0.58×** | **0.67×** | **0.21×** | **0.21×** |
-| `7z` | **0.94×** | 1.00× | 1.75× | 1.56× |
-| `rar5` | 1.38× | 1.31× | 6.84× | 5.66× |
-| `rar3` | 1.26× | 1.32× | 1.30× | 1.32× |
+| `zstd-raw` | 1.39× | 1.75× | 1.00× | 1.61× |
+| `tar.zst` | **0.94×** | 1.14× | **0.42×** | **0.45×** |
+| `xz-raw` | **0.90×** | **0.88×** | **0.92×** | **0.91×** |
+| `tar.xz` | **0.96×** | **0.94×** | **0.93×** | **0.93×** |
+| `gz-raw` | 1.48× | 1.52× | 1.94× | 1.82× |
+| `tar.gz` | 1.00× | 1.04× | 1.08× | 1.04× |
+| `lz4-raw` | 1.50× | 1.59× | 1.06× | 1.01× |
+| `tar.lz4` | **0.97×** | 1.20× | **0.43×** | **0.47×** |
+| `tar` | 1.42× | 1.36× | **0.80×** | **0.97×** |
+| `zip` | **0.68×** | **0.59×** | **0.19×** | **0.17×** |
+| `7z` | **0.83×** | **0.84×** | 1.06× | **0.95×** |
+| `rar5` | 1.29× | 1.49× | **0.86×** | **0.86×** |
+| `rar3` | 1.07× | 1.16× | 1.04× | 1.03× |
 
-Geomean at 100 MiB · warm: **1.06×** across all 13 formats — peel is
-within ~6 % of the reference CLI overall.
+Geomean at 100 MiB · warm: **0.82×** across all 13 formats — peel is
+~18 % faster than the reference CLI overall.
 
 ### Reading the grid
 
@@ -370,46 +370,52 @@ At 10 MiB the comparison is dominated by per-invocation overhead.
 Both sides pay `fork` + `execve` + dynamic-linker + `dlopen` of the
 codec library; the decoder kernel does microseconds of work over
 megabytes. Tiny absolute deltas (< 30 ms) blow the ratio around —
-`lz4-raw` reads as 1.55× warm because peel takes 34 ms vs `lz4 -d`'s
-22 ms, both of which are mostly process startup.
+`lz4-raw` reads as 1.59× warm because peel takes 36 ms vs `lz4 -d`'s
+23 ms, both of which are mostly process startup.
 
 The 100 MiB columns are where the per-format decoder story lives.
-`tar.zst` and `tar.lz4` lead at **0.49×** because peel finishes
-decoding *and* writing entries during what the reference pipeline
-still spends piping `zstd -dc | tar -xf -` between two processes.
-`tar.xz`, `xz-raw`, and `tar` all land near parity (0.90–0.93×):
-that's the LZMA decode floor (peel's
+`tar.zst` and `tar.lz4` lead at **0.45×** / **0.47×** because peel
+finishes decoding *and* writing entries during what the reference
+pipeline still spends piping `zstd -dc | tar -xf -` between two
+processes. `tar.xz`, `xz-raw`, and `tar` all land near parity
+(0.80–0.93×): that's the LZMA decode floor (peel's
 [`xz_liblzma_phase_f`](internal/old/PLAN_xz_liblzma_phase_f.md) matches
 `liblzma` per-CPU-cycle) and the bsdtar floor (a memcpy loop).
 
-`zip` is the headline at **0.21×** — peel finishes in 1/5 of the
+`zip` is the headline at **0.17×** — peel finishes in 1/6 of the
 `unzip` wall-clock at 100 MiB warm. peel's hand-rolled central-
 directory parse + STORED entry copy stays in one process and one
 write loop; `unzip` does the same work but pays the codec library's
 per-entry overhead.
 
-The slower-than-1× rows are honest. `gz-raw` at **1.80× warm** is
+The slower-than-1× rows are honest. `gz-raw` at **1.82× warm** is
 peel's hand-rolled DEFLATE decoder
 ([`PLAN_decoder_throughput_vs_cli.md`](internal/old/PLAN_decoder_throughput_vs_cli.md)
 §5): single-threaded today and waiting on the parallel-member round
 that [`PLAN_gzip_throughput.md`](internal/PLAN_gzip_throughput.md) lays
-out. `zstd-raw` at **1.75× warm** is a similar story: the bench
+out. `zstd-raw` at **1.61× warm** is a similar story: the bench
 extracts a single raw zstd frame to one output file, where peel's
 sink fsync + buffer dance shows up against `zstd`'s straight-through
 copy. The tar-wrapped row (`tar.zst`) reclaims the lead via the
-skip-the-pipe shape. `7z` is **1.56× warm** because the bench uses
-COPY-coded entries — peel's per-folder write loop is doing what the
-reference `7z` binary's tight memcpy loop does, with more
-ceremony.
+skip-the-pipe shape.
 
-`rar5` at **5.66× warm** is the largest gap on the grid. peel's RAR5
-STORED pipeline ([`internal/PLAN_rar.md`](internal/PLAN_rar.md) §3) is
-recent and not yet tuned; RARLAB's mature `unrar` has a 10× lead on
-the unwrapped STORED case. `rar3` is a much closer **1.32× warm**
-because the per-entry work is real LZ + RarVM filter decode on both
-sides, and peel's hand-rolled
-[`decode::rar_legacy`](src/decode/rar_legacy.rs) pipeline is
-competitive with `unrar`'s implementation at that workload size.
+`rar5` and `rar3` both land at parity-or-better — `rar5` at
+**0.86× warm**, `rar3` at **1.03×**. This is a step change from
+the first round-one §3 numbers (`rar5` warm = 5.66× when the
+grid first shipped); the §G1 throughput pass in
+[`internal/PLAN_rar5_decoder.md`](internal/PLAN_rar5_decoder.md) found
+that the RAR5 STORED hot path was spending most of its cycles
+inside [`RarSink::write_entry`](src/sink/rar.rs) maintaining a
+running BLAKE2sp digest that nothing ever consumed (the §1 parser
+does not yet decode the BLAKE2sp extra-record so the expected
+value was always `None`) and a slice-by-16 CRC-32 on a CPU whose
+single-instruction `CRC32X` would do the same work 4× as fast.
+The sink now skips each hash when the file header carries no
+matching expected value, [`zip::Crc32`](src/zip/crc32.rs) dispatches
+to the aarch64 `crc` extension when the runtime CPU exposes it
+(`__crc32x` at 8 bytes per instruction, ~10 GB/s on M-series), and
+the STORED copy loop reads 1 MiB at a time instead of 64 KiB so
+the per-iteration syscall / callback overhead drops 16×.
 
 ## When to reach for `peel`
 

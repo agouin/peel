@@ -1,7 +1,8 @@
 ## Plan: hand-rolled RAR5 decoder
 
 > **Status: §A1, §A2, §B1, §B2, §C1, §E1, §F1 landed
-> (drafted 2026-05-09, round-one shipped through 2026-05-11).**
+> (drafted 2026-05-09, round-one shipped through 2026-05-11);
+> §G1 round-one (STORED) landed 2026-05-13.**
 > The `method >= 1` dispatch in
 > [`rar_pipeline::extract_entry`](../src/download/rar_pipeline.rs)
 > now drives [`RarStreamDecoder`](../src/decode/rar_native/stream.rs);
@@ -13,10 +14,11 @@
 > resolved 2026-05-10).
 >
 > **Open**: §C2 (custom-filter bytecode) — deferred to
-> `O.RAR.CUSTOMFILTER`. §G1 (throughput) — not started; the
-> bench grid in the README currently exercises STORED-method
-> archives only, so the compressed-method hot-path profile that
-> §G1 calls for has not yet been collected.
+> `O.RAR.CUSTOMFILTER`. §G1 round-two (compressed-method hot
+> path) — not started; round-one shipped the STORED-side
+> optimizations that brought the README bench grid's `rar5`
+> 100 MiB warm cell from **5.66× → 0.86×** of `unrar` (see the
+> Postmortem note at the bottom of §G1).
 >
 > **Sequencing.** §1+§2+§3 of `internal/PLAN_rar.md` were on `main`
 > before §A1 began; the decoder plugs into the same `RarSink` /
@@ -317,6 +319,48 @@ corpus is large enough to be a reliable benchmark.
 
 **Demo**: bench-grid run shows decode throughput within 2× of
 the `unrar` C++ reference on the curated corpus.
+
+**Postmortem note** (2026-05-13): round-one of §G1 turned out
+to live entirely *outside* `src/decode/rar_native/` — the §3
+STORED hot path was dominated by sink-side bookkeeping the
+decoder never participated in. Three changes shipped together;
+the bench-grid `rar5` 100 MiB · warm cell moved **5.66× → 0.86×**
+of `unrar` (README §"Local-file decode" was refreshed in the
+same change). Source-of-record commits stay on the
+`g1-stored-perf` topic branch:
+1. [`RarSink`](../src/sink/rar.rs) builds its running BLAKE2sp
+   and CRC-32 only when the caller supplied the matching
+   `expected_*` field. The §1 parser does not yet decode the
+   BLAKE2sp extra-record (`O.RAR.HASH_EXTRA`) so production
+   pre-this-change was paying ~125 ms per 100 MiB for a digest
+   no consumer ever read. `EntryFinalize::{crc32,blake2sp}`
+   shifted from `u32`/`[u8; 32]` to `Option<…>` so the slot
+   shape now matches the runtime cost.
+2. [`zip::Crc32::update`](../src/zip/crc32.rs) now dispatches to
+   an `#[target_feature(enable = "crc")]` aarch64 path that
+   folds 8 input bytes per `__crc32x` instruction; slice-by-16
+   stays as the portable fallback. Apple Silicon's CRC unit
+   takes the slice-by-16 path's ~25 ms per 100 MiB to ~3 ms,
+   with a cross-check test
+   (`hw_and_portable_paths_agree_on_random_corpus`) pinning
+   bit-exact equivalence against the table-based oracle. The
+   `hash::crc32` variant — used by gzip / xz / xz-block — stays
+   slice-by-1 and is the obvious next throughput follow-on for
+   the gz-raw row in the same README grid.
+3. The three STORED copy loops in `rar_pipeline` (RAR5 plain,
+   RAR5 encrypted, RAR3 plain) read 1 MiB at a time instead of
+   64 KiB. The macOS pread + write syscall pair was the next
+   bottleneck after the hash work fell away — at 64 KiB a
+   100 MiB archive paid ~1600 syscall round-trips, at 1 MiB it
+   pays ~100. Constant lives in
+   [`STORED_COPY_BUF_LEN`](../src/download/rar_pipeline.rs).
+
+Round-two of §G1 — the compressed-method hot path, where
+`internal/PLAN_rar5_decoder.md` Phase B's LZSS dispatcher and
+Phase C's filter VM live — has not yet been profiled. The
+bench grid's `rar5` row exercises STORED only; a
+compressed-method bench is the gating prerequisite for that
+work.
 
 ---
 

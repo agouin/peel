@@ -112,42 +112,34 @@ impl Crc32 {
         Self { state: !0u32 }
     }
 
-    /// Feed the next chunk of input into the hasher. Processes
-    /// 16 input bytes per iteration via slicing-by-16; the < 16-byte
-    /// tail falls back to the byte-at-a-time table.
+    /// Feed the next chunk of input into the hasher.
+    ///
+    /// Dispatches to the fastest available implementation:
+    ///
+    /// 1. **aarch64 + `crc` extension** — `__crc32x` (8 bytes per
+    ///    instruction, ~25 GB/s on Apple M-series). Apple Silicon
+    ///    always advertises the extension; the runtime check is a
+    ///    cached atomic load after the first call. This was the
+    ///    last piece needed to bring RAR5 STORED decode to ≤1× of
+    ///    `unrar` (§G1 of `internal/PLAN_rar5_decoder.md`): at
+    ///    256 MiB warm the slice-by-16 path costs ~25 ms on the
+    ///    bench machine, the HW path ~3 ms.
+    /// 2. **slice-by-16** — table-based portable fallback used on
+    ///    every other target, plus aarch64 hosts whose CPU does
+    ///    not expose `crc`. ~4 GB/s on M-series.
     pub fn update(&mut self, data: &[u8]) {
-        let mut state = self.state;
-        let mut chunks = data.chunks_exact(16);
-        for chunk in &mut chunks {
-            // INVARIANT: `chunks_exact(16)` yields slices of length 16;
-            // `try_into` cannot fail here.
-            let arr: [u8; 16] = chunk.try_into().unwrap();
-            // First 4 bytes XOR-into the u32 state; the next 12 are
-            // pure inputs. All 16 lookups are independent, so LLVM is
-            // free to schedule them across the load ports. Indexing
-            // through `u8` indices folds the bounds checks.
-            let lo = (state ^ u32::from_le_bytes([arr[0], arr[1], arr[2], arr[3]])).to_le_bytes();
-            state = TABLES[15][lo[0] as usize]
-                ^ TABLES[14][lo[1] as usize]
-                ^ TABLES[13][lo[2] as usize]
-                ^ TABLES[12][lo[3] as usize]
-                ^ TABLES[11][arr[4] as usize]
-                ^ TABLES[10][arr[5] as usize]
-                ^ TABLES[9][arr[6] as usize]
-                ^ TABLES[8][arr[7] as usize]
-                ^ TABLES[7][arr[8] as usize]
-                ^ TABLES[6][arr[9] as usize]
-                ^ TABLES[5][arr[10] as usize]
-                ^ TABLES[4][arr[11] as usize]
-                ^ TABLES[3][arr[12] as usize]
-                ^ TABLES[2][arr[13] as usize]
-                ^ TABLES[1][arr[14] as usize]
-                ^ TABLES[0][arr[15] as usize];
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("crc") {
+                // SAFETY: `is_aarch64_feature_detected!` returning
+                // `true` guarantees the runtime CPU supports the
+                // `crc` extension that [`update_aarch64_crc`]
+                // requires.
+                self.state = unsafe { update_aarch64_crc(self.state, data) };
+                return;
+            }
         }
-        for &b in chunks.remainder() {
-            state = TABLE[((state ^ u32::from(b)) & 0xFF) as usize] ^ (state >> 8);
-        }
-        self.state = state;
+        self.state = update_portable(self.state, data);
     }
 
     /// Replace the running state with one that, if [`Self::finalize`]
@@ -169,6 +161,92 @@ impl Crc32 {
     pub fn current(&self) -> u32 {
         !self.state
     }
+}
+
+/// Slice-by-16 inner loop, factored out of [`Crc32::update`] so the
+/// HW-accelerated path on aarch64 can sit beside it without an
+/// `#[cfg]` block in the middle of the method body.
+///
+/// Processes 16 input bytes per iteration via 16 precomputed 256-entry
+/// tables; the < 16-byte tail falls back to the byte-at-a-time table.
+#[inline]
+fn update_portable(mut state: u32, data: &[u8]) -> u32 {
+    let mut chunks = data.chunks_exact(16);
+    for chunk in &mut chunks {
+        // INVARIANT: `chunks_exact(16)` yields slices of length 16;
+        // `try_into` cannot fail here.
+        let arr: [u8; 16] = chunk.try_into().unwrap();
+        // First 4 bytes XOR-into the u32 state; the next 12 are
+        // pure inputs. All 16 lookups are independent, so LLVM is
+        // free to schedule them across the load ports. Indexing
+        // through `u8` indices folds the bounds checks.
+        let lo = (state ^ u32::from_le_bytes([arr[0], arr[1], arr[2], arr[3]])).to_le_bytes();
+        state = TABLES[15][lo[0] as usize]
+            ^ TABLES[14][lo[1] as usize]
+            ^ TABLES[13][lo[2] as usize]
+            ^ TABLES[12][lo[3] as usize]
+            ^ TABLES[11][arr[4] as usize]
+            ^ TABLES[10][arr[5] as usize]
+            ^ TABLES[9][arr[6] as usize]
+            ^ TABLES[8][arr[7] as usize]
+            ^ TABLES[7][arr[8] as usize]
+            ^ TABLES[6][arr[9] as usize]
+            ^ TABLES[5][arr[10] as usize]
+            ^ TABLES[4][arr[11] as usize]
+            ^ TABLES[3][arr[12] as usize]
+            ^ TABLES[2][arr[13] as usize]
+            ^ TABLES[1][arr[14] as usize]
+            ^ TABLES[0][arr[15] as usize];
+    }
+    for &b in chunks.remainder() {
+        state = TABLE[((state ^ u32::from(b)) & 0xFF) as usize] ^ (state >> 8);
+    }
+    state
+}
+
+/// aarch64 hardware-accelerated CRC-32 inner loop. Folds 8 input
+/// bytes per `__crc32d` instruction; the trailing 0..7 bytes go
+/// through the corresponding byte-wide intrinsic.
+///
+/// The intrinsics use the IEEE polynomial 0xEDB88320 in reflected
+/// form, identical to the slice-by-16 table — both paths produce
+/// bit-identical running state for any input, so the cross-check
+/// test (`hw_and_portable_paths_agree_on_random_corpus`) acts as
+/// the source of truth.
+///
+/// # Safety
+///
+/// The caller must have already verified that the host CPU exposes
+/// the aarch64 `crc` extension (via
+/// [`std::arch::is_aarch64_feature_detected!`]). The
+/// `#[target_feature]` annotation only changes codegen; without
+/// runtime support the CRC instructions raise an undefined-
+/// instruction exception.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn update_aarch64_crc(mut state: u32, data: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32b, __crc32d};
+    let mut p = data.as_ptr();
+    // SAFETY: `p` is `data.as_ptr()` and `data.len()` is a valid
+    // slice length, so `p.add(data.len())` is in-bounds (or one past
+    // the end, which is the canonical end pointer).
+    let end = unsafe { p.add(data.len()) };
+    // SAFETY: every pointer step below stays within `[data.as_ptr(),
+    // data.as_ptr().add(data.len()))`. The 8-byte read uses
+    // `read_unaligned` because the slice carries no alignment
+    // guarantee — slice references for `u8` are 1-byte aligned.
+    unsafe {
+        while end.offset_from(p) >= 8 {
+            let word = (p as *const u64).read_unaligned();
+            state = __crc32d(state, word);
+            p = p.add(8);
+        }
+        while p < end {
+            state = __crc32b(state, *p);
+            p = p.add(1);
+        }
+    }
+    state
 }
 
 /// Convenience: full-buffer CRC-32 in one call.
@@ -374,6 +452,53 @@ mod tests {
                     mine,
                     theirs.sum(),
                     "Crc32::ieee disagrees with flate2::Crc at len={len}, seed={seed:#x}",
+                );
+            }
+        }
+    }
+
+    /// The aarch64 hardware path and the portable slice-by-16 path
+    /// must produce bit-identical running state for any input. If a
+    /// future refactor breaks the equivalence (different polynomial
+    /// reflection, wrong intrinsic, off-by-one tail handling) this
+    /// test surfaces it before any consumer sees a CRC mismatch on
+    /// a fixture extraction.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn hw_and_portable_paths_agree_on_random_corpus() {
+        if !std::arch::is_aarch64_feature_detected!("crc") {
+            // Build target with the extension but the runtime CPU
+            // does not expose it — `update` would have skipped the
+            // HW path, so there is nothing to cross-check.
+            return;
+        }
+        fn lcg_buf(seed: u64, len: usize) -> Vec<u8> {
+            let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+            let mut out = Vec::with_capacity(len);
+            while out.len() < len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                out.extend_from_slice(&state.to_le_bytes());
+            }
+            out.truncate(len);
+            out
+        }
+        // Same length grid as `slicing_matches_byte_by_byte_random`
+        // — every (len % 16) tail class for the slice-by-16 path,
+        // plus every (len % 8) tail class for the HW path. The
+        // grid implicitly covers both.
+        for len in (0..=64).chain([100, 1024, 65535, 1 << 20]) {
+            for seed in [0u64, 1, 0xDEADBEEF, 0xC0FFEE] {
+                let buf = lcg_buf(seed, len);
+                let portable = update_portable(!0u32, &buf);
+                // SAFETY: `is_aarch64_feature_detected!("crc")`
+                // returned `true` above.
+                let hw = unsafe { update_aarch64_crc(!0u32, &buf) };
+                assert_eq!(
+                    portable, hw,
+                    "HW CRC32 disagrees with slice-by-16 at len={len}, seed={seed:#x}: \
+                     portable={portable:#010x}, hw={hw:#010x}",
                 );
             }
         }

@@ -92,6 +92,23 @@ use crate::sink::rar::{BeginEntryOutcome, EntryFinalize, RarSink};
 use crate::sink::SinkError;
 use crate::types::{ByteOffset, ChunkIndex};
 
+/// Buffer size for the per-entry STORED copy loop (RAR5 plain,
+/// RAR5 encrypted, RAR3 plain).
+///
+/// 1 MiB is the value we landed on while tuning the §G1 throughput
+/// pass for round-one §3. The STORED loop on macOS is dominated by
+/// the per-iteration `pread` + `write` syscall pair — at 64 KiB a
+/// 256 MiB archive took ~4096 syscalls and ~30 ms in kernel
+/// (`getrusage`'s `sys` column); 1 MiB cuts it to ~512 syscalls
+/// and ~8 ms. Going bigger (4 MiB) starts evicting the CRC-32
+/// HW intrinsic's working set from L2 without measurable wall-
+/// clock improvement, so 1 MiB is the sweet spot.
+///
+/// The constant is also a multiple of 16, which the AES-CBC
+/// encrypted-STORED loop relies on to keep its intermediate
+/// chunks block-aligned.
+const STORED_COPY_BUF_LEN: usize = 1024 * 1024;
+
 /// Configuration for a [`RarPipeline::run`] invocation.
 #[derive(Debug, Clone)]
 pub struct RarPipelineConfig {
@@ -1035,7 +1052,15 @@ impl<'a> RarPipeline<'a> {
             // sink already replayed the on-disk file to seed its
             // hashes.
             let mut skip_remaining = effective_resume_offset;
-            let mut buf = vec![0u8; 64 * 1024];
+            // 256 KiB — large enough that the per-iteration syscall
+            // / callback / atomic-store overhead is amortized
+            // (~1600 iterations at 64 KiB collapses to ~400 at 256
+            // KiB on a 100 MiB STORED archive), small enough to
+            // stay in L2 across the CRC-32 update. The buffer is
+            // a multiple of every relevant alignment (AES blocks,
+            // page size, the encrypted-STORED loop's 16-byte
+            // requirement).
+            let mut buf = vec![0u8; STORED_COPY_BUF_LEN];
             for (seg_off, seg_size) in &segments {
                 let seg_end = seg_off.checked_add(*seg_size).ok_or_else(|| {
                     RarPipelineError::Rar(RarError::CorruptHeader {
@@ -1355,8 +1380,10 @@ impl<'a> RarPipeline<'a> {
         let plaintext_total = entry.header.unpacked_size;
         let mut plaintext_written: u64 = 0;
         let mut cursor_in_entry = data_offset;
-        // 64 KiB is a multiple of 16 bytes (the AES block size).
-        let mut buf = vec![0u8; 64 * 1024];
+        // [`STORED_COPY_BUF_LEN`] is a multiple of 16 bytes (the
+        // AES block size), so the CBC-block alignment invariant
+        // below still holds with the bigger buffer.
+        let mut buf = vec![0u8; STORED_COPY_BUF_LEN];
         while cursor_in_entry < data_end {
             let mut want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
             // CBC requires block-aligned input. The data-area size
@@ -1982,7 +2009,9 @@ impl<'a> RarPipeline<'a> {
 
         let copy_start = data_offset.saturating_add(resume_offset);
         let mut cursor_in_entry = copy_start;
-        let mut buf = vec![0u8; 64 * 1024];
+        // Same rationale as the RAR5 STORED loop: amortize the
+        // per-iteration syscall / callback overhead.
+        let mut buf = vec![0u8; STORED_COPY_BUF_LEN];
         while cursor_in_entry < data_end {
             let want = (data_end - cursor_in_entry).min(buf.len() as u64) as usize;
             self.sparse

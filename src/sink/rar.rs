@@ -87,14 +87,24 @@ struct EntryState {
     /// Expected total uncompressed size from the file header. The
     /// sink rejects writes that would push past this bound.
     expected_size: u64,
-    /// Running BLAKE2sp over every byte we've written (or replayed
-    /// from disk on resume).
-    blake2sp: Blake2sp,
-    /// Running CRC-32 over the same bytes. Updated only when the
-    /// file header carried a recorded CRC-32 (otherwise the field
-    /// is not consulted at end-of-entry; we still maintain it so
-    /// resume's prefix replay does not need a special-case skip).
-    crc32: Crc32,
+    /// Running BLAKE2sp over every byte written. `Some` only when
+    /// the file header recorded a BLAKE2sp digest to verify against
+    /// — computing the hash is ~125 ms per 100 MiB and the result
+    /// is unobservable when there's nothing to compare it to.
+    ///
+    /// Round-one §3's §1 parser does not yet decode the BLAKE2sp
+    /// extra-record (`O.RAR.HASH_EXTRA`), so this is always `None`
+    /// for archives parsed through the current path; the slot is
+    /// kept so callers (tests, future parser extensions) that
+    /// supply an expected digest still get verification.
+    blake2sp: Option<Blake2sp>,
+    /// Running CRC-32 over the bytes written. `Some` only when the
+    /// file header carried a `CRC32_PRESENT` value to verify
+    /// against. The CRC table-lookup is cheap (~25 ms per 100 MiB
+    /// via slice-by-16) but adds up on STORED throughput, and
+    /// there is no consumer for the running value other than the
+    /// end-of-entry comparison.
+    crc32: Option<Crc32>,
     /// Optional CRC-32 the file header recorded for the entry.
     /// `None` when the header's `CRC32_PRESENT` bit is clear.
     expected_crc32: Option<u32>,
@@ -308,8 +318,8 @@ impl RarSink {
             file,
             bytes_written: 0,
             expected_size,
-            blake2sp: Blake2sp::new(),
-            crc32: Crc32::new(),
+            blake2sp: expected_blake2sp.map(|_| Blake2sp::new()),
+            crc32: expected_crc32.map(|_| Crc32::new()),
             expected_crc32,
             expected_blake2sp,
             name: entry_name.to_string(),
@@ -396,37 +406,48 @@ impl RarSink {
             path: path.clone(),
             source,
         })?;
-        // Replay the prefix to seed the BLAKE2sp + CRC-32.
-        file.seek(SeekFrom::Start(0))
-            .map_err(|source| SinkError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        let mut blake2sp = Blake2sp::new();
-        let mut crc32 = Crc32::new();
-        let mut buf = [0u8; 64 * 1024];
-        let mut remaining = resume_at;
-        while remaining > 0 {
-            let want = usize::try_from(remaining)
-                .unwrap_or(usize::MAX)
-                .min(buf.len());
-            let n = file
-                .read(&mut buf[..want])
+        // Replay the prefix to seed the running BLAKE2sp + CRC-32
+        // — but only the hashes we'll actually verify at
+        // [`Self::end_entry`]. With no expected digest in the file
+        // header there's no consumer for the value, so a 12.5 MiB
+        // STORED entry resume that would otherwise pay 30 ms for
+        // an unused BLAKE2sp can skip the read entirely.
+        let mut blake2sp = expected_blake2sp.map(|_| Blake2sp::new());
+        let mut crc32 = expected_crc32.map(|_| Crc32::new());
+        if blake2sp.is_some() || crc32.is_some() {
+            file.seek(SeekFrom::Start(0))
                 .map_err(|source| SinkError::Io {
                     path: path.clone(),
                     source,
                 })?;
-            if n == 0 {
-                return self.poison_with(SinkError::Io {
-                    path: path.clone(),
-                    source: std::io::Error::other(format!(
-                        "RAR resume read short: wanted {remaining} more bytes from {entry_name:?}"
-                    )),
-                });
+            let mut buf = [0u8; 64 * 1024];
+            let mut remaining = resume_at;
+            while remaining > 0 {
+                let want = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(buf.len());
+                let n = file
+                    .read(&mut buf[..want])
+                    .map_err(|source| SinkError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                if n == 0 {
+                    return self.poison_with(SinkError::Io {
+                        path: path.clone(),
+                        source: std::io::Error::other(format!(
+                            "RAR resume read short: wanted {remaining} more bytes from {entry_name:?}"
+                        )),
+                    });
+                }
+                if let Some(b) = blake2sp.as_mut() {
+                    b.update(&buf[..n]);
+                }
+                if let Some(c) = crc32.as_mut() {
+                    c.update(&buf[..n]);
+                }
+                remaining -= n as u64;
             }
-            blake2sp.update(&buf[..n]);
-            crc32.update(&buf[..n]);
-            remaining -= n as u64;
         }
         // Reposition for append-style writes.
         file.seek(SeekFrom::Start(resume_at))
@@ -493,8 +514,12 @@ impl RarSink {
             self.poisoned = true;
             SinkError::Io { path, source }
         })?;
-        entry.blake2sp.update(buf);
-        entry.crc32.update(buf);
+        if let Some(b) = entry.blake2sp.as_mut() {
+            b.update(buf);
+        }
+        if let Some(c) = entry.crc32.as_mut() {
+            c.update(buf);
+        }
         entry.bytes_written = new_total;
         Ok(())
     }
@@ -543,10 +568,26 @@ impl RarSink {
             self.poisoned = true;
             SinkError::Io { path, source }
         })?;
-        let crc_finalized = entry.crc32.finalize();
-        let blake2sp_finalized = entry.blake2sp.finalize();
+        // The running hashes only exist when a corresponding
+        // `expected_*` was supplied. `Some(expected) + None` would
+        // imply a caller mismatch (we'd asked for the hash but
+        // never primed the slot); treat that as an internal error
+        // rather than silently passing the entry through.
+        let crc_finalized = entry.crc32.take().map(Crc32::finalize);
+        let blake2sp_finalized = entry.blake2sp.take().map(Blake2sp::finalize);
         if let Some(expected) = entry.expected_crc32 {
-            if crc_finalized != expected {
+            let Some(computed) = crc_finalized else {
+                self.poisoned = true;
+                return Err(SinkError::Io {
+                    path: entry.path.clone(),
+                    source: std::io::Error::other(format!(
+                        "internal: expected_crc32 set but RarSink computed no running CRC \
+                         for entry {:?}",
+                        entry.name,
+                    )),
+                });
+            };
+            if computed != expected {
                 let name = entry.name.clone();
                 self.poisoned = true;
                 return Err(SinkError::Io {
@@ -556,7 +597,7 @@ impl RarSink {
                             entry_name: name,
                             hash: "CRC32",
                             expected: format!("{expected:#010x}"),
-                            computed: format!("{crc_finalized:#010x}"),
+                            computed: format!("{computed:#010x}"),
                         }
                         .to_string(),
                     ),
@@ -564,7 +605,18 @@ impl RarSink {
             }
         }
         if let Some(expected) = entry.expected_blake2sp {
-            if blake2sp_finalized != expected {
+            let Some(computed) = blake2sp_finalized else {
+                self.poisoned = true;
+                return Err(SinkError::Io {
+                    path: entry.path.clone(),
+                    source: std::io::Error::other(format!(
+                        "internal: expected_blake2sp set but RarSink computed no running \
+                         digest for entry {:?}",
+                        entry.name,
+                    )),
+                });
+            };
+            if computed != expected {
                 let name = entry.name.clone();
                 self.poisoned = true;
                 return Err(SinkError::Io {
@@ -574,7 +626,7 @@ impl RarSink {
                             entry_name: name,
                             hash: "BLAKE2sp",
                             expected: hex_encode(&expected),
-                            computed: hex_encode(&blake2sp_finalized),
+                            computed: hex_encode(&computed),
                         }
                         .to_string(),
                     ),
@@ -654,11 +706,17 @@ pub struct EntryFinalize {
     /// uncompressed size).
     pub bytes_written: u64,
     /// CRC-32 the sink computed (and validated against the file
-    /// header when one was supplied).
-    pub crc32: u32,
+    /// header when one was supplied). `None` when the file header
+    /// carried no `CRC32_PRESENT` value — the sink skips the
+    /// running CRC in that case (`O.RAR.HASH_EXTRA`) since there
+    /// would be no end-of-entry comparison.
+    pub crc32: Option<u32>,
     /// BLAKE2sp the sink computed (and validated against the
-    /// expected digest when one was supplied).
-    pub blake2sp: [u8; BLAKE2SP_DIGEST_LEN],
+    /// expected digest when one was supplied). `None` when the
+    /// caller did not request verification (the round-one §3 §1
+    /// parser does not decode BLAKE2sp extra-records yet, so this
+    /// is currently always `None` in production).
+    pub blake2sp: Option<[u8; BLAKE2SP_DIGEST_LEN]>,
     /// Final on-disk path for the entry.
     pub path: PathBuf,
 }
@@ -732,13 +790,38 @@ mod tests {
         sink.write_entry(payload).expect("write");
         let fin = sink.end_entry().expect("end");
         assert_eq!(fin.bytes_written, payload.len() as u64);
-        assert_eq!(fin.crc32, expected_crc32);
-        assert_eq!(fin.blake2sp, expected_blake2sp);
+        assert_eq!(fin.crc32, Some(expected_crc32));
+        assert_eq!(fin.blake2sp, Some(expected_blake2sp));
         assert!(sink.is_quiescent());
         sink.close().expect("close");
 
         let on_disk = fs::read(root.join("greetings.txt")).expect("read back");
         assert_eq!(on_disk, payload);
+    }
+
+    #[test]
+    fn entry_with_no_expected_hashes_skips_running_digests() {
+        let root = unique_dir("nohash");
+        let _g = CleanupOnDrop(root.clone());
+        let mut sink = RarSink::new(&root).expect("new");
+        let payload = b"no-hash payload";
+        sink.begin_entry(0, "p.bin", false, payload.len() as u64, None, None)
+            .expect("begin");
+        sink.write_entry(payload).expect("write");
+        let fin = sink.end_entry().expect("end");
+        assert_eq!(fin.bytes_written, payload.len() as u64);
+        // No `expected_*` was supplied, so the sink never built a
+        // running hasher and the finalize struct carries `None` for
+        // both columns rather than a freshly-finalized empty digest.
+        assert!(
+            fin.crc32.is_none(),
+            "running CRC should be skipped without expected_crc32"
+        );
+        assert!(
+            fin.blake2sp.is_none(),
+            "running BLAKE2sp should be skipped without expected_blake2sp"
+        );
+        sink.close().expect("close");
     }
 
     #[test]
@@ -940,8 +1023,8 @@ mod tests {
             sink.write_entry(&payload[split..]).expect("suffix");
             let fin = sink.end_entry().expect("end");
             assert_eq!(fin.bytes_written, payload.len() as u64);
-            assert_eq!(fin.crc32, expected_crc32);
-            assert_eq!(fin.blake2sp, expected_blake2sp);
+            assert_eq!(fin.crc32, Some(expected_crc32));
+            assert_eq!(fin.blake2sp, Some(expected_blake2sp));
             sink.close().expect("close");
         }
 
