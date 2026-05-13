@@ -254,15 +254,15 @@ download-then-extract sequence.
 
 | Format | 10 Mbps · 8 MiB | 100 Mbps · 32 MiB | 1 Gbps · 128 MiB | 10 Gbps · 256 MiB |
 | --- | --- | --- | --- | --- |
-| `tar` | 1.13× | **0.93×** | **0.79×** | **0.84×** |
-| `tar.zst` | 1.07× | **0.93×** | **0.76×** | **0.58×** |
-| `tar.gz` | 1.16× | **0.93×** | **0.75×** | **0.78×** |
-| `tar.lz4` | 1.12× | **0.94×** | **0.75×** | **0.59×** |
-| `tar.xz` | 1.05× | **0.84×** | **0.77×** | **0.96×** |
-| `zip` | 1.09× | **0.91×** | **0.62×** | **0.29×** |
-| `7z` | 1.10× | **0.94×** | **0.79×** | **0.84×** |
-| `rar5` | 1.10× | **0.97×** | **0.94×** | 2.48× |
-| `rar3` | 1.12× | **0.97×** | **0.99×** | 1.32× |
+| `tar` | 1.09× | **0.93×** | **0.77×** | **0.92×** |
+| `tar.zst` | **0.95×** | **0.93×** | **0.74×** | **0.66×** |
+| `tar.gz` | 1.08× | **0.93×** | **0.74×** | **0.79×** |
+| `tar.lz4` | 1.07× | **0.93×** | **0.76×** | **0.65×** |
+| `tar.xz` | **0.99×** | **0.83×** | **0.77×** | **0.97×** |
+| `zip` | 1.00× | **0.91×** | **0.59×** | **0.24×** |
+| `7z` | 1.06× | **0.95×** | **0.78×** | **0.73×** |
+| `rar5` | 1.03× | **0.95×** | **0.80×** | 1.16× |
+| `rar3` | 1.04× | **0.95×** | **0.90×** | 1.07× |
 
 ### Reading the grid
 
@@ -302,18 +302,18 @@ file (the binary `lseek`s its input regardless of where the metadata
 sits), so a streaming-pipe baseline doesn't exist for them either —
 this grid is the only fair head-to-head. peel ties or beats the
 baseline at every cell from 10 Mbps through 1 Gbps for both formats.
-The 10 Gbps × 256 MiB cell is the one place `unrar` wins outright: at
-that scale the wire window collapses to ~0.3 s and the per-entry
-extraction cost dominates, where RARLAB's mature implementation has
-the edge over the freshly-landed pipelines (RAR5 STORED in
-[`internal/PLAN_rar.md`](internal/PLAN_rar.md) §3 and RAR3 LZ-Normal in
-[`internal/PLAN_rar3.md`](internal/PLAN_rar3.md) Phases B–C). The RAR3 row is
-also doing real decode work both sides — `-m3` packs the
-incompressible bench payload through full LZ + RarVM filters, not
-COPY — so its wall-clock floor (~1.8 s) is much higher than the
-other formats. peel's parallel-GET-plus-stream shape pays for itself
-everywhere the wire-time is non-trivial, which covers every real
-production scenario. (Both rar rows skip rather than fail when
+At the 10 Gbps × 256 MiB cell — where the wire window collapses to
+~0.3 s and per-entry extraction cost dominates — peel still loses
+by ~16% on `rar5` (was 2.48× in the original §3 numbers before §G1's
+STORED-throughput pass; see the local-file decode grid below for
+the per-byte story) and ~7% on `rar3`. The RAR3 row is also doing
+real decode work both sides — `-m3` packs the incompressible bench
+payload through full LZ + RarVM filters, not COPY — so its
+wall-clock floor (~1.8 s) is much higher than the other formats,
+and the relative difference between peel and the baseline shrinks
+correspondingly. peel's parallel-GET-plus-stream shape pays for
+itself everywhere the wire-time is non-trivial, which covers every
+real production scenario. (Both rar rows skip rather than fail when
 `unrar` is missing from `PATH`.)
 
 ## Benchmarks: peel's decoder vs the reference CLI (local files)
