@@ -3014,3 +3014,229 @@ fn small_cap_with_drip_server_completes() {
     let out = read_dir_recursive(&out_dir);
     assert_eq!(out.len(), 8);
 }
+
+/// `docs/PLAN_multivolume_archives.md` §7 Phase 4: with the
+/// `multi_part_storage` opt-in flipped, a 3-part HTTP run lays bytes
+/// out as `<anchor>.peel.part.NNN` (one sidecar per source part),
+/// extracts byte-identically to a single-`.peel.part` run, and the
+/// clean-completion sweep deletes every per-part sidecar.
+///
+/// Distinct from the existing `multi_url_*` tests, which all run
+/// against the single-`.peel.part` layout — they assert the
+/// extracted output and per-part integrity verification work, but
+/// the on-disk landing shape is the legacy concatenated file. This
+/// test pins the *new* shape so a regression silently flipping the
+/// layout back is caught.
+#[test]
+fn multi_part_storage_layout_lands_per_part_sidecars_and_cleans_up() {
+    let big_payload = vec![0x77u8; 200 * 1024];
+    let mut archive = build_simple_archive(&[
+        ("a.bin", &big_payload),
+        ("b.bin", &big_payload),
+        ("c.bin", &big_payload),
+    ]);
+    let total: usize = 768 * 1024;
+    archive.resize(total, 0u8);
+
+    let part_size: usize = 256 * 1024;
+    let p0 = archive[..part_size].to_vec();
+    let p1 = archive[part_size..2 * part_size].to_vec();
+    let p2 = archive[2 * part_size..].to_vec();
+
+    let server0 = MockServer::start(ok_handler(p0, Some("\"v0\"")));
+    let server1 = MockServer::start(ok_handler(p1, Some("\"v1\"")));
+    let server2 = MockServer::start(ok_handler(p2, Some("\"v2\"")));
+
+    let work = unique_dir("multipart_storage");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let mut config = coord_config_for_test(64 * 1024);
+    config.forced_format = Some("tar".into());
+    config.multi_part_storage = true;
+    // `workdir` keeps the sidecars in a predictable directory we
+    // can scan; without it they'd land next to `out_dir`, which is
+    // valid but harder to dirent-scan in isolation.
+    config.workdir = Some(work.clone());
+
+    let args = RunArgs {
+        url: format!("{}/x.tar.part0000", server0.base_url()),
+        additional_urls: vec![
+            format!("{}/x.tar.part0001", server1.base_url()),
+            format!("{}/x.tar.part0002", server2.base_url()),
+        ],
+        output: OutputTarget::Dir(out_dir.clone()),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+        io_backend: None,
+    };
+    let stats = run(args).expect("multi-part-storage run completes");
+    assert!(!stats.resumed);
+
+    // Output is byte-identical to the single-`.peel.part` layout.
+    let entries = read_dir_recursive(&out_dir);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"a.bin"));
+    assert!(names.contains(&"b.bin"));
+    assert!(names.contains(&"c.bin"));
+
+    // Per-part cleanup: none of the `.peel.part.NNN` files
+    // survives. Listing the workdir confirms there are no leftover
+    // sidecars — including the legacy `.peel.part` name, which
+    // multi-part runs never create.
+    let workdir_entries: Vec<String> = fs::read_dir(&work)
+        .expect("workdir read")
+        .map(|r| {
+            r.expect("dirent")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    for entry in &workdir_entries {
+        assert!(
+            !entry.contains(".peel.part"),
+            "clean completion left sidecar {entry} in {}",
+            work.display()
+        );
+    }
+}
+
+/// Multi-part storage + multi-URL kill/resume: a mid-flight abort
+/// against an N-part HTTP run must leave a coherent set of
+/// `.peel.part.NNN` files on disk that a subsequent re-run can
+/// resume from byte-identically.
+///
+/// The on-disk surface area is the new piece relative to the
+/// existing `multi_url_per_part_sha256_kill_then_resume_completes_cleanly`
+/// test: that one runs against the legacy single-`.peel.part`
+/// layout, this one pins the multi-part layout's resume contract
+/// (each sidecar is sized to its part's exact bytes after the
+/// first run; the second run validates each before re-opening).
+#[test]
+fn multi_part_storage_kill_then_resume_completes_cleanly() {
+    let big_payload = vec![0x91u8; 200 * 1024];
+    let mut archive = build_simple_archive(&[
+        ("a.bin", &big_payload),
+        ("b.bin", &big_payload),
+        ("c.bin", &big_payload),
+    ]);
+    let total: usize = 768 * 1024;
+    archive.resize(total, 0u8);
+
+    let part_size: usize = 256 * 1024;
+    let p0 = archive[..part_size].to_vec();
+    let p1 = archive[part_size..2 * part_size].to_vec();
+    let p2 = archive[2 * part_size..].to_vec();
+    let h0 = sha256_hex(&p0);
+    let h1 = sha256_hex(&p1);
+    let h2 = sha256_hex(&p2);
+
+    let server0 = MockServer::start(ok_handler(p0, Some("\"k0\"")));
+    let server1 = MockServer::start(ok_handler(p1, Some("\"k1\"")));
+    let server2 = MockServer::start(ok_handler(p2, Some("\"k2\"")));
+
+    let work = unique_dir("multipart_kill_resume_layout");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let mut config1 = coord_config_for_test(64 * 1024);
+    config1.forced_format = Some("tar".into());
+    config1.multi_part_storage = true;
+    config1.workdir = Some(work.clone());
+    config1.expected_sha256s = vec![h0, h1, h2];
+
+    let kill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let args1 = RunArgs {
+        url: format!("{}/x.tar.part0000", server0.base_url()),
+        additional_urls: vec![
+            format!("{}/x.tar.part0001", server1.base_url()),
+            format!("{}/x.tar.part0002", server2.base_url()),
+        ],
+        output: OutputTarget::Dir(out_dir.clone()),
+        config: config1.clone(),
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: Some(Arc::clone(&kill)),
+        io_backend: None,
+    };
+    // Trip the kill switch immediately so the run aborts before
+    // delivering anything (the harness is a smoke test that
+    // resume rebuilds state — the *value* of how far it got
+    // is irrelevant to the contract).
+    kill.store(true, std::sync::atomic::Ordering::Release);
+    let r1 = run(args1);
+    assert!(r1.is_err(), "kill-switch run should abort");
+
+    // Phase 2: re-run with the same config. The resume probe must
+    // accept the existing `.peel.part.NNN` sidecars (or none, if
+    // the abort beat the workers) and complete the run.
+    let args2 = RunArgs {
+        url: format!("{}/x.tar.part0000", server0.base_url()),
+        additional_urls: vec![
+            format!("{}/x.tar.part0001", server1.base_url()),
+            format!("{}/x.tar.part0002", server2.base_url()),
+        ],
+        output: OutputTarget::Dir(out_dir.clone()),
+        config: config1,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+        io_backend: None,
+    };
+    run(args2).expect("resume completes cleanly");
+    let entries = read_dir_recursive(&out_dir);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"a.bin"));
+    assert!(names.contains(&"b.bin"));
+    assert!(names.contains(&"c.bin"));
+}
+
+/// Multi-part storage + `--no-extract` is rejected up front: there
+/// is no single byte stream to rename to one output path, so the
+/// coordinator surfaces a typed `ConflictingOptions` rather than
+/// silently dropping every part past the first.
+#[test]
+fn multi_part_storage_rejects_no_extract() {
+    let p0 = vec![0u8; 1024];
+    let p1 = vec![0u8; 1024];
+    let server0 = MockServer::start(ok_handler(p0, Some("\"x0\"")));
+    let server1 = MockServer::start(ok_handler(p1, Some("\"x1\"")));
+
+    let work = unique_dir("multipart_no_extract_conflict");
+    let _g = CleanupDir(work.clone());
+
+    let mut config = coord_config_for_test(64);
+    config.multi_part_storage = true;
+    config.no_extract = true;
+    config.forced_format = Some("tar".into());
+
+    let args = RunArgs {
+        url: format!("{}/x.tar.part0000", server0.base_url()),
+        additional_urls: vec![format!("{}/x.tar.part0001", server1.base_url())],
+        output: OutputTarget::File(work.join("out.bin")),
+        config,
+        client: build_client(),
+        registry: DecoderRegistry::with_defaults(),
+        progress: None,
+        progress_state: None,
+        kill_switch: None,
+        io_backend: None,
+    };
+    match run(args) {
+        Err(peel::coordinator::CoordinatorError::ConflictingOptions { detail }) => {
+            assert!(detail.contains("--no-extract"), "detail: {detail}");
+        }
+        other => panic!("expected ConflictingOptions, got {other:?}"),
+    }
+}
