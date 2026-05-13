@@ -17,35 +17,55 @@
 //!
 //! # Scope (PLAN_local_file_extract.md §2)
 //!
-//! This module handles the **streaming-decoder** formats — every
-//! container that flows through [`crate::extractor::Extractor`]:
-//! `zstd`, `xz`, `lz4`, `gzip`, plus any of those wrapping a tar.
-//! ZIP, RAR, and 7z are random-access formats and route through
-//! their own per-pipeline orchestrators inside
-//! [`crate::coordinator::run`]; those pipelines are tightly
-//! coupled to the HTTP-side
-//! [`crate::download::BlockingSparseReader`] today, so the local
-//! path surfaces [`crate::coordinator::CoordinatorError::NoDecoder`]
-//! for those formats with a clear "use the HTTP path for now"
-//! message. Re-using their per-entry extractors against a local
-//! file is a follow-on item — the plan asserts those entry points
-//! exist already, but on inspection they don't yet, and adding
-//! them is its own design.
+//! This module handles **every** format peel supports. Streaming
+//! formats (`zstd`, `xz`, `lz4`, `gzip`, plus any of those wrapping
+//! a tar) flow through [`crate::extractor::Extractor`] driven by a
+//! plain [`std::fs::File`]. Random-access formats (ZIP, 7z, RAR —
+//! both RAR5 and legacy RAR3/RAR4) route through their per-format
+//! pipelines from [`crate::download::zip_pipeline`],
+//! [`crate::download::sevenz_pipeline`], and
+//! [`crate::download::rar_pipeline`]; those pipelines consume a
+//! [`crate::download::MultiSparse`] + [`crate::bitmap::ChunkBitmap`]
+//! pair, and the local path provides that pair by opening the
+//! user's archive read-only via
+//! [`crate::download::SparseFile::open_readonly`] and pre-filling
+//! the bitmap so every chunk reads "complete" on the first poll.
+//! The pipelines run unchanged. Destructive mode (`-d`) is
+//! suppressed for random-access formats — their pipelines seek
+//! backwards into the archive (zip's central directory at the tail,
+//! 7z's trailer, rar's per-entry headers), so a monotonic punch
+//! cursor can't be maintained.
 
 #![cfg(unix)]
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::bitmap::ChunkBitmap;
 use crate::checkpoint::{Checkpoint, CheckpointError, PartRecord, RunMode, SinkState};
-use crate::coordinator::{CoordinatorError, OutputTarget, ProgressFn, RunStats};
+use crate::coordinator::{CoordinatorError, OutputTarget, ProgressFn, RunStats, KILL_SENTINEL};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, FormatShape, StreamingDecoder};
+use crate::download::multi_sparse::MultiSparse;
+#[cfg(feature = "rar")]
+use crate::download::rar_pipeline::{
+    RarExtractionStats, RarPipeline, RarPipelineConfig, RarPipelineError, RarResumeState,
+};
+use crate::download::scheduler::{DownloadStats, SchedulerError};
+use crate::download::sevenz_pipeline::{
+    SevenzExtractionStats, SevenzPipeline, SevenzPipelineConfig, SevenzPipelineError,
+    SevenzPipelineEvent, SevenzResumeState,
+};
+use crate::download::sparse_file::SparseFile;
+use crate::download::zip_pipeline::{
+    ZipExtractionStats, ZipPipeline, ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent,
+    ZipResumeState,
+};
 use crate::extractor::{
     ExtractionStats, Extractor, ExtractorConfig, ExtractorError, DEFAULT_PUNCH_THRESHOLD,
 };
@@ -56,8 +76,10 @@ use crate::punch::{default_puncher, NoopPuncher, PunchHole};
 #[cfg(feature = "rar")]
 use crate::rar::FORMAT_NAME as RAR_FORMAT_NAME;
 use crate::sevenz::FORMAT_NAME as SEVENZ_FORMAT_NAME;
-use crate::sink::{RawSink, Sink, TarSink};
-use crate::types::ByteOffset;
+#[cfg(feature = "rar")]
+use crate::sink::RarSink;
+use crate::sink::{RawSink, SevenzSink, Sink, TarSink, ZipSink};
+use crate::types::{ByteOffset, ChunkIndex};
 use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
 
 /// Arguments for [`run`] — the local-mode counterpart of
@@ -284,39 +306,36 @@ fn local_run_url(source: &Path) -> Url {
         .unwrap_or_else(|_| Url::parse("http://local/").expect("loopback url parses"))
 }
 
-/// Reject the random-access formats — ZIP, RAR, 7z — in local
-/// mode for now (`docs/PLAN_local_file_extract.md` §2 step 5).
+/// Identify a random-access format (ZIP, 7z, RAR) by registry name.
 ///
-/// The plan asserts these formats have a "fed a local file" entry
-/// point; the audit in §3 confirmed they don't yet — every
-/// shipping pipeline goes through
-/// [`crate::download::BlockingSparseReader`]. Surfacing a
-/// dedicated error keeps the failure mode honest and gives a
-/// future contributor a clear "follow-on work" hook.
-fn reject_random_access_formats(
+/// Random-access formats keep their metadata at the end of the
+/// archive (zip/7z) or walk a header chain (rar), so they can't
+/// flow through the same single-pass streaming decoder the rest of
+/// the local-file path uses. They route through their own
+/// per-pipeline orchestrators
+/// ([`crate::download::ZipPipeline`],
+/// [`crate::download::sevenz_pipeline::SevenzPipeline`], and
+/// [`crate::download::rar_pipeline::RarPipeline`] under the `rar`
+/// feature), driven from [`run_random_access_local`].
+///
+/// Returns the registry name when the resolved factory is one of
+/// the random-access shapes; `None` otherwise.
+fn random_access_format_name(
     factory: DecoderFactory,
     registry: &DecoderRegistry,
-) -> Result<(), CoordinatorError> {
-    let name = registry.name_for_factory(factory).unwrap_or("?");
-    let is_random_access = name == ZIP_FORMAT_NAME || name == SEVENZ_FORMAT_NAME || {
-        #[cfg(feature = "rar")]
-        {
-            name == RAR_FORMAT_NAME
-        }
-        #[cfg(not(feature = "rar"))]
-        {
-            false
-        }
-    };
-    if is_random_access {
-        return Err(CoordinatorError::NoDecoder {
-            filename: format!(
-                "{name} (random-access; local-file extraction not yet \
-                 supported — re-run against the HTTP source instead)"
-            ),
-        });
+) -> Option<&'static str> {
+    let name = registry.name_for_factory(factory)?;
+    if name == ZIP_FORMAT_NAME {
+        return Some(ZIP_FORMAT_NAME);
     }
-    Ok(())
+    if name == SEVENZ_FORMAT_NAME {
+        return Some(SEVENZ_FORMAT_NAME);
+    }
+    #[cfg(feature = "rar")]
+    if name == RAR_FORMAT_NAME {
+        return Some(RAR_FORMAT_NAME);
+    }
+    None
 }
 
 /// Pre-flight check: ensure the source's filesystem supports
@@ -611,22 +630,17 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     let started = Instant::now();
     note_destructive_pre_flight();
 
-    // Open the source with read+write so the puncher can issue
-    // `fallocate(PUNCH_HOLE)` against it. Read-only would suffice
-    // for the decoder, but the in-loop puncher needs write access
-    // to release blocks. With `-k` set the puncher is a no-op and
-    // write access is moot, but the cost of opening read+write
-    // anyway is one extra `open(2)` flag — not worth the dispatch
-    // complexity to special-case.
-    let mut source_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&args.source)
-        .map_err(|source| CoordinatorError::Io {
-            path: args.source.clone(),
-            source,
-        })?;
-    let source_meta = source_file
+    // Probe the source read-only first so format detection runs
+    // against a handle that doesn't require write permission. The
+    // streaming-decoder path re-opens read+write below (the puncher
+    // needs it for destructive mode); the random-access path
+    // stays read-only the whole way through, so a read-only
+    // archive on disk extracts cleanly.
+    let mut probe_file = File::open(&args.source).map_err(|source| CoordinatorError::Io {
+        path: args.source.clone(),
+        source,
+    })?;
+    let source_meta = probe_file
         .metadata()
         .map_err(|source| CoordinatorError::Io {
             path: args.source.clone(),
@@ -636,8 +650,38 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     let source_mtime_val = source_mtime(&source_meta);
     let ckpt_path = local_checkpoint_path(&args);
 
-    let (format_shape, factory, _prefix) = select_local_decoder_factory(&args, &mut source_file)?;
-    reject_random_access_formats(factory, &args.registry)?;
+    let (format_shape, factory, _prefix) = select_local_decoder_factory(&args, &mut probe_file)?;
+
+    // Random-access formats (zip / 7z / rar) take their own
+    // non-destructive path through the existing per-format
+    // pipelines — they read the user's archive through a
+    // [`SparseFile::open_readonly`] wrapped in a [`MultiSparse`]
+    // with a fully-marked [`ChunkBitmap`], so the existing
+    // pipelines run unchanged (`docs/PLAN_local_file_extract.md`
+    // §2 step 5).
+    if let Some(name) = random_access_format_name(factory, &args.registry) {
+        drop(probe_file);
+        return run_random_access_local(&args, name, total_size, started);
+    }
+
+    // Streaming-decoder formats need read+write so the puncher
+    // can issue `fallocate(PUNCH_HOLE)` in destructive mode. The
+    // open succeeds for any mode-0600 archive; mode-0444 archives
+    // can still extract through the random-access path above, but
+    // not through this one.
+    drop(probe_file);
+    let mut source_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&args.source)
+        .map_err(|source| CoordinatorError::Io {
+            path: args.source.clone(),
+            source,
+        })?;
+    // Re-seek to byte 0 + re-run the prefix probe so the decoder's
+    // file handle starts at the same place it would have in the
+    // single-open flow. Cheap; the metadata is already cached.
+    let _ = select_local_decoder_factory(&args, &mut source_file)?;
 
     // The CLI resolver runs against the source's filename suffix
     // and `--format` overrides only — magic detection happens
@@ -1070,5 +1114,412 @@ impl<R: Read> Read for ProgressReader<R> {
             self.state.set_bytes_decoded_input(self.total_read);
         }
         Ok(n)
+    }
+}
+
+/// Chunk size the local random-access driver feeds the pipelines'
+/// internal `BoundedSparseReader` / `SparseFileSliceReader`. The
+/// bitmap is fully marked from the start, so the actual value
+/// only affects the per-read boundary check (the reader bounds
+/// its returned slice to one chunk at a time). 4 MiB matches the
+/// HTTP-side default; small enough to keep the bitmap allocation
+/// tiny (~8 bytes per 32 MiB), large enough to avoid extra
+/// boundary loop iterations on big archives.
+const LOCAL_RANDOM_ACCESS_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Drive zip / 7z / rar extraction against a local archive
+/// (`docs/PLAN_local_file_extract.md` §2 step 5).
+///
+/// The trick: the existing per-format pipelines all consume a
+/// [`MultiSparse`] + [`ChunkBitmap`] pair plus a few coordination
+/// signals (`cursor`, `download_done`, `download_outcome`). For a
+/// local file every range is always "complete" — we open the
+/// archive read-only via [`SparseFile::open_readonly`], wrap it in
+/// a one-part [`MultiSparse`], and pre-fill a [`ChunkBitmap`] so
+/// every chunk reads "is_complete" on the first poll. The
+/// pipelines then run unchanged: their reads dispatch into the
+/// kernel `pread` path, their cursor steering becomes a no-op
+/// (no workers to steer), and their `wait_for_range` calls return
+/// immediately.
+///
+/// Destructive mode (`-d`) does not apply — random-access
+/// pipelines seek backwards into the archive (zip's central
+/// directory at the tail, 7z's trailer pointer, rar's per-entry
+/// headers), so a monotonically-advancing punch cursor can't be
+/// maintained. The plan asks us to warn and proceed
+/// non-destructively when `-d` is set on a random-access source;
+/// we do exactly that.
+fn run_random_access_local(
+    args: &LocalRunArgs,
+    format_name: &str,
+    total_size: u64,
+    started: Instant,
+) -> Result<RunStats, CoordinatorError> {
+    let output_dir = match &args.output {
+        OutputTarget::Dir(d) => d.clone(),
+        OutputTarget::File(path) => {
+            return Err(CoordinatorError::OutputShapeMismatch {
+                shape: FormatShape::Tree,
+                path: path.clone(),
+                detail: format!(
+                    "{format_name} produces a directory tree but `-o {}` is a file path. \
+                     Pass a directory path (trailing slash optional) instead.",
+                    path.display(),
+                ),
+            })
+        }
+    };
+
+    if args.destructive {
+        tracing::warn!(
+            format = format_name,
+            source = %args.source.display(),
+            "destructive mode does not apply to random-access formats; \
+             source will be preserved. Drop `-d` to silence this warning.",
+        );
+    }
+
+    fs::create_dir_all(&output_dir).map_err(|source| CoordinatorError::Io {
+        path: output_dir.clone(),
+        source,
+    })?;
+
+    // Open the user's archive read-only via SparseFile so the
+    // existing pipelines accept it through MultiSparse. The
+    // read-only flag prevents any accidental write/punch path
+    // (the random-access pipelines never call those methods
+    // themselves, but the guard catches future regressions).
+    let sparse_file =
+        SparseFile::open_readonly(&args.source).map_err(CoordinatorError::SparseFile)?;
+    let sparse = MultiSparse::from_single(sparse_file);
+
+    // Build a ChunkBitmap that's fully marked from the start so
+    // every `is_complete` / `wait_for_range` call inside the
+    // pipelines returns immediately.
+    let chunk_size = LOCAL_RANDOM_ACCESS_CHUNK_SIZE;
+    let num_chunks_u64 = if total_size == 0 {
+        1u64
+    } else {
+        total_size.div_ceil(chunk_size)
+    };
+    let num_chunks = u32::try_from(num_chunks_u64).map_err(|_| CoordinatorError::Io {
+        path: args.source.clone(),
+        source: io::Error::other(format!(
+            "archive at {} is too large for a {chunk_size}-byte chunk bitmap \
+             ({num_chunks_u64} chunks > u32::MAX); split the file or raise \
+             LOCAL_RANDOM_ACCESS_CHUNK_SIZE",
+            args.source.display(),
+        )),
+    })?;
+    let bitmap = ChunkBitmap::new(num_chunks);
+    bitmap.complete_range(ChunkIndex::new(0), ChunkIndex::new(num_chunks));
+
+    // Coordination signals the pipelines borrow. There is no
+    // download thread, no scheduler, no progress-side throttle —
+    // the cursor never gets read, `download_done` stays `false`
+    // for the whole run (the pipelines only consult it on the
+    // not-yet-complete path, which we never enter), and the
+    // outcome slot is never populated.
+    let cursor = Arc::new(AtomicU64::new(0));
+    let download_done = Arc::new(AtomicBool::new(false));
+    let download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>> =
+        Arc::new(Mutex::new(None));
+
+    let kill_switch = args.kill_switch.as_ref();
+    let password_source = args.password_source.as_ref();
+    let label = args.source.display().to_string();
+
+    let stats = match format_name {
+        ZIP_FORMAT_NAME => run_zip_local(
+            &sparse,
+            &bitmap,
+            &cursor,
+            &download_done,
+            &download_outcome,
+            &output_dir,
+            total_size,
+            chunk_size,
+            kill_switch,
+            password_source,
+            &label,
+        )?,
+        SEVENZ_FORMAT_NAME => run_sevenz_local(
+            &sparse,
+            &bitmap,
+            &cursor,
+            &download_done,
+            &download_outcome,
+            &output_dir,
+            total_size,
+            chunk_size,
+            kill_switch,
+            password_source,
+            &label,
+        )?,
+        #[cfg(feature = "rar")]
+        RAR_FORMAT_NAME => run_rar_local(
+            &sparse,
+            &bitmap,
+            &cursor,
+            &download_done,
+            &download_outcome,
+            &output_dir,
+            total_size,
+            chunk_size,
+            kill_switch,
+            password_source,
+            &label,
+        )?,
+        _ => {
+            return Err(CoordinatorError::NoDecoder {
+                filename: format!("unknown random-access format `{format_name}`"),
+            })
+        }
+    };
+
+    Ok(RunStats {
+        final_url: local_run_url(&args.source),
+        total_size,
+        resumed: false,
+        resume_decoder_position: None,
+        resume_used_decoder_state: false,
+        download: Default::default(),
+        extraction: stats,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Inner driver: zip pipeline over a local random-access source.
+#[allow(clippy::too_many_arguments)]
+fn run_zip_local(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    output_dir: &Path,
+    total_size: u64,
+    chunk_size: u64,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    password_source: Option<&crate::secret::source::PasswordSource>,
+    label: &str,
+) -> Result<ExtractionStats, CoordinatorError> {
+    let mut sink = ZipSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+    let pipeline_cfg = ZipPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: Duration::from_millis(1),
+        initial_tail_window: crate::zip::MAX_EOCD_TAIL_BYTES.min(total_size),
+    };
+    let pipeline = ZipPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        progress_state: None,
+        password_source,
+        password_label: label,
+    };
+    let puncher = NoopPuncher::new();
+    let result = pipeline.run(&mut sink, &puncher, ZipResumeState::default(), |event| {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            ZipPipelineEvent::Started { .. }
+            | ZipPipelineEvent::EntryFinished { .. }
+            | ZipPipelineEvent::InEntryProgress { .. } => Ok(()),
+        }
+    });
+    match result {
+        Ok(stats) => {
+            sink.close().map_err(CoordinatorError::Sink)?;
+            Ok(extraction_stats_from_zip(stats, total_size))
+        }
+        Err(ZipPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written: 0,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Zip(other)),
+    }
+}
+
+/// Inner driver: 7z pipeline over a local random-access source.
+#[allow(clippy::too_many_arguments)]
+fn run_sevenz_local(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    output_dir: &Path,
+    total_size: u64,
+    chunk_size: u64,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    password_source: Option<&crate::secret::source::PasswordSource>,
+    label: &str,
+) -> Result<ExtractionStats, CoordinatorError> {
+    let mut sink = SevenzSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+    let pipeline_cfg = SevenzPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: Duration::from_millis(1),
+    };
+    let pipeline = SevenzPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        progress_state: None,
+        password_source,
+        password_label: label,
+    };
+    let puncher = NoopPuncher::new();
+    let result = pipeline.run(&mut sink, &puncher, SevenzResumeState::default(), |event| {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            SevenzPipelineEvent::Started { .. }
+            | SevenzPipelineEvent::FolderFinished { .. }
+            | SevenzPipelineEvent::Complete { .. } => Ok(()),
+        }
+    });
+    match result {
+        Ok(stats) => Ok(extraction_stats_from_sevenz(stats, total_size)),
+        Err(SevenzPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written: 0,
+            })
+        }
+        Err(SevenzPipelineError::Sevenz(e)) | Err(SevenzPipelineError::FolderDecode(e)) => {
+            Err(CoordinatorError::Sevenz(e))
+        }
+        Err(SevenzPipelineError::Sink(e)) => Err(CoordinatorError::Sink(e)),
+        Err(SevenzPipelineError::Sparse(e)) => Err(CoordinatorError::SparseFile(e)),
+        Err(other) => Err(CoordinatorError::SevenzPipeline(other)),
+    }
+}
+
+/// Inner driver: RAR pipeline over a local random-access source.
+#[cfg(feature = "rar")]
+#[allow(clippy::too_many_arguments)]
+fn run_rar_local(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    output_dir: &Path,
+    total_size: u64,
+    chunk_size: u64,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    password_source: Option<&crate::secret::source::PasswordSource>,
+    label: &str,
+) -> Result<ExtractionStats, CoordinatorError> {
+    let mut sink = RarSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+    let pipeline_cfg = RarPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: Duration::from_millis(1),
+        initial_header_window: 64 * 1024,
+        volume_starts: Vec::new(),
+    };
+    let pipeline = RarPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        progress_state: None,
+        password_source,
+        password_label: label,
+    };
+    let puncher = NoopPuncher::new();
+    let result = pipeline.run(&mut sink, &puncher, RarResumeState::default(), |event| {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        let _ = event;
+        Ok(())
+    });
+    match result {
+        Ok(stats) => Ok(extraction_stats_from_rar(stats, total_size)),
+        Err(RarPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written: 0,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Rar(other)),
+    }
+}
+
+/// Convert [`ZipExtractionStats`] into the wider
+/// [`ExtractionStats`] shape the local runner surfaces. Same
+/// mapping the HTTP-side `run_zip` uses, minus the
+/// CheckpointObserverStats merge (the local random-access path
+/// writes no checkpoints).
+fn extraction_stats_from_zip(stats: ZipExtractionStats, total_size: u64) -> ExtractionStats {
+    ExtractionStats {
+        bytes_in: total_size,
+        bytes_out: stats.bytes_written,
+        bytes_punched: stats.bytes_punched,
+        punch_calls: u64::from(stats.entries_extracted),
+        punch_unsupported: false,
+        frame_boundaries_observed: u64::from(stats.entries_extracted),
+        quiescent_checkpoints: 0,
+        decode_time: Duration::default(),
+        write_time: Duration::default(),
+        punch_time: Duration::default(),
+        ..ExtractionStats::default()
+    }
+}
+
+/// Convert [`SevenzExtractionStats`] into [`ExtractionStats`].
+/// Mirrors `extraction_stats_from_sevenz` in
+/// [`crate::coordinator`].
+fn extraction_stats_from_sevenz(stats: SevenzExtractionStats, total_size: u64) -> ExtractionStats {
+    ExtractionStats {
+        bytes_in: total_size,
+        bytes_out: 0,
+        bytes_punched: stats.bytes_punched,
+        punch_calls: u64::from(stats.folders_extracted),
+        punch_unsupported: false,
+        frame_boundaries_observed: u64::from(stats.folders_extracted),
+        quiescent_checkpoints: 0,
+        decode_time: Duration::default(),
+        write_time: Duration::default(),
+        punch_time: Duration::default(),
+        ..ExtractionStats::default()
+    }
+}
+
+/// Convert [`RarExtractionStats`] into [`ExtractionStats`].
+#[cfg(feature = "rar")]
+fn extraction_stats_from_rar(stats: RarExtractionStats, total_size: u64) -> ExtractionStats {
+    ExtractionStats {
+        bytes_in: total_size,
+        bytes_out: stats.bytes_written,
+        bytes_punched: stats.bytes_punched,
+        punch_calls: u64::from(stats.entries_extracted),
+        punch_unsupported: false,
+        frame_boundaries_observed: u64::from(stats.entries_extracted),
+        quiescent_checkpoints: 0,
+        decode_time: Duration::default(),
+        write_time: Duration::default(),
+        punch_time: Duration::default(),
+        ..ExtractionStats::default()
     }
 }

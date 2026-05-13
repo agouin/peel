@@ -80,13 +80,16 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use peel::coordinator::local::{run as local_run, LocalRunArgs};
-use peel::coordinator::OutputTarget;
-
 #[path = "support/mod.rs"]
 mod support;
 
+#[cfg(feature = "rar")]
+use support::rar_bench_fixtures::{
+    ensure_rar3_stored, ensure_rar5_stored, rar3_encoder_present, rar5_encoder_present, unrar_path,
+};
+use support::sevenz_fixtures::build_copy_sevenz;
 use support::tar_fixtures::build_simple_archive;
+use support::zip_fixtures::{build_zip, ZipEntrySpec};
 
 // ---- size tiers -------------------------------------------------------
 
@@ -166,10 +169,16 @@ impl Drop for CleanupDir {
     }
 }
 
-/// True if `name` resolves on `PATH`. Same pattern as the streaming
-/// bench so a missing reference CLI surfaces as a `[skip]` row, not
-/// a test failure.
+/// True if `name` resolves on `PATH`, or — when it contains a path
+/// separator — points at an existing executable file on disk. Same
+/// pattern as the streaming bench so a missing reference CLI
+/// surfaces as a `[skip]` row, not a test failure. The path-aware
+/// branch is used for the licensed `unrar` at
+/// `~/Downloads/rar/unrar`, which is typically not on `$PATH`.
 fn tool_present(name: &str) -> bool {
+    if name.contains('/') {
+        return std::path::Path::new(name).is_file();
+    }
     Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {name} >/dev/null 2>&1"))
@@ -428,6 +437,7 @@ mod rusage {
     /// `RUSAGE_SELF` from `<sys/resource.h>`: CPU time consumed by
     /// the calling process (all threads). Used for in-process peel
     /// runs.
+    #[allow(dead_code)]
     pub const RUSAGE_SELF: i32 = 0;
 
     /// `RUSAGE_CHILDREN` (numeric value `-1`): cumulative CPU time
@@ -470,23 +480,65 @@ mod rusage {
 
 // ---- peel-local driver ------------------------------------------------
 
-/// Run peel's local-file coordinator against `source`, writing
-/// output to `output`. Returns `(wall, cpu)` durations.
+/// Output target for [`run_peel_local`]. Mirrors the streaming bench's
+/// shape: file-shape outputs flow through `peel -o <path>` (raw codec
+/// targets), tree-shape through `peel -o <path>/` (anything that
+/// extracts entries: tar wrappers and the random-access containers).
+enum PeelLocalOut {
+    File(PathBuf),
+    Dir(PathBuf),
+}
+
+/// Run the `peel` CLI binary against a local source, timing both
+/// wall-clock and child CPU.
 ///
-/// We leave `destructive=false` (the default) so the same fixture
-/// survives across cold, warm, and repeated invocations —
-/// destructive mode would punch and then delete the source
-/// mid-bench, forcing a fresh encode every iteration. The decoder
-/// kernel under test is identical either way: the only difference
-/// is whether the puncher fires alongside it, and this bench is
-/// about the decoder, not the puncher.
-fn run_peel_local(source: &Path, output: OutputTarget) -> (Duration, Duration) {
-    let cpu_before = rusage::sample(rusage::RUSAGE_SELF);
+/// This is the subprocess equivalent of the prior in-process
+/// `coordinator::local::run` driver. We spawn the binary because the
+/// reference baselines below shell out to `zstd` / `xz` / `unzip` /
+/// `7z` / `unrar` — each of which pays the same
+/// `fork`/`execve`/`dlopen` cost on every invocation. Measuring peel
+/// in-process would hide its own process-startup work (allocator
+/// pools, registry init, command-line parsing) behind the test
+/// harness's already-warm address space and produce ratios that
+/// flatter the in-process API at the expense of the published CLI.
+///
+/// CPU is sampled via `getrusage(RUSAGE_CHILDREN)` — same primitive
+/// the reference pipeline uses — so the wall/CPU columns are
+/// directly comparable across rows. We leave `-d` off (the
+/// non-destructive default) so the same fixture survives the cold
+/// and warm iterations; destructive mode would punch + delete the
+/// source mid-bench.
+fn run_peel_local(source: &Path, out: PeelLocalOut) -> (Duration, Duration) {
+    let exe = env!("CARGO_BIN_EXE_peel");
+    let cpu_before = rusage::sample(rusage::RUSAGE_CHILDREN);
     let wall_started = Instant::now();
-    let args = LocalRunArgs::new(source.to_path_buf(), output);
-    local_run(args).expect("peel local run succeeds");
+    let mut cmd = Command::new(exe);
+    cmd.arg(source);
+    match &out {
+        PeelLocalOut::Dir(d) => {
+            // Trailing slash forces directory-shape output regardless
+            // of suffix detection.
+            cmd.arg("-o").arg(format!("{}/", d.display()));
+        }
+        PeelLocalOut::File(f) => {
+            cmd.arg("-o").arg(f);
+        }
+    }
+    let output = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn peel subprocess");
     let wall = wall_started.elapsed();
-    let cpu_after = rusage::sample(rusage::RUSAGE_SELF);
+    let cpu_after = rusage::sample(rusage::RUSAGE_CHILDREN);
+    if !output.status.success() {
+        panic!(
+            "peel subprocess exited {}: stderr=\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     (wall, cpu_after.saturating_sub(cpu_before))
 }
 
@@ -528,14 +580,38 @@ fn run_ref_pipeline(pipeline: &str, src: &Path) -> (Duration, Duration) {
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Shape {
     /// Single-stream decoder; output is a single file
-    /// ([`OutputTarget::File`]).
+    /// ([`PeelLocalOut::File`]).
     Raw,
     /// Tar-wrapping decoder; output is a directory tree
-    /// ([`OutputTarget::Dir`]).
+    /// ([`PeelLocalOut::Dir`]).
     Tar,
     /// Identity (no compression); output is a directory tree.
     Identity,
+    /// Random-access container (zip / 7z / rar). Output is a
+    /// directory tree; the encoder takes the named entry list
+    /// directly rather than a single byte buffer. Peel's local
+    /// path routes these through the per-format pipelines
+    /// (`docs/PLAN_local_file_extract.md` §2 step 5).
+    Container,
 }
+
+/// Inputs available to a fixture encoder. Streaming encoders use
+/// `raw_payload`; tar-wrapped encoders use `tar_archive` (the same
+/// bytes for `Identity`); container encoders use `entries` (and, for
+/// cached fixtures like rar5/rar3, `payload_bytes` as the cache key).
+struct FixtureInput<'a> {
+    raw_payload: &'a [u8],
+    tar_archive: &'a [u8],
+    entries: &'a [(String, Vec<u8>)],
+    /// Cache key for size-indexed fixture caches (rar5/rar3). Only
+    /// read when the `rar` feature is on; without it the field
+    /// exists so [`build_fixture`] can populate one shape of input
+    /// regardless of feature config.
+    #[cfg_attr(not(feature = "rar"), allow(dead_code))]
+    payload_bytes: usize,
+}
+
+type FixtureEncoder = Box<dyn Fn(&FixtureInput<'_>) -> Vec<u8>>;
 
 /// One row in the bench grid. `ref_tools` is the human-readable
 /// reference-CLI label printed alongside the row; `ref_required` is
@@ -548,109 +624,201 @@ struct FormatSpec {
     label: &'static str,
     shape: Shape,
     ext: &'static str,
-    /// Encoder for the on-disk fixture. Takes the raw payload bytes
-    /// (for `Raw`) or the tar-archive bytes (for `Tar` /
-    /// `Identity`) and returns the compressed bytes that will be
-    /// written to `<tmp>/<label>.<ext>`.
-    encode: fn(&[u8]) -> Vec<u8>,
+    /// Encoder for the on-disk fixture. Receives [`FixtureInput`]
+    /// and returns the compressed bytes that will be written to
+    /// `<tmp>/<label>.<ext>`. The closure picks which input fields
+    /// it needs based on `shape`.
+    encode: FixtureEncoder,
     /// Human-readable reference-tool name (e.g. `"zstd|tar"`).
-    ref_tools: &'static str,
+    ref_tools: String,
     /// Tool binaries to probe via `command -v` before running.
-    ref_required: &'static [&'static str],
+    /// Use an absolute path (e.g. for the licensed `unrar`) when
+    /// the binary is not on `PATH`; the bench's `tool_present`
+    /// helper accepts both.
+    ref_required: Vec<String>,
     /// Bash one-liner. `$SRC` is the fixture path; `$DST` is the
     /// destination path (file for `Raw`, directory for
-    /// `Tar`/`Identity`).
-    ref_pipeline: &'static str,
+    /// `Tar`/`Identity`/`Container`).
+    ref_pipeline: String,
 }
 
-/// Pass-through identity encoder for the plain-`tar` row.
-fn encode_identity(payload: &[u8]) -> Vec<u8> {
-    payload.to_vec()
-}
+/// Build the bench grid format list. Container formats are added
+/// dynamically when their fixture-builder dependencies are present
+/// (the `rar` Cargo feature for rar5/rar3; the `unrar` binary on
+/// PATH or `~/Downloads/rar/unrar`; Docker for the rar3 fixture
+/// encoder).
+fn formats() -> Vec<FormatSpec> {
+    // `mut` only required when the `rar` feature is on; without it
+    // the rar5/rar3 push sites are compiled out and the vec is never
+    // mutated after construction.
+    #[cfg_attr(not(feature = "rar"), allow(unused_mut))]
+    let mut v: Vec<FormatSpec> = vec![
+        FormatSpec {
+            label: "zstd-raw",
+            shape: Shape::Raw,
+            ext: "zst",
+            encode: Box::new(|i| encode_zstd(i.raw_payload)),
+            ref_tools: "zstd".into(),
+            ref_required: vec!["zstd".into()],
+            ref_pipeline: r#"zstd -d -q -f -o "$DST" "$SRC""#.into(),
+        },
+        FormatSpec {
+            label: "tar.zst",
+            shape: Shape::Tar,
+            ext: "tar.zst",
+            encode: Box::new(|i| encode_zstd(i.tar_archive)),
+            ref_tools: "zstd|tar".into(),
+            ref_required: vec!["zstd".into(), "tar".into()],
+            ref_pipeline: r#"zstd -dc -q "$SRC" | tar -xf - -C "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "xz-raw",
+            shape: Shape::Raw,
+            ext: "xz",
+            encode: Box::new(|i| encode_xz(i.raw_payload)),
+            ref_tools: "xz".into(),
+            ref_required: vec!["xz".into()],
+            ref_pipeline: r#"xz -dc -q "$SRC" > "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "tar.xz",
+            shape: Shape::Tar,
+            ext: "tar.xz",
+            encode: Box::new(|i| encode_xz(i.tar_archive)),
+            ref_tools: "xz|tar".into(),
+            ref_required: vec!["xz".into(), "tar".into()],
+            ref_pipeline: r#"xz -dc -q "$SRC" | tar -xf - -C "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "gz-raw",
+            shape: Shape::Raw,
+            ext: "gz",
+            encode: Box::new(|i| encode_gzip(i.raw_payload)),
+            ref_tools: "gzip".into(),
+            ref_required: vec!["gzip".into()],
+            ref_pipeline: r#"gzip -dc -q "$SRC" > "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "tar.gz",
+            shape: Shape::Tar,
+            ext: "tar.gz",
+            encode: Box::new(|i| encode_gzip(i.tar_archive)),
+            ref_tools: "gzip|tar".into(),
+            ref_required: vec!["gzip".into(), "tar".into()],
+            ref_pipeline: r#"gzip -dc -q "$SRC" | tar -xf - -C "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "lz4-raw",
+            shape: Shape::Raw,
+            ext: "lz4",
+            encode: Box::new(|i| encode_lz4_uncompressed_frame(i.raw_payload)),
+            ref_tools: "lz4".into(),
+            ref_required: vec!["lz4".into()],
+            ref_pipeline: r#"lz4 -dc -q "$SRC" > "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "tar.lz4",
+            shape: Shape::Tar,
+            ext: "tar.lz4",
+            encode: Box::new(|i| encode_lz4_uncompressed_frame(i.tar_archive)),
+            ref_tools: "lz4|tar".into(),
+            ref_required: vec!["lz4".into(), "tar".into()],
+            ref_pipeline: r#"lz4 -dc -q "$SRC" | tar -xf - -C "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "tar",
+            shape: Shape::Identity,
+            ext: "tar",
+            encode: Box::new(|i| i.tar_archive.to_vec()),
+            ref_tools: "tar".into(),
+            ref_required: vec!["tar".into()],
+            ref_pipeline: r#"tar -xf "$SRC" -C "$DST""#.into(),
+        },
+        // ---- random-access containers --------------------------------
+        // ZIP. STORED entries — the bench measures the central
+        // directory scan + per-entry write loop, not codec work,
+        // matching the streaming bench's incompressible-payload
+        // shape.
+        FormatSpec {
+            label: "zip",
+            shape: Shape::Container,
+            ext: "zip",
+            encode: Box::new(|i| {
+                let specs: Vec<ZipEntrySpec> = i
+                    .entries
+                    .iter()
+                    .map(|(n, b)| ZipEntrySpec::stored(n.clone(), b.clone()))
+                    .collect();
+                build_zip(&specs)
+            }),
+            ref_tools: "unzip".into(),
+            ref_required: vec!["unzip".into()],
+            ref_pipeline: r#"unzip -q -o "$SRC" -d "$DST""#.into(),
+        },
+        // 7z, COPY-coded — same rationale as zip.
+        FormatSpec {
+            label: "7z",
+            shape: Shape::Container,
+            ext: "7z",
+            encode: Box::new(|i| {
+                let pairs: Vec<(&str, Vec<u8>)> = i
+                    .entries
+                    .iter()
+                    .map(|(n, b)| (n.as_str(), b.clone()))
+                    .collect();
+                build_copy_sevenz(&pairs)
+            }),
+            ref_tools: "7z".into(),
+            ref_required: vec!["7z".into()],
+            ref_pipeline: r#"7z x -y -bd -bb0 "$SRC" "-o$DST" >/dev/null"#.into(),
+        },
+    ];
 
-const FORMATS: &[FormatSpec] = &[
-    FormatSpec {
-        label: "zstd-raw",
-        shape: Shape::Raw,
-        ext: "zst",
-        encode: encode_zstd,
-        ref_tools: "zstd",
-        ref_required: &["zstd"],
-        ref_pipeline: r#"zstd -d -q -f -o "$DST" "$SRC""#,
-    },
-    FormatSpec {
-        label: "tar.zst",
-        shape: Shape::Tar,
-        ext: "tar.zst",
-        encode: encode_zstd,
-        ref_tools: "zstd|tar",
-        ref_required: &["zstd", "tar"],
-        ref_pipeline: r#"zstd -dc -q "$SRC" | tar -xf - -C "$DST""#,
-    },
-    FormatSpec {
-        label: "xz-raw",
-        shape: Shape::Raw,
-        ext: "xz",
-        encode: encode_xz,
-        ref_tools: "xz",
-        ref_required: &["xz"],
-        ref_pipeline: r#"xz -dc -q "$SRC" > "$DST""#,
-    },
-    FormatSpec {
-        label: "tar.xz",
-        shape: Shape::Tar,
-        ext: "tar.xz",
-        encode: encode_xz,
-        ref_tools: "xz|tar",
-        ref_required: &["xz", "tar"],
-        ref_pipeline: r#"xz -dc -q "$SRC" | tar -xf - -C "$DST""#,
-    },
-    FormatSpec {
-        label: "gz-raw",
-        shape: Shape::Raw,
-        ext: "gz",
-        encode: encode_gzip,
-        ref_tools: "gzip",
-        ref_required: &["gzip"],
-        ref_pipeline: r#"gzip -dc -q "$SRC" > "$DST""#,
-    },
-    FormatSpec {
-        label: "tar.gz",
-        shape: Shape::Tar,
-        ext: "tar.gz",
-        encode: encode_gzip,
-        ref_tools: "gzip|tar",
-        ref_required: &["gzip", "tar"],
-        ref_pipeline: r#"gzip -dc -q "$SRC" | tar -xf - -C "$DST""#,
-    },
-    FormatSpec {
-        label: "lz4-raw",
-        shape: Shape::Raw,
-        ext: "lz4",
-        encode: encode_lz4_uncompressed_frame,
-        ref_tools: "lz4",
-        ref_required: &["lz4"],
-        ref_pipeline: r#"lz4 -dc -q "$SRC" > "$DST""#,
-    },
-    FormatSpec {
-        label: "tar.lz4",
-        shape: Shape::Tar,
-        ext: "tar.lz4",
-        encode: encode_lz4_uncompressed_frame,
-        ref_tools: "lz4|tar",
-        ref_required: &["lz4", "tar"],
-        ref_pipeline: r#"lz4 -dc -q "$SRC" | tar -xf - -C "$DST""#,
-    },
-    FormatSpec {
-        label: "tar",
-        shape: Shape::Identity,
-        ext: "tar",
-        encode: encode_identity,
-        ref_tools: "tar",
-        ref_required: &["tar"],
-        ref_pipeline: r#"tar -xf "$SRC" -C "$DST""#,
-    },
-];
+    // RAR rows (gated on the `rar` feature). Fixtures come from
+    // the licensed `rar` 7.22 encoder for rar5 and from `rar 5.0.0`
+    // (via Docker) for rar3 — matching the streaming bench so the
+    // baseline `unrar` decoder sees the same RAR wire bytes both
+    // grids feed it. Each row is skipped when its encoder /
+    // baseline binary isn't available.
+    #[cfg(feature = "rar")]
+    {
+        if let Some(unrar) = unrar_path() {
+            let unrar_quoted = shell_quote(Path::new(&unrar));
+            if rar5_encoder_present() {
+                let unrar_q = unrar_quoted.clone();
+                v.push(FormatSpec {
+                    label: "rar5",
+                    shape: Shape::Container,
+                    ext: "rar",
+                    encode: Box::new(|i| ensure_rar5_stored(i.entries, i.payload_bytes)),
+                    ref_tools: "unrar".into(),
+                    ref_required: vec![unrar.clone()],
+                    // Trailing slash on the destination is required
+                    // for `unrar x`. Use the resolved binary path so
+                    // the licensed `~/Downloads/rar/unrar` works
+                    // even when the binary is not on $PATH.
+                    ref_pipeline: format!(r#"{unrar} x -inul -y "$SRC" "$DST/""#, unrar = unrar_q,),
+                });
+            }
+            if rar3_encoder_present() {
+                v.push(FormatSpec {
+                    label: "rar3",
+                    shape: Shape::Container,
+                    ext: "rar",
+                    encode: Box::new(|i| ensure_rar3_stored(i.entries, i.payload_bytes)),
+                    ref_tools: "unrar".into(),
+                    ref_required: vec![unrar.clone()],
+                    ref_pipeline: format!(
+                        r#"{unrar} x -inul -y "$SRC" "$DST/""#,
+                        unrar = unrar_quoted,
+                    ),
+                });
+            }
+        }
+    }
+
+    v
+}
 
 // ---- grid driver ------------------------------------------------------
 
@@ -670,7 +838,7 @@ impl Mode {
 }
 
 struct Cell {
-    format: &'static str,
+    format: String,
     tier: &'static str,
     mode: Mode,
     payload_bytes: u64,
@@ -679,7 +847,7 @@ struct Cell {
     peel_cpu: Duration,
     ref_wall: Duration,
     ref_cpu: Duration,
-    ref_tools: &'static str,
+    ref_tools: String,
 }
 
 impl Cell {
@@ -738,12 +906,29 @@ fn build_fixture(fmt: &FormatSpec, tier: Tier, dir: &Path) -> Fixture {
             let payload = random_bytes(0xC0FFEE, tier.payload_bytes);
             (payload, Vec::new())
         }
-        Shape::Tar | Shape::Identity => {
+        Shape::Tar | Shape::Identity | Shape::Container => {
             let (archive, entries) = build_tar_payload(tier.payload_bytes, tier.tar_files);
             (archive, entries)
         }
     };
-    let body = (fmt.encode)(&raw_payload);
+    // For Container formats `raw_payload` is the (unused) tar
+    // archive bytes — encoders ignore it; they reach for
+    // `entries` instead. The same tar bytes are still useful as
+    // the post-decode reference for any future Container row
+    // that needs them. `tar_archive` and `raw_payload` differ
+    // only for `Raw`-shape rows; for tar-wrapped shapes they
+    // alias.
+    let tar_archive: &[u8] = match fmt.shape {
+        Shape::Raw => &[],
+        Shape::Tar | Shape::Identity | Shape::Container => &raw_payload,
+    };
+    let input = FixtureInput {
+        raw_payload: &raw_payload,
+        tar_archive,
+        entries: &entries,
+        payload_bytes: tier.payload_bytes,
+    };
+    let body = (fmt.encode)(&input);
     fs::write(&source, &body).expect("write fixture");
     Fixture {
         source,
@@ -767,14 +952,14 @@ fn one_peel_iter(
     match fmt.shape {
         Shape::Raw => {
             let out = iter_dir.join("decoded.bin");
-            let (wall, cpu) = run_peel_local(source, OutputTarget::File(out.clone()));
+            let (wall, cpu) = run_peel_local(source, PeelLocalOut::File(out.clone()));
             assert_file_matches(&out, payload);
             (wall, cpu)
         }
-        Shape::Tar | Shape::Identity => {
+        Shape::Tar | Shape::Identity | Shape::Container => {
             let out = iter_dir.join("out");
             fs::create_dir_all(&out).expect("mkdir peel out");
-            let (wall, cpu) = run_peel_local(source, OutputTarget::Dir(out.clone()));
+            let (wall, cpu) = run_peel_local(source, PeelLocalOut::Dir(out.clone()));
             assert_dir_matches(&out, entries);
             (wall, cpu)
         }
@@ -801,19 +986,25 @@ fn one_ref_iter(
                 .replace("\"$DST\"", &shell_quote(&dst))
                 .replace("\"$SRC\"", &shell_quote(source));
         }
-        Shape::Tar | Shape::Identity => {
+        Shape::Tar | Shape::Identity | Shape::Container => {
             dst = iter_dir.join("out");
             fs::create_dir_all(&dst).expect("mkdir ref out");
+            // Some pipelines (e.g. `7z x -o<DIR>`) embed the
+            // destination as a bare-token argument rather than a
+            // `"$DST"` placeholder, so we substitute the
+            // unquoted form too.
             pipeline = fmt
                 .ref_pipeline
                 .replace("\"$DST\"", &shell_quote(&dst))
-                .replace("\"$SRC\"", &shell_quote(source));
+                .replace("$DST", &dst.display().to_string())
+                .replace("\"$SRC\"", &shell_quote(source))
+                .replace("$SRC", &source.display().to_string());
         }
     }
     let (wall, cpu) = run_ref_pipeline(&pipeline, source);
     match fmt.shape {
         Shape::Raw => assert_file_matches(&dst, payload),
-        Shape::Tar | Shape::Identity => assert_dir_matches(&dst, entries),
+        Shape::Tar | Shape::Identity | Shape::Container => assert_dir_matches(&dst, entries),
     }
     (wall, cpu)
 }
@@ -829,7 +1020,7 @@ fn one_ref_iter(
 /// inflates wall-clock cost on the 1 GiB tier with no signal gain
 /// at this resolution).
 fn run_cell(fmt: &FormatSpec, tier: Tier, out: &mut Vec<Cell>) {
-    for tool in fmt.ref_required {
+    for tool in &fmt.ref_required {
         if !tool_present(tool) {
             skip(fmt.label, tier.label, tool);
             return;
@@ -863,7 +1054,7 @@ fn run_cell(fmt: &FormatSpec, tier: Tier, out: &mut Vec<Cell>) {
         &ref_cold_dir,
     );
     out.push(Cell {
-        format: fmt.label,
+        format: fmt.label.to_string(),
         tier: tier.label,
         mode: Mode::Cold,
         payload_bytes: fixture.payload.len() as u64,
@@ -872,7 +1063,7 @@ fn run_cell(fmt: &FormatSpec, tier: Tier, out: &mut Vec<Cell>) {
         peel_cpu: peel_c_cold,
         ref_wall: ref_w_cold,
         ref_cpu: ref_c_cold,
-        ref_tools: fmt.ref_tools,
+        ref_tools: fmt.ref_tools.clone(),
     });
 
     // Warm: discard one warm-up run, then time. The cold runs above
@@ -918,7 +1109,7 @@ fn run_cell(fmt: &FormatSpec, tier: Tier, out: &mut Vec<Cell>) {
         &ref_warm_dir,
     );
     out.push(Cell {
-        format: fmt.label,
+        format: fmt.label.to_string(),
         tier: tier.label,
         mode: Mode::Warm,
         payload_bytes: fixture.payload.len() as u64,
@@ -927,7 +1118,7 @@ fn run_cell(fmt: &FormatSpec, tier: Tier, out: &mut Vec<Cell>) {
         peel_cpu: peel_c_warm,
         ref_wall: ref_w_warm,
         ref_cpu: ref_c_warm,
-        ref_tools: fmt.ref_tools,
+        ref_tools: fmt.ref_tools.clone(),
     });
 }
 
@@ -997,9 +1188,10 @@ fn print_summary(cells: &[Cell]) {
 fn bench_decode_local_grid() {
     print_host_banner();
     let tiers = pick_tiers();
-    let mut cells: Vec<Cell> = Vec::with_capacity(FORMATS.len() * tiers.len() * 2);
+    let format_list = formats();
+    let mut cells: Vec<Cell> = Vec::with_capacity(format_list.len() * tiers.len() * 2);
     for &tier in &tiers {
-        for fmt in FORMATS {
+        for fmt in &format_list {
             run_cell(fmt, tier, &mut cells);
         }
     }

@@ -1676,6 +1676,16 @@ where
             // Tick loop: render, sleep, render, … until done. We do an
             // extra final render after the done flag flips so the user
             // sees the final counters.
+            //
+            // The sleep is broken into small slices so a `mark_done`
+            // call wakes the join within tens of milliseconds rather
+            // than blocking until the next full `refresh` tick — the
+            // production CLI joins this handle on shutdown, and the
+            // 2 s LogRenderer cadence used in non-TTY runs would
+            // otherwise add up to 2 s of tail latency to every clean
+            // exit (a subprocess `peel <file>` would block 2 s after
+            // the actual work finished).
+            const SLEEP_SLICE: Duration = Duration::from_millis(20);
             loop {
                 let snap = state.snapshot();
                 let now = Instant::now();
@@ -1685,7 +1695,15 @@ where
                 if snap.done {
                     break;
                 }
-                thread::sleep(refresh);
+                let mut left = refresh;
+                while !left.is_zero() {
+                    if state.is_done() {
+                        break;
+                    }
+                    let slice = left.min(SLEEP_SLICE);
+                    thread::sleep(slice);
+                    left = left.saturating_sub(slice);
+                }
             }
             renderer.finish();
         })

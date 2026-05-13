@@ -192,7 +192,7 @@ use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
 /// recognize this string and translate it into a typed
 /// [`CoordinatorError::Aborted`]; everything else surfaces as an
 /// extractor / pipeline failure.
-const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
+pub(crate) const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
 
 /// What kind of output the coordinator should produce.
 #[derive(Debug, Clone)]

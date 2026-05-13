@@ -126,6 +126,21 @@ pub enum SparseFileError {
     #[error("hole punch failed")]
     Punch(#[source] PunchError),
 
+    /// A write-side operation (`pwrite_at`, `punch`, `sync_all`,
+    /// `order_writes`) was attempted on a read-only [`SparseFile`]
+    /// (built via [`SparseFile::open_readonly`]). The local-file
+    /// extraction path opens the user's archive read-only so the
+    /// existing pipelines can drive it through [`MultiSparse`]
+    /// without ever modifying the source; the pipelines never call
+    /// the write-side methods themselves, so hitting this variant
+    /// indicates a bug in the caller (typically the coordinator
+    /// glue) rather than user input.
+    #[error("operation not supported on a read-only sparse file at {path}")]
+    ReadOnly {
+        /// The on-disk path the read-only file was opened from.
+        path: PathBuf,
+    },
+
     /// `mmap`-mode construction failed before a [`SparseFile`] could be
     /// returned. Wrapped from the underlying `mmap(2)` failure.
     /// Linux-only because the mmap storage backend is gated on Linux
@@ -177,6 +192,13 @@ pub struct SparseFile {
     total_size: u64,
     path: PathBuf,
     storage: Storage,
+    /// When `true` the file was opened by [`SparseFile::open_readonly`]
+    /// — write/punch/sync operations fail with
+    /// [`SparseFileError::ReadOnly`]. Read operations are always
+    /// allowed. This exists to feed the user's archive into the
+    /// existing zip/7z/rar pipelines (via [`crate::download::multi_sparse::MultiSparse`])
+    /// without granting any write authority.
+    readonly: bool,
 }
 
 /// Internal: the storage backend a [`SparseFile`] dispatches to.
@@ -240,6 +262,55 @@ impl SparseFile {
             total_size,
             path: path.to_path_buf(),
             storage: Storage::Pwrite { backend },
+            readonly: false,
+        })
+    }
+
+    /// Open `path` read-only and report its existing size as
+    /// [`Self::total_size`]. No `set_len`, no write authority on the
+    /// kernel fd. Used by the local-file extraction path so the
+    /// existing zip/7z/rar pipelines can drive the user's archive
+    /// through a [`crate::download::multi_sparse::MultiSparse`]
+    /// wrapper without granting any write authority on the source.
+    ///
+    /// The pwrite/punch/sync methods on the returned [`SparseFile`]
+    /// fail with [`SparseFileError::ReadOnly`]; the pipelines never
+    /// call them, but the variant exists so a bug in the local-mode
+    /// coordinator glue surfaces as a clean error rather than a
+    /// silent write into the user's archive.
+    ///
+    /// The IO backend is left as the default (blocking pread) — the
+    /// local path never benefits from `io_uring` because there is no
+    /// concurrent worker pool issuing the reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparseFileError::Open`] if the file cannot be opened
+    /// (typically `ENOENT` or permission denied).
+    pub fn open_readonly(path: &Path) -> Result<Self, SparseFileError> {
+        let file =
+            OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|source| SparseFileError::Open {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let total_size = file
+            .metadata()
+            .map_err(|source| SparseFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        Ok(Self {
+            file,
+            total_size,
+            path: path.to_path_buf(),
+            storage: Storage::Pwrite {
+                backend: default_backend(),
+            },
+            readonly: true,
         })
     }
 
@@ -283,6 +354,7 @@ impl SparseFile {
             storage: Storage::Mmap {
                 region: Arc::new(region),
             },
+            readonly: false,
         })
     }
 
@@ -379,6 +451,11 @@ impl SparseFile {
     /// overflows `u64`, or [`SparseFileError::Io`] for any other OS
     /// error.
     pub fn pwrite_at(&self, offset: ByteOffset, buf: &[u8]) -> Result<(), SparseFileError> {
+        if self.readonly {
+            return Err(SparseFileError::ReadOnly {
+                path: self.path.clone(),
+            });
+        }
         let raw_offset = offset.get();
         let len = buf.len() as u64;
         let end = raw_offset
@@ -537,6 +614,11 @@ impl SparseFile {
         offset: ByteOffset,
         length: u64,
     ) -> Result<(), SparseFileError> {
+        if self.readonly {
+            return Err(SparseFileError::ReadOnly {
+                path: self.path.clone(),
+            });
+        }
         puncher
             .punch(self.as_fd(), offset, length)
             .map_err(SparseFileError::Punch)

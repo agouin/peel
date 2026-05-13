@@ -222,30 +222,76 @@ fn local_run_pumps_progress_state_counters() {
 }
 
 #[test]
-fn local_zip_rejected_with_clear_error() {
-    // ZIP / RAR / 7z are random-access formats; local-file mode
-    // currently surfaces a `NoDecoder` error pointing the user at
-    // the HTTP path until the per-format local extractor lands.
-    let dir = unique_dir("zip_rejected");
+fn local_zip_extracts_entry_to_output_dir() {
+    // ZIP local-file extraction runs the same pipeline the HTTP
+    // path uses, but driven against a `SparseFile::open_readonly`
+    // wrap of the user's archive
+    // (`docs/PLAN_local_file_extract.md` §2 step 5).
+    let dir = unique_dir("local_zip_extract");
+    let payload: Vec<u8> = (0..4u32 * 1024).map(|i| i as u8).collect();
     let zip = support::zip_fixtures::build_zip(&[support::zip_fixtures::ZipEntrySpec::stored(
-        "hello.txt",
-        b"hi\n",
+        "data/hello.bin",
+        payload.clone(),
     )]);
     let source = dir.join("archive.zip");
     std::fs::write(&source, &zip).expect("write zip");
     let out = dir.join("out");
 
-    let args = LocalRunArgs::new(source, OutputTarget::Dir(out));
-    let err = local_run(args).expect_err("must error");
-    match err {
-        CoordinatorError::NoDecoder { filename } => {
-            assert!(
-                filename.contains("zip"),
-                "error message should name the offending format, got: {filename:?}",
-            );
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    let _stats = local_run(args).expect("local zip extracts");
+
+    let got = std::fs::read(out.join("data/hello.bin")).expect("read extracted entry");
+    assert_eq!(got, payload);
+    // Source preserved (random-access local mode is always
+    // non-destructive).
+    assert!(source.exists(), "local zip must preserve the source");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_7z_extracts_folder_to_output_dir() {
+    // 7z local-file extraction parallels the zip path.
+    let dir = unique_dir("local_7z_extract");
+    let payload: Vec<u8> = b"seven-zip local content\n".to_vec();
+    let body = support::sevenz_fixtures::build_copy_sevenz(&[("hello.txt", payload.clone())]);
+    let source = dir.join("archive.7z");
+    std::fs::write(&source, &body).expect("write 7z");
+    let out = dir.join("out");
+
+    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    let _stats = local_run(args).expect("local 7z extracts");
+
+    let got = std::fs::read(out.join("hello.txt")).expect("read extracted file");
+    assert_eq!(got, payload);
+    assert!(source.exists(), "local 7z must preserve the source");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "rar")]
+#[test]
+fn local_rar_extracts_entry_to_output_dir() {
+    // RAR5 local-file extraction. Uses STORED-encoded fixtures
+    // produced by `support::rar_fixtures` (the synthetic builder;
+    // no licensed `rar` binary required).
+    let dir = unique_dir("local_rar_extract");
+    let payload: Vec<u8> = (0..4u32 * 1024).map(|i| (i * 7) as u8).collect();
+    let entries = vec![support::rar_fixtures::RarEntrySpec::stored(
+        "rar/hello.bin",
+        payload.clone(),
+    )];
+    let body = support::rar_fixtures::build_rar5(0, None, &entries);
+    let source = dir.join("archive.rar");
+    std::fs::write(&source, &body).expect("write rar");
+    let out = dir.join("out");
+
+    let args = LocalRunArgs::new(source.clone(), OutputTarget::Dir(out.clone()));
+    let _stats = local_run(args).expect("local rar extracts");
+
+    let got = std::fs::read(out.join("rar/hello.bin")).expect("read extracted entry");
+    assert_eq!(got, payload);
+    assert!(source.exists(), "local rar must preserve the source");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

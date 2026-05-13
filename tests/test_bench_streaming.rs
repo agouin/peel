@@ -44,7 +44,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -1836,33 +1836,21 @@ fn run_throttled_case(
     let server = MockServer::start(ok_handler(body.to_vec()));
     let url = format!("{}/{suffix}", server.base_url());
 
-    // ---- peel ----
+    // ---- peel (CLI subprocess) ----
+    // We invoke the built `peel` binary as a subprocess rather than
+    // calling `coordinator::run` in-process: the reference baselines
+    // pay process-spawn + dynamic-linker cost on every run, and
+    // measuring peel through the same shape keeps the comparison
+    // honest.
     let work_p = unique_dir(&format!("net_{format_label}_peel"));
     let _g_p = CleanupDir(work_p.clone());
-    let mut config = coord_config();
-    config.max_bandwidth_bps = Some(rate.bytes_per_sec);
-    // Phase 2 of `PLAN_checkpoint_cadence_throughput.md`: the
-    // rate-aware byte floor only activates when a `ProgressState`
-    // is wired up. The production CLI does so unconditionally
-    // (`src/main.rs`); mirror that here so the grid numbers track
-    // production behavior.
-    let progress_state = std::sync::Arc::new(peel::progress::ProgressState::new());
-    let args = RunArgs {
-        url: url.clone(),
-        additional_urls: Vec::new(),
-        output: OutputTarget::Dir(work_p.clone()),
-        config,
-        client: build_client(),
-        registry: DecoderRegistry::with_defaults(),
-        progress: None,
-        progress_state: Some(std::sync::Arc::clone(&progress_state)),
-        kill_switch: None,
-        io_backend: None,
-    };
-    let started = Instant::now();
-    let stats = run(args).expect("peel run succeeds");
-    let peel_elapsed = started.elapsed();
-    assert_eq!(stats.extraction.bytes_out, archive.len() as u64);
+    let peel_elapsed = run_peel_subprocess(&url, &work_p, Some(rate.bytes_per_sec));
+    // Sanity-check the on-disk tree: the bench is unsafe if peel
+    // silently produced wrong output. The exact byte count is not
+    // checked here (peel surfaces `bytes_out` only through its
+    // stderr stats line); `assert_dir_matches` re-derives the
+    // expected bodies and compares them.
+    let _ = archive;
     assert_dir_matches(&work_p, entries);
 
     // ---- curl|tool ----
@@ -1884,6 +1872,47 @@ fn run_throttled_case(
         ratio = peel_s / base_s.max(1e-9),
         tools = tools_label,
     );
+}
+
+/// Spawn the `peel` CLI binary and time it.
+///
+/// `bytes_per_sec` caps aggregate download bandwidth via
+/// `--max-bandwidth`; pass `None` to skip the cap (the local-file
+/// bench wires this in differently — see [`run_peel_local_subprocess`]).
+/// `output_dir` is passed with a trailing slash so peel treats it as
+/// a tree-shape output target regardless of suffix. stdout / stderr
+/// are captured and surfaced on non-zero exit so a regression in
+/// the binary's wiring fails the bench loudly rather than silently
+/// producing zero-time rows.
+fn run_peel_subprocess(url: &str, output_dir: &Path, bytes_per_sec: Option<u64>) -> Duration {
+    let exe = env!("CARGO_BIN_EXE_peel");
+    let mut cmd = Command::new(exe);
+    cmd.arg(url)
+        .arg("-o")
+        .arg(format!("{}/", output_dir.display()));
+    // Disable multi-volume auto-discovery: the MockServer is a
+    // happy-path fixture and responds OK to every `<basename>.001`
+    // / `<base>.z01` / `<base>.part2.rar` sibling probe, which
+    // would otherwise make peel fan out indefinitely against a
+    // single-volume bench URL.
+    cmd.arg("--no-auto-discover");
+    if let Some(bps) = bytes_per_sec {
+        cmd.arg("--max-bandwidth").arg(bps.to_string());
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let output = cmd.output().expect("spawn peel subprocess");
+    let elapsed = started.elapsed();
+    if !output.status.success() {
+        panic!(
+            "peel subprocess exited {}: stderr=\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    elapsed
 }
 
 /// Like [`build_tar_payload`] but takes a target raw-byte total. Files
@@ -2238,27 +2267,15 @@ fn run_throttled_dnx_case(
     let server = MockServer::start(ok_handler(body.to_vec()));
     let url = format!("{}/{suffix}", server.base_url());
 
-    // ---- peel ----
+    // ---- peel (CLI subprocess) ----
+    // Same rationale as `run_throttled_case`: spawning the built
+    // binary keeps the comparison honest against the curl-based
+    // baselines (which also pay process-spawn cost). The
+    // `peel_subprocess` helper handles `--max-bandwidth`, stderr
+    // capture, and non-zero-exit panics.
     let work_p = unique_dir(&format!("dnx_{format_label}_peel"));
     let _g_p = CleanupDir(work_p.clone());
-    let mut config = coord_config();
-    config.max_bandwidth_bps = Some(rate.bytes_per_sec);
-    let progress_state = std::sync::Arc::new(peel::progress::ProgressState::new());
-    let args = RunArgs {
-        url: url.clone(),
-        additional_urls: Vec::new(),
-        output: OutputTarget::Dir(work_p.clone()),
-        config,
-        client: build_client(),
-        registry: DecoderRegistry::with_defaults(),
-        progress: None,
-        progress_state: Some(std::sync::Arc::clone(&progress_state)),
-        kill_switch: None,
-        io_backend: None,
-    };
-    let started = Instant::now();
-    let _stats = run(args).expect("peel run succeeds");
-    let peel_elapsed = started.elapsed();
+    let peel_elapsed = run_peel_subprocess(&url, &work_p, Some(rate.bytes_per_sec));
     assert_dir_matches(&work_p, entries);
 
     // ---- curl -O && extract && rm ----
