@@ -430,6 +430,16 @@ pub enum CliError {
     #[error("HTTP client setup failed")]
     Client(#[from] crate::http::ClientError),
 
+    /// Multi-volume HTTP auto-discovery
+    /// (`docs/PLAN_multivolume_archives.md` §1) failed against a
+    /// seed URL that matched a multi-volume pattern. Wraps the
+    /// per-pattern diagnostic — `MissingVolume`, `FinalVolumeMissing`,
+    /// or a `HEAD`-side network error — so the user knows
+    /// auto-discovery was attempted (i.e. the seed pattern was
+    /// recognised) but the resolved set was incomplete.
+    #[error("multi-volume auto-discovery failed")]
+    VolumeDiscovery(#[source] crate::multivolume::MvError),
+
     /// `--sha256 <HEX>` was given but the value did not parse as a
     /// 64-character hex digest.
     #[error("--sha256 value is not a valid SHA-256 digest")]
@@ -995,6 +1005,100 @@ fn classify_source(arg: &str) -> Result<SourceClassification, CliError> {
     }
 }
 
+/// Result of a successful multi-volume HTTP discovery pass
+/// (`docs/PLAN_multivolume_archives.md` §1).
+///
+/// Captures the canonical URL list resolved by
+/// [`crate::multivolume::discover_http`] reshaped into the
+/// `(primary, additional)` split [`RunArgs`] expects:
+/// `primary` is volume 1's URL (the discovery walker normalises
+/// to start at volume 1 even when the user passed a higher-numbered
+/// seed), `additional` is the rest of the volume set in order.
+struct ResolvedVolumeSet {
+    primary: String,
+    additional: Vec<String>,
+}
+
+/// Try multi-volume HTTP auto-discovery against `primary_url`.
+///
+/// Returns:
+/// - `Ok(Some(set))` when the seed matched a multi-volume pattern
+///   *and* discovery resolved a set of >1 volumes. The caller
+///   should switch to `multi_part_storage`-on for the run.
+/// - `Ok(None)` when the seed is plainly single-URL — either the
+///   string isn't a valid URL (let [`crate::http`] surface that
+///   later), or the basename does not match any multi-volume
+///   pattern, or discovery returned just a single volume (e.g.
+///   `foo.part0001.rar` exists but `foo.part0002.rar` doesn't —
+///   discovered as one volume, which is the same as single-URL
+///   for the coordinator's purposes).
+/// - `Err(CliError::VolumeDiscovery)` when the seed pattern *was*
+///   recognised but discovery surfaced a real failure — a missing
+///   lower-numbered volume, a missing ZIP final volume, or a HEAD
+///   network error. Returning the typed error preserves the
+///   operator-facing diagnostic instead of silently swallowing it.
+fn resolve_multi_volume_http(
+    client: &Client,
+    primary_url: &str,
+) -> Result<Option<ResolvedVolumeSet>, CliError> {
+    use crate::multivolume::{discover_http, parse_volume_name, MvError};
+
+    let Ok(seed) = Url::parse(primary_url) else {
+        // Defer URL validation to the downstream HTTP code paths;
+        // a malformed URL surfaces there with a clearer message.
+        return Ok(None);
+    };
+    let basename = seed
+        .path()
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    if parse_volume_name(basename).is_none() {
+        return Ok(None);
+    }
+    match discover_http(client, &seed) {
+        Ok(urls) => {
+            if urls.len() <= 1 {
+                // The seed pattern matched but only one volume
+                // resolved — treat the same as single-URL so the
+                // coordinator's multi-part bookkeeping (per-part
+                // sidecars, routing puncher, conflict checks)
+                // doesn't kick in for a single sparse file.
+                return Ok(None);
+            }
+            let mut iter = urls.into_iter();
+            let primary = iter.next().expect("urls.len() > 1").to_string();
+            let additional: Vec<String> = iter.map(|u| u.to_string()).collect();
+            Ok(Some(ResolvedVolumeSet {
+                primary,
+                additional,
+            }))
+        }
+        // `PatternNotRecognised` here is a discovery-time anomaly
+        // — `parse_volume_name` already returned `Some` above, so
+        // the basename matched. Surface it as a soft skip rather
+        // than a hard error to match the "treat unknown patterns
+        // as single-URL" rule.
+        Err(MvError::PatternNotRecognised { .. }) => Ok(None),
+        // A transport-level `HEAD` failure (connection refused,
+        // DNS failure, TLS error, …) means the origin is
+        // unreachable. We cannot tell from a transport error
+        // whether the seed is single-volume or multi-volume, so
+        // fall through to the single-URL path and let the
+        // coordinator's normal HTTP request surface the
+        // underlying network problem with the full retry +
+        // mirror plumbing rather than aborting at CLI parse
+        // time with a "discovery failed" message that hides the
+        // real cause. Specific *protocol-level* failures
+        // (`MvError::MissingVolume`, `FinalVolumeMissing`,
+        // `UnexpectedStatus`) still propagate — they mean the
+        // origin answered, and the answer is incompatible with
+        // a multi-volume seed the user clearly intended.
+        Err(MvError::Head { .. }) => Ok(None),
+        Err(other) => Err(CliError::VolumeDiscovery(other)),
+    }
+}
+
 /// Top-level entry from [`Cli::into_dispatch`]: a parsed CLI lands
 /// in one of two pipelines depending on what the positional
 /// `<source>` arguments looked like
@@ -1366,6 +1470,35 @@ impl Cli {
             http_version,
             ..ClientConfig::default()
         })?;
+
+        // Multi-volume HTTP auto-discovery
+        // (`docs/PLAN_multivolume_archives.md` §1 / §7 Phase 5):
+        // when the user passes a single URL whose basename looks
+        // like a multi-volume seed (`foo.part0001.rar`,
+        // `foo.7z.001`, `foo.z01` / `foo.zip`), HEAD-probe the
+        // sibling volumes and flip `multi_part_storage` on so each
+        // volume lands in its own `.peel.part.NNN` sidecar.
+        //
+        // - Auto-discovery is skipped when the user already supplied
+        //   additional URLs (they're being explicit).
+        // - A seed whose basename doesn't match any pattern (e.g.
+        //   `archive.tar.zst`) returns `PatternNotRecognised` and is
+        //   silently treated as single-URL — the normal path.
+        // - Every *other* discovery error surfaces as
+        //   [`CliError::VolumeDiscovery`] so the user knows
+        //   auto-discovery was attempted; specifically
+        //   `MissingVolume` / `FinalVolumeMissing` mean the seed
+        //   pattern *did* match but the resolved set was incomplete.
+        let (primary_url, additional_urls, multi_part_storage) = if additional_urls.is_empty() {
+            match resolve_multi_volume_http(&client, &primary_url) {
+                Ok(Some(resolved)) => (resolved.primary, resolved.additional, true),
+                Ok(None) => (primary_url, additional_urls, false),
+                Err(e) => return Err(e),
+            }
+        } else {
+            (primary_url, additional_urls, false)
+        };
+
         Ok(RunArgs {
             url: primary_url,
             additional_urls,
@@ -1395,7 +1528,7 @@ impl Cli {
                 keep_archive,
                 strict_format: self.strict_format,
                 password_source,
-                multi_part_storage: false,
+                multi_part_storage,
             },
             client,
             registry: DecoderRegistry::with_defaults(),
