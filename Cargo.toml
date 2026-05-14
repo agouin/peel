@@ -82,12 +82,17 @@ required-features = ["rar"]
 # Man-page generator for the `peel` binary. Renders `peel::cli::Cli`
 # through `clap_mangen` and writes troff to its first positional
 # argument (default `target/man/peel.1`). Invoked from `release.yml`
-# before packaging so every release tarball ships a `peel.1`.
-# See `internal/PLAN_packaging.md` §0.2 for why this is an example
-# rather than a `build.rs` script.
-[[example]]
-name = "gen_man"
-path = "examples/gen_man.rs"
+# before packaging so every release tarball ships a `peel.1`, and
+# called from the Fedora `.spec` / Debian `rules` / Arch `PKGBUILD`
+# (`packaging/`) during the distro source build. Gated by the
+# `man-page` feature so the default `cargo install peel-rs` doesn't
+# build a generator nobody asked for. See
+# `internal/PLAN_packaging.md` §0.2 for the design rationale
+# (bin vs. example; optional normal dep vs. dev-dep).
+[[bin]]
+name = "peel-mangen"
+path = "src/bin/peel-mangen.rs"
+required-features = ["man-page"]
 
 [[example]]
 name = "rar_decode_probe"
@@ -125,6 +130,15 @@ bzip2 = []
 zip = ["gzip", "zstd"]
 sevenz = ["gzip", "xz"]
 rar = []
+# Gates the `peel-mangen` helper binary that renders the man page
+# via `clap_mangen`. Off by default — most users `cargo install
+# peel-rs` for the runtime binary only. Distro packagers turn it
+# on (`packaging/fedora/peel.spec`, `packaging/aur/peel/PKGBUILD`,
+# `packaging/debian/rules`) so the man page can be generated from
+# source during the distro build. Implementation: enabling the
+# feature activates the optional `clap_mangen` dep so `peel-mangen`
+# can compile.
+man-page = ["dep:clap_mangen"]
 # Link against the distro's `libzstd.so` instead of vendoring and
 # statically linking the C source via `zstd-sys`. Off by default
 # (the crates.io release / GitHub-released binaries / `cargo install
@@ -162,6 +176,15 @@ lz4_flex = { version = "0.11", default-features = false, features = ["safe-decod
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # internal/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }
+# Companion `clap` crate that renders a `clap::Command` to troff for
+# `man(1)`. Maintained by the clap-rs org, same MIT/Apache-2.0
+# license as `clap`, no transitive C deps. Optional + gated by the
+# `man-page` feature so it only enters the build closure when a
+# packager runs `cargo build --bin peel-mangen --features man-page`.
+# The default `peel` binary does not link it. Sits logically under
+# the `clap` row in `internal/ENGINEERING_STANDARDS.md` §2.2; see
+# `internal/PLAN_packaging.md` §0.2 for the rationale.
+clap_mangen = { version = "0.2", optional = true }
 # Application-level error reporting at the binary boundary, pre-approved
 # per internal/ENGINEERING_STANDARDS.md §2.2 / §3.2.
 anyhow = "1"
@@ -200,16 +223,6 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 io-uring = { version = "0.7", default-features = false }
 
 [dev-dependencies]
-# Dev-only man-page renderer used by the `gen_man` example
-# (`examples/gen_man.rs`). Maintained by the clap-rs org, same
-# MIT/Apache-2.0 license as `clap`, no transitive C deps. Sits
-# logically under the `clap` row in
-# `internal/ENGINEERING_STANDARDS.md` §2.2 — the runtime binary does
-# not link `clap_mangen`; only the example invoked from
-# `release.yml` does. See `internal/PLAN_packaging.md` §0.2 for the
-# rationale (we ship a generated `peel.1` in every release tarball
-# so distros don't have to hand-write or re-derive one).
-clap_mangen = "0.2"
 # Dev-only reference implementation used by `hash::sha256` tests to
 # cross-check the hand-rolled SHA-256 against a battle-tested upstream
 # (`PLAN_v2.md` §10 / `internal/ENGINEERING_STANDARDS.md` §2.2). The

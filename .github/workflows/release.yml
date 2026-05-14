@@ -78,9 +78,12 @@ jobs:
       - name: Generate man page
         # Built host-native (no --target) because the output is
         # architecture-independent troff and we just need it on disk
-        # for the Package step. See `examples/gen_man.rs` and
-        # `internal/PLAN_packaging.md` §0.2.
-        run: cargo run --release --example gen_man --locked -- target/man/peel.1
+        # for the Package step. See `src/bin/peel-mangen.rs` and
+        # `internal/PLAN_packaging.md` §0.2 for why this is a bin
+        # gated by the `man-page` feature rather than a dev-dep
+        # example (examples pull in every dev-dep — including the
+        # heavy xz2 → lzma-sys C compile — which a bin avoids).
+        run: cargo run --release --bin peel-mangen --features man-page --locked -- target/man/peel.1
 
       - name: Strip binary
         # Hoisted out of the Package step so the cargo-deb step below

@@ -8,14 +8,22 @@
 //!
 //! Distros pick the file up either from the release tarball (where it lives
 //! at `peel-<version>-<target>/peel.1`, written by `release.yml`) or by
-//! re-running this example against the source tree.
+//! re-running this binary against the source tree.
 //!
-//! Why an example rather than a `build.rs`: `peel::cli::Cli` depends on
-//! the full lib (decoder registry, HTTP client config, password sources,
-//! etc.), so a `build.rs` `#[path]` include can't compile it without the
-//! lib already being built — a circular dep. An example sits naturally
-//! above the lib in cargo's compile order. See `internal/PLAN_packaging.md`
-//! §0.2 for the design discussion.
+//! Shape choice: a separate `[[bin]]` rather than an `[[example]]` because
+//! examples are compiled as part of cargo's dev-target scope, which drags
+//! every `[dev-dependencies]` entry into the build closure (including
+//! `xz2` → `lzma-sys`'s C compile). A bin compiles only the deps reachable
+//! from its target, so the man-page generator stays cheap to build in a
+//! distro chroot. `clap_mangen` is therefore an optional normal dep gated
+//! by the `man-page` feature, not a dev-dep. See `internal/PLAN_packaging.md`
+//! §0.2.
+//!
+//! Why this isn't a `build.rs`: `peel::cli::Cli` depends on the full lib
+//! (decoder registry, HTTP client config, password sources, etc.), so a
+//! `build.rs` `#[path]` include can't compile it without the lib already
+//! being built — a circular dep. A bin sits naturally above the lib in
+//! cargo's compile order.
 
 #![cfg(unix)]
 
@@ -37,7 +45,7 @@ fn main() -> ExitCode {
 
     if let Some(parent) = out.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            eprintln!("gen_man: create_dir_all({}): {e}", parent.display());
+            eprintln!("peel-mangen: create_dir_all({}): {e}", parent.display());
             return ExitCode::from(1);
         }
     }
@@ -46,15 +54,15 @@ fn main() -> ExitCode {
     let man = Man::new(cmd);
     let mut buf: Vec<u8> = Vec::new();
     if let Err(e) = man.render(&mut buf) {
-        eprintln!("gen_man: render: {e}");
+        eprintln!("peel-mangen: render: {e}");
         return ExitCode::from(1);
     }
 
     if let Err(e) = fs::write(&out, &buf) {
-        eprintln!("gen_man: write({}): {e}", out.display());
+        eprintln!("peel-mangen: write({}): {e}", out.display());
         return ExitCode::from(1);
     }
 
-    eprintln!("gen_man: wrote {} ({} bytes)", out.display(), buf.len());
+    eprintln!("peel-mangen: wrote {} ({} bytes)", out.display(), buf.len());
     ExitCode::SUCCESS
 }
