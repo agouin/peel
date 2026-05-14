@@ -75,6 +75,13 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target ${{ matrix.target }} --bin peel
 
+      - name: Generate man page
+        # Built host-native (no --target) because the output is
+        # architecture-independent troff and we just need it on disk
+        # for the Package step. See `examples/gen_man.rs` and
+        # `internal/PLAN_packaging.md` §0.2.
+        run: cargo run --release --example gen_man --locked -- target/man/peel.1
+
       - name: Package
         shell: bash
         run: |
@@ -88,6 +95,14 @@ jobs:
           strip "${bin}"
           cp "${bin}" "${staging}/"
           cp README.md "${staging}/"
+          # Distro packaging (PLAN_packaging.md §0.5) expects LICENSE-MIT,
+          # LICENSE-APACHE, and NOTICE at the top of `/usr/share/doc/peel/`
+          # or `/usr/share/licenses/peel/`. Shipping them in every release
+          # tarball means each spec/PKGBUILD/APKBUILD just `install -Dm0644`s
+          # what's already on disk.
+          cp LICENSE-MIT LICENSE-APACHE NOTICE "${staging}/"
+          # Man page generated in the previous step; arch-independent troff.
+          install -Dm0644 target/man/peel.1 "${staging}/share/man/man1/peel.1"
 
           ( cd dist && tar -czf "${name}.tar.gz" "${name}" )
           rm -rf "${staging}"

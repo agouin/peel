@@ -32,6 +32,16 @@ name = "rar_list"
 path = "examples/rar_list.rs"
 required-features = ["rar"]
 
+# Man-page generator for the `peel` binary. Renders `peel::cli::Cli`
+# through `clap_mangen` and writes troff to its first positional
+# argument (default `target/man/peel.1`). Invoked from `release.yml`
+# before packaging so every release tarball ships a `peel.1`.
+# See `internal/PLAN_packaging.md` §0.2 for why this is an example
+# rather than a `build.rs` script.
+[[example]]
+name = "gen_man"
+path = "examples/gen_man.rs"
+
 [[example]]
 name = "rar_decode_probe"
 path = "examples/rar_decode_probe.rs"
@@ -133,6 +143,16 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 io-uring = { version = "0.7", default-features = false }
 
 [dev-dependencies]
+# Dev-only man-page renderer used by the `gen_man` example
+# (`examples/gen_man.rs`). Maintained by the clap-rs org, same
+# MIT/Apache-2.0 license as `clap`, no transitive C deps. Sits
+# logically under the `clap` row in
+# `internal/ENGINEERING_STANDARDS.md` §2.2 — the runtime binary does
+# not link `clap_mangen`; only the example invoked from
+# `release.yml` does. See `internal/PLAN_packaging.md` §0.2 for the
+# rationale (we ship a generated `peel.1` in every release tarball
+# so distros don't have to hand-write or re-derive one).
+clap_mangen = "0.2"
 # Dev-only reference implementation used by `hash::sha256` tests to
 # cross-check the hand-rolled SHA-256 against a battle-tested upstream
 # (`PLAN_v2.md` §10 / `internal/ENGINEERING_STANDARDS.md` §2.2). The
