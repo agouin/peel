@@ -1,0 +1,13 @@
+# dpkg-source options for the `peel` package.
+#
+# `extend-diff-ignore` keeps dpkg-source from tracking changes inside
+# `vendor/` — that directory is a fully-resolved cargo vendor output
+# (shipped as part of the orig tarball; see
+# `packaging/debian/README.md` §6 / `internal/PLAN_packaging.md` §0.3).
+# Tracking it would produce a multi-megabyte `peel_*.debian.tar.xz`
+# diff that's noise, and it would also let `dh_clean` (or any tool
+# that interprets dpkg-source's notion of "extra files") strip
+# upstream-shipped files like `vendor/*/Cargo.toml.orig` — those
+# are part of the vendored crate and cargo needs them to verify
+# checksums.
+extend-diff-ignore = "(^|/)vendor/.*"

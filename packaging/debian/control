@@ -1,0 +1,44 @@
+Source: peel
+Section: utils
+Priority: optional
+Maintainer: Andrew Gouin <andrew@gouin.io>
+# Build-time deps:
+#   debhelper-compat / debhelper-compat — modern Debian build harness.
+#   rustc / cargo — the toolchain. `>= 1.85` matches the declared MSRV
+#     in Cargo.toml (`internal/PLAN_packaging.md` §0.6); when archive
+#     rustc is below this on the target series, Launchpad PPA builds
+#     install a newer toolchain via rustup in `debian/rules`.
+#   libzstd-dev — provides libzstd.so + pkg-config metadata for the
+#     `system-libs` Cargo feature.
+#   pkg-config — required for the `zstd-sys` pkg-config probe.
+#   ca-certificates — only needed if `debian/rules` runs cargo's vendor
+#     refresh online; the vendored-tarball path used by the official
+#     archive builds and the PPA does not need network access.
+Build-Depends:
+ debhelper-compat (= 13),
+ rustc (>= 1.85),
+ cargo,
+ libzstd-dev,
+ pkg-config
+Standards-Version: 4.7.0
+Homepage: https://github.com/agouin/peel
+Vcs-Browser: https://github.com/agouin/peel
+Vcs-Git: https://github.com/agouin/peel.git
+Rules-Requires-Root: no
+
+Package: peel
+Architecture: any
+# `shlibs:Depends` is filled in by `dpkg-shlibdeps` from the linked
+# binary — with `--features system-libs` that resolves to libc6,
+# libgcc-s1, and libzstd1. `misc:Depends` covers debhelper-managed
+# auto-deps.
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: streaming, resumable, space-efficient HTTP archive extractor
+ peel downloads compressed archives over HTTP and streams them through
+ decompression in a single pass, hole-punching the compressed bytes from
+ disk as the decoder advances. A SIGKILL mid-extraction resumes exactly
+ where it left off, byte-identical to a clean run.
+ .
+ Supports tar / tar.zst / tar.xz / tar.lz4 / tar.gz / tar.bz2 / zip /
+ 7z / rar (rar5 + rar3/rar4), plus the raw single-stream forms of those
+ codecs.

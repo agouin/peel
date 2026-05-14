@@ -1,0 +1,68 @@
+#!/usr/bin/make -f
+# debian/rules — build orchestration for the `peel` Debian package.
+#
+# The vendored-deps tarball (peel-v<version>-vendored.tar.gz) from the
+# upstream GitHub release is extracted into the source tree before
+# `dpkg-buildpackage` runs (see packaging/debian/README.md §3). The
+# tarball ships `vendor/` and a ready-made `cargo-vendor-config.toml`;
+# this rules file just wires them into `.cargo/config.toml` so cargo
+# resolves every crate locally. See `internal/PLAN_packaging.md` §0.3.
+
+export CARGO_HOME=$(CURDIR)/debian/cargo-home
+export DEB_CARGO_CRATE=peel
+# Defensive: keep cargo away from the system cargo cache.
+export CARGO_NET_OFFLINE=true
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p .cargo
+	# Drop in the source-replacement snippet shipped in the vendored
+	# tarball so cargo finds every crate under `vendor/`.
+	cp cargo-vendor-config.toml .cargo/config.toml
+
+override_dh_auto_build:
+	# Main binary: --features system-libs swaps zstd-sys's vendored
+	# C source for libzstd.so.1 via pkg-config (libzstd-dev provides
+	# `libzstd.pc`). PLAN_packaging.md §0.4.
+	cargo build --release --frozen --features system-libs --bin peel
+	# Man-page generator: gated by the `man-page` feature so the
+	# default `peel` binary stays free of clap_mangen. The bin
+	# emits troff to its first positional arg.
+	# PLAN_packaging.md §0.2.
+	cargo build --release --frozen --features system-libs,man-page \
+	    --bin peel-mangen
+	./target/release/peel-mangen target/man/peel.1
+
+override_dh_auto_test:
+	# Skip cargo test in this build profile — the official Debian
+	# archive's `nocheck` flag also exempts us, and the upstream
+	# CI runs the full test suite. If a packager wants tests run
+	# locally, drop the override and the default dh path will
+	# `cargo test --release --frozen`.
+
+override_dh_auto_install:
+	install -Dm0755 target/release/peel \
+	    debian/peel/usr/bin/peel
+	install -Dm0644 target/man/peel.1 \
+	    debian/peel/usr/share/man/man1/peel.1
+	install -Dm0644 LICENSE-MIT \
+	    debian/peel/usr/share/doc/peel/LICENSE-MIT
+	install -Dm0644 LICENSE-APACHE \
+	    debian/peel/usr/share/doc/peel/LICENSE-APACHE
+	install -Dm0644 NOTICE \
+	    debian/peel/usr/share/doc/peel/NOTICE
+
+override_dh_auto_clean:
+	cargo clean || true
+	rm -rf .cargo debian/cargo-home
+
+# `dh_clean`'s default cleanup pattern includes `*.orig` files — a
+# leftover from when patches typically produced them. Inside our
+# vendored crate tree those filenames are load-bearing
+# (cargo verifies vendored crates against the `Cargo.toml.orig`
+# from the upstream `.crate`), so tell dh_clean to skip anything
+# under `vendor/`.
+override_dh_clean:
+	dh_clean -Xvendor
