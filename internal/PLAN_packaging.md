@@ -356,7 +356,7 @@ install -Dm0644 README.md        %{buildroot}%{_docdir}/peel/README.md
 %{_mandir}/man1/peel.1*
 
 %changelog
-* <date> Andrew Gouin <andrew.gouin@ondo.finance> - 0.5.0-1
+* <date> Andrew Gouin <andrew@gouin.io> - 0.5.0-1
 - Initial Fedora packaging.
 ```
 
@@ -436,7 +436,7 @@ Key file: `debian/control`:
 Source: peel
 Section: utils
 Priority: optional
-Maintainer: Andrew Gouin <andrew.gouin@ondo.finance>
+Maintainer: Andrew Gouin <andrew@gouin.io>
 Build-Depends:
  debhelper-compat (= 13),
  rustc (>= 1.93),
@@ -604,7 +604,7 @@ unless someone asks for it.
 ### §4.2 `PKGBUILD` for the source package
 
 ```bash
-# Maintainer: Andrew Gouin <andrew.gouin@ondo.finance>
+# Maintainer: Andrew Gouin <andrew@gouin.io>
 pkgname=peel
 pkgver=0.5.0
 pkgrel=1
@@ -701,8 +701,8 @@ package gets promoted to `community/`.
 ### §5.2 `APKBUILD`
 
 ```sh
-# Contributor: Andrew Gouin <andrew.gouin@ondo.finance>
-# Maintainer: Andrew Gouin <andrew.gouin@ondo.finance>
+# Contributor: Andrew Gouin <andrew@gouin.io>
+# Maintainer: Andrew Gouin <andrew@gouin.io>
 pkgname=peel
 pkgver=0.5.0
 pkgrel=0
