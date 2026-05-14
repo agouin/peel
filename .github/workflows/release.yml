@@ -432,9 +432,233 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Alpine `.apk` built from `packaging/alpine/APKBUILD`. Matrix-fanned
+  # across x86_64 and aarch64 because abuild compiles the binary in the
+  # chroot, so the runner has to be the right native arch. See
+  # `packaging/alpine/README.md` and `internal/PLAN_packaging.md` §5.
+  package-alpine:
+    name: Alpine .apk (${{ matrix.arch }})
+    needs: vendor
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-22.04
+          - arch: aarch64
+            runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    container: alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: sh
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps
+        run: |
+          apk add --no-cache alpine-sdk build-base abuild cargo rust \
+              zstd-dev pkgconf coreutils git tar
+
+      - name: Set up abuild user
+        # abuild refuses to run as root. Create a `builder` user, seed
+        # its abuild key, and run all subsequent build steps under it.
+        run: |
+          set -ex
+          addgroup -S builder 2>/dev/null || true
+          adduser -S -G builder builder 2>/dev/null || true
+          addgroup builder abuild 2>/dev/null || true
+          su builder -s /bin/sh -c 'abuild-keygen -a -n' || true
+          cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
+
+      - name: Download vendored crates
+        uses: actions/download-artifact@v4
+        with:
+          name: peel-vendor
+          path: vendor-artifact
+
+      - name: Stage sources + patch APKBUILD
+        # abuild fetches sources from `source=` URLs by default, but we
+        # pre-populate the distfiles cache with locally-staged files so
+        # it short-circuits the network fetch and uses our copies.
+        # The vendored tarball doesn't exist on the upstream release
+        # yet during the *first* run that produces it (this is the
+        # workflow producing the release), so caching is mandatory.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          ver="${tag#v}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p /var/cache/distfiles /tmp/build
+          # Source0: github-style archive of the tagged tree.
+          git archive --prefix="peel-${ver}/" HEAD \
+              -o "/var/cache/distfiles/peel-${ver}.tar.gz"
+          # Source1: vendored crates from the `vendor` job artifact.
+          vendored=$(find vendor-artifact -name 'peel-*-vendored.tar.gz' | head -1)
+          test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
+          cp "${vendored}" "/var/cache/distfiles/peel-v${ver}-vendored.tar.gz"
+          chmod a+r /var/cache/distfiles/*
+          # Patch APKBUILD's sha512sums block with the just-computed
+          # checksums. Use python over sed because the multi-line block
+          # is awkward to express in sed portably.
+          SHA1=$(sha512sum "/var/cache/distfiles/peel-${ver}.tar.gz" | awk '{print $1}')
+          SHA2=$(sha512sum "/var/cache/distfiles/peel-v${ver}-vendored.tar.gz" | awk '{print $1}')
+          cp packaging/alpine/APKBUILD /tmp/build/APKBUILD
+          python3 - "${SHA1}" "${SHA2}" "${ver}" <<'PY'
+          import re, sys
+          sha1, sha2, ver = sys.argv[1:]
+          p = "/tmp/build/APKBUILD"
+          content = open(p).read()
+          new_block = (
+              f'sha512sums="\n'
+              f'{sha1}  peel-{ver}.tar.gz\n'
+              f'{sha2}  peel-v{ver}-vendored.tar.gz\n'
+              f'"'
+          )
+          content = re.sub(r'sha512sums="[^"]*"', new_block, content,
+                           count=1, flags=re.DOTALL)
+          open(p, "w").write(content)
+          PY
+          chown -R builder:builder /tmp/build
+
+      - name: Build .apk
+        # `-F` forces abuild to run despite being invoked from a non-aports
+        # checkout. `REPODEST` controls where built .apk files land.
+        shell: bash
+        run: |
+          set -euo pipefail
+          su builder -s /bin/sh -c '
+            cd /tmp/build &&
+            REPODEST=/tmp/packages abuild -r -F
+          '
+
+      - name: Stage outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find /tmp/packages -name 'peel-*.apk' -exec cp {} dist/ \;
+          ( cd dist && sha256sum peel-*.apk > "peel-alpine-${{ matrix.arch }}.sha256" )
+          ls -lh dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: peel-alpine-${{ matrix.arch }}
+          path: |
+            dist/peel-*.apk
+            dist/peel-alpine-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # Arch `.pkg.tar.zst` built from `packaging/aur/peel/PKGBUILD`. Arch's
+  # official distribution is x86_64-only (Arch Linux ARM is a separate
+  # community project, served by AUR rebuilds on user machines), so we
+  # don't matrix-fan this one. See `packaging/aur/README.md` and
+  # `internal/PLAN_packaging.md` §4.
+  package-arch:
+    name: Arch .pkg.tar.zst
+    needs: vendor
+    runs-on: ubuntu-22.04
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps + create builder user
+        # `makepkg` refuses to run as root. Provision a `builder` user
+        # with passwordless sudo so the build can pacman-install
+        # makedepends. base-devel includes the standard PKGBUILD
+        # toolchain (fakeroot, sudo, etc.).
+        shell: bash
+        run: |
+          set -ex
+          pacman -Syu --noconfirm --noprogressbar \
+              base-devel rust cargo zstd pkgconf git > /dev/null
+          useradd -m -G wheel builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+
+      - name: Stage sources + patch PKGBUILD
+        # Drop the upstream-source archive into the build dir at the
+        # exact name PKGBUILD's `source=` line references so makepkg
+        # uses it instead of fetching from GitHub. Same caching shape
+        # as the Alpine job above.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          ver="${tag#v}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p /home/builder/build
+          cp packaging/aur/peel/PKGBUILD /home/builder/build/PKGBUILD
+          git archive --prefix="peel-${ver}/" HEAD \
+              -o "/home/builder/build/peel-${ver}.tar.gz"
+          # PKGBUILD's `source=` array uses
+          # `peel-${pkgver}.tar.gz::<URL>` which makepkg parses as
+          # "rename to peel-<ver>.tar.gz, fetch from URL". With the
+          # file already at that path it skips the fetch when sha
+          # matches.
+          SHA0=$(sha256sum "/home/builder/build/peel-${ver}.tar.gz" | awk '{print $1}')
+          # Replace the single-element sha256sums tuple. The PKGBUILD
+          # ships as `sha256sums=('SKIP')`.
+          sed -i "s|^sha256sums=(.*|sha256sums=('${SHA0}')|" \
+              /home/builder/build/PKGBUILD
+          chown -R builder:builder /home/builder/build
+
+      - name: Build .pkg.tar.zst
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `--syncdeps` installs missing makedepends, `--rmdeps`
+          # removes them after the build, `--nocheck` skips the
+          # PKGBUILD's `check()` (cargo test) for the same reason
+          # the Fedora and Alpine builds skip theirs.
+          su builder -c '
+            cd /home/builder/build &&
+            makepkg --noconfirm --syncdeps --rmdeps --nocheck
+          '
+
+      - name: Stage outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp /home/builder/build/peel-*.pkg.tar.zst dist/
+          ( cd dist && sha256sum peel-*.pkg.tar.zst > peel-arch.sha256 )
+          ls -lh dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: peel-arch
+          path: |
+            dist/peel-*.pkg.tar.zst
+            dist/peel-arch.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish release
-    needs: [build, vendor, package-fedora, package-debian-source]
+    needs: [build, vendor, package-fedora, package-debian-source, package-alpine, package-arch]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -498,6 +722,11 @@ jobs:
             # Debian source package material (PPA upload).
             dist/peel_*.dsc dist/peel_*.orig.tar.gz dist/peel_*.debian.tar.xz
             dist/peel_*_source.changes dist/peel-debian-source.sha256
+            # Alpine .apk (main + -doc subpackage, per arch).
+            dist/peel-*.apk dist/peel-alpine-*.sha256
+            # Arch .pkg.tar.zst (x86_64 only — Arch Linux ARM users
+            # build from AUR on their side).
+            dist/peel-*.pkg.tar.zst dist/peel-arch.sha256
             # Aggregate checksums.
             dist/SHA256SUMS
           )

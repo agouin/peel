@@ -1,0 +1,79 @@
+# Contributor: Andrew Gouin <andrew@gouin.io>
+# Maintainer: Andrew Gouin <andrew@gouin.io>
+pkgname=peel
+pkgver=0.5.0
+pkgrel=0
+pkgdesc="Streaming, resumable, space-efficient HTTP archive extractor"
+url="https://github.com/agouin/peel"
+arch="x86_64 aarch64"
+license="MIT OR Apache-2.0"
+makedepends="cargo rust zstd-dev pkgconf"
+# Alpine convention: man pages and other doc files live in a separate
+# `-doc` subpackage so the main runtime package stays minimal. abuild's
+# `default_doc` splitter moves anything under `/usr/share/man/`,
+# `/usr/share/doc/`, etc. into `peel-doc` and gzips man pages
+# automatically — no manual gzip step needed in `package()`.
+subpackages="$pkgname-doc"
+# Source0: upstream source archive (GitHub auto-generated for the tag).
+# Source1: vendored crates produced by `release.yml`'s `vendor` job;
+#   needed because Alpine's `abuild` chroot is network-isolated, so
+#   cargo cannot fetch from crates.io at build time. See
+#   `internal/PLAN_packaging.md` §0.3 / §5.
+source="$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz
+        $pkgname-v$pkgver-vendored.tar.gz::$url/releases/download/v$pkgver/peel-v$pkgver-vendored.tar.gz"
+builddir="$srcdir/$pkgname-$pkgver"
+
+prepare() {
+	default_prepare
+	cd "$builddir"
+	# The vendored tarball expands to a sibling
+	# `peel-v<version>-vendored/` directory under $srcdir; move its
+	# `vendor/` and `cargo-vendor-config.toml` into the build tree so
+	# cargo finds every crate locally.
+	mv "$srcdir/peel-v$pkgver-vendored/vendor" .
+	mkdir -p .cargo
+	mv "$srcdir/peel-v$pkgver-vendored/cargo-vendor-config.toml" \
+		.cargo/config.toml
+}
+
+build() {
+	cd "$builddir"
+	# `--features system-libs` swaps zstd-sys's vendored C source for
+	# Alpine's libzstd via pkg-config — same shared-linkage rationale
+	# as the Fedora / Debian builds (`internal/PLAN_packaging.md` §0.4).
+	cargo build --release --frozen \
+		--features system-libs --bin peel
+	# `--features man-page` activates the optional `clap_mangen` dep so
+	# the `peel-mangen` bin compiles; default builds stay free of it.
+	cargo build --release --frozen \
+		--features system-libs,man-page --bin peel-mangen
+	./target/release/peel-mangen target/man/peel.1
+}
+
+check() {
+	# Tests run in the upstream `ci.yml` workflow on every push; running
+	# them here would re-trigger the heavy `xz2 → lzma-sys` dev-dep C
+	# build for no incremental signal. Match the Fedora spec's `--nocheck`.
+	:
+}
+
+package() {
+	cd "$builddir"
+	install -Dm755 target/release/peel \
+		"$pkgdir"/usr/bin/peel
+	install -Dm644 target/man/peel.1 \
+		"$pkgdir"/usr/share/man/man1/peel.1
+	install -Dm644 LICENSE-MIT \
+		"$pkgdir"/usr/share/licenses/$pkgname/LICENSE-MIT
+	install -Dm644 LICENSE-APACHE \
+		"$pkgdir"/usr/share/licenses/$pkgname/LICENSE-APACHE
+	install -Dm644 NOTICE \
+		"$pkgdir"/usr/share/licenses/$pkgname/NOTICE
+}
+
+# Replace 'SKIP' with the actual sha512 values once v$pkgver ships; the
+# `release.yml` `package-alpine` job patches these in at build time.
+sha512sums="
+SKIP  $pkgname-$pkgver.tar.gz
+SKIP  $pkgname-v$pkgver-vendored.tar.gz
+"
