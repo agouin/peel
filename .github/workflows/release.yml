@@ -890,6 +890,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          # Limit to the artifacts the matrix jobs upload (all named
+          # `peel-*`). Without the filter, this step also tries to
+          # download `<owner>~<repo>~<id>.dockerbuild`, a build-record
+          # artifact that `docker/build-push-action@v6` auto-uploads
+          # alongside the image push. That artifact is small (~80 KB),
+          # unrelated to the release assets, and consistently fails
+          # extraction here — failing the whole publish job after the
+          # 12 peel artifacts have already downloaded cleanly.
+          pattern: peel-*
 
       - name: Aggregate checksums
         # SHA256SUMS rolls up every per-file checksum file into one,
