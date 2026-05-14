@@ -36,6 +36,7 @@ converts that warning to a fatal error.
 | `.xz` / `.tar.xz` | ✓ | per LZMA2 chunk | n/a | n/a |
 | `.lz4` / `.tar.lz4` | ✓ | per lz4 block | n/a | n/a |
 | `.gz` / `.tar.gz` | ✓ | per deflate block¹ | n/a | n/a |
+| `.bz2` / `.tar.bz2` / `.tbz2` / `.tbz` | ✓ | per bzip2 block | n/a | n/a |
 | `.zip` | per-entry² | per entry + intra-entry³ | WinZip-AES, ZipCrypto | spanned ZIP (`.zNN` + `.zip`) |
 | `.7z` | per-folder⁴ | per folder | AES-256-CBC (SHA-256 KDF) | `.7z.001`/`.002`/… |
 | `.rar` (RAR5) | per-entry⁵ | per entry + intra-entry⁶ | AES-256-CBC (header + per-file) | `.part0001.rar`/… |
@@ -89,6 +90,24 @@ sequence and emitted as one logical stream.
 ¹ `flate2` is a `[dev-dependencies]` only (used in the differential
 test harness to cross-check the hand-rolled decoder); the runtime
 binary does not link `flate2`.
+
+### `.bz2` / `.tar.bz2` / `.tbz2` / `.tbz`
+
+Streaming bzip2 with hand-rolled MSB-first Huffman / MTF / RLE2 /
+BWT / RLE1 layers. Each block (≤ 900 KB uncompressed at `-9`, with
+a 48-bit `pi` BCD sync header `0x314159265359` per the bzip2 wire
+format) is an independent restart point; the per-block resume blob
+is ~25 bytes (bit cursor + running stream CRC + cross-block RLE1
+state + stream level). The decoder rejects the legacy bzip2 0.9.0
+"randomised block" flag with a specific diagnostic; modern encoders
+have not emitted that flag since 1.0.0 in 1999.
+
+Multi-stream `.bz2` files (the `cat a.bz2 b.bz2 > c.bz2` shape) are
+handled by aligning to the next byte boundary after each stream's
+combined CRC and re-entering the per-block loop with a fresh RLE1
+state.
+
+`peel` does not link `libbz2`; the decoder is pure Rust.
 
 ## Random-access archives
 
@@ -245,7 +264,6 @@ without the 'rar' feature` error rather than `unknown format`.
 
 The following are not in the current release:
 
-- `.bz2` / `.tar.bz2`: not registered; surfaces as `unknown format`.
 - `.lzma` (raw LZMA1, no XZ container): not registered.
 - PKWARE strong encryption: clear error.
 - ZIP64 multi-disk: clear error (regular Zip64 is supported).

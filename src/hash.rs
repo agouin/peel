@@ -37,6 +37,7 @@
 #[cfg(feature = "rar")]
 pub mod blake2sp;
 pub mod crc32;
+pub mod crc32_bzip2;
 pub mod crc32c;
 pub mod crc64;
 pub mod sha256;

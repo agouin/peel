@@ -81,7 +81,8 @@ the tar formats.
   to the filesystem as the decoder advances. Peak compressed-side disk
   is ~the download window, not the archive size.
 - **Multi-format.** `.tar`, `.tar.zst`/`.zst`, `.tar.xz`/`.xz`,
-  `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`, `.zip` (STORED + DEFLATE +
+  `.tar.lz4`/`.lz4`, `.tar.gz`/`.gz`,
+  `.tar.bz2`/`.bz2`/`.tbz2`/`.tbz`, `.zip` (STORED + DEFLATE +
   zstd entries), `.7z` (COPY + DEFLATE + LZMA + LZMA2 coders;
   plain and unencrypted-encoded headers; single-volume), and
   `.rar` — both **RAR5** (STORED + the standard RAR5 algorithm

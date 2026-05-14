@@ -20,16 +20,25 @@ For a single-line non-interactive invocation,
 `PEEL_PW=… peel … --password-from env:PEEL_PW` is two characters
 longer than `--password=…` and avoids the visibility problem.
 
-## No `.bz2` support
+## Why `.bz2` support was added in round two
 
-Bzip2 is a slow, single-threaded codec superseded by xz (better
-ratio) and zstd (faster). The `.tar.bz2` format is common in legacy
-archives but not in modern publishing pipelines, and is deliberately
-out of round-one scope.
+Round one shipped without `.bz2` on the basis that bzip2 is a slow,
+single-threaded codec superseded by xz (better ratio) and zstd
+(faster). That priors-only argument held until a real corpus
+arrived as `.tar.bz2` and `bunzip2 | peel /dev/stdin` discarded the
+streaming + resume properties `peel` exists to deliver — the source
+side's on-disk footprint went unbounded across the workaround pipe,
+and a mid-extraction `kill -9` restarted the whole thing.
 
-To handle `.bz2`, decompress it once with `bunzip2` and then run
-`peel` against the resulting `.tar` (or pipe it through the local
-extraction path).
+`.bz2`, `.tar.bz2`, `.tbz2`, and `.tbz` are now first-class formats.
+The pipeline matches the other compressed `.tar.*` codecs: parallel
+ranged HTTP downloads, in-flight streaming decompression,
+`fallocate(PUNCH_HOLE)` reclaim of the compressed source as the
+decoder advances, and per-block frame-aligned checkpointing so a
+crash mid-extraction resumes exactly where it left off. See
+`internal/PLAN_bz2_support.md` for the engineering plan and
+trade-offs (randomised blocks, mid-block resume, parallel block
+decoding) deferred from this round.
 
 ## No raw `lzma` support (only `xz`)
 

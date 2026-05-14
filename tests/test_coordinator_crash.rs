@@ -2613,3 +2613,163 @@ fn random_kill_points_resume_multi_member_tar_gz_byte_identical() {
         ExpectedResumeMode::SomeDecoderState,
     );
 }
+
+// ---- harness: `.tar.bz2` (PLAN_bz2_support Phase 11) -------------------
+
+/// Encode `payload` via the system `bzip2 -c` CLI at the given level
+/// (`1..=9`). Used by the Phase 11 crash-resume harness so the
+/// fixtures match what `bzip2` / `tar -j` produces by default — one
+/// monolithic bzip2 stream whose only restart points are the
+/// per-block boundaries the hand-rolled
+/// `crate::decode::bzip2_native` decoder exposes (Phase 7
+/// `decoder_state` blob, Phase 9 registry wire-up).
+///
+/// Skips the test (via `panic!`) if `bzip2` is not on `PATH`. Round-
+/// one CI always has `bzip2` available; the diagnostic surfaces
+/// quickly on hosts that don't.
+fn encode_bzip2_via_cli(payload: &[u8], level: u8) -> Vec<u8> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    assert!((1..=9).contains(&level), "bzip2 level out of range");
+    let level_flag = format!("-{level}");
+    let mut child = Command::new("bzip2")
+        .arg("-c")
+        .arg(level_flag)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn bzip2 (CI must have bzip2 on PATH)");
+    {
+        let stdin = child.stdin.as_mut().expect("bzip2 stdin");
+        stdin.write_all(payload).expect("write bzip2 stdin");
+    }
+    let out = child.wait_with_output().expect("wait bzip2");
+    assert!(out.status.success(), "bzip2 -c failed: {:?}", out.status);
+    out.stdout
+}
+
+#[test]
+fn random_kill_points_resume_single_stream_tar_bz2_byte_identical() {
+    // `internal/PLAN_bz2_support.md` Phase 11: a single-stream
+    // `.tar.bz2` is the dominant production shape (`bzip2` /
+    // `tar -j` CLI's default). Bzip2 block boundaries
+    // (≤ 900 KB uncompressed each at `-9`, sync header
+    // `0x314159265359` per the wire format) are the *only*
+    // restart points — there is no block-internal resume by
+    // construction (the BWT inverse is a single monolithic pass
+    // and the RLE1 inverse runs at the stream level).
+    //
+    // We size the tar archive across multiple blocks at level 1
+    // (100 KB block ceiling) so the harness has many
+    // (decoder-state-bearing) checkpoints to randomize over.
+    // Sized for debug-build test time: bzip2's MTF-pop in
+    // pure Rust is O(rank) per byte and runs un-optimised here,
+    // so the per-block cost adds up quickly. Fixture below is
+    // ~300 KB tar → ~3 blocks at level 1 (100 KB block) so we
+    // still get ≥ 2 mid-stream checkpoints to randomize over.
+    let mut members: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    let primes = [73_523usize, 89_269, 101_999];
+    for i in 0..3 {
+        let name = Box::leak(format!("dir/bz2_member_{i:02}.bin").into_boxed_str());
+        let payload = build_lzma_friendly_input(primes[i % primes.len()], 0xBEEF_C0DE ^ i as u32);
+        members.push((name, payload));
+    }
+    let mut archive = Vec::new();
+    for (name, payload) in &members {
+        archive.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    archive.extend_from_slice(&end_of_archive_block());
+
+    let body = encode_bzip2_via_cli(&archive, 1);
+    let trial_count = 8u64;
+    run_dir_kill_resume_trials(
+        "single_stream_tar_bz2",
+        "x.tar.bz2",
+        body,
+        "\"v-single-stream-tar-bz2\"",
+        0xBAD0_F00D_BEEF_CAFEu64,
+        trial_count,
+        // Single-stream tar.bz2: bzip2 boundaries are always
+        // mid-stream (per-block, with cross-block RLE1 state),
+        // so every kill+resume takes the `resume_factory` path
+        // with the 25-byte blob carrying bit cursor + running
+        // stream CRC + RLE1 state. End-of-stream EOS is the
+        // only no-blob position and a kill is overwhelmingly
+        // unlikely to land there.
+        ExpectedResumeMode::AllDecoderState,
+    );
+}
+
+#[test]
+fn random_kill_points_resume_multi_stream_tar_bz2_byte_identical() {
+    // Multi-stream `.bz2` (the `cat a.bz2 b.bz2 > c.bz2` shape) is
+    // permitted by the bzip2 1.0 reference: concatenated streams
+    // are decoded in sequence and emitted as one logical output.
+    // The decoder aligns to the next byte boundary after each
+    // stream's combined CRC (libbz2's `bsFinishWrite` pads to a
+    // byte boundary on the encoder side) and re-enters the per-
+    // block loop with a fresh RLE1 state at every stream
+    // boundary; pin that contract under kill -9.
+    // Same debug-build sizing trade-off as the single-stream
+    // test above: keep the archive small enough that 8 kill-
+    // and-resume trials in pure-Rust un-optimised MTF stay under
+    // the typical CI per-test timeout, but big enough that 3
+    // streams × multi-block-per-stream gives a healthy mix of
+    // mid-stream and stream-boundary checkpoints to randomize
+    // over.
+    const BZ2_STREAMS: usize = 3;
+    const TAR_MEMBERS_PER_BZ2: usize = 2;
+    let primes = [37_633usize, 47_777, 59_141, 71_413, 83_311, 97_169];
+    let total_tar_members = BZ2_STREAMS * TAR_MEMBERS_PER_BZ2;
+    let mut tar_members: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for i in 0..total_tar_members {
+        let name = Box::leak(format!("dir/multi_stream_bz2_{i:02}.bin").into_boxed_str());
+        let payload = build_lzma_friendly_input(primes[i % primes.len()], 0xF00D_C0DE ^ i as u32);
+        tar_members.push((name, payload));
+    }
+    let mut archive = Vec::new();
+    for (name, payload) in &tar_members {
+        archive.extend_from_slice(&member_archive_bytes(name, payload));
+    }
+    archive.extend_from_slice(&end_of_archive_block());
+
+    // Split the tar archive into BZ2_STREAMS approximately-equal
+    // contiguous chunks; encode each as an independent bzip2
+    // stream; concatenate. The decoded byte stream is identical
+    // to encoding the whole archive as one stream (per the bzip2
+    // reference's multi-stream contract), but the on-the-wire
+    // shape exercises the cross-stream RLE1 reset path.
+    let chunk = archive.len() / BZ2_STREAMS;
+    let mut body = Vec::new();
+    for i in 0..BZ2_STREAMS {
+        let start = i * chunk;
+        let end = if i + 1 == BZ2_STREAMS {
+            archive.len()
+        } else {
+            start + chunk
+        };
+        body.extend_from_slice(&encode_bzip2_via_cli(&archive[start..end], 1));
+    }
+
+    let trial_count = 8u64;
+    run_dir_kill_resume_trials(
+        "multi_stream_tar_bz2",
+        "x.tar.bz2",
+        body,
+        "\"v-multi-stream-tar-bz2\"",
+        0xC0DE_BABE_BEEF_F00Du64,
+        trial_count,
+        // Multi-stream tar.bz2: most kills land mid-stream
+        // (decoder_state path with cross-block RLE1 state); the
+        // stream boundaries themselves don't currently emit a
+        // `decoder_state` blob (the
+        // `bzip2_native::decoder_state_into` impl gates on
+        // `AwaitingBlockMarker`, which means the very-first block
+        // of stream N+1 is the first boundary to capture a blob
+        // post-stream-boundary). `SomeDecoderState` is the right
+        // bar — ≥ 1 trial out of 12 must take the decoder_state
+        // path, while the rest may take either path.
+        ExpectedResumeMode::SomeDecoderState,
+    );
+}

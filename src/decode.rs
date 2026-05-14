@@ -83,6 +83,13 @@ pub mod zstd;
 // (`src/zip/decode.rs`) still uses it; Phase 9 swaps that too.
 pub mod deflate_native;
 
+// Hand-rolled bzip2 decoder (`internal/PLAN_bz2_support.md`).
+// Phase 1 ships the MSB-first bit reader and the local error type;
+// subsequent phases land the framing parser, Huffman / MTF / RLE2 /
+// BWT / RLE1 layers, the trait integration, and the resume seam.
+// Registered into [`DecoderRegistry::with_defaults`] in Phase 9.
+pub mod bzip2_native;
+
 // Hand-rolled RAR5 decoder (`internal/PLAN_rar5_decoder.md`). Gated
 // behind the `rar` Cargo feature alongside the rest of the RAR5
 // module tree (`internal/PLAN_rar.md` §0.5). Phase A1 ships the
@@ -582,6 +589,32 @@ impl DecoderRegistry {
             }],
             gzip::factory,
         );
+        // bzip2 (`internal/PLAN_bz2_support.md`). The 3-byte magic
+        // `42 5A 68` (`BZh`) is shared by every bzip2 stream; the
+        // level byte that follows (`'1'..='9'`) is validated by the
+        // decoder constructor on the first `decode_step` rather than
+        // baked into the registered magic (the alternative of
+        // registering nine variants of the magic would add no
+        // discrimination beyond what the decoder does anyway).
+        // Round-one ships only the standalone format; the zip-method-
+        // 12 + 7z-coder-0x040202 integrations are tracked in
+        // `OPTIMIZATIONS.md §O.8b` / §O.32e.
+        r.register_format(
+            "bzip2",
+            FormatShape::Stream,
+            &[
+                (".bz2", FormatShape::Stream),
+                (".tar.bz2", FormatShape::Tree),
+                (".tbz2", FormatShape::Tree),
+                (".tbz", FormatShape::Tree),
+            ],
+            &[MagicSignature {
+                offset: 0,
+                bytes: &[0x42, 0x5A, 0x68],
+            }],
+            bzip2_native::factory,
+        );
+        r.register_resume_factory("bzip2", bzip2_native::resume::resume_factory);
         // ZIP doesn't use the streaming-decoder loop — see
         // `internal/PLAN_v2.md` §5 and `crate::zip::streaming_factory_placeholder`.
         // The registry entry exists so suffix / magic / format-name
@@ -1006,8 +1039,14 @@ mod tests {
         // streaming formats.
         assert!(r.factory_for_name("dataset.gz").is_some());
         assert!(r.factory_for_name("dataset.tar.gz").is_some());
+        // `.bz2` / `.tar.bz2` / `.tbz2` / `.tbz` registered as of
+        // `internal/PLAN_bz2_support.md` Phase 9.
+        assert!(r.factory_for_name("dataset.bz2").is_some());
+        assert!(r.factory_for_name("dataset.tar.bz2").is_some());
+        assert!(r.factory_for_name("dataset.tbz2").is_some());
+        assert!(r.factory_for_name("dataset.tbz").is_some());
         // A suffix that no shipping decoder owns still misses.
-        assert!(r.factory_for_name("dataset.bz2").is_none());
+        assert!(r.factory_for_name("dataset.unknownfmt").is_none());
     }
 
     #[test]
@@ -1107,8 +1146,12 @@ mod tests {
         assert!(r.factory_for_format_name("zstd").is_some());
         assert!(r.factory_for_format_name("ZSTD").is_some());
         assert!(r.factory_for_format_name("gzip").is_some());
+        // `bzip2` registered as of `internal/PLAN_bz2_support.md`
+        // Phase 9; magic `42 5A 68` resolves to bzip2 too.
+        assert!(r.factory_for_format_name("bzip2").is_some());
+        assert!(r.factory_for_prefix(&[0x42, 0x5A, 0x68, 0x39]).is_some());
         // A format name no shipping decoder owns still misses.
-        assert!(r.factory_for_format_name("bzip2").is_none());
+        assert!(r.factory_for_format_name("nonexistent_format").is_none());
     }
 
     #[test]
@@ -1236,6 +1279,12 @@ mod tests {
         assert_eq!(r.shape_for_name("foo.tar.gz"), Some(FormatShape::Tree));
         assert_eq!(r.shape_for_name("foo.lz4"), Some(FormatShape::Stream));
         assert_eq!(r.shape_for_name("foo.tar.lz4"), Some(FormatShape::Tree));
+        // bzip2: same Stream / Tree split as the other compression
+        // codecs (`internal/PLAN_bz2_support.md` Phase 9).
+        assert_eq!(r.shape_for_name("foo.bz2"), Some(FormatShape::Stream));
+        assert_eq!(r.shape_for_name("foo.tar.bz2"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.tbz2"), Some(FormatShape::Tree));
+        assert_eq!(r.shape_for_name("foo.tbz"), Some(FormatShape::Tree));
         // Archive containers register as Tree at every suffix.
         assert_eq!(r.shape_for_name("foo.tar"), Some(FormatShape::Tree));
         assert_eq!(r.shape_for_name("foo.zip"), Some(FormatShape::Tree));
@@ -1259,8 +1308,11 @@ mod tests {
         assert_eq!(r.shape_for_format_name("7z"), Some(FormatShape::Tree));
         // Case-insensitive.
         assert_eq!(r.shape_for_format_name("ZSTD"), Some(FormatShape::Stream));
+        // `bzip2` registered as of `internal/PLAN_bz2_support.md`
+        // Phase 9 with `Stream` as the default shape.
+        assert_eq!(r.shape_for_format_name("bzip2"), Some(FormatShape::Stream));
         // Unknown name → None.
-        assert_eq!(r.shape_for_format_name("bzip2"), None);
+        assert_eq!(r.shape_for_format_name("nonexistent_format"), None);
     }
 
     #[test]
@@ -1280,6 +1332,7 @@ mod tests {
         assert!(names.contains(&"lz4"));
         assert!(names.contains(&"zip"));
         assert!(names.contains(&"7z"));
+        assert!(names.contains(&"bzip2"));
     }
 
     #[test]
@@ -1364,11 +1417,19 @@ mod tests {
             gzip_resume,
             gzip::resume_factory as DecoderResumeFactory,
         ));
+        let bzip2_resume = r
+            .resume_factory_for_name("bzip2")
+            .expect("bzip2 resume registered");
+        assert!(std::ptr::fn_addr_eq(
+            bzip2_resume,
+            bzip2_native::resume::resume_factory as DecoderResumeFactory,
+        ));
         // Case-insensitive lookup matches the rest of the registry.
         assert!(r.resume_factory_for_name("LZ4").is_some());
         assert!(r.resume_factory_for_name("ZSTD").is_some());
         assert!(r.resume_factory_for_name("XZ").is_some());
         assert!(r.resume_factory_for_name("GZIP").is_some());
+        assert!(r.resume_factory_for_name("BZIP2").is_some());
 
         // identity (tar) and zip restart cleanly from
         // `frame_boundary` and don't need a resume factory.
