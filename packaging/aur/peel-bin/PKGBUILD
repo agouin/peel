@@ -1,0 +1,46 @@
+# Maintainer: Andrew Gouin <andrew@gouin.io>
+#
+# Prebuilt-binary AUR package for `peel`. Skips the rustc build and
+# installs the binary released at
+#   https://github.com/agouin/peel/releases/download/v${pkgver}/peel-v${pkgver}-${target}.tar.gz
+# Source-build alternative: the `peel` AUR package.
+
+pkgname=peel-bin
+_binname=peel
+pkgver=0.5.0
+pkgrel=1
+pkgdesc='Streaming, resumable, space-efficient HTTP archive extractor (prebuilt binary)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/agouin/peel'
+license=('MIT' 'Apache-2.0')
+# The upstream binaries are mostly statically linked (vendored
+# libzstd, ring's bundled libcrypto). glibc / gcc-libs are the only
+# runtime deps the binary actually pulls in.
+depends=('glibc' 'gcc-libs')
+provides=("peel=${pkgver}")
+conflicts=('peel')
+
+# GitHub release artifacts are named per the `release.yml` matrix:
+#   peel-v${pkgver}-${rust-target-triple}.tar.gz
+# x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu are the
+# arches we ship. The bundled `.tar.gz.sha256` file alongside each
+# tarball carries the checksum and is concatenated into the
+# release's SHA256SUMS file.
+_release_url="${url}/releases/download/v${pkgver}"
+source_x86_64=("${_binname}-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz::${_release_url}/${_binname}-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("${_binname}-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz::${_release_url}/${_binname}-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+# Replace 'SKIP' values with the sha256 from the release's
+# SHA256SUMS file once v${pkgver} ships.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    # `CARCH` is "x86_64" or "aarch64"; the matching release tarball
+    # was extracted into the directory of the same triple-prefix.
+    cd "${_binname}-v${pkgver}-${CARCH}-unknown-linux-gnu"
+    install -Dm0755 peel "${pkgdir}/usr/bin/peel"
+    install -Dm0644 share/man/man1/peel.1 "${pkgdir}/usr/share/man/man1/peel.1"
+    install -Dm0644 LICENSE-MIT "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+    install -Dm0644 LICENSE-APACHE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+    install -Dm0644 NOTICE "${pkgdir}/usr/share/licenses/${pkgname}/NOTICE"
+}
