@@ -158,9 +158,283 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Pre-vendored crates tarball, consumed by every distro-package job
+  # below and also shipped as a release asset. Most distro build
+  # environments are network-isolated (Fedora mock, Debian sbuild,
+  # Alpine abuild), so cargo cannot fetch from crates.io during the
+  # build; shipping a vendored copy lets each spec / debian/rules /
+  # APKBUILD use a one-line `.cargo/config.toml` redirect. See
+  # `internal/PLAN_packaging.md` §0.3.
+  vendor:
+    name: Vendor crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Vendor dependencies
+        # `--versioned-dirs` keeps multiple versions of the same crate
+        # from colliding (defensive; uncommon in the current tree).
+        # cargo writes progress to stderr and the
+        # `[source.crates-io] / [source.vendored-sources]` snippet to
+        # stdout — we save the snippet next to the `vendor/` dir so
+        # distros have a drop-in `.cargo/config.toml`. Vendoring to
+        # the relative path `vendor` (not the staging dir) keeps the
+        # `directory = ...` line in the snippet relative — i.e. the
+        # path the distro sees after extracting the tarball — then
+        # we move the directory into staging for packaging.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          name="peel-${tag}-vendored"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+          cargo vendor --locked --versioned-dirs vendor \
+            > "${staging}/cargo-vendor-config.toml"
+          mv vendor "${staging}/vendor"
+          ( cd dist && tar -czf "${name}.tar.gz" "${name}" )
+          rm -rf "${staging}"
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: peel-vendor
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # Fedora binary + source RPMs built from `packaging/fedora/peel.spec`.
+  # Per-architecture matrix because rpmbuild compiles the binary, so
+  # the runner has to be the right native arch. See
+  # `packaging/fedora/README.md` and `internal/PLAN_packaging.md` §1.
+  package-fedora:
+    name: Fedora .rpm (${{ matrix.arch }})
+    needs: vendor
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-22.04
+          - arch: aarch64
+            runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps
+        # `rust-toolset` / `rust` packages on Fedora don't always
+        # satisfy the spec's `BuildRequires: rust >= 1.85` (Fedora 41
+        # ships 1.81). Install 1.95 via rustup to match the
+        # `rust-toolchain.toml` pin used in CI.
+        run: |
+          dnf -y -q install rpm-build pkgconf-pkg-config libzstd-devel \
+              gcc git tar rustup
+          rustup-init -y --default-toolchain 1.95.0 --profile minimal \
+              --no-modify-path > /dev/null 2>&1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Download vendored crates
+        uses: actions/download-artifact@v4
+        with:
+          name: peel-vendor
+          path: vendor-artifact
+
+      - name: Stage rpmbuild sources
+        # Source0: github-style archive of the tagged tree. Source1:
+        # the vendored-deps tarball produced by the `vendor` job.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          ver="${tag#v}"
+          mkdir -p /github/home/rpmbuild/SOURCES /github/home/rpmbuild/SPECS
+          # `safe.directory` keeps `git archive` from refusing to read
+          # the workspace inside the container (git complains about
+          # ownership when the on-disk uid doesn't match the container
+          # user).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git archive --prefix="peel-${ver}/" HEAD \
+              -o "/github/home/rpmbuild/SOURCES/peel-${ver}.tar.gz"
+          # `find` rather than a fixed path: actions/upload-artifact@v4
+          # may strip the workspace-relative `dist/` prefix from the
+          # artifact, so the vendored tarball can end up at the top of
+          # `vendor-artifact/` or under `vendor-artifact/dist/`
+          # depending on action version. The find is robust to either.
+          vendored=$(find vendor-artifact -name 'peel-*-vendored.tar.gz' | head -1)
+          test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
+          cp "${vendored}" "/github/home/rpmbuild/SOURCES/peel-${tag}-vendored.tar.gz"
+          cp packaging/fedora/peel.spec /github/home/rpmbuild/SPECS/peel.spec
+
+      - name: Build RPMs
+        # `--nocheck` skips the spec's `%check` step (cargo test) —
+        # the main CI workflow already runs tests on every push, and
+        # %check would re-trigger the heavy xz2 → lzma-sys dev-dep
+        # build chain just to repeat what ci.yml already verified.
+        # `--nodeps` because the rust toolchain came from rustup, not
+        # dnf, so the `rust >= 1.85` BuildRequires can't see it.
+        shell: bash
+        run: |
+          export HOME=/github/home
+          rpmbuild -bs ~/rpmbuild/SPECS/peel.spec
+          rpmbuild -bb --nocheck --nodeps ~/rpmbuild/SPECS/peel.spec
+
+      - name: Stage outputs
+        # The `.src.rpm` is arch-independent and gets rebuilt
+        # identically by both matrix branches. Ship it from one
+        # branch only so the publish job doesn't see two upload
+        # candidates for the same filename. x86_64 is the conventional
+        # arbiter.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            cp /github/home/rpmbuild/SRPMS/peel-*.src.rpm dist/
+          fi
+          cp "/github/home/rpmbuild/RPMS/${{ matrix.arch }}/"peel-*.rpm dist/
+          ( cd dist && sha256sum *.rpm > "peel-fedora-${{ matrix.arch }}.sha256" )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: peel-fedora-${{ matrix.arch }}
+          path: |
+            dist/*.rpm
+            dist/peel-fedora-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # Debian source package (`.dsc` + `.orig.tar.gz` + `.debian.tar.xz`)
+  # for PPA upload. Architecture-independent — sponsors / Launchpad
+  # build farms compile per-arch on their side. The cargo-deb path in
+  # the `build` matrix produces the drop-in user-facing `.deb`; this
+  # job produces the source-package material a Debian sponsor / PPA
+  # would consume. See `packaging/debian/README.md`.
+  package-debian-source:
+    name: Debian source package
+    needs: vendor
+    runs-on: ubuntu-22.04
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+              build-essential debhelper devscripts dpkg-dev fakeroot \
+              git ca-certificates xz-utils > /dev/null
+
+      - name: Download vendored crates
+        uses: actions/download-artifact@v4
+        with:
+          name: peel-vendor
+          path: vendor-artifact
+
+      - name: Stage and build source package
+        # The Debian source package consists of:
+        #   peel_<version>.orig.tar.gz     — upstream source (incl. vendor/)
+        #   peel_<version>-1.debian.tar.xz — debian/ as a quilt-style diff
+        #   peel_<version>-1.dsc           — control manifest
+        # We assemble the orig tarball from `git archive` + the vendored
+        # tarball, drop `packaging/debian/` in as the debian/ tree, then
+        # `dpkg-buildpackage -S` produces the .dsc + the debian.tar.xz.
+        #
+        # Build flags: `-S` is source-only (no binary build), `-us -uc`
+        # skips signing (PPA upload signs separately on the maintainer
+        # host), `-d` skips Build-Depends check — we don't install the
+        # rust toolchain in this job because we're producing source
+        # material, not a binary build.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          ver="${tag#v}"
+          work=/tmp/peel-deb-stage
+          rm -rf "${work}" && mkdir -p "${work}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git archive --prefix="peel-${ver}/" HEAD | tar -x -C "${work}"
+          # Locate the vendored tarball regardless of whether
+          # upload-artifact preserved the workspace-relative `dist/`
+          # prefix in the artifact zip.
+          vendored=$(find vendor-artifact -name 'peel-*-vendored.tar.gz' | head -1)
+          test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
+          tar -xzf "${vendored}" -C "${work}/peel-${ver}" --strip-components=1
+          cp -r packaging/debian "${work}/peel-${ver}/debian"
+          ( cd "${work}" && tar --exclude="peel-${ver}/debian" \
+              -czf "peel_${ver}.orig.tar.gz" "peel-${ver}/" )
+          cd "${work}/peel-${ver}"
+          dpkg-buildpackage -S -us -uc -d
+
+      - name: Stage outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp /tmp/peel-deb-stage/peel_*.dsc dist/
+          cp /tmp/peel-deb-stage/peel_*.orig.tar.gz dist/
+          cp /tmp/peel-deb-stage/peel_*.debian.tar.xz dist/
+          cp /tmp/peel-deb-stage/peel_*_source.changes dist/
+          # Per-file checksums; the publish job rolls all of these up
+          # into SHA256SUMS.
+          ( cd dist && sha256sum peel_*.dsc peel_*.orig.tar.gz \
+              peel_*.debian.tar.xz peel_*_source.changes \
+              > peel-debian-source.sha256 )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: peel-debian-source
+          path: |
+            dist/peel_*.dsc
+            dist/peel_*.orig.tar.gz
+            dist/peel_*.debian.tar.xz
+            dist/peel_*_source.changes
+            dist/peel-debian-source.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish release
-    needs: build
+    needs: [build, vendor, package-fedora, package-debian-source]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -184,52 +458,16 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Vendor dependencies
-        # Most distro build environments are network-isolated (Fedora
-        # mock, Debian sbuild, Alpine abuild), so they cannot fetch
-        # from crates.io during the build. Shipping a pre-vendored
-        # tarball alongside each release lets each spec / debian/rules
-        # / APKBUILD use the vendored copy and a one-line
-        # `.cargo/config.toml` redirect. See
-        # `internal/PLAN_packaging.md` §0.3 for the rationale.
-        #
-        # Architecture-independent (downloads are not compiles), so
-        # we run this once in the publish job rather than once per
-        # matrix target. `--versioned-dirs` keeps multiple versions
-        # of the same crate from colliding — uncommon but defensive.
-        # cargo writes progress to stderr and the
-        # `[source.crates-io] / [source.vendored-sources]` snippet to
-        # stdout, which we save next to the `vendor/` dir so distros
-        # have a drop-in `.cargo/config.toml`. We vendor to the
-        # relative path `vendor` (not the staging dir) so the
-        # `directory = ...` line in the snippet stays relative — the
-        # path the distro sees after extracting the tarball — and
-        # then move the directory into staging for packaging.
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          name="peel-${tag}-vendored"
-          staging="dist/${name}"
-          mkdir -p "${staging}"
-          cargo vendor --locked --versioned-dirs vendor \
-            > "${staging}/cargo-vendor-config.toml"
-          mv vendor "${staging}/vendor"
-          ( cd dist && tar -czf "${name}.tar.gz" "${name}" )
-          rm -rf "${staging}"
-          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
-
       - name: Aggregate checksums
-        # SHA256SUMS rolls up every per-file checksum into one file so a
-        # downloader can verify the whole release with a single
-        # `shasum -c SHA256SUMS` from the release page. .deb checksum
-        # files only exist for matrix entries that produced one
-        # (gnu Linux targets — see the cargo-deb gate in the build job),
-        # so use `find` with `-name` to tolerate their absence.
+        # SHA256SUMS rolls up every per-file checksum file into one,
+        # so a downloader can verify the whole release with one
+        # `shasum -c SHA256SUMS`. The producing jobs each emit a
+        # `*.sha256` file; we concatenate all of them (skipping
+        # SHA256SUMS itself if a prior run left one behind).
         shell: bash
         run: |
           set -euo pipefail
-          ( cd dist && find . -maxdepth 1 -name '*.tar.gz.sha256' -o -name '*.deb.sha256' \
+          ( cd dist && find . -maxdepth 1 -name '*.sha256' ! -name 'SHA256SUMS' \
               | sort | xargs cat > SHA256SUMS )
 
       - name: Create or update release
@@ -246,11 +484,23 @@ jobs:
           fi
 
           # `nullglob` makes empty globs expand to nothing instead of
-          # the literal pattern (the .deb glob can be empty in the
-          # unlikely case all cargo-deb runs failed; tarballs always
-          # exist because the matrix would fail loudly).
+          # the literal pattern. Every glob below is allowed to be
+          # empty in principle, but in practice the matrix would fail
+          # loudly before publish runs if a tarball or RPM was missing.
           shopt -s nullglob
-          assets=( dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.deb dist/*.deb.sha256 dist/SHA256SUMS )
+          assets=(
+            # Per-target binary tarballs (build matrix).
+            dist/peel-*.tar.gz dist/peel-*.tar.gz.sha256
+            # Drop-in .deb from cargo-deb (build matrix, gnu Linux only).
+            dist/peel_*.deb dist/peel-*.deb.sha256
+            # Fedora RPMs (binary + source).
+            dist/peel-*.rpm dist/peel-fedora-*.sha256
+            # Debian source package material (PPA upload).
+            dist/peel_*.dsc dist/peel_*.orig.tar.gz dist/peel_*.debian.tar.xz
+            dist/peel_*_source.changes dist/peel-debian-source.sha256
+            # Aggregate checksums.
+            dist/SHA256SUMS
+          )
 
           if gh release view "${tag}" >/dev/null 2>&1; then
             gh release upload "${tag}" "${assets[@]}" --clobber
