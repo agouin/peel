@@ -129,7 +129,10 @@ jobs:
           # what's already on disk.
           cp LICENSE-MIT LICENSE-APACHE NOTICE "${staging}/"
           # Man page generated in the previous step; arch-independent troff.
-          install -Dm0644 target/man/peel.1 "${staging}/share/man/man1/peel.1"
+          # `install -D` is GNU-only — macOS BSD `install` lacks it, so
+          # mkdir + plain install for portability across all matrix hosts.
+          mkdir -p "${staging}/share/man/man1"
+          install -m0644 target/man/peel.1 "${staging}/share/man/man1/peel.1"
 
           ( cd dist && tar -czf "${name}.tar.gz" "${name}" )
           rm -rf "${staging}"
@@ -275,13 +278,18 @@ jobs:
           tag="${{ steps.tag.outputs.tag }}"
           ver="${tag#v}"
           mkdir -p /github/home/rpmbuild/SOURCES /github/home/rpmbuild/SPECS
-          # `safe.directory` keeps `git archive` from refusing to read
-          # the workspace inside the container (git complains about
-          # ownership when the on-disk uid doesn't match the container
-          # user).
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git archive --prefix="peel-${ver}/" HEAD \
-              -o "/github/home/rpmbuild/SOURCES/peel-${ver}.tar.gz"
+          # `actions/checkout@v4` falls back to a tarball download
+          # when the container doesn't have `git` pre-installed
+          # (fedora:latest doesn't), so the workspace has no `.git/`
+          # by the time this step runs. Build the source tarball
+          # from the workspace tree directly. `--transform` adds the
+          # `peel-<version>/` prefix the spec's `%autosetup` expects.
+          tar -czf "/github/home/rpmbuild/SOURCES/peel-${ver}.tar.gz" \
+              -C "$GITHUB_WORKSPACE" \
+              --transform "s,^\./,peel-${ver}/," \
+              --exclude='./.git' --exclude='./target' \
+              --exclude='./dist' --exclude='./vendor-artifact' \
+              .
           # `find` rather than a fixed path: actions/upload-artifact@v4
           # may strip the workspace-relative `dist/` prefix from the
           # artifact, so the vendored tarball can end up at the top of
@@ -389,9 +397,16 @@ jobs:
           tag="${{ steps.tag.outputs.tag }}"
           ver="${tag#v}"
           work=/tmp/peel-deb-stage
-          rm -rf "${work}" && mkdir -p "${work}"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git archive --prefix="peel-${ver}/" HEAD | tar -x -C "${work}"
+          rm -rf "${work}" && mkdir -p "${work}/peel-${ver}"
+          # `actions/checkout@v4` may have used the tarball-fallback
+          # path (debian:trixie's base image doesn't have git, so the
+          # action falls back when it can't shell-out to git), which
+          # leaves no `.git/`. Copy the workspace tree directly into
+          # the staging dir instead of `git archive HEAD`.
+          tar -cf - -C "$GITHUB_WORKSPACE" \
+              --exclude='./.git' --exclude='./target' \
+              --exclude='./dist' --exclude='./vendor-artifact' \
+              . | tar -x -C "${work}/peel-${ver}"
           # Locate the vendored tarball regardless of whether
           # upload-artifact preserved the workspace-relative `dist/`
           # prefix in the artifact zip.
@@ -434,8 +449,20 @@ jobs:
 
   # Alpine `.apk` built from `packaging/alpine/APKBUILD`. Matrix-fanned
   # across x86_64 and aarch64 because abuild compiles the binary in the
-  # chroot, so the runner has to be the right native arch. See
-  # `packaging/alpine/README.md` and `internal/PLAN_packaging.md` §5.
+  # chroot, so the runner has to be the right native arch.
+  #
+  # Unlike the other distro jobs, this one runs on the *host* runner
+  # rather than inside a `container:`. Two reasons:
+  #   1. JavaScript Actions (`actions/checkout`, `actions/upload-artifact`,
+  #      `actions/download-artifact`) are not supported in Alpine
+  #      containers on aarch64 runners — Node.js's prebuilt binaries
+  #      need glibc, and Alpine ships musl. GHA refuses to start
+  #      JS actions in that combination.
+  #   2. The `alpine:latest` base image doesn't include `bash`, so any
+  #      `shell: bash` step fails.
+  # The host (ubuntu-22.04 / ubuntu-22.04-arm) has both Node.js and
+  # bash, and `docker run` invokes the alpine container for the
+  # actual abuild step with the staged sources mounted.
   package-alpine:
     name: Alpine .apk (${{ matrix.arch }})
     needs: vendor
@@ -448,36 +475,19 @@ jobs:
           - arch: aarch64
             runs-on: ubuntu-22.04-arm
     runs-on: ${{ matrix.runs-on }}
-    container: alpine:latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve tag
         id: tag
-        shell: sh
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             tag="${{ inputs.tag }}"
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Install build deps
-        run: |
-          apk add --no-cache alpine-sdk build-base abuild cargo rust \
-              zstd-dev pkgconf coreutils git tar
-
-      - name: Set up abuild user
-        # abuild refuses to run as root. Create a `builder` user, seed
-        # its abuild key, and run all subsequent build steps under it.
-        run: |
-          set -ex
-          addgroup -S builder 2>/dev/null || true
-          adduser -S -G builder builder 2>/dev/null || true
-          addgroup builder abuild 2>/dev/null || true
-          su builder -s /bin/sh -c 'abuild-keygen -a -n' || true
-          cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
 
       - name: Download vendored crates
         uses: actions/download-artifact@v4
@@ -486,37 +496,37 @@ jobs:
           path: vendor-artifact
 
       - name: Stage sources + patch APKBUILD
-        # abuild fetches sources from `source=` URLs by default, but we
-        # pre-populate the distfiles cache with locally-staged files so
-        # it short-circuits the network fetch and uses our copies.
-        # The vendored tarball doesn't exist on the upstream release
-        # yet during the *first* run that produces it (this is the
-        # workflow producing the release), so caching is mandatory.
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
           ver="${tag#v}"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          mkdir -p /var/cache/distfiles /tmp/build
-          # Source0: github-style archive of the tagged tree.
-          git archive --prefix="peel-${ver}/" HEAD \
-              -o "/var/cache/distfiles/peel-${ver}.tar.gz"
+          mkdir -p staging/distfiles
+
+          # Source0: tarball of the workspace tree (no .git/ needed —
+          # see the parallel notes in the fedora / debian / arch jobs).
+          tar -czf "staging/distfiles/peel-${ver}.tar.gz" \
+              -C "$GITHUB_WORKSPACE" \
+              --transform "s,^\./,peel-${ver}/," \
+              --exclude='./.git' --exclude='./target' \
+              --exclude='./dist' --exclude='./vendor-artifact' \
+              --exclude='./staging' \
+              .
+
           # Source1: vendored crates from the `vendor` job artifact.
           vendored=$(find vendor-artifact -name 'peel-*-vendored.tar.gz' | head -1)
           test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
-          cp "${vendored}" "/var/cache/distfiles/peel-v${ver}-vendored.tar.gz"
-          chmod a+r /var/cache/distfiles/*
-          # Patch APKBUILD's sha512sums block with the just-computed
-          # checksums. Use python over sed because the multi-line block
-          # is awkward to express in sed portably.
-          SHA1=$(sha512sum "/var/cache/distfiles/peel-${ver}.tar.gz" | awk '{print $1}')
-          SHA2=$(sha512sum "/var/cache/distfiles/peel-v${ver}-vendored.tar.gz" | awk '{print $1}')
-          cp packaging/alpine/APKBUILD /tmp/build/APKBUILD
+          cp "${vendored}" "staging/distfiles/peel-v${ver}-vendored.tar.gz"
+
+          # Patch APKBUILD with real sha512s. Python over sed because
+          # the multi-line block is awkward to express in sed portably.
+          SHA1=$(sha512sum "staging/distfiles/peel-${ver}.tar.gz" | awk '{print $1}')
+          SHA2=$(sha512sum "staging/distfiles/peel-v${ver}-vendored.tar.gz" | awk '{print $1}')
+          cp packaging/alpine/APKBUILD staging/APKBUILD
           python3 - "${SHA1}" "${SHA2}" "${ver}" <<'PY'
           import re, sys
           sha1, sha2, ver = sys.argv[1:]
-          p = "/tmp/build/APKBUILD"
+          p = "staging/APKBUILD"
           content = open(p).read()
           new_block = (
               f'sha512sums="\n'
@@ -528,25 +538,53 @@ jobs:
                            count=1, flags=re.DOTALL)
           open(p, "w").write(content)
           PY
-          chown -R builder:builder /tmp/build
 
       - name: Build .apk
-        # `-F` forces abuild to run despite being invoked from a non-aports
-        # checkout. `REPODEST` controls where built .apk files land.
+        # Run abuild inside an alpine container with the staged
+        # sources + APKBUILD mounted at /staging. Outputs land in
+        # staging/packages on the host via the mount. abuild refuses
+        # to run as root, so we create a non-root `builder` user and
+        # seed an ephemeral signing key.
         shell: bash
         run: |
           set -euo pipefail
-          su builder -s /bin/sh -c '
-            cd /tmp/build &&
-            REPODEST=/tmp/packages abuild -r -F
-          '
+          mkdir -p staging/packages
+          docker run --rm \
+              -v "${PWD}/staging:/staging:rw" \
+              alpine:latest sh -c '
+                set -ex
+                apk add --no-cache alpine-sdk build-base abuild cargo \
+                    rust zstd-dev pkgconf coreutils
+                addgroup -S builder 2>/dev/null || true
+                adduser -S -G builder builder 2>/dev/null || true
+                addgroup builder abuild 2>/dev/null || true
+                su builder -s /bin/sh -c "abuild-keygen -a -n" || true
+                cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
+
+                # Pre-populate distfiles cache so abuild skips the
+                # network fetch (the vendored tarball does not exist
+                # at the upstream URL the first time this workflow
+                # produces the release).
+                mkdir -p /var/cache/distfiles
+                cp /staging/distfiles/* /var/cache/distfiles/
+                chmod a+r /var/cache/distfiles/*
+
+                mkdir -p /tmp/build
+                cp /staging/APKBUILD /tmp/build/
+                chown -R builder:builder /tmp/build
+
+                su builder -s /bin/sh -c "
+                  cd /tmp/build &&
+                  REPODEST=/staging/packages abuild -r -F
+                "
+              '
 
       - name: Stage outputs
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          find /tmp/packages -name 'peel-*.apk' -exec cp {} dist/ \;
+          find staging/packages -name 'peel-*.apk' -exec cp {} dist/ \;
           ( cd dist && sha256sum peel-*.apk > "peel-alpine-${{ matrix.arch }}.sha256" )
           ls -lh dist/
 
@@ -607,11 +645,18 @@ jobs:
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
           ver="${tag#v}"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           mkdir -p /home/builder/build
           cp packaging/aur/peel/PKGBUILD /home/builder/build/PKGBUILD
-          git archive --prefix="peel-${ver}/" HEAD \
-              -o "/home/builder/build/peel-${ver}.tar.gz"
+          # `actions/checkout@v4` falls back to a tarball download
+          # when the container doesn't ship git (archlinux:latest's
+          # base image doesn't), leaving no `.git/`. Build the
+          # source tarball from the workspace tree.
+          tar -czf "/home/builder/build/peel-${ver}.tar.gz" \
+              -C "$GITHUB_WORKSPACE" \
+              --transform "s,^\./,peel-${ver}/," \
+              --exclude='./.git' --exclude='./target' \
+              --exclude='./dist' --exclude='./vendor-artifact' \
+              .
           # PKGBUILD's `source=` array uses
           # `peel-${pkgver}.tar.gz::<URL>` which makepkg parses as
           # "rename to peel-<ver>.tar.gz, fetch from URL". With the
