@@ -67,27 +67,39 @@ use thiserror::Error;
 
 use crate::types::ByteOffset;
 
-pub mod gzip;
+// Tar (identity / passthrough) is the always-on substrate: no
+// compression layer, no dependencies, tiny. Every other format
+// is gated behind its `peel` Cargo feature; with the feature
+// disabled the registry registers a diagnostic stub against the
+// format's suffix + magic so the user sees a precise "compiled
+// without `<feature>` feature" message instead of the generic
+// "unknown format". See `internal/PLAN_rar.md` §0.5 for the
+// original rationale (which now applies uniformly).
 pub mod identity;
+
+#[cfg(feature = "gzip")]
+pub mod gzip;
+#[cfg(feature = "lz4")]
 pub mod lz4;
+#[cfg(feature = "sevenz")]
 pub mod sevenz;
+#[cfg(feature = "xz")]
 pub mod xz;
+#[cfg(feature = "xz")]
 pub mod xz_liblzma;
+#[cfg(feature = "zstd")]
 pub mod zstd;
 
 // Hand-rolled DEFLATE decoder (`internal/PLAN_deflate_block_decoder.md`).
-// Phase 8 swapped the production gzip path over to this module —
-// `crate::decode::gzip` is now a thin re-export of
-// [`deflate_native::gzip`]. The `flate2` crate stays in runtime
-// dependencies for the moment because the zip-DEFLATE pipeline
-// (`src/zip/decode.rs`) still uses it; Phase 9 swaps that too.
+// Gated under the `gzip` feature: standalone `.gz` / `.tar.gz`
+// extraction is the externally visible consumer, and the `zip`
+// and `sevenz` container features pull in `gzip` so their
+// DEFLATE entry / coder paths compile alongside.
+#[cfg(feature = "gzip")]
 pub mod deflate_native;
 
 // Hand-rolled bzip2 decoder (`internal/PLAN_bz2_support.md`).
-// Phase 1 ships the MSB-first bit reader and the local error type;
-// subsequent phases land the framing parser, Huffman / MTF / RLE2 /
-// BWT / RLE1 layers, the trait integration, and the resume seam.
-// Registered into [`DecoderRegistry::with_defaults`] in Phase 9.
+#[cfg(feature = "bzip2")]
 pub mod bzip2_native;
 
 // Hand-rolled RAR5 decoder (`internal/PLAN_rar5_decoder.md`). Gated
@@ -350,6 +362,58 @@ pub type DecoderFactory =
 pub type DecoderResumeFactory =
     fn(Box<dyn Read + Send>, &[u8], u64) -> Result<Box<dyn StreamingDecoder>, DecodeError>;
 
+/// Diagnostic-stub factories registered when a per-format Cargo
+/// feature is disabled.
+///
+/// Each function shares the [`DecoderFactory`] signature and
+/// always fails [`DecodeError::Construct`] with a message naming
+/// the missing feature and the rebuild command. The intent — same
+/// as `crate::rar::streaming_factory_placeholder` under the
+/// disabled-`rar` branch — is that the registry still owns the
+/// format's suffix + magic so suffix / magic / `--format <name>`
+/// detection resolves the format, and the user sees a precise
+/// "compiled without `<feature>` feature" diagnostic instead of
+/// the generic "unknown format" error.
+///
+/// `bzip2` / `gzip` / `lz4` / `xz` / `zstd` are codec stubs that
+/// stand in for the real per-codec factory. The `zip` and
+/// `sevenz` container stubs live alongside the rest of their
+/// always-exported scaffolding in `crate::zip::streaming_factory_placeholder`
+/// and `crate::sevenz::streaming_factory_placeholder` so the
+/// pipeline-dispatch sentinel and the disabled-feature
+/// diagnostic share one entry point.
+mod disabled {
+    #[allow(unused_imports)]
+    use super::{DecodeError, StreamingDecoder};
+    #[allow(unused_imports)]
+    use std::io::Read;
+
+    macro_rules! disabled_factory {
+        ($name:ident, $format:literal, $feature:literal) => {
+            #[cfg(not(feature = $feature))]
+            pub fn $name(
+                _src: Box<dyn Read + Send>,
+            ) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
+                Err(DecodeError::Construct(std::io::Error::other(concat!(
+                    "this build of `peel` was compiled without the `",
+                    $feature,
+                    "` feature; rebuild with default features (or `--features ",
+                    $feature,
+                    "`) to extract ",
+                    $format,
+                    " archives",
+                ))))
+            }
+        };
+    }
+
+    disabled_factory!(zstd_factory, "zstd (.zst / .tar.zst)", "zstd");
+    disabled_factory!(xz_factory, "xz / lzma (.xz / .tar.xz)", "xz");
+    disabled_factory!(lz4_factory, "LZ4 (.lz4 / .tar.lz4)", "lz4");
+    disabled_factory!(gzip_factory, "gzip (.gz / .tar.gz)", "gzip");
+    disabled_factory!(bzip2_factory, "bzip2 (.bz2 / .tar.bz2)", "bzip2");
+}
+
 /// Shape of the output a format produces, used by the CLI's unified
 /// `-o` resolver (`internal/PLAN_download_modes.md` §1) to validate a
 /// user-supplied output path against the format dictated by either
@@ -506,6 +570,21 @@ impl DecoderRegistry {
         // resolver (`internal/PLAN_download_modes.md` §1) demands a
         // directory output for those URLs without needing to peek
         // through the codec.
+        // Each compression codec is gated by its per-format Cargo
+        // feature; when the feature is off we still register the
+        // suffix + magic but point them at a diagnostic stub from
+        // [`disabled`] so the user sees a precise
+        // "compiled without `<feature>` feature" message instead of
+        // the generic "unknown format". See `internal/PLAN_rar.md`
+        // §0.5 for the original rationale.
+        //
+        // The resume-factory companions only register when the
+        // matching codec is on — there is nothing to resume against
+        // when the codec itself is a stub.
+        #[cfg(feature = "zstd")]
+        let zstd_factory = zstd::factory;
+        #[cfg(not(feature = "zstd"))]
+        let zstd_factory = disabled::zstd_factory;
         r.register_format(
             "zstd",
             FormatShape::Stream,
@@ -519,7 +598,7 @@ impl DecoderRegistry {
                 offset: 0,
                 bytes: &[0x28, 0xB5, 0x2F, 0xFD],
             }],
-            zstd::factory,
+            zstd_factory,
         );
         r.register_format(
             "tar",
@@ -537,6 +616,10 @@ impl DecoderRegistry {
             ],
             identity::factory,
         );
+        #[cfg(feature = "xz")]
+        let xz_factory = xz::factory;
+        #[cfg(not(feature = "xz"))]
+        let xz_factory = disabled::xz_factory;
         r.register_format(
             "xz",
             FormatShape::Stream,
@@ -545,8 +628,12 @@ impl DecoderRegistry {
                 offset: 0,
                 bytes: &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00],
             }],
-            xz::factory,
+            xz_factory,
         );
+        #[cfg(feature = "lz4")]
+        let lz4_factory = lz4::factory;
+        #[cfg(not(feature = "lz4"))]
+        let lz4_factory = disabled::lz4_factory;
         r.register_format(
             "lz4",
             FormatShape::Stream,
@@ -558,7 +645,7 @@ impl DecoderRegistry {
                 offset: 0,
                 bytes: &[0x04, 0x22, 0x4D, 0x18],
             }],
-            lz4::factory,
+            lz4_factory,
         );
         // Mid-frame resume hook: lz4 (per-block), zstd (per-block
         // inside a frame), xz (per-LZMA2-chunk inside a Block,
@@ -575,10 +662,18 @@ impl DecoderRegistry {
         // needed to produce byte-identical output past the
         // boundary. identity (tar) restarts cleanly from
         // `frame_boundary` and so does not need this hook.
+        #[cfg(feature = "lz4")]
         r.register_resume_factory("lz4", lz4::resume_factory);
+        #[cfg(feature = "zstd")]
         r.register_resume_factory("zstd", zstd::resume_factory);
+        #[cfg(feature = "xz")]
         r.register_resume_factory("xz", xz::resume_factory);
+        #[cfg(feature = "gzip")]
         r.register_resume_factory("gzip", gzip::resume_factory);
+        #[cfg(feature = "gzip")]
+        let gzip_factory = gzip::factory;
+        #[cfg(not(feature = "gzip"))]
+        let gzip_factory = disabled::gzip_factory;
         r.register_format(
             "gzip",
             FormatShape::Stream,
@@ -587,7 +682,7 @@ impl DecoderRegistry {
                 offset: 0,
                 bytes: &[0x1F, 0x8B],
             }],
-            gzip::factory,
+            gzip_factory,
         );
         // bzip2 (`internal/PLAN_bz2_support.md`). The 3-byte magic
         // `42 5A 68` (`BZh`) is shared by every bzip2 stream; the
@@ -599,6 +694,10 @@ impl DecoderRegistry {
         // Round-one ships only the standalone format; the zip-method-
         // 12 + 7z-coder-0x040202 integrations are tracked in
         // `OPTIMIZATIONS.md §O.8b` / §O.32e.
+        #[cfg(feature = "bzip2")]
+        let bzip2_factory = bzip2_native::factory;
+        #[cfg(not(feature = "bzip2"))]
+        let bzip2_factory = disabled::bzip2_factory;
         r.register_format(
             "bzip2",
             FormatShape::Stream,
@@ -612,8 +711,9 @@ impl DecoderRegistry {
                 offset: 0,
                 bytes: &[0x42, 0x5A, 0x68],
             }],
-            bzip2_native::factory,
+            bzip2_factory,
         );
+        #[cfg(feature = "bzip2")]
         r.register_resume_factory("bzip2", bzip2_native::resume::resume_factory);
         // ZIP doesn't use the streaming-decoder loop — see
         // `internal/PLAN_v2.md` §5 and `crate::zip::streaming_factory_placeholder`.
@@ -1353,6 +1453,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "lz4")]
     #[test]
     fn registry_with_defaults_registers_lz4_suffix_and_magic() {
         let r = DecoderRegistry::with_defaults();
@@ -1375,6 +1476,13 @@ mod tests {
         ));
     }
 
+    #[cfg(all(
+        feature = "lz4",
+        feature = "zstd",
+        feature = "xz",
+        feature = "gzip",
+        feature = "bzip2",
+    ))]
     #[test]
     fn registry_with_defaults_registers_resume_factories_for_lz4_zstd_xz_and_gzip() {
         // lz4 (per-block mid-frame), zstd (per-block mid-frame),
@@ -1441,6 +1549,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "xz")]
     #[test]
     fn registry_with_defaults_registers_xz_suffix_and_magic() {
         let r = DecoderRegistry::with_defaults();

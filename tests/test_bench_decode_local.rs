@@ -1,3 +1,11 @@
+#![cfg(all(
+    feature = "zstd",
+    feature = "xz",
+    feature = "gzip",
+    feature = "lz4",
+    feature = "bzip2",
+    feature = "sevenz"
+))]
 //! Local-only decoder throughput grid: peel vs. the reference CLI.
 //!
 //! This suite isolates the **decoder** by running both peel and the

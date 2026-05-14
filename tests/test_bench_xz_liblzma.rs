@@ -1,3 +1,4 @@
+#![cfg(feature = "xz")]
 //! Phase 4 of [`internal/PLAN_xz_liblzma_port.md`](../internal/PLAN_xz_liblzma_port.md):
 //! the **gating bench**.
 //!

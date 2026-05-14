@@ -6,13 +6,17 @@
 //! state machine and accounting live alongside the implementation in
 //! `src/decode/zstd.rs`.
 
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 use std::io::{Cursor, Read, Write};
 
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 use peel::decode::{DecodeError, DecodeStatus, DecoderRegistry, FormatShape, StreamingDecoder};
+#[cfg(any(feature = "zstd", feature = "xz", feature = "lz4"))]
 use peel::types::ByteOffset;
 
 /// A two-frame zstd stream that the registered `.zst` factory should
 /// decode end-to-end with frame boundaries at the expected offsets.
+#[cfg(feature = "zstd")]
 #[test]
 fn registry_factory_decodes_multi_frame_zst_stream() {
     let payload_a: Vec<u8> = b"alpha-frame-payload\n".repeat(640);
@@ -70,6 +74,7 @@ fn registry_factory_decodes_multi_frame_zst_stream() {
 /// We use a custom factory that is distinguishable from the default
 /// zstd one — it just decodes nothing — so the test is about lookup
 /// precedence, not decode semantics.
+#[cfg(feature = "zstd")]
 #[test]
 fn registry_longest_suffix_takes_precedence_over_shorter() {
     fn marker_factory(
@@ -127,6 +132,7 @@ fn registry_longest_suffix_takes_precedence_over_shorter() {
 
 /// The decoder is `Send`, so it can be moved into a worker thread and
 /// driven there. This is the shape the §8 extractor will rely on.
+#[cfg(feature = "zstd")]
 #[test]
 fn decoder_can_be_driven_from_a_worker_thread() {
     let payload = b"thread-driven-payload\n".repeat(2048);
@@ -160,6 +166,7 @@ fn decoder_can_be_driven_from_a_worker_thread() {
 /// The registry routes `.xz` and `.tar.xz` to the xz decoder, decodes
 /// a single-Stream xz blob round-trip, and reports the end-of-Stream
 /// frame boundary at the cumulative source-byte offset.
+#[cfg(feature = "xz")]
 #[test]
 fn registry_factory_decodes_single_stream_xz() {
     use xz2::stream::{Action, Check, Status, Stream};
@@ -244,6 +251,7 @@ fn registry_factory_decodes_single_stream_xz() {
 /// Magic-byte detection picks up the xz format from a prefix even
 /// when the URL has no helpful suffix. Mirrors the §1 magic-only
 /// resolution path against the §3 decoder.
+#[cfg(feature = "xz")]
 #[test]
 fn registry_factory_for_prefix_routes_to_xz() {
     let xz_magic = [0xFD_u8, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x00];
@@ -257,6 +265,7 @@ fn registry_factory_for_prefix_routes_to_xz() {
 /// The registry routes `.lz4` and `.tar.lz4` to the lz4 decoder and a
 /// hand-encoded single-frame lz4 source decodes round-trip with the
 /// per-block frame boundaries the §4 contract specifies.
+#[cfg(feature = "lz4")]
 #[test]
 fn registry_factory_decodes_single_frame_lz4() {
     /// Build a minimal lz4 frame around `payload` with one
@@ -412,6 +421,7 @@ fn registry_factory_decodes_single_frame_lz4() {
 
 /// Magic-byte detection picks up the lz4 format from a prefix even
 /// when the URL has no helpful suffix.
+#[cfg(feature = "lz4")]
 #[test]
 fn registry_factory_for_prefix_routes_to_lz4() {
     let lz4_magic = [0x04u8, 0x22, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00];
@@ -425,6 +435,7 @@ fn registry_factory_for_prefix_routes_to_lz4() {
 /// Truncated streams must surface as a clean [`DecodeError::Read`]
 /// rather than a panic. The decoder should not over-report
 /// `bytes_consumed` in this case.
+#[cfg(feature = "zstd")]
 #[test]
 fn truncated_stream_reports_read_error() {
     let payload = b"truncated-input".repeat(4096);

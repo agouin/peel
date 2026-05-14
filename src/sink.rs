@@ -42,20 +42,27 @@
 //! (malformed header, bad checksum), in the entry being written
 //! (unsafe path, unsupported type), or in the local environment (IO).
 
-// `rar` lives behind the `rar` Cargo feature alongside the rest of
-// the RAR5 module tree (`internal/PLAN_rar.md` §0.5 / §3).
+// Container-format sinks live behind their respective Cargo
+// features (`internal/PLAN_rar.md` §0.5 / §3). When the feature is
+// disabled the registry's diagnostic-stub factory short-circuits
+// before any sink is constructed, so the module itself is simply
+// omitted from compilation.
 #[cfg(feature = "rar")]
 pub mod rar;
 pub mod raw;
+#[cfg(feature = "sevenz")]
 pub mod sevenz;
 pub mod tar;
+#[cfg(feature = "zip")]
 pub mod zip;
 
 #[cfg(feature = "rar")]
 pub use rar::RarSink;
 pub use raw::RawSink;
+#[cfg(feature = "sevenz")]
 pub use sevenz::SevenzSink;
 pub use tar::TarSink;
+#[cfg(feature = "zip")]
 pub use zip::{BeginEntryOutcome, EntryFinalize, ZipSink};
 
 use std::path::PathBuf;

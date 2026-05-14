@@ -1,3 +1,4 @@
+#![cfg(feature = "xz")]
 //! Phase 7 of [`internal/PLAN_xz_liblzma_port.md`](../internal/PLAN_xz_liblzma_port.md):
 //! the **full differential corpus** for the public
 //! [`peel::decode::xz_liblzma::Decoder`].

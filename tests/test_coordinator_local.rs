@@ -1,3 +1,4 @@
+#![cfg(all(feature = "zstd", feature = "zip", feature = "sevenz"))]
 //! Integration tests for `peel::coordinator::local::run`
 //! (`internal/old/PLAN_local_file_extract.md` §2).
 //!

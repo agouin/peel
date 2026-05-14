@@ -1,3 +1,4 @@
+#![cfg(feature = "sevenz")]
 //! End-to-end CLI tests for `--password-from` and the exit-code-4
 //! contract documented in `internal/ENCRYPTION.md`.
 //!

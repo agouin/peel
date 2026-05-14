@@ -40,28 +40,40 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
+use std::io;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
 use crate::bitmap::ChunkBitmap;
 use crate::checkpoint::{Checkpoint, CheckpointError, PartRecord, RunMode, SinkState};
-use crate::coordinator::{CoordinatorError, OutputTarget, ProgressFn, RunStats, KILL_SENTINEL};
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
+use crate::coordinator::KILL_SENTINEL;
+use crate::coordinator::{CoordinatorError, OutputTarget, ProgressFn, RunStats};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, FormatShape, StreamingDecoder};
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
 use crate::download::multi_sparse::MultiSparse;
 #[cfg(feature = "rar")]
 use crate::download::rar_pipeline::{
     RarExtractionStats, RarPipeline, RarPipelineConfig, RarPipelineError, RarResumeState,
 };
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
 use crate::download::scheduler::{DownloadStats, SchedulerError};
+#[cfg(feature = "sevenz")]
 use crate::download::sevenz_pipeline::{
     SevenzExtractionStats, SevenzPipeline, SevenzPipelineConfig, SevenzPipelineError,
     SevenzPipelineEvent, SevenzResumeState,
 };
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
 use crate::download::sparse_file::SparseFile;
+#[cfg(feature = "zip")]
 use crate::download::zip_pipeline::{
     ZipExtractionStats, ZipPipeline, ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent,
     ZipResumeState,
@@ -75,11 +87,19 @@ use crate::progress::ProgressState;
 use crate::punch::{default_puncher, NoopPuncher, PunchHole};
 #[cfg(feature = "rar")]
 use crate::rar::FORMAT_NAME as RAR_FORMAT_NAME;
+#[cfg(feature = "sevenz")]
 use crate::sevenz::FORMAT_NAME as SEVENZ_FORMAT_NAME;
 #[cfg(feature = "rar")]
 use crate::sink::RarSink;
-use crate::sink::{RawSink, SevenzSink, Sink, TarSink, ZipSink};
-use crate::types::{ByteOffset, ChunkIndex};
+#[cfg(feature = "sevenz")]
+use crate::sink::SevenzSink;
+#[cfg(feature = "zip")]
+use crate::sink::ZipSink;
+use crate::sink::{RawSink, Sink, TarSink};
+use crate::types::ByteOffset;
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
+use crate::types::ChunkIndex;
+#[cfg(feature = "zip")]
 use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
 
 /// Arguments for [`run`] — the local-mode counterpart of
@@ -324,10 +344,20 @@ fn random_access_format_name(
     factory: DecoderFactory,
     registry: &DecoderRegistry,
 ) -> Option<&'static str> {
+    // The `let name = …?` binding feeds the per-feature compares
+    // below; when every random-access format is gated out the
+    // binding has no consumers, so silence the inner-unused warning
+    // rather than gate the whole helper (callers stay unchanged).
+    #[cfg_attr(
+        not(any(feature = "zip", feature = "sevenz", feature = "rar")),
+        allow(unused_variables)
+    )]
     let name = registry.name_for_factory(factory)?;
+    #[cfg(feature = "zip")]
     if name == ZIP_FORMAT_NAME {
         return Some(ZIP_FORMAT_NAME);
     }
+    #[cfg(feature = "sevenz")]
     if name == SEVENZ_FORMAT_NAME {
         return Some(SEVENZ_FORMAT_NAME);
     }
@@ -669,7 +699,23 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     // §2 step 5).
     if let Some(name) = random_access_format_name(factory, &args.registry) {
         drop(probe_file);
-        return run_random_access_local(&args, name, total_size, started);
+        #[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
+        {
+            return run_random_access_local(&args, name, total_size, started);
+        }
+        #[cfg(not(any(feature = "zip", feature = "sevenz", feature = "rar")))]
+        {
+            // `random_access_format_name` only returns `Some` when at
+            // least one of the random-access format features is on,
+            // so this arm is unreachable; the binding is named to
+            // suppress the unused-warning on `name` in that build.
+            let _ = name;
+            unreachable!(
+                "random_access_format_name returned Some(...) without any of the \
+                 `zip`/`sevenz`/`rar` features enabled — the helper's `#[cfg]` \
+                 guards should make this impossible",
+            )
+        }
     }
 
     // Streaming-decoder formats need read+write so the puncher
@@ -1179,6 +1225,7 @@ impl<R: Read> Read for ProgressReader<R> {
 /// HTTP-side default; small enough to keep the bitmap allocation
 /// tiny (~8 bytes per 32 MiB), large enough to avoid extra
 /// boundary loop iterations on big archives.
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
 const LOCAL_RANDOM_ACCESS_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Drive zip / 7z / rar extraction against a local archive
@@ -1203,6 +1250,7 @@ const LOCAL_RANDOM_ACCESS_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 /// maintained. The plan asks us to warn and proceed
 /// non-destructively when `-d` is set on a random-access source;
 /// we do exactly that.
+#[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
 fn run_random_access_local(
     args: &LocalRunArgs,
     format_name: &str,
@@ -1296,6 +1344,7 @@ fn run_random_access_local(
     let label = args.source.display().to_string();
 
     let stats = match format_name {
+        #[cfg(feature = "zip")]
         ZIP_FORMAT_NAME => run_zip_local(
             &sparse,
             &bitmap,
@@ -1309,6 +1358,7 @@ fn run_random_access_local(
             password_source,
             &label,
         )?,
+        #[cfg(feature = "sevenz")]
         SEVENZ_FORMAT_NAME => run_sevenz_local(
             &sparse,
             &bitmap,
@@ -1356,6 +1406,7 @@ fn run_random_access_local(
 }
 
 /// Inner driver: zip pipeline over a local random-access source.
+#[cfg(feature = "zip")]
 #[allow(clippy::too_many_arguments)]
 fn run_zip_local(
     sparse: &MultiSparse,
@@ -1416,6 +1467,7 @@ fn run_zip_local(
 }
 
 /// Inner driver: 7z pipeline over a local random-access source.
+#[cfg(feature = "sevenz")]
 #[allow(clippy::too_many_arguments)]
 fn run_sevenz_local(
     sparse: &MultiSparse,
@@ -1551,6 +1603,7 @@ fn run_rar_local(
 /// mapping the HTTP-side `run_zip` uses, minus the
 /// CheckpointObserverStats merge (the local random-access path
 /// writes no checkpoints).
+#[cfg(feature = "zip")]
 fn extraction_stats_from_zip(stats: ZipExtractionStats, total_size: u64) -> ExtractionStats {
     ExtractionStats {
         bytes_in: total_size,
@@ -1570,6 +1623,7 @@ fn extraction_stats_from_zip(stats: ZipExtractionStats, total_size: u64) -> Extr
 /// Convert [`SevenzExtractionStats`] into [`ExtractionStats`].
 /// Mirrors `extraction_stats_from_sevenz` in
 /// [`crate::coordinator`].
+#[cfg(feature = "sevenz")]
 fn extraction_stats_from_sevenz(stats: SevenzExtractionStats, total_size: u64) -> ExtractionStats {
     ExtractionStats {
         bytes_in: total_size,

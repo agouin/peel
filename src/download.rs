@@ -29,15 +29,18 @@ pub mod mirrors;
 pub mod mmap_region;
 pub mod multi_sparse;
 pub mod multi_url;
-// `rar_pipeline` is gated behind the `rar` feature alongside the
-// rest of the RAR5 module tree (`internal/PLAN_rar.md` §0.5 / §3).
+// Container-format pipelines live behind their respective Cargo
+// features (`internal/PLAN_rar.md` §0.5 / §3); the coordinator's
+// dispatch sites are gated to match.
 #[cfg(feature = "rar")]
 pub mod rar_pipeline;
 pub mod rate_limit;
 pub mod scheduler;
+#[cfg(feature = "sevenz")]
 pub mod sevenz_pipeline;
 pub mod sparse_file;
 pub mod worker;
+#[cfg(feature = "zip")]
 pub mod zip_pipeline;
 
 pub use chunk_fingerprints::{ChunkFingerprints, FingerprintsDecodeError};
@@ -71,6 +74,7 @@ pub use sparse_file::{SparseFile, SparseFileError};
 pub use worker::{
     ChunkFailure, ChunkOutcome, Dispatch, DispatchKind, RetryConfig, SourceFingerprint, WorkerError,
 };
+#[cfg(feature = "zip")]
 pub use zip_pipeline::{
     BoundedSparseReader, ZipExtractionStats, ZipPipeline, ZipPipelineConfig, ZipPipelineError,
     ZipPipelineEvent, ZipResumeState,

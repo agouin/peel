@@ -1,3 +1,4 @@
+#![cfg(feature = "xz")]
 //! Phase 6 of [`internal/PLAN_xz_liblzma_port.md`](../internal/PLAN_xz_liblzma_port.md):
 //! differential test suite for the public
 //! [`peel::decode::xz_liblzma::Decoder`] type. Phase F.6 retired

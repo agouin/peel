@@ -45,16 +45,34 @@
 //! the plan's "the user should see 'AES encryption is not supported',
 //! not 'malformed header'" guideline.
 
-pub mod aes_decrypt;
+// `crc32` is always-available: the ZIP-flavored CRC-32 is shared
+// scaffolding used by the `rar`, `sevenz`, and `deflate_native::gzip`
+// modules (and their sinks) for their own integrity-check paths, so
+// gating it under `feature = "zip"` would force every consumer to
+// pull `zip` in just for a CRC. The rest of the ZIP wire-format and
+// extraction code (parser, decoder, sinks, AES, ZipCrypto, the
+// `ZipError` type) is gated behind `feature = "zip"` and reached
+// only through [`crate::download::zip_pipeline`].
 pub mod crc32;
+
+#[cfg(feature = "zip")]
+pub mod aes_decrypt;
+#[cfg(feature = "zip")]
 pub mod decode;
+#[cfg(feature = "zip")]
 pub mod encrypt_legacy;
+#[cfg(feature = "zip")]
 pub mod format;
 
-pub use aes_decrypt::AesDecryptReader;
 pub use crc32::{ieee, Crc32};
+
+#[cfg(feature = "zip")]
+pub use aes_decrypt::AesDecryptReader;
+#[cfg(feature = "zip")]
 pub use decode::{decompress_entry, EntryDecodeError, COPY_BUFFER_LEN};
+#[cfg(feature = "zip")]
 pub use encrypt_legacy::ZipCryptoReader;
+#[cfg(feature = "zip")]
 pub use format::{
     find_aes_extra, find_eocd, parse_central_directory, AesExtra, AesStrength, AesVersion,
     CentralDirectoryEntry, CompressionMethod, EndOfCentralDirectory, GeneralPurposeFlags,
@@ -64,6 +82,7 @@ pub use format::{
 
 use std::io::Read;
 
+#[cfg(feature = "zip")]
 use thiserror::Error;
 
 use crate::decode::{DecodeError, StreamingDecoder};
@@ -97,9 +116,19 @@ pub const FORMAT_NAME: &str = "zip";
 pub fn streaming_factory_placeholder(
     _src: Box<dyn Read + Send>,
 ) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
-    Err(DecodeError::Construct(std::io::Error::other(
-        "internal error: ZIP factory invoked instead of dispatching to the ZIP pipeline",
-    )))
+    #[cfg(feature = "zip")]
+    {
+        Err(DecodeError::Construct(std::io::Error::other(
+            "internal error: ZIP factory invoked instead of dispatching to the ZIP pipeline",
+        )))
+    }
+    #[cfg(not(feature = "zip"))]
+    {
+        Err(DecodeError::Construct(std::io::Error::other(
+            "this build of `peel` was compiled without the `zip` feature; \
+             rebuild with default features (or `--features zip`) to extract ZIP archives",
+        )))
+    }
 }
 
 /// Errors produced while parsing or extracting a ZIP archive.
@@ -122,6 +151,7 @@ pub fn streaming_factory_placeholder(
 ///
 /// Per `internal/ENGINEERING_BEST_PRACTICES.md` §3.1 every variant carries
 /// enough structured context that the message alone is debuggable.
+#[cfg(feature = "zip")]
 #[derive(Debug, Error)]
 pub enum ZipError {
     /// A 4-byte signature header had an unexpected value.
@@ -222,4 +252,5 @@ pub enum ZipError {
     Encryption(#[source] EncryptionError),
 }
 
+#[cfg(feature = "zip")]
 pub use crate::encryption::EncryptionError;

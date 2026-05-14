@@ -1,3 +1,4 @@
+#![cfg(feature = "sevenz")]
 //! Integration tests for the 7z second-pipeline driver in
 //! [`peel::coordinator`].
 //!

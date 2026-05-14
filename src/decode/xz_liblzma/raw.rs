@@ -13,6 +13,16 @@
 //! "chunk" and validates the well-known
 //! "size-encoded, no EOPM" termination condition LZMA1 streams
 //! in 7z follow.
+//!
+//! Today's only non-test caller is the `sevenz` feature; the
+//! module itself is gated under `feature = "xz"` (it lives next
+//! to the LZMA2 stream decoder), so building with `xz` alone
+//! compiles every function here without exercising the raw
+//! entry points. Suppress the dead-code lint so the module
+//! stays a self-contained reference implementation regardless of
+//! which downstream container features are enabled.
+
+#![allow(dead_code)]
 
 use std::io::Write;
 

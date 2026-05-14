@@ -28,20 +28,41 @@ name = "rar_list"
 path = "examples/rar_list.rs"
 required-features = ["rar"]
 
+[[example]]
+name = "rar_decode_probe"
+path = "examples/rar_decode_probe.rs"
+required-features = ["rar"]
+
 [features]
-# Default feature set. Includes `rar` so a `cargo build` with no flags
-# produces the standard `peel` binary. Distros / users who want to
-# shave the RAR5 decoder out of the binary build with
-# `--no-default-features`. See `internal/PLAN_rar.md` §0.5 for the
-# rationale (post-resolution, the rationale is binary size and
-# modular gating of the §4 decoder rollout — the OSI-licensing
-# concern that originally motivated this flag evaporated when §0.1
-# resolved to hand-roll).
-default = ["rar"]
-# RAR5 archive support (`internal/PLAN_rar.md`). When disabled, the
-# crate still registers `.rar` and the RAR5 magic against a
-# diagnostic-only factory, so the user sees a precise "compiled
-# without `rar` feature" error rather than "unknown format".
+# Default feature set: every supported format is on, so plain
+# `cargo build` produces the standard `peel` binary. Distros /
+# size-conscious users opt formats out with
+# `--no-default-features --features <list>` (see
+# `internal/PLAN_packaging.md`). Tar (uncompressed `.tar`) is the
+# always-on substrate and is not feature-gated — it carries no
+# dependencies and is tiny.
+default = ["zstd", "xz", "lz4", "gzip", "bzip2", "zip", "sevenz", "rar"]
+# Per-format gates. Each format module is wrapped in
+# `#[cfg(feature = "<name>")]`; with the feature disabled the
+# crate still registers the format's suffix / magic against a
+# diagnostic-only factory so the user sees a precise
+# "compiled without `<name>` feature" error rather than
+# "unknown format". See `internal/PLAN_rar.md` §0.5 for the
+# original rationale (which now applies uniformly).
+#
+# Compression / stream codecs.
+zstd = ["dep:zstd"]
+xz = []
+lz4 = ["dep:lz4_flex"]
+gzip = []
+bzip2 = []
+# Container formats. Each container's entry decoders rely on
+# specific compression codecs, so a container feature implies the
+# compression features it needs — enabling `zip` brings DEFLATE
+# (via `gzip`) and zstd along automatically, enabling `sevenz`
+# brings DEFLATE and LZMA/LZMA2 (via `xz`) along.
+zip = ["gzip", "zstd"]
+sevenz = ["gzip", "xz"]
 rar = []
 
 [dependencies]
@@ -59,14 +80,14 @@ webpki-roots = "0.26"
 # and does not depend on this crate. The default features (legacy
 # decoders, dictionary builder, etc.) are not needed and would expand
 # the audit surface for no gain.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13", default-features = false, optional = true }
 # lz4 frame-format decompression backend (PLAN_v2.md §4 / internal/ENGINEERING_STANDARDS.md §2.2).
 # Pure Rust. We consume only the block-layer API (`block::decompress_into`)
 # and parse the LZ4 Frame Format ourselves to keep the wire-level surface
 # stable; the default `frame` feature pulls a `twox-hash` dep we don't
 # need at runtime, so it stays disabled. `safe-decode` keeps malformed
 # input from triggering panics inside the block decompressor.
-lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"], optional = true }
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # internal/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }

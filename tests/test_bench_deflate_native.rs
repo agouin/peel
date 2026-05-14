@@ -1,3 +1,4 @@
+#![cfg(feature = "gzip")]
 //! Phase 0 throughput-only benchmark fixture for the hand-rolled
 //! gzip / DEFLATE decoder ([`peel::decode::deflate_native`]).
 //!

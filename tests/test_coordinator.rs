@@ -1,3 +1,4 @@
+#![cfg(all(feature = "zstd", feature = "xz", feature = "lz4", feature = "zip"))]
 //! Integration tests for [`peel::coordinator`].
 //!
 //! These tests run the full pipeline end-to-end against the in-process

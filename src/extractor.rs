@@ -1020,7 +1020,7 @@ impl<S: Sink> Write for SinkAdapter<'_, S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "zstd"))]
 mod tests {
     use super::*;
 

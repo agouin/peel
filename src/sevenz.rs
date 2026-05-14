@@ -41,8 +41,10 @@
 //! [`SevenzError::UnsupportedFeature`] naming the specific feature
 //! (`"BCJ filter"`, `"AES-256 encryption"`, etc.).
 
+#[cfg(feature = "sevenz")]
 pub mod error;
 
+#[cfg(feature = "sevenz")]
 pub use error::SevenzError;
 
 use std::io::Read;
@@ -79,9 +81,19 @@ pub const FORMAT_NAME: &str = "7z";
 pub fn streaming_factory_placeholder(
     _src: Box<dyn Read + Send>,
 ) -> Result<Box<dyn StreamingDecoder>, DecodeError> {
-    Err(DecodeError::Construct(std::io::Error::other(
-        "internal error: 7z factory invoked instead of dispatching to the 7z pipeline",
-    )))
+    #[cfg(feature = "sevenz")]
+    {
+        Err(DecodeError::Construct(std::io::Error::other(
+            "internal error: 7z factory invoked instead of dispatching to the 7z pipeline",
+        )))
+    }
+    #[cfg(not(feature = "sevenz"))]
+    {
+        Err(DecodeError::Construct(std::io::Error::other(
+            "this build of `peel` was compiled without the `sevenz` feature; \
+             rebuild with default features (or `--features sevenz`) to extract 7z archives",
+        )))
+    }
 }
 
 /// SignatureHeader magic that begins every 7z archive: `7z¼¯' \x1c`

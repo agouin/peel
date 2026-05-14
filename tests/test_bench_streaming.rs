@@ -1,3 +1,12 @@
+#![cfg(all(
+    feature = "zstd",
+    feature = "xz",
+    feature = "gzip",
+    feature = "lz4",
+    feature = "bzip2",
+    feature = "zip",
+    feature = "sevenz"
+))]
 //! Comparative streaming-extraction benchmarks: `peel` vs `curl | tool`.
 //!
 //! For every supported source format the suite builds a representative

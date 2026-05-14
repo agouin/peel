@@ -414,6 +414,7 @@ mod tests {
     /// zstd-encoded frame. This is the end-to-end invariant Phase 6
     /// depends on. The streaming `Encoder` is used (not
     /// `encode_all`) because the latter defaults to no checksum.
+    #[cfg(feature = "zstd")]
     #[test]
     fn matches_zstd_crate_content_checksum_trailer() {
         use std::io::Write;

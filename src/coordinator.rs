@@ -162,6 +162,7 @@ use thiserror::Error;
 use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
 use crate::checkpoint::{Checkpoint, CheckpointError, RunMode, SinkState};
 use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, FormatShape, StreamingDecoder};
+#[cfg(feature = "sevenz")]
 use crate::download::sevenz_pipeline::{
     SevenzExtractionStats, SevenzPipeline, SevenzPipelineConfig, SevenzPipelineError,
     SevenzPipelineEvent, SevenzResumeState,
@@ -169,8 +170,12 @@ use crate::download::sevenz_pipeline::{
 use crate::download::{
     chunk_count, discover_with_mirrors, run as run_scheduler, ChunkFingerprints, DownloadInfo,
     DownloadStats, MirrorSet, MultiSparse, ProbeConfig, RetryConfig, SchedulerConfig,
-    SchedulerError, SourceFingerprint, SparseFile, SparseFileError, ZipPipeline, ZipPipelineConfig,
-    ZipPipelineError, ZipPipelineEvent, ZipResumeState, DEFAULT_CHUNK_SIZE, DEFAULT_WORKERS,
+    SchedulerError, SourceFingerprint, SparseFile, SparseFileError, DEFAULT_CHUNK_SIZE,
+    DEFAULT_WORKERS,
+};
+#[cfg(feature = "zip")]
+use crate::download::{
+    ZipPipeline, ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent, ZipResumeState,
 };
 use crate::extractor::{
     CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
@@ -181,9 +186,15 @@ use crate::progress::ProgressState;
 use crate::punch::{default_puncher, NoopPuncher, PunchHole};
 #[cfg(feature = "rar")]
 use crate::rar::FORMAT_NAME as RAR_FORMAT_NAME;
+#[cfg(feature = "sevenz")]
 use crate::sevenz::FORMAT_NAME as SEVENZ_FORMAT_NAME;
-use crate::sink::{RawSink, SevenzSink, Sink, SinkError, TarSink, ZipSink};
+#[cfg(feature = "sevenz")]
+use crate::sink::SevenzSink;
+#[cfg(feature = "zip")]
+use crate::sink::ZipSink;
+use crate::sink::{RawSink, Sink, SinkError, TarSink};
 use crate::types::{ByteOffset, ChunkIndex};
+#[cfg(feature = "zip")]
 use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
 
 /// Sentinel `io::Error` message used to thread kill-switch trips
@@ -816,17 +827,20 @@ pub enum CoordinatorError {
     },
 
     /// The ZIP pipeline failed.
+    #[cfg(feature = "zip")]
     #[error("ZIP extraction failed")]
     Zip(#[source] ZipPipelineError),
 
     /// The 7z parser surfaced a wire-format failure.
     /// Surfaced via [`run_sevenz`] (`internal/PLAN_7z_support.md`
     /// §10).
+    #[cfg(feature = "sevenz")]
     #[error("7z format error")]
     Sevenz(#[source] crate::sevenz::SevenzError),
 
     /// The 7z pipeline failed for a non-Sevenz reason
     /// (download / IO / hole punching).
+    #[cfg(feature = "sevenz")]
     #[error("7z extraction failed")]
     SevenzPipeline(#[source] SevenzPipelineError),
 
@@ -1500,8 +1514,14 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             // works for the free-function factories every shipping
             // format uses.
             let format_name = registry.name_for_factory(factory).map(String::from);
+            #[cfg(feature = "zip")]
             let is_zip = format_name.as_deref() == Some(ZIP_FORMAT_NAME);
+            #[cfg(not(feature = "zip"))]
+            let is_zip = false;
+            #[cfg(feature = "sevenz")]
             let is_sevenz = format_name.as_deref() == Some(SEVENZ_FORMAT_NAME);
+            #[cfg(not(feature = "sevenz"))]
+            let is_sevenz = false;
             #[cfg(feature = "rar")]
             let is_rar = format_name.as_deref() == Some(RAR_FORMAT_NAME);
             #[cfg(not(feature = "rar"))]
@@ -1521,34 +1541,41 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             };
 
             let extraction_stats = if is_zip {
-                let dir = match &output {
-                    OutputTarget::Dir(d) => d.clone(),
-                    OutputTarget::File(_) => {
-                        return Err(CoordinatorError::ZipNeedsDirectory);
-                    }
-                };
-                run_zip(
-                    &sparse,
-                    &bitmap,
-                    &fingerprints,
-                    &cursor,
-                    &download_done,
-                    &download_outcome,
-                    puncher.as_ref(),
-                    &ckpt_path,
-                    &info,
-                    &url,
-                    chunk_size,
-                    total_size,
-                    &dir,
-                    &resume_plan,
-                    &config,
-                    progress.as_mut(),
-                    progress_state.as_ref(),
-                    kill_switch.as_ref(),
-                    prior_elapsed,
-                    started,
-                )?
+                #[cfg(feature = "zip")]
+                {
+                    let dir = match &output {
+                        OutputTarget::Dir(d) => d.clone(),
+                        OutputTarget::File(_) => {
+                            return Err(CoordinatorError::ZipNeedsDirectory);
+                        }
+                    };
+                    run_zip(
+                        &sparse,
+                        &bitmap,
+                        &fingerprints,
+                        &cursor,
+                        &download_done,
+                        &download_outcome,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &info,
+                        &url,
+                        chunk_size,
+                        total_size,
+                        &dir,
+                        &resume_plan,
+                        &config,
+                        progress.as_mut(),
+                        progress_state.as_ref(),
+                        kill_switch.as_ref(),
+                        prior_elapsed,
+                        started,
+                    )?
+                }
+                #[cfg(not(feature = "zip"))]
+                {
+                    unreachable!("is_zip can only be true when the `zip` feature is enabled")
+                }
             } else if is_rar {
                 #[cfg(feature = "rar")]
                 {
@@ -1586,32 +1613,39 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     unreachable!("is_rar can only be true when the `rar` feature is enabled")
                 }
             } else if is_sevenz {
-                let dir = match &output {
-                    OutputTarget::Dir(d) => d.clone(),
-                    OutputTarget::File(_) => {
-                        return Err(CoordinatorError::ZipNeedsDirectory);
-                    }
-                };
-                run_sevenz(
-                    &sparse,
-                    &bitmap,
-                    &cursor,
-                    &download_done,
-                    &download_outcome,
-                    puncher.as_ref(),
-                    &ckpt_path,
-                    &info,
-                    &url,
-                    chunk_size,
-                    total_size,
-                    &dir,
-                    &resume_plan,
-                    &config,
-                    progress_state.as_ref(),
-                    kill_switch.as_ref(),
-                    prior_elapsed,
-                    started,
-                )?
+                #[cfg(feature = "sevenz")]
+                {
+                    let dir = match &output {
+                        OutputTarget::Dir(d) => d.clone(),
+                        OutputTarget::File(_) => {
+                            return Err(CoordinatorError::ZipNeedsDirectory);
+                        }
+                    };
+                    run_sevenz(
+                        &sparse,
+                        &bitmap,
+                        &cursor,
+                        &download_done,
+                        &download_outcome,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &info,
+                        &url,
+                        chunk_size,
+                        total_size,
+                        &dir,
+                        &resume_plan,
+                        &config,
+                        progress_state.as_ref(),
+                        kill_switch.as_ref(),
+                        prior_elapsed,
+                        started,
+                    )?
+                }
+                #[cfg(not(feature = "sevenz"))]
+                {
+                    unreachable!("is_sevenz can only be true when the `sevenz` feature is enabled")
+                }
             } else {
                 // Resolve the integrity-tracking hasher (if any) up
                 // front: if --sha256 is on, build it from prior
@@ -2649,6 +2683,7 @@ fn run_one<S: Sink>(
 /// emission. The differences are mechanical — the pipeline runs
 /// per-entry rather than per-frame, and the checkpoint records
 /// [`SinkState::Zip`] instead of `Tar` / `Raw`.
+#[cfg(feature = "zip")]
 #[allow(clippy::too_many_arguments)]
 fn run_zip(
     sparse: &MultiSparse,
@@ -3400,6 +3435,7 @@ fn run_rar(
 /// kill-switch threading, disk-buffer-cap override (7z is
 /// random-access just like zip — trailer at the end, pack
 /// data at the front).
+#[cfg(feature = "sevenz")]
 #[allow(clippy::too_many_arguments)]
 fn run_sevenz(
     sparse: &MultiSparse,
@@ -3598,6 +3634,7 @@ fn run_sevenz(
 /// minimum-viable wiring does not collect them; that lands as
 /// a follow-up alongside the kill-switch + checkpoint cadence
 /// integration.
+#[cfg(feature = "sevenz")]
 fn extraction_stats_from_sevenz(stats: SevenzExtractionStats, total_size: u64) -> ExtractionStats {
     ExtractionStats {
         bytes_in: total_size,

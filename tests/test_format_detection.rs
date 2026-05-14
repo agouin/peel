@@ -112,6 +112,7 @@ fn coord_config_for_test(chunk_size: u64) -> CoordinatorConfig {
     }
 }
 
+#[cfg(feature = "zstd")]
 fn encode_zstd(payload: &[u8]) -> Vec<u8> {
     zstd::encode_all(payload, 1).expect("encode zstd")
 }
@@ -252,6 +253,7 @@ fn make_args(
 
 // ---- (1) suffix path works --------------------------------------------
 
+#[cfg(feature = "zstd")]
 #[test]
 fn detection_suffix_only_path_extracts_zst() {
     let payload = b"suffix-only-payload, ".repeat(1024);
@@ -276,6 +278,7 @@ fn detection_suffix_only_path_extracts_zst() {
 
 // ---- (2) magic-only path works ----------------------------------------
 
+#[cfg(feature = "zstd")]
 #[test]
 fn detection_magic_only_path_extracts_when_no_suffix_registered() {
     // URL ends in `.bin` — neither the default registry nor the gzip
@@ -303,6 +306,7 @@ fn detection_magic_only_path_extracts_when_no_suffix_registered() {
 
 // ---- (3) suffix vs. magic conflict --> FormatMismatch ------------------
 
+#[cfg(feature = "zstd")]
 #[test]
 fn detection_conflict_aborts_with_format_mismatch() {
     // URL ends in `.gz` (suffix → gzip stub) but body is zstd
@@ -338,6 +342,7 @@ fn detection_conflict_aborts_with_format_mismatch() {
 
 // ---- (4) --force-format-from-magic resolves the conflict --------------
 
+#[cfg(feature = "zstd")]
 #[test]
 fn detection_conflict_resolved_by_force_format_from_magic() {
     let payload = b"force-magic-payload, ".repeat(1024);
@@ -364,6 +369,7 @@ fn detection_conflict_resolved_by_force_format_from_magic() {
 
 // ---- --format <name> bypasses both detectors --------------------------
 
+#[cfg(feature = "zstd")]
 #[test]
 fn detection_forced_format_name_bypasses_sniff() {
     // The URL has no suffix at all — neither suffix nor magic-aware
@@ -391,6 +397,7 @@ fn detection_forced_format_name_bypasses_sniff() {
     assert_eq!(fs::read(&out_path).expect("read"), payload);
 }
 
+#[cfg(feature = "zstd")]
 #[test]
 fn detection_forced_format_unknown_name_errors_cleanly() {
     let payload = b"unknown-name-payload";

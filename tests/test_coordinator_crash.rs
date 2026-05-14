@@ -1,3 +1,4 @@
+#![cfg(all(feature = "zstd", feature = "xz", feature = "lz4", feature = "zip"))]
 //! Crash-test harness for [`peel::coordinator`].
 //!
 //! Plan §10.3 calls out a harness that "runs the binary 100 times with

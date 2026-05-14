@@ -275,6 +275,7 @@ pub fn ieee(data: &[u8]) -> u32 {
 ///
 /// Not exposed publicly outside the crate; ZipCrypto is the only
 /// caller.
+#[cfg(feature = "zip")]
 #[must_use]
 pub(crate) fn crc32_step(state: u32, byte: u8) -> u32 {
     TABLE[((state ^ u32::from(byte)) & 0xFF) as usize] ^ (state >> 8)

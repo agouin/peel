@@ -28,6 +28,8 @@ pub mod rar_fixtures;
 // directly, but the only consumer is the rar bench rows.
 #[cfg(feature = "rar")]
 pub mod rar_bench_fixtures;
+#[cfg(feature = "sevenz")]
 pub mod sevenz_fixtures;
 pub mod tar_fixtures;
+#[cfg(feature = "zip")]
 pub mod zip_fixtures;

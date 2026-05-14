@@ -1,3 +1,4 @@
+#![cfg(feature = "zip")]
 //! Integration tests for the zip second-pipeline driver in
 //! [`peel::coordinator`].
 //!

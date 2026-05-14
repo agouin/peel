@@ -10,17 +10,32 @@
 #![cfg(unix)]
 
 use std::fs::{self, OpenOptions};
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
 use std::io::Read;
 use std::os::fd::AsFd;
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use peel::decode::{DecoderRegistry, StreamingDecoder};
-use peel::extractor::{ExtractionStats, Extractor, ExtractorConfig};
-use peel::punch::{default_puncher, NoopPuncher, PunchError, PunchHole};
-use peel::sink::{RawSink, TarSink};
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
+use peel::decode::DecoderRegistry;
+use peel::decode::StreamingDecoder;
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
+use peel::extractor::ExtractorConfig;
+use peel::extractor::{ExtractionStats, Extractor};
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
+use peel::punch::default_puncher;
+use peel::punch::NoopPuncher;
+#[cfg(feature = "zstd")]
+use peel::punch::{PunchError, PunchHole};
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
+use peel::sink::RawSink;
+use peel::sink::TarSink;
+#[cfg(feature = "zstd")]
 use peel::types::ByteOffset;
 
 #[path = "support/mod.rs"]
@@ -71,6 +86,7 @@ fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
 
 /// Encode `payloads` as a sequence of independent zstd frames at level
 /// 1 (fast, low-ratio — the tests pick payload entropy themselves).
+#[cfg(feature = "zstd")]
 fn encode_frames(payloads: &[&[u8]]) -> Vec<u8> {
     let mut combined = Vec::new();
     for p in payloads {
@@ -85,6 +101,7 @@ fn encode_frames(payloads: &[&[u8]]) -> Vec<u8> {
 /// archive shape matches what `xz` CLI produces by default — one
 /// monolithic Block whose only restart points are the
 /// per-LZMA2-chunk boundaries the hand-rolled decoder exposes.
+#[cfg(feature = "xz")]
 fn xz2_encode_single_block(payload: &[u8], preset: u32) -> Vec<u8> {
     use std::io::Write;
     let mut compressed = Vec::new();
@@ -101,6 +118,7 @@ fn xz2_encode_single_block(payload: &[u8], preset: u32) -> Vec<u8> {
 /// points are the per-deflate-block boundaries the hand-rolled
 /// `crate::decode::deflate_native::gzip` decoder exposes (Phase 7
 /// `decoder_state` blob, Phase 8 registry swap).
+#[cfg(feature = "gzip")]
 fn encode_gzip_single_member(payload: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -116,6 +134,7 @@ fn encode_gzip_single_member(payload: &[u8]) -> Vec<u8> {
 /// data — those leave the LZMA model un-allocated, which means
 /// the per-LZMA2-chunk `frame_boundary` advance never fires).
 /// Mirrors `tests/test_xz_native.rs::build_lzma_friendly_input`.
+#[cfg(any(feature = "xz", feature = "gzip"))]
 fn build_lzma_friendly_input(len: usize) -> Vec<u8> {
     let lines: &[&[u8]] = &[
         b"the quick brown fox jumps over the lazy dog ",
@@ -142,6 +161,7 @@ fn build_lzma_friendly_input(len: usize) -> Vec<u8> {
 /// `frame_count` zstd frames so the extractor observes a real
 /// frame-boundary checkpoint discipline rather than just a single
 /// terminal boundary.
+#[cfg(feature = "zstd")]
 fn build_multi_frame_zstd_tar(files: &[(&str, &[u8])], frame_count: usize) -> Vec<u8> {
     assert!(frame_count >= 1);
     let archive = build_simple_archive(files);
@@ -162,6 +182,7 @@ fn build_multi_frame_zstd_tar(files: &[(&str, &[u8])], frame_count: usize) -> Ve
 /// checkpoint — both the multi-frame and single-frame callers below
 /// rely on per-block boundaries firing now that the hand-rolled
 /// decoder is the production path.
+#[cfg(feature = "zstd")]
 fn run_zstd_tar_extraction(
     label: &str,
     combined: &[u8],
@@ -210,6 +231,7 @@ fn run_zstd_tar_extraction(
 
 /// Run the extractor against a `.tar.zst`-shaped local file and verify
 /// every file lands at the right path with the right contents.
+#[cfg(feature = "zstd")]
 #[test]
 fn extracts_multi_frame_zstd_tar_into_directory() {
     let files: &[(&str, &[u8])] = &[
@@ -230,6 +252,7 @@ fn extracts_multi_frame_zstd_tar_into_directory() {
 /// Without per-block advance the extractor would never observe a
 /// quiescent checkpoint inside a single-frame archive — exactly the
 /// production failure that motivated this plan.
+#[cfg(feature = "zstd")]
 #[test]
 fn extracts_single_frame_zstd_tar_into_directory() {
     let files: &[(&str, &[u8])] = &[
@@ -251,6 +274,7 @@ fn extracts_single_frame_zstd_tar_into_directory() {
 
 /// `RawSink` end-to-end: a raw single-stream `.zst` decompressed back
 /// to a file is byte-identical to the original payload.
+#[cfg(feature = "zstd")]
 #[test]
 fn extracts_zst_to_raw_sink_byte_identical() {
     let payload = random_bytes(0x1234, 256 * 1024);
@@ -293,6 +317,7 @@ fn extracts_zst_to_raw_sink_byte_identical() {
 /// on-disk block count. On Linux + ext4/xfs/btrfs the block count
 /// strictly decreases; on filesystems that report
 /// [`PunchError::Unsupported`] we accept the no-shrink path.
+#[cfg(feature = "zstd")]
 #[test]
 fn punching_shrinks_or_preserves_source_footprint() {
     // Use random data that doesn't compress so the source has a
@@ -369,12 +394,14 @@ fn punching_shrinks_or_preserves_source_footprint() {
 /// ~300 MB of disk for the compressed side" — survives even a single
 /// monolithic zstd frame, the production failure mode that motivated
 /// `internal/PLAN_zstd_block_decoder.md`.
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
 struct PeakSamplingPuncher {
     inner: Box<dyn PunchHole>,
     src_path: PathBuf,
     samples_before_punch: Mutex<Vec<u64>>,
 }
 
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
 impl PeakSamplingPuncher {
     fn new(inner: Box<dyn PunchHole>, src_path: &Path) -> Self {
         Self {
@@ -389,6 +416,7 @@ impl PeakSamplingPuncher {
     }
 }
 
+#[cfg(any(feature = "zstd", feature = "xz", feature = "gzip"))]
 impl PunchHole for PeakSamplingPuncher {
     fn punch(
         &self,
@@ -439,6 +467,7 @@ impl PunchHole for PeakSamplingPuncher {
 /// the *peak* is trivially the file size. The interesting invariant
 /// is the *slope* — that `last_punched` keeps pace with
 /// `bytes_consumed` — which is what (3) measures.
+#[cfg(feature = "zstd")]
 #[test]
 fn single_frame_zstd_punches_per_block_bounded_peak() {
     // ~16 MiB of random bytes wrapped in a tar archive, then packaged
@@ -567,6 +596,7 @@ fn single_frame_zstd_punches_per_block_bounded_peak() {
 /// coordinator to drive a progress UI: at least one of the time fields
 /// is non-zero on a non-trivial workload, and the byte counters
 /// reconcile with the source/sink lengths.
+#[cfg(feature = "zstd")]
 #[test]
 fn stats_account_for_bytes_and_time() {
     let payload = random_bytes(0xACE, 128 * 1024);
@@ -613,6 +643,7 @@ fn stats_account_for_bytes_and_time() {
 /// errno) propagates the failure to the caller and stops the
 /// extraction. This lives in the integration suite because it
 /// exercises the public API surface composed across modules.
+#[cfg(feature = "zstd")]
 #[test]
 fn fatal_punch_error_aborts_extraction() {
     struct Boom;
@@ -676,6 +707,7 @@ fn fatal_punch_error_aborts_extraction() {
 /// extraction. The hand-rolled decoder advances per LZMA2 chunk
 /// so the extractor sees multiple quiescent checkpoints inside
 /// the single Block.
+#[cfg(feature = "xz")]
 #[test]
 fn extracts_single_block_xz_tar_into_directory() {
     let files: &[(&str, &[u8])] = &[
@@ -746,6 +778,7 @@ fn extracts_single_block_xz_tar_into_directory() {
 /// trivially the file size. The interesting invariant is the
 /// *slope* — that `last_punched` keeps pace with
 /// `bytes_consumed` — which is what (3) measures.
+#[cfg(feature = "xz")]
 #[test]
 fn single_block_xz_punches_per_chunk_bounded_peak() {
     // ~16 MiB LZMA-friendly content packed into a tar archive.
@@ -878,6 +911,7 @@ fn single_block_xz_punches_per_chunk_bounded_peak() {
 /// intermediate deflate-block boundaries inside the single
 /// member fire as quiescent checkpoints — proving the new
 /// hand-rolled decoder is the production path.
+#[cfg(feature = "gzip")]
 #[test]
 fn extracts_single_member_tar_gz_into_directory() {
     let files: &[(&str, &[u8])] = &[
@@ -958,6 +992,7 @@ fn extracts_single_member_tar_gz_into_directory() {
 /// count is `EOF - last_punched`. The interesting invariant is
 /// the *slope* — that `last_punched` keeps pace with
 /// `bytes_consumed` — which (3) measures.
+#[cfg(feature = "gzip")]
 #[test]
 fn single_member_gzip_punches_per_block_bounded_peak() {
     let payload = build_lzma_friendly_input(16 * 1024 * 1024);
