@@ -2,7 +2,11 @@
 name = "peel-rs"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.93"
+# MSRV. Declared floor for distros / downstream consumers building
+# against an older rustc. Deliberately lower than `rust-toolchain.toml`
+# (the dev/CI pin); rationale in `internal/PLAN_packaging.md` §0.6.
+# CI enforces this via the `msrv` job in `.github/workflows/ci.yml`.
+rust-version = "1.85"
 description = "Streaming, resumable, space-efficient extractor for compressed archives downloaded over HTTP."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/agouin/peel"

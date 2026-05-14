@@ -275,7 +275,7 @@ mod tests {
         push(&mut bits, cols, 16);
 
         // Pad to byte boundary.
-        while !bits.len().is_multiple_of(8) {
+        while bits.len() % 8 != 0 {
             bits.push(false);
         }
 
@@ -317,7 +317,7 @@ mod tests {
         push(&mut bits, 0, 24);
         push(&mut bits, 1 << 15, 16); // row 0 populated
         push(&mut bits, 1 << 15, 16); // column 0 populated → symbol 0
-        while !bits.len().is_multiple_of(8) {
+        while bits.len() % 8 != 0 {
             bits.push(false);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);
@@ -350,7 +350,7 @@ mod tests {
         push(&mut bits, 0, 1);
         push(&mut bits, 0, 24);
         push(&mut bits, 0, 16); // no rows populated
-        while !bits.len().is_multiple_of(8) {
+        while bits.len() % 8 != 0 {
             bits.push(false);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);

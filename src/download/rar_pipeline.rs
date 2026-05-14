@@ -1400,7 +1400,7 @@ impl<'a> RarPipeline<'a> {
                             .to_string(),
                     }));
                 }
-            } else if !want.is_multiple_of(BLOCK_LEN) {
+            } else if want % BLOCK_LEN != 0 {
                 return Err(RarPipelineError::Rar(RarError::CorruptHeader {
                     archive_offset: cursor_in_entry,
                     reason: format!(

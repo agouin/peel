@@ -156,7 +156,7 @@ mod tests {
                 bits.push((v >> i) & 1 != 0);
             }
         }
-        while !bits.len().is_multiple_of(8) {
+        while bits.len() % 8 != 0 {
             bits.push(false);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);

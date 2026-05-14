@@ -121,11 +121,7 @@ fn bench_xxh64_64kib() {
     // of an even number of identical digests collapses to either the
     // digest (odd-count) or zero (even-count). `ITERS` for a 1 GiB /
     // 64 KiB workload is 16 384 — even, so the expected XOR is 0.
-    let expected_xor = if ITERS.is_multiple_of(2) {
-        0u64
-    } else {
-        pinned_digest
-    };
+    let expected_xor = if ITERS % 2 == 0 { 0u64 } else { pinned_digest };
     assert_eq!(
         xor_acc, expected_xor,
         "Xxh64 produced inconsistent digests across iterations \

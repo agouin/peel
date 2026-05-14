@@ -54,3 +54,27 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # MSRV check. The declared floor lives in `Cargo.toml` (`rust-version`);
+  # rationale and the audit that picked 1.85 are in
+  # `internal/PLAN_packaging.md` §0.6. `RUSTUP_TOOLCHAIN` overrides the
+  # `rust-toolchain.toml` pin so we actually exercise 1.85 here.
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.85.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustc 1.85.0
+        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+      - name: Check at MSRV
+        run: cargo check --all-targets --all-features --locked

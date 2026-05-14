@@ -869,7 +869,7 @@ mod tests {
     fn fresh_allocator_invariants() {
         let a = Allocator::new(TEST_ARENA_BYTES).expect("alloc");
         // Working area is unit-aligned and within bounds.
-        assert!((a.size() as usize).is_multiple_of(UNIT_SIZE));
+        assert!((a.size() as usize) % UNIT_SIZE == 0);
         assert!((a.size() as usize) <= TEST_ARENA_BYTES);
         // Initial unit region carved off the top, text region empty.
         assert_eq!(a.lo_unit(), a.units_start());

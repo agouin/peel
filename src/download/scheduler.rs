@@ -1634,7 +1634,7 @@ fn run_single_stream(
 
     // Final (possibly partial) chunk if total_size isn't a multiple of
     // chunk_size.
-    if !total_size.is_multiple_of(chunk_size) {
+    if total_size % chunk_size != 0 {
         let last = u32::try_from(total_size / chunk_size).unwrap_or(u32::MAX);
         if last < total_chunks && !bitmap.is_complete(ChunkIndex::new(last)) {
             bitmap.mark_complete(ChunkIndex::new(last));
