@@ -1,7 +1,28 @@
+**Docs:** <https://agouin.github.io/peel/> — full usage guide,
+flag reference, format support matrix, design notes.
+
 ## Install
 
 Pick the matching path for your OS. All artifacts are signed by GitHub's
 release infrastructure and checksummed in `SHA256SUMS`.
+
+### Docker (`linux/amd64`, `linux/arm64`)
+
+The multi-arch image lives at `ghcr.io/agouin/peel`. Tag aliases:
+`${TAG}` (this release), `latest` (most recent stable), and the
+immutable per-arch digests below for reproducible pins.
+
+```bash
+docker pull ghcr.io/agouin/peel:${TAG}
+docker run --rm ghcr.io/agouin/peel:${TAG} --help
+```
+
+For reproducible pins (recommended for CI / production):
+
+| Platform      | Digest                                                |
+| ------------- | ----------------------------------------------------- |
+| `linux/amd64` | `ghcr.io/agouin/peel@${DOCKER_AMD64_DIGEST}` |
+| `linux/arm64` | `ghcr.io/agouin/peel@${DOCKER_ARM64_DIGEST}` |
 
 ### Debian / Ubuntu (`.deb`)
 

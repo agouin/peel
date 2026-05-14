@@ -1,15 +1,18 @@
 name: Docker
 
+# Tag-driven builds (`v*.*.*`) are handled by `release.yml`'s `docker`
+# job so the per-arch image digests can flow into the release notes
+# atomically with the rest of the release. This workflow only handles
+# non-tag (branch) pushes — the `main` / feature-branch images
+# published to `ghcr.io/<owner>/peel:<branch>` for in-development pulls.
 on:
   push:
     branches:
       - '**'
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing git tag to release (e.g. v0.1.0)'
+        description: 'Existing git tag to release (e.g. v0.1.0). Mostly redundant with release.yml; use only to backfill an image for a tag that release.yml missed.'
         required: true
 
 permissions:

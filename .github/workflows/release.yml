@@ -656,9 +656,99 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Multi-arch (linux/amd64 + linux/arm64) OCI image built once with
+  # `docker buildx` and pushed to `ghcr.io/<owner>/peel`. The
+  # `docker.yml` workflow handles non-tag (branch) pushes so this job
+  # only runs on releases. Per-arch image digests are captured here as
+  # job outputs so the `publish` job can embed immutable
+  # `@sha256:...` pins in the release notes.
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest_amd64: ${{ steps.digests.outputs.amd64 }}
+      digest_arm64: ${{ steps.digests.outputs.arm64 }}
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/peel
+          # Tag set: raw semver (`v0.6.0`), major.minor (`v0.6`), and
+          # `latest` for non-pre-release semver. Mirrors what the
+          # superseded tag-handling block in `docker.yml` did.
+          tags: |
+            type=semver,pattern={{raw}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern=v{{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
+            type=raw,value=latest,enable=${{ steps.tag.outputs.tag != '' && !contains(steps.tag.outputs.tag, '-') }}
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Capture per-arch digests
+        id: digests
+        # `docker buildx imagetools inspect --raw` returns the
+        # multi-arch manifest list; we jq out each platform's
+        # `digest` (an immutable `sha256:...` reference).
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          image="ghcr.io/${{ github.repository_owner }}/peel:${tag}"
+          manifest=$(docker buildx imagetools inspect "${image}" --raw)
+          amd64=$(echo "${manifest}" \
+              | jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest')
+          arm64=$(echo "${manifest}" \
+              | jq -r '.manifests[] | select(.platform.architecture=="arm64" and .platform.os=="linux") | .digest')
+          test -n "${amd64}" || { echo "amd64 digest missing"; exit 1; }
+          test -n "${arm64}" || { echo "arm64 digest missing"; exit 1; }
+          echo "amd64=${amd64}" >> "$GITHUB_OUTPUT"
+          echo "arm64=${arm64}" >> "$GITHUB_OUTPUT"
+          echo "Resolved digests:"
+          echo "  linux/amd64 → ${amd64}"
+          echo "  linux/arm64 → ${arm64}"
+
   publish:
     name: Publish release
-    needs: [build, vendor, package-fedora, package-debian-source, package-alpine, package-arch]
+    needs: [build, vendor, package-fedora, package-debian-source, package-alpine, package-arch, docker]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -696,16 +786,17 @@ jobs:
 
       - name: Build release notes
         # Per-OS install instructions live in
-        # `.github/RELEASE_NOTES_TEMPLATE.md` with `${TAG}` /
-        # `${VERSION}` placeholders. `envsubst` substitutes only those
-        # two variables (not the entire env, which could accidentally
-        # interpolate `$auto` strings from elsewhere). The auto-changelog
-        # comes from the GitHub `generate-notes` API and is appended
-        # below the install block — same content `--generate-notes`
-        # would produce, but we can't use that flag because we want to
-        # prepend our own copy.
+        # `.github/RELEASE_NOTES_TEMPLATE.md` with `${TAG}`,
+        # `${VERSION}`, `${DOCKER_AMD64_DIGEST}`, and
+        # `${DOCKER_ARM64_DIGEST}` placeholders. `envsubst`
+        # substitutes only those four variables (not the entire env,
+        # which could accidentally interpolate `$auto` strings from
+        # elsewhere). The auto-changelog comes from the GitHub
+        # `generate-notes` API and is appended below the install block.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKER_AMD64_DIGEST: ${{ needs.docker.outputs.digest_amd64 }}
+          DOCKER_ARM64_DIGEST: ${{ needs.docker.outputs.digest_arm64 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -714,7 +805,7 @@ jobs:
           export TAG="${tag}" VERSION="${version}"
 
           # Install section.
-          envsubst '${TAG} ${VERSION}' \
+          envsubst '${TAG} ${VERSION} ${DOCKER_AMD64_DIGEST} ${DOCKER_ARM64_DIGEST}' \
               < .github/RELEASE_NOTES_TEMPLATE.md \
               > dist/RELEASE_NOTES.md
 
