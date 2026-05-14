@@ -19,6 +19,21 @@ depends=('zstd' 'gcc-libs')
 makedepends=('rust' 'cargo' 'pkgconf')
 provides=("peel=${pkgver}")
 conflicts=('peel-bin')
+# Opt out of makepkg's global LTO. Arch's default `/etc/makepkg.conf`
+# enables `lto` in `OPTIONS`, which appends `-flto=auto` to `CFLAGS`.
+# ring 0.17.14's build.rs uses cc-rs to compile its C/asm source for
+# `libring_core_0_17_14.a`, and cc-rs picks up `CFLAGS` from the
+# environment. With `-flto=auto` set, the resulting archive members
+# are LLVM LTO bitcode rather than regular ELF objects. The final
+# Rust link step is *not* doing whole-program LTO (the binary is
+# linked normally), so the linker treats those bitcode objects as
+# opaque and every ring C symbol — `ring_core_0_17_14__*` — comes
+# back undefined. Fedora / Debian / Alpine / the Docker image don't
+# hit this because their build environments don't push `-flto` into
+# `CFLAGS` by default. `!lto` strips the flag from `CFLAGS` /
+# `CXXFLAGS` / `LDFLAGS` for this package without touching the rest
+# of `/etc/makepkg.conf`.
+options=('!lto')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")
 # Replace 'SKIP' with the actual sha256 once the v${pkgver} release
 # tag exists upstream. The GitHub-released `SHA256SUMS` file in the
