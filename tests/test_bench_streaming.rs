@@ -227,6 +227,40 @@ fn encode_gzip_multi_member(payload: &[u8], n_members: usize) -> Vec<u8> {
 /// also decodes. Re-implemented here (rather than depending on a
 /// frame-format encoder crate) to keep the benchmark independent of
 /// dev-dep choices made elsewhere.
+/// Single-stream bzip2 blob via the system `bzip2 -c -9` CLI. peel
+/// does not link `libbz2` and the project does not ship a bzip2
+/// crate — the decoder is hand-rolled in
+/// `crate::decode::bzip2_native` (`internal/PLAN_bz2_support.md`),
+/// and the bench harness shells out for fixture generation only.
+///
+/// Stdin is fed from a background thread so the parent can drain
+/// stdout concurrently — otherwise the pipe buffers (typically
+/// 64 KiB each) deadlock on payloads larger than ~32 KiB worth of
+/// compressed output.
+fn encode_bzip2(payload: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    let mut child = Command::new("bzip2")
+        .arg("-c")
+        .arg("-9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn bzip2");
+    let mut stdin = child.stdin.take().expect("bzip2 stdin");
+    let payload_clone: Vec<u8> = payload.to_vec();
+    let writer = thread::spawn(move || {
+        stdin.write_all(&payload_clone).expect("write bzip2 stdin");
+        drop(stdin);
+    });
+    let out = child.wait_with_output().expect("wait bzip2");
+    writer.join().expect("bzip2 stdin writer");
+    assert!(out.status.success(), "bzip2 -c -9 failed: {:?}", out.status);
+    out.stdout
+}
+
 fn encode_lz4_uncompressed_frame(payload: &[u8]) -> Vec<u8> {
     const PRIME32_1: u32 = 0x9E37_79B1;
     const PRIME32_2: u32 = 0x85EB_CA77;
@@ -1680,6 +1714,32 @@ fn bench_throttled_realistic_grid() {
             ));
         }
 
+        // ---- tar.bz2 (single-stream, bzip2 -9 default) ----------------
+        // The pure-Rust decoder lives in
+        // `crate::decode::bzip2_native` (`internal/PLAN_bz2_support.md`).
+        // Encoder side shells out to the system `bzip2 -c -9` because
+        // the project does not ship a bzip2 crate (decoder-only design);
+        // the baseline pipe `bzip2 -d` is single-threaded, matching
+        // peel's per-block decoder cadence.
+        if tool_present("tar") && tool_present("bzip2") {
+            let body = encode_bzip2(&archive);
+            cells.push(measure_throttled_case(
+                rate,
+                "tar.bz2",
+                "curl|bzip2|tar",
+                &body,
+                &entries,
+                "bundle.tar.bz2",
+                |dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} "$URL" | bzip2 -d -q | tar -xf - -C {dir}"#,
+                        limit = rate.bytes_per_sec,
+                        dir = shell_quote(dir),
+                    )
+                },
+            ));
+        }
+
         emit_column("net", rate, mib, &cells);
     }
 }
@@ -2202,6 +2262,27 @@ fn bench_throttled_download_then_extract_grid() {
                 |file, dir| {
                     format!(
                         r#"curl -sS --limit-rate {limit} -o {file} "$URL" && lz4 -dc -q {file} | tar -xf - -C {dir} && rm {file}"#,
+                        limit = rate.bytes_per_sec,
+                        file = shell_quote(file),
+                        dir = shell_quote(dir),
+                    )
+                },
+            ));
+        }
+
+        // ---- tar.bz2 (single-stream, bzip2 -9 default) ----------------
+        if tool_present("tar") && tool_present("bzip2") {
+            let body = encode_bzip2(&archive);
+            cells.push(measure_throttled_dnx_case(
+                rate,
+                "tar.bz2",
+                "curl+bzip2+tar",
+                &body,
+                &entries,
+                "bundle.tar.bz2",
+                |file, dir| {
+                    format!(
+                        r#"curl -sS --limit-rate {limit} -o {file} "$URL" && bzip2 -dc -q {file} | tar -xf - -C {dir} && rm {file}"#,
                         limit = rate.bytes_per_sec,
                         file = shell_quote(file),
                         dir = shell_quote(dir),

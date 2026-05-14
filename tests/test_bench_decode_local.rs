@@ -262,6 +262,38 @@ fn encode_gzip(payload: &[u8]) -> Vec<u8> {
     encoder.finish().expect("finish gzip")
 }
 
+/// Single-stream bzip2 blob via the system `bzip2 -c -9` CLI. peel
+/// does not link `libbz2` and the project does not ship a bzip2
+/// crate — the decoder is hand-rolled in
+/// `crate::decode::bzip2_native` (`internal/PLAN_bz2_support.md`),
+/// and the bench harness shells out for fixture generation. Stdin
+/// is fed from a background thread so the parent can drain stdout
+/// concurrently; otherwise the kernel pipe buffers deadlock on any
+/// payload bigger than the buffer-pair (~128 KiB).
+fn encode_bzip2(payload: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    let mut child = Command::new("bzip2")
+        .arg("-c")
+        .arg("-9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn bzip2");
+    let mut stdin = child.stdin.take().expect("bzip2 stdin");
+    let payload_clone: Vec<u8> = payload.to_vec();
+    let writer = thread::spawn(move || {
+        stdin.write_all(&payload_clone).expect("write bzip2 stdin");
+        drop(stdin);
+    });
+    let out = child.wait_with_output().expect("wait bzip2");
+    writer.join().expect("bzip2 stdin writer");
+    assert!(out.status.success(), "bzip2 -c -9 failed: {:?}", out.status);
+    out.stdout
+}
+
 /// Single-frame, single-block, *uncompressed* LZ4 archive. Same
 /// shape produced by the streaming bench; both `peel::decode::lz4`
 /// and `lz4 -d` accept it. The wire-size matches the raw payload so
@@ -724,6 +756,24 @@ fn formats() -> Vec<FormatSpec> {
             ref_tools: "lz4|tar".into(),
             ref_required: vec!["lz4".into(), "tar".into()],
             ref_pipeline: r#"lz4 -dc -q "$SRC" | tar -xf - -C "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "bz2-raw",
+            shape: Shape::Raw,
+            ext: "bz2",
+            encode: Box::new(|i| encode_bzip2(i.raw_payload)),
+            ref_tools: "bzip2".into(),
+            ref_required: vec!["bzip2".into()],
+            ref_pipeline: r#"bzip2 -dc -q "$SRC" > "$DST""#.into(),
+        },
+        FormatSpec {
+            label: "tar.bz2",
+            shape: Shape::Tar,
+            ext: "tar.bz2",
+            encode: Box::new(|i| encode_bzip2(i.tar_archive)),
+            ref_tools: "bzip2|tar".into(),
+            ref_required: vec!["bzip2".into(), "tar".into()],
+            ref_pipeline: r#"bzip2 -dc -q "$SRC" | tar -xf - -C "$DST""#.into(),
         },
         FormatSpec {
             label: "tar",

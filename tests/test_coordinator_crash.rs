@@ -2630,6 +2630,7 @@ fn random_kill_points_resume_multi_member_tar_gz_byte_identical() {
 fn encode_bzip2_via_cli(payload: &[u8], level: u8) -> Vec<u8> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
+    use std::thread;
     assert!((1..=9).contains(&level), "bzip2 level out of range");
     let level_flag = format!("-{level}");
     let mut child = Command::new("bzip2")
@@ -2640,11 +2641,17 @@ fn encode_bzip2_via_cli(payload: &[u8], level: u8) -> Vec<u8> {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn bzip2 (CI must have bzip2 on PATH)");
-    {
-        let stdin = child.stdin.as_mut().expect("bzip2 stdin");
-        stdin.write_all(payload).expect("write bzip2 stdin");
-    }
+    // Write stdin from a thread so the parent can drain stdout
+    // concurrently — otherwise the kernel's ~64 KiB pipe buffers
+    // deadlock on any non-trivial payload.
+    let mut stdin = child.stdin.take().expect("bzip2 stdin");
+    let payload_clone: Vec<u8> = payload.to_vec();
+    let writer = thread::spawn(move || {
+        stdin.write_all(&payload_clone).expect("write bzip2 stdin");
+        drop(stdin);
+    });
     let out = child.wait_with_output().expect("wait bzip2");
+    writer.join().expect("bzip2 stdin writer");
     assert!(out.status.success(), "bzip2 -c failed: {:?}", out.status);
     out.stdout
 }
