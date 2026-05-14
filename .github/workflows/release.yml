@@ -694,6 +694,42 @@ jobs:
           ( cd dist && find . -maxdepth 1 -name '*.sha256' ! -name 'SHA256SUMS' \
               | sort | xargs cat > SHA256SUMS )
 
+      - name: Build release notes
+        # Per-OS install instructions live in
+        # `.github/RELEASE_NOTES_TEMPLATE.md` with `${TAG}` /
+        # `${VERSION}` placeholders. `envsubst` substitutes only those
+        # two variables (not the entire env, which could accidentally
+        # interpolate `$auto` strings from elsewhere). The auto-changelog
+        # comes from the GitHub `generate-notes` API and is appended
+        # below the install block — same content `--generate-notes`
+        # would produce, but we can't use that flag because we want to
+        # prepend our own copy.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${tag#v}"
+          export TAG="${tag}" VERSION="${version}"
+
+          # Install section.
+          envsubst '${TAG} ${VERSION}' \
+              < .github/RELEASE_NOTES_TEMPLATE.md \
+              > dist/RELEASE_NOTES.md
+
+          # Auto-changelog. The `generate-notes` API needs at least one
+          # prior release to compute a diff against; on a first-ever
+          # tag the body is empty, which is fine — the install
+          # section still stands on its own.
+          gh api -X POST \
+              "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${tag}" \
+              --jq .body \
+              >> dist/RELEASE_NOTES.md \
+              || echo "(generate-notes API returned no body; skipping changelog append)" \
+              >> dist/RELEASE_NOTES.md
+
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -731,13 +767,17 @@ jobs:
             dist/SHA256SUMS
           )
 
+          # `--notes-file` instead of `--generate-notes`: we built the
+          # notes ourselves so we could prepend per-OS install
+          # instructions to the auto-generated changelog.
           if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release edit "${tag}" --notes-file dist/RELEASE_NOTES.md
             gh release upload "${tag}" "${assets[@]}" --clobber
           else
             gh release create "${tag}" \
               --title "${tag}" \
               --verify-tag \
-              --generate-notes \
+              --notes-file dist/RELEASE_NOTES.md \
               ${prerelease_flag} \
               "${assets[@]}"
           fi
