@@ -78,6 +78,16 @@ bzip2 = []
 zip = ["gzip", "zstd"]
 sevenz = ["gzip", "xz"]
 rar = []
+# Link against the distro's `libzstd.so` instead of vendoring and
+# statically linking the C source via `zstd-sys`. Off by default
+# (the crates.io release / GitHub-released binaries / `cargo install
+# peel-rs` all stay self-contained), on for distro builds where
+# security updates to libzstd should flow without rebuilding peel.
+# Weak feature reference (`zstd?/`) means this is a no-op if `zstd`
+# is also disabled — `cargo build --no-default-features --features
+# system-libs` won't fail trying to find libzstd. See
+# `internal/PLAN_packaging.md` §0.4 for the rationale.
+system-libs = ["zstd?/pkg-config"]
 
 [dependencies]
 thiserror = "2"
