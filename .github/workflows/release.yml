@@ -298,7 +298,14 @@ jobs:
           vendored=$(find vendor-artifact -name 'peel-*-vendored.tar.gz' | head -1)
           test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
           cp "${vendored}" "/github/home/rpmbuild/SOURCES/peel-${tag}-vendored.tar.gz"
+          # Patch the spec's `Version:` to the tag's version. The
+          # committed `peel.spec` carries whatever the last release
+          # was (so manual local builds work); CI overrides at build
+          # time so we don't have to bump three packaging files for
+          # every tag.
           cp packaging/fedora/peel.spec /github/home/rpmbuild/SPECS/peel.spec
+          sed -i "s/^Version:.*/Version:        ${ver}/" \
+              /github/home/rpmbuild/SPECS/peel.spec
 
       - name: Build RPMs
         # `--nocheck` skips the spec's `%check` step (cargo test) —
@@ -414,6 +421,12 @@ jobs:
           test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
           tar -xzf "${vendored}" -C "${work}/peel-${ver}" --strip-components=1
           cp -r packaging/debian "${work}/peel-${ver}/debian"
+          # Patch the changelog's top-line version to match the tag.
+          # `peel (<oldver>-1) ...` → `peel (<newver>-1) ...`.
+          # dpkg-buildpackage takes the version from this line; the
+          # rest of the changelog body is left alone.
+          sed -i "1 s/peel ([^)]*)/peel (${ver}-1)/" \
+              "${work}/peel-${ver}/debian/changelog"
           ( cd "${work}" && tar --exclude="peel-${ver}/debian" \
               -czf "peel_${ver}.orig.tar.gz" "peel-${ver}/" )
           cd "${work}/peel-${ver}"
@@ -523,6 +536,11 @@ jobs:
           SHA1=$(sha512sum "staging/distfiles/peel-${ver}.tar.gz" | awk '{print $1}')
           SHA2=$(sha512sum "staging/distfiles/peel-v${ver}-vendored.tar.gz" | awk '{print $1}')
           cp packaging/alpine/APKBUILD staging/APKBUILD
+          # Patch APKBUILD's pkgver to match the tag. The committed
+          # APKBUILD carries the last release's pkgver; CI overrides
+          # at build time so we don't bump three packaging files per
+          # release.
+          sed -i "s/^pkgver=.*/pkgver=${ver}/" staging/APKBUILD
           python3 - "${SHA1}" "${SHA2}" "${ver}" <<'PY'
           import re, sys
           sha1, sha2, ver = sys.argv[1:]
@@ -647,6 +665,12 @@ jobs:
           ver="${tag#v}"
           mkdir -p /home/builder/build
           cp packaging/aur/peel/PKGBUILD /home/builder/build/PKGBUILD
+          # Patch PKGBUILD's pkgver to match the tag. Same pattern as
+          # the fedora/alpine jobs above: the committed PKGBUILD
+          # carries the last release's pkgver for manual local builds;
+          # CI overrides at tag-time so we don't bump three packaging
+          # files per release.
+          sed -i "s/^pkgver=.*/pkgver=${ver}/" /home/builder/build/PKGBUILD
           # `actions/checkout@v4` falls back to a tarball download
           # when the container doesn't ship git (archlinux:latest's
           # base image doesn't), leaving no `.git/`. Build the
