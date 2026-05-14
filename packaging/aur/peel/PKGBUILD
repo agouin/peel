@@ -36,19 +36,6 @@ build() {
     cd "${pkgname}-${pkgver}"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
-    # Force the bfd linker. Arch's `rust` package drives the linker
-    # via `-fuse-ld=lld` by default; combined with `-Wl,--gc-sections`
-    # (a Rust release-profile default) and ring 0.17.14's
-    # split-archive layout (Rust rlib references C/asm symbols that
-    # live in a separate `libring_core_0_17_14.a` from ring's
-    # build.rs), lld fails to pull in the static archive's members
-    # and emits `undefined symbol: ring_core_0_17_*` errors. bfd
-    # resolves the same archive correctly — Fedora / Debian / the
-    # Docker image all use bfd by default and don't hit this. bfd
-    # is provided by `binutils`, which is part of `base-devel` and
-    # therefore always present in the Arch build environment.
-    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=bfd"
-    export RUSTFLAGS
     # `system-libs` forwards zstd-sys to pkg-config so we link against
     # the distro's libzstd.so instead of vendoring the C source — Arch
     # convention prefers shared linkage so security updates flow.
@@ -64,10 +51,6 @@ build() {
 check() {
     cd "${pkgname}-${pkgver}"
     export RUSTUP_TOOLCHAIN=stable
-    # Same bfd-linker rationale as build() — local `makepkg` runs
-    # check() by default and would hit the ring link error otherwise.
-    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=bfd"
-    export RUSTFLAGS
     cargo test --frozen --release --features system-libs
 }
 

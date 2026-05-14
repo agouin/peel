@@ -655,13 +655,39 @@ jobs:
         # with passwordless sudo so the build can pacman-install
         # makedepends. base-devel includes the standard PKGBUILD
         # toolchain (fakeroot, sudo, etc.).
+        #
+        # Rust is installed via rustup, not pacman, even though
+        # `pacman -S rust` would be the obvious choice for an Arch
+        # container. Arch's `rust` package (1.95.0 as of this writing,
+        # same nominal version as upstream) produces a build where
+        # ring 0.17.14's build.rs runs and emits
+        # `cargo:rustc-link-search=native=$OUT_DIR` (the `-L` for the
+        # ring build dir shows up on the link line) but the matching
+        # `cargo:rustc-link-lib=static=ring_core_0_17_14` is dropped
+        # somewhere in cargo's dep-graph propagation, so the final
+        # linker invocation never sees `-lring_core_0_17_14` and every
+        # ring C/asm symbol comes back undefined at link time. The
+        # Fedora job has used rustup-installed 1.95.0 since the
+        # packaging matrix landed and has never hit this; switching
+        # the Arch job to the same rustup-managed toolchain brings
+        # the two jobs into the same configuration that's known to
+        # work.
         shell: bash
         run: |
           set -ex
           pacman -Syu --noconfirm --noprogressbar \
-              base-devel rust cargo zstd pkgconf git > /dev/null
+              base-devel zstd pkgconf git curl > /dev/null
           useradd -m -G wheel builder
           echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          # Install rustup-managed 1.95.0 into the builder user's home
+          # so it owns the toolchain (rustup writes to ~/.rustup and
+          # ~/.cargo). `--no-modify-path` keeps the system PATH clean;
+          # the build step sources `~/.cargo/env` explicitly.
+          su builder -c '
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.95.0 --profile minimal \
+                  --no-modify-path > /dev/null 2>&1
+          '
 
       - name: Stage sources + patch PKGBUILD
         # Drop the upstream-source archive into the build dir at the
@@ -681,6 +707,15 @@ jobs:
           # CI overrides at tag-time so we don't bump three packaging
           # files per release.
           sed -i "s/^pkgver=.*/pkgver=${ver}/" /home/builder/build/PKGBUILD
+          # Strip the PKGBUILD's `export RUSTUP_TOOLCHAIN=stable` lines.
+          # The CI container has rustup pinned to 1.95.0 (matching
+          # `rust-toolchain.toml` and the Fedora job); leaving `stable`
+          # set would override that and trigger a redundant toolchain
+          # download (and could pick up a newer stable that breaks
+          # against the pinned MSRV). AUR end users keep the original
+          # behavior because the committed PKGBUILD is untouched.
+          sed -i '/^[[:space:]]*export RUSTUP_TOOLCHAIN=stable$/d' \
+              /home/builder/build/PKGBUILD
           # `actions/checkout@v4` falls back to a tarball download
           # when the container doesn't ship git (archlinux:latest's
           # base image doesn't), leaving no `.git/`. Build the
@@ -707,13 +742,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # `--syncdeps` installs missing makedepends, `--rmdeps`
-          # removes them after the build, `--nocheck` skips the
-          # PKGBUILD's `check()` (cargo test) for the same reason
-          # the Fedora and Alpine builds skip theirs.
-          su builder -c '
+          # `--nodeps` because we pre-installed every makedepend in the
+          # previous step (rust + cargo via rustup into the builder
+          # user's home, the rest via pacman). `--syncdeps`/`--rmdeps`
+          # would re-trigger a pacman install of Arch's `rust`/`cargo`
+          # — and a re-removal — which is exactly the toolchain we're
+          # avoiding here. `--nocheck` skips the PKGBUILD's `check()`
+          # (cargo test) for the same reason the Fedora and Alpine
+          # builds skip theirs.
+          su - builder -c '
+            source ~/.cargo/env &&
             cd /home/builder/build &&
-            makepkg --noconfirm --syncdeps --rmdeps --nocheck
+            makepkg --noconfirm --nodeps --nocheck
           '
 
       - name: Stage outputs
