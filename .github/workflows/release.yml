@@ -591,6 +591,16 @@ jobs:
                 cp /staging/APKBUILD /tmp/build/
                 chown -R builder:builder /tmp/build
 
+                # `REPODEST` lives on the bind-mount, created on the host
+                # as the runner UID. The Alpine `builder` is a system
+                # user (`adduser -S`) with a low UID that does not match
+                # the host runner, so abuild`s `mkdir $REPODEST/.../tmp`
+                # fails with EACCES. Reassign ownership inside the
+                # container before su; the bind-mount makes this visible
+                # on the host too, which is fine — the next step reads
+                # the apks back out as root.
+                chown -R builder:builder /staging/packages
+
                 su builder -s /bin/sh -c "
                   cd /tmp/build &&
                   REPODEST=/staging/packages abuild -r -F
