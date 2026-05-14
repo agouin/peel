@@ -40,7 +40,7 @@ peel https://example.com/installer.bin
 ## Why you want this
 
 **Local workstations.** Pulling a 40 GB `.tar.zst` dataset shouldn't
-require 80 GB free. With `peel`, peak disk usage is roughly
+require > 80 GB free. With `peel`, peak disk usage is roughly
 `extracted_size + a few hundred MB` — not `compressed_size +
 extracted_size`.
 
