@@ -76,6 +76,7 @@ fn realistic_tar_checkpoint() -> Checkpoint {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     }
 }
 
@@ -323,9 +324,36 @@ fn round_trip_raw_sink_state() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     ckpt.write(&path).expect("write");
 
     let parsed = Checkpoint::read(&path).expect("read").expect("present");
     assert_eq!(parsed, ckpt);
+}
+
+/// v15 round-trip: a non-zero `cumulative_elapsed` survives a
+/// write-then-read cycle and the on-disk header advertises v15
+/// so older binaries refuse cleanly. ZERO-valued checkpoints
+/// keep the v8..=v14 byte-identical shape — verified in the
+/// unit test `default_mode_writes_pre_v12_format_byte_identical`
+/// next to the implementation.
+#[test]
+fn cumulative_elapsed_round_trip_via_disk() {
+    let path = unique_temp("v15-cumulative-elapsed");
+    let _g = CleanupOnDrop(path.clone());
+
+    let mut original = realistic_tar_checkpoint();
+    original.cumulative_elapsed = Duration::new(3_725, 250_000_000);
+    original.write(&path).expect("write");
+
+    let parsed = Checkpoint::read(&path).expect("read").expect("present");
+    assert_eq!(parsed, original);
+    assert_eq!(parsed.cumulative_elapsed, Duration::new(3_725, 250_000_000),);
+
+    // Sanity: the on-disk header advertises v15 when the trailer
+    // is populated.
+    let raw = fs::read(&path).expect("re-read raw bytes");
+    let format_version = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    assert_eq!(format_version, FORMAT_VERSION);
 }

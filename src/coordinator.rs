@@ -567,7 +567,16 @@ pub struct RunStats {
     pub download: DownloadStats,
     /// Aggregated extraction statistics.
     pub extraction: ExtractionStats,
-    /// Wall-clock time spent inside [`run`].
+    /// Wall-clock time accumulated across every run that
+    /// contributed to this operation. Fresh runs report
+    /// `started.elapsed()`; resumed runs report `prior_elapsed +
+    /// started.elapsed()`, where `prior_elapsed` is sourced from
+    /// the checkpoint's v15 `cumulative_elapsed` trailer. The
+    /// `[done]` line in `peel` renders this with [`format_eta`]
+    /// so a long-running operation killed and resumed many times
+    /// still reports a coherent "total time to complete."
+    ///
+    /// [`format_eta`]: crate::progress::format_eta
     pub elapsed: Duration,
 }
 
@@ -1051,6 +1060,14 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     }
 
     let prior = Checkpoint::read(&ckpt_path).map_err(CoordinatorError::Checkpoint)?;
+    // Wall-clock time accumulated by prior runs that contributed
+    // to this checkpoint. Seeds the v15 `cumulative_elapsed`
+    // trailer so the final `[done]` line reports total time
+    // across crash-resumes rather than just the last attempt.
+    let prior_elapsed = prior
+        .as_ref()
+        .map(|p| p.cumulative_elapsed)
+        .unwrap_or_default();
     if prior.is_some() {
         // A checkpoint exists — refuse to silently fall back to a
         // fresh-zero part file. `open_sparse` would otherwise CREAT
@@ -1529,6 +1546,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     progress.as_mut(),
                     progress_state.as_ref(),
                     kill_switch.as_ref(),
+                    prior_elapsed,
+                    started,
                 )?
             } else if is_rar {
                 #[cfg(feature = "rar")]
@@ -1558,6 +1577,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                         progress.as_mut(),
                         progress_state.as_ref(),
                         kill_switch.as_ref(),
+                        prior_elapsed,
+                        started,
                     )?
                 }
                 #[cfg(not(feature = "rar"))]
@@ -1588,6 +1609,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     &config,
                     progress_state.as_ref(),
                     kill_switch.as_ref(),
+                    prior_elapsed,
+                    started,
                 )?
             } else {
                 // Resolve the integrity-tracking hasher (if any) up
@@ -1792,6 +1815,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
+                            prior_elapsed,
+                            started,
                         )
                     }
                     OutputTarget::Dir(path) => {
@@ -1813,6 +1838,8 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                             progress.as_mut(),
                             kill_switch.as_ref(),
                             hasher_handle.as_ref(),
+                            prior_elapsed,
+                            started,
                         )
                     }
                 };
@@ -1992,7 +2019,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         resume_used_decoder_state: extraction_outcome.used_decoder_state,
         download: extraction_outcome.download.clone(),
         extraction: extraction_outcome.extraction,
-        elapsed: started.elapsed(),
+        elapsed: prior_elapsed.saturating_add(started.elapsed()),
     };
 
     if let Some(cb) = progress.as_mut() {
@@ -2436,6 +2463,8 @@ fn run_one<S: Sink>(
     progress: Option<&mut ProgressFn>,
     kill_switch: Option<&Arc<AtomicBool>>,
     hasher_for_ckpt: Option<&crate::hash::SharedHasher>,
+    prior_elapsed: Duration,
+    started: Instant,
 ) -> Result<ExtractionStats, CoordinatorError> {
     let mut progress_inner = progress;
     let mut checkpoints_written: u64 = 0;
@@ -2521,6 +2550,7 @@ fn run_one<S: Sink>(
                 decoder_state: None,
                 mode: current_mode,
                 source_mtime: None,
+                cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
             };
             let prep_time = serialize_prep_start.elapsed();
             let mut decstate_time = Duration::ZERO;
@@ -2639,6 +2669,8 @@ fn run_zip(
     mut progress: Option<&mut ProgressFn>,
     progress_state: Option<&Arc<ProgressState>>,
     kill_switch: Option<&Arc<AtomicBool>>,
+    prior_elapsed: Duration,
+    started: Instant,
 ) -> Result<ExtractionStats, CoordinatorError> {
     fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
         path: output_dir.to_path_buf(),
@@ -2821,6 +2853,7 @@ fn run_zip(
                     decoder_state: None,
                     mode: current_run_mode(config),
                     source_mtime: None,
+                    cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
                 };
                 let prep_time = serialize_prep_start.elapsed();
                 let write_timings = ckpt
@@ -2941,6 +2974,7 @@ fn run_zip(
                     decoder_state: None,
                     mode: current_run_mode(config),
                     source_mtime: None,
+                    cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
                 };
                 let prep_time = serialize_prep_start.elapsed();
                 let write_timings = ckpt
@@ -3045,6 +3079,8 @@ fn run_rar(
     mut progress: Option<&mut ProgressFn>,
     progress_state: Option<&Arc<ProgressState>>,
     kill_switch: Option<&Arc<AtomicBool>>,
+    prior_elapsed: Duration,
+    started: Instant,
 ) -> Result<ExtractionStats, CoordinatorError> {
     use crate::download::rar_pipeline::{
         RarPipeline, RarPipelineConfig, RarPipelineError, RarPipelineEvent, RarResumeState,
@@ -3182,6 +3218,7 @@ fn run_rar(
             decoder_state: None,
             mode: current_run_mode(config),
             source_mtime: None,
+            cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
         };
         let prep_time = serialize_prep_start.elapsed();
         let write_timings = ckpt
@@ -3386,6 +3423,8 @@ fn run_sevenz(
     // on-disk-but-not-yet-extracted footprint.
     progress_state: Option<&Arc<ProgressState>>,
     kill_switch: Option<&Arc<AtomicBool>>,
+    prior_elapsed: Duration,
+    started: Instant,
 ) -> Result<ExtractionStats, CoordinatorError> {
     fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
         path: output_dir.to_path_buf(),
@@ -3523,6 +3562,7 @@ fn run_sevenz(
                     decoder_state: None,
                     mode: current_run_mode(config),
                     source_mtime: None,
+                    cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
                 };
                 ckpt.write_timed(ckpt_path)
                     .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
@@ -5012,6 +5052,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 

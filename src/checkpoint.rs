@@ -98,6 +98,7 @@
 //!     decoder_state: None,
 //!     mode: RunMode::Extract,
 //!     source_mtime: None,
+//!     cumulative_elapsed: std::time::Duration::ZERO,
 //! };
 //! ckpt.write(std::path::Path::new("/tmp/peel-demo.ckpt"))?;
 //! # Ok::<(), peel::checkpoint::CheckpointError>(())
@@ -229,7 +230,21 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 /// with every part's `volume_role` defaulting to `None`. Older
 /// binaries refuse v14 files with
 /// [`CheckpointError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 14;
+///
+/// **v15** — appends an optional [`Checkpoint::cumulative_elapsed`]
+/// trailer carrying the total wall-clock time spent on the
+/// operation across every run that has contributed to this
+/// checkpoint. The coordinator seeds the value from the prior
+/// checkpoint on resume and snapshots `prior + (now - run_start)`
+/// at every write so a crash-loop accumulates monotonically. v15
+/// readers parse v1..=v14 files transparently with the value
+/// defaulting to [`Duration::ZERO`]. The writer only bumps the
+/// on-disk version to 15 when the value is non-zero, so existing
+/// byte-identical regression tests (sample checkpoints constructed
+/// with `Duration::ZERO`) keep their v8..=v14 layouts. Older
+/// binaries refuse v15 files with
+/// [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 15;
 
 /// Pre-§F1 max format version, written when no SinkState payload
 /// uses v11-only fields. Keeping the on-disk version dynamic
@@ -238,6 +253,13 @@ pub const FORMAT_VERSION: u32 = 14;
 /// (whose checkpoint sidecar size is observed indirectly via
 /// kill-switch timing) stable across the §F1 transition.
 const FORMAT_VERSION_RAR_STORED_ONLY: u32 = 10;
+
+/// `internal/PLAN_rar5_decoder.md` §F1: format version the writer
+/// upgrades to when [`SinkState::Rar::current_entry_decoder_state`]
+/// is populated. The reader dispatches on `format_version >= 11`
+/// to know whether the per-entry decoder-state presence byte is
+/// present in the body.
+const FORMAT_VERSION_RAR_F1: u32 = 11;
 
 /// `internal/PLAN_download_modes.md` §5: format version the writer
 /// upgrades to when [`Checkpoint::mode`] is anything other than
@@ -261,6 +283,14 @@ const FORMAT_VERSION_LOCAL_DESTRUCTIVE: u32 = 13;
 /// keep writing v8..=v13 layouts byte-identically so the existing
 /// resume tests do not see a sidecar-size drift on the bump.
 const FORMAT_VERSION_MULTIVOLUME: u32 = 14;
+
+/// Format version the writer upgrades to when
+/// [`Checkpoint::cumulative_elapsed`] is non-zero. The 12-byte
+/// trailer (i64 secs + u32 nanos) is appended unconditionally at
+/// v15, so the read path is "read trailer iff `format_version >=
+/// 15 && cursor.remaining() > 0`". Zero-valued checkpoints keep
+/// writing the v8..=v14 layout byte-identically.
+const FORMAT_VERSION_CUMULATIVE_ELAPSED: u32 = 15;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -1038,6 +1068,22 @@ pub struct Checkpoint {
     /// [`CheckpointError::SourceMismatch`] before any decoder
     /// state restores from a stale blob.
     pub source_mtime: Option<SystemTime>,
+
+    /// Total wall-clock time spent on this operation, accumulated
+    /// across every run that has written to this checkpoint. The
+    /// coordinator seeds this from the prior checkpoint on resume
+    /// (or [`Duration::ZERO`] for a fresh run) and writes
+    /// `prior + (now - run_start)` at every observer-driven
+    /// checkpoint, so a long-running operation killed and resumed
+    /// many times still reports a coherent "total time to
+    /// complete" in the final `[done]` line.
+    ///
+    /// Added in checkpoint format v15. Pre-v15 readers default to
+    /// [`Duration::ZERO`] (the value is also written as
+    /// byte-identical-with-v14 when zero, so sample checkpoints
+    /// and tests that don't care about wall-clock keep their
+    /// existing on-disk shape).
+    pub cumulative_elapsed: Duration,
 }
 
 /// Maximum body length [`Checkpoint::deserialize`] will trust before
@@ -1123,16 +1169,20 @@ impl Checkpoint {
         } else {
             &self.parts
         };
-        // v14: write a per-part volume_role trailer when at least
-        // one part carries a role. Writing it uniformly across
-        // every part (rather than only the populated ones) keeps
-        // the read loop's shape fixed: at v14 the reader always
-        // expects exactly one presence byte per part. When every
-        // part is `None` the writer falls back to the v13 layout
-        // byte-identically so multi-URL and single-source
-        // checkpoints written by v14 binaries decode under v8..=v13
-        // readers and produce identical bytes to a v13 writer.
-        let any_volume_role = parts_ref.iter().any(|p| p.volume_role.is_some());
+        // v14: write a per-part volume_role trailer when the
+        // on-disk version is v14 or higher. Writing it uniformly
+        // across every part (rather than only the populated ones)
+        // keeps the read loop's shape fixed: at v14 the reader
+        // always expects exactly one presence byte per part. The
+        // trailer fires whenever `required_format_version() >=
+        // 14`, which covers both "at least one part has Some(role)"
+        // (the original v14 trigger) AND "a later trailer like v15
+        // `cumulative_elapsed` has bumped the on-disk version past
+        // 14." When every part is `None` AND the on-disk version
+        // is below v14, the writer falls back to the v8..=v13
+        // layout byte-identically.
+        let on_disk_version = self.required_format_version();
+        let write_volume_role_trailer = on_disk_version >= FORMAT_VERSION_MULTIVOLUME;
         let parts_count = u32::try_from(parts_ref.len()).unwrap_or(u32::MAX);
         write_u32(&mut body, parts_count);
         for part in parts_ref.iter().take(parts_count as usize) {
@@ -1147,7 +1197,7 @@ impl Checkpoint {
                 }
                 None => body.push(0),
             }
-            if any_volume_role {
+            if write_volume_role_trailer {
                 match part.volume_role {
                     Some(role) => {
                         body.push(1);
@@ -1265,18 +1315,27 @@ impl Checkpoint {
                 write_u64(&mut body, *current_entry_offset);
                 // v11: optional in-flight decoder state blob.
                 // Skipped entirely (no presence byte) when the
-                // blob is `None` — that keeps STORED-only RAR
+                // blob is `None` AND the on-disk version stays
+                // below v11 — that keeps STORED-only RAR
                 // checkpoints byte-identical to the v10 layout
                 // so older readers parse them transparently and
                 // tight crash-resume tests keyed off checkpoint
-                // sidecar size do not see a drift. The reader
-                // dispatches on `format_version >= 11` to know
-                // whether to expect the trailing byte.
-                if let Some(blob) = current_entry_decoder_state {
-                    body.push(1);
-                    let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
-                    write_u32(&mut body, len);
-                    body.extend_from_slice(&blob[..len as usize]);
+                // sidecar size do not see a drift. As soon as
+                // anything bumps the on-disk version past v10 —
+                // either a populated blob OR a later trailer like
+                // the v15 `cumulative_elapsed` — the presence byte
+                // must be written even for a `None` blob, because
+                // the v11+ reader unconditionally reads it.
+                if on_disk_version >= FORMAT_VERSION_RAR_F1 {
+                    match current_entry_decoder_state {
+                        Some(blob) => {
+                            body.push(1);
+                            let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+                            write_u32(&mut body, len);
+                            body.extend_from_slice(&blob[..len as usize]);
+                        }
+                        None => body.push(0),
+                    }
                 }
             }
         }
@@ -1339,12 +1398,18 @@ impl Checkpoint {
         }
 
         // v12 (`internal/PLAN_download_modes.md` §5): the `mode` tag is
-        // written only when the run is in a non-default mode. The
-        // `required_format_version` rule below upgrades the on-disk
-        // version in lockstep so older readers cleanly reject the
-        // bumped checkpoint instead of misparsing the trailing
-        // tag.
-        if self.mode != RunMode::Extract {
+        // written whenever the on-disk version is v12 or higher.
+        // For a default-mode (`Extract`) checkpoint with no later
+        // trailers (cumulative_elapsed = ZERO, etc.) the
+        // `required_format_version` rule keeps the on-disk version
+        // below v12, so the tag is omitted and the v10/v11
+        // byte-identical layout is preserved. As soon as a later
+        // trailer (e.g. the v15 `cumulative_elapsed`) bumps the
+        // on-disk version past v12, the mode tag MUST be present
+        // because the v12 reader's `remaining() > 0` heuristic
+        // would otherwise interpret the next trailer's first byte
+        // as a mode tag.
+        if on_disk_version >= FORMAT_VERSION_RUN_MODE {
             body.push(self.mode.to_tag());
         }
 
@@ -1364,6 +1429,21 @@ impl Checkpoint {
                 }
                 None => body.push(0),
             }
+        }
+
+        // v15: the `cumulative_elapsed` trailer is written when
+        // (and only when) the value is non-zero. Layout: 8-byte
+        // u64 whole-seconds + 4-byte u32 sub-second nanos. The
+        // `required_format_version` rule above bumps the on-disk
+        // header to 15 in lockstep so older readers cleanly
+        // reject the bumped checkpoint instead of misparsing the
+        // trailing 12 bytes. ZERO-valued checkpoints (sample /
+        // test fixtures and short-lived runs that never crossed a
+        // checkpoint observer) keep the v8..=v14 byte-identical
+        // shape.
+        if self.cumulative_elapsed != Duration::ZERO {
+            write_u64(&mut body, self.cumulative_elapsed.as_secs());
+            write_u32(&mut body, self.cumulative_elapsed.subsec_nanos());
         }
 
         let body_len = body.len() as u64;
@@ -1389,11 +1469,14 @@ impl Checkpoint {
     /// the surrounding fields decide whether v11 is required.
     fn required_format_version(&self) -> u32 {
         // The §F1 SinkState::Rar-with-decoder-state path used to be
-        // the high-water mark (FORMAT_VERSION = 11). §5's RunMode
-        // bump moved FORMAT_VERSION to 12, so the literal here
-        // names v11 explicitly to keep the lower bound stable
-        // (byte-identical writes for the default-mode RAR path).
-        const FORMAT_VERSION_RAR_F1: u32 = 11;
+        // the high-water mark (FORMAT_VERSION = 11). Subsequent
+        // bumps (v12 RunMode, v13 source_mtime, v14 volume_role,
+        // v15 cumulative_elapsed) layer on top. The
+        // `FORMAT_VERSION_RAR_F1` constant is now at module scope
+        // because the serializer's SinkState::Rar arm references it
+        // to decide whether to emit the presence byte (see the
+        // serialize_with comment for why the writer can no longer
+        // skip the byte purely on `decoder_state == None`).
         // v12 (`internal/PLAN_download_modes.md` §5): a non-default
         // `mode` forces v12. v13 (`internal/old/PLAN_local_file_extract.md`
         // §5): a [`RunMode::LocalDestructive`] run forces v13
@@ -1426,7 +1509,19 @@ impl Checkpoint {
         } else {
             0
         };
-        mode_version.max(sink_version).max(parts_version)
+        // v15: a non-zero cumulative_elapsed value requires a v15
+        // trailer so the reader's `format_version >= 15` dispatch
+        // picks up the duration. ZERO keeps the on-disk shape
+        // byte-identical with v14 (no trailer written).
+        let elapsed_version = if self.cumulative_elapsed != Duration::ZERO {
+            FORMAT_VERSION_CUMULATIVE_ELAPSED
+        } else {
+            0
+        };
+        mode_version
+            .max(sink_version)
+            .max(parts_version)
+            .max(elapsed_version)
     }
 
     /// Parse a checkpoint from its on-disk binary representation.
@@ -1955,6 +2050,22 @@ impl Checkpoint {
             None
         };
 
+        // v15: a 12-byte `cumulative_elapsed` trailer (u64 secs +
+        // u32 nanos) is appended when the value is non-zero. The
+        // writer omits it for zero-valued checkpoints (those keep
+        // the v8..=v14 byte-identical shape), so at v15 the
+        // trailer may or may not be present — `remaining() > 0`
+        // is the signal. Pre-v15 readers see no trailer; the
+        // value defaults to ZERO.
+        let cumulative_elapsed =
+            if format_version >= FORMAT_VERSION_CUMULATIVE_ELAPSED && cursor.remaining() > 0 {
+                let secs = cursor.read_u64("cumulative_elapsed.secs")?;
+                let nanos = cursor.read_u32("cumulative_elapsed.nanos")?;
+                Duration::new(secs, nanos)
+            } else {
+                Duration::ZERO
+            };
+
         if cursor.remaining() != 0 {
             return Err(CheckpointError::Truncated {
                 reason: format!(
@@ -1998,6 +2109,7 @@ impl Checkpoint {
             decoder_state,
             mode,
             source_mtime,
+            cumulative_elapsed,
         })
     }
 
@@ -2739,6 +2851,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -2777,6 +2890,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -2832,6 +2946,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -2914,6 +3029,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -2949,7 +3065,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_format_version_is_fourteen() {
+    fn checkpoint_format_version_is_fifteen() {
         // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
         // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
         // work (v6), `internal/PLAN_deflate_block_decoder.md` Phase 9b's
@@ -2964,12 +3080,13 @@ mod tests {
         // `internal/PLAN_download_modes.md` §5's [`RunMode`] tag (v12),
         // `internal/old/PLAN_local_file_extract.md` §5's
         // [`RunMode::LocalDestructive`] + `source_mtime` trailer
-        // (v13), and `internal/PLAN_multivolume_archives.md` §5's
-        // per-`PartRecord` [`VolumeRole`] tag (v14) each bumped
-        // this when an optional trailer landed. If a future change
-        // resets it, this guards against silently dropping the
+        // (v13), `internal/PLAN_multivolume_archives.md` §5's
+        // per-`PartRecord` [`VolumeRole`] tag (v14), and the v15
+        // `cumulative_elapsed` trailer each bumped this when an
+        // optional trailer landed. If a future change resets it,
+        // this guards against silently dropping the
         // upgrade-required signal older readers depend on.
-        assert_eq!(FORMAT_VERSION, 14);
+        assert_eq!(FORMAT_VERSION, 15);
     }
 
     // ---- §5: RunMode round-trip + forward-compat -----------------------
@@ -3000,6 +3117,7 @@ mod tests {
             decoder_state: None,
             mode,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -3085,6 +3203,53 @@ mod tests {
         assert_eq!(parsed.source_mtime, None);
     }
 
+    // ---- v15: cumulative_elapsed round-trip + forward-compat ---------
+
+    #[test]
+    fn zero_cumulative_elapsed_does_not_bump_to_v15() {
+        // Byte-identical guarantee: a ZERO-valued cumulative_elapsed
+        // keeps the v8..=v14 layout so existing regression tests
+        // that observe checkpoint bytes (or sizes) stay stable.
+        let ckpt = sample_raw();
+        assert_eq!(ckpt.cumulative_elapsed, Duration::ZERO);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert!(
+            format_version < FORMAT_VERSION_CUMULATIVE_ELAPSED,
+            "zero cumulative_elapsed should not bump to v{FORMAT_VERSION_CUMULATIVE_ELAPSED}; got v{format_version}",
+        );
+        // And reading it back must round-trip with ZERO.
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.cumulative_elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn nonzero_cumulative_elapsed_bumps_format_version_to_fifteen() {
+        // A populated value forces the v15 header so older binaries
+        // refuse the file cleanly instead of skipping the trailer.
+        let mut ckpt = sample_raw();
+        ckpt.cumulative_elapsed = Duration::from_millis(123_456);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_CUMULATIVE_ELAPSED,
+            "non-zero cumulative_elapsed should write v{FORMAT_VERSION_CUMULATIVE_ELAPSED}, got v{format_version}",
+        );
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.cumulative_elapsed, Duration::from_millis(123_456));
+    }
+
+    #[test]
+    fn cumulative_elapsed_round_trips_subsecond_precision() {
+        // The trailer is u64 secs + u32 nanos; verify both halves
+        // survive a write/read cycle.
+        let mut ckpt = sample_raw();
+        ckpt.cumulative_elapsed = Duration::new(7_200, 987_654_321);
+        let bytes = ckpt.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.cumulative_elapsed, Duration::new(7_200, 987_654_321),);
+    }
+
     // ---- §5: multi-volume VolumeRole round-trip + forward-compat -----
 
     /// Build a multi-part checkpoint whose `parts` carry the
@@ -3121,6 +3286,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -3371,6 +3537,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -3431,6 +3598,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         }
     }
 
@@ -4058,6 +4226,7 @@ mod tests {
             decoder_state: None,
             mode: RunMode::Extract,
             source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
         };
         let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
         assert_eq!(parsed, ckpt);
@@ -4558,6 +4727,19 @@ mod tests {
                 None
             };
 
+            // Half the trials carry a v15 `cumulative_elapsed`
+            // trailer (random duration up to 1 hour, sub-second
+            // precision) to exercise the new field; the other
+            // half leave it at ZERO so v8..=v14 byte-identical
+            // layouts round-trip too.
+            let cumulative_elapsed = if rng.next_bool() {
+                let secs = u64::from(rng.next_u32() % 3600);
+                let nanos = rng.next_u32() % 1_000_000_000;
+                Duration::new(secs, nanos)
+            } else {
+                Duration::ZERO
+            };
+
             let ckpt = Checkpoint {
                 url: url.clone(),
                 etag: etag.clone(),
@@ -4581,6 +4763,7 @@ mod tests {
                 decoder_state,
                 mode: RunMode::Extract,
                 source_mtime: None,
+                cumulative_elapsed,
             };
             let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
             assert_eq!(parsed, ckpt);

@@ -523,6 +523,7 @@ fn cross_mode_resume_no_extract_to_extract_is_rejected() {
         decoder_state: None,
         mode: RunMode::NoExtract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     ckpt.write(&work.join("blob.bin.peel.ckpt"))
         .expect("write ckpt");
@@ -1114,6 +1115,7 @@ fn resume_picks_up_from_existing_checkpoint() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let ckpt_path = work2.join("out.bin.peel.ckpt");
     ckpt.write(&ckpt_path).expect("ckpt write");
@@ -1168,6 +1170,7 @@ fn etag_mismatch_on_resume_aborts_cleanly() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -1223,6 +1226,7 @@ fn url_change_on_resume_aborts_cleanly() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -2121,6 +2125,7 @@ fn sha256_added_on_resume_without_saved_state_errors() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -2185,6 +2190,7 @@ fn sha256_dropped_on_resume_with_saved_state_errors() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let ckpt_path = work.join("out.bin.peel.ckpt");
     let part_path = work.join("out.bin.peel.part");
@@ -2299,6 +2305,7 @@ fn source_drift_on_resume_is_caught_by_probe() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let part_path = work.join("out.bin.peel.part");
     let ckpt_path = work.join("out.bin.peel.ckpt");
@@ -2422,6 +2429,7 @@ fn cursor_chunk_audit_rejects_corrupted_part_file_on_resume() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let part_path = work.join("out.bin.peel.part");
     let ckpt_path = work.join("out.bin.peel.ckpt");
@@ -2540,6 +2548,7 @@ fn cursor_chunk_audit_skips_when_cursor_is_mid_chunk() {
         decoder_state: None,
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: Duration::ZERO,
     };
     let part_path = work.join("out.bin.peel.part");
     let ckpt_path = work.join("out.bin.peel.ckpt");

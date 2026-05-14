@@ -372,6 +372,7 @@ fn local_destructive_resume_rejects_size_drift() {
         decoder_state: None,
         mode: RunMode::LocalDestructive,
         source_mtime: Some(mtime),
+        cumulative_elapsed: std::time::Duration::ZERO,
     };
     ckpt.write(&ckpt_path).expect("write ckpt");
 
@@ -430,6 +431,7 @@ fn local_destructive_resume_rejects_mode_mismatch() {
         // coordinator's resume validator.
         mode: RunMode::Extract,
         source_mtime: None,
+        cumulative_elapsed: std::time::Duration::ZERO,
     };
     ckpt.write(&ckpt_path).expect("write ckpt");
 
@@ -489,6 +491,7 @@ fn local_non_destructive_ignores_stale_ckpt() {
         decoder_state: None,
         mode: RunMode::LocalDestructive,
         source_mtime: None,
+        cumulative_elapsed: std::time::Duration::ZERO,
     };
     ckpt.write(&ckpt_path).expect("write ckpt");
 

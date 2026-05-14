@@ -32,7 +32,7 @@ use peel::coordinator::{run, CoordinatorError, ProgressEvent, ProgressFn, RunArg
 use peel::decode::DecoderRegistry;
 use peel::download::{SchedulerError, WorkerError};
 use peel::encryption::EncryptionError;
-use peel::progress::{spawn_renderer, LogRenderer, ProgressState, TtyRenderer};
+use peel::progress::{format_eta, spawn_renderer, LogRenderer, ProgressState, TtyRenderer};
 
 /// SIGINT — `Ctrl-C` from an interactive shell.
 const SIGINT: i32 = 2;
@@ -526,6 +526,15 @@ fn main() -> Result<()> {
         stats.extraction.frame_boundaries_observed,
         stats.extraction.quiescent_checkpoints,
     );
+    // Render the cumulative wall-clock with the same human shape
+    // the progress renderer uses for ETA (e.g. `2m14s`, `1h7m3s`)
+    // so the final summary is at-a-glance readable even for
+    // resumed runs whose total spans hours or days. The value is
+    // sourced from `RunStats::elapsed`, which the coordinator
+    // populates as `prior_elapsed + started.elapsed()` — the
+    // accumulator survives crash-resumes via the checkpoint's v15
+    // trailer.
+    eprintln!("[stats] total_time={}", format_eta(Some(stats.elapsed)));
     Ok(())
 }
 
@@ -628,6 +637,9 @@ fn run_local_dispatch(
         stats.extraction.frame_boundaries_observed,
         stats.extraction.quiescent_checkpoints,
     );
+    // Cumulative wall-clock across every run that contributed —
+    // see the HTTP path's identical line for the rationale.
+    eprintln!("[stats] total_time={}", format_eta(Some(stats.elapsed)));
     Ok(())
 }
 

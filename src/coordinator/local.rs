@@ -385,6 +385,11 @@ enum LocalResumePlan {
         decoder_position: u64,
         decoder_state: Option<Vec<u8>>,
         sink_state: SinkState,
+        /// Wall-clock time the prior run(s) had already accumulated
+        /// when this checkpoint was last written. The current run
+        /// adds its own elapsed on top so the final `[done]` line
+        /// reports the true total across crash-resumes.
+        cumulative_elapsed: Duration,
     },
 }
 
@@ -547,6 +552,7 @@ fn read_local_resume_plan(
         decoder_position: prior.decoder_position.get(),
         decoder_state: prior.decoder_state,
         sink_state: prior.sink_state,
+        cumulative_elapsed: prior.cumulative_elapsed,
     })
 }
 
@@ -565,6 +571,7 @@ fn build_local_checkpoint(
     source_mtime: SystemTime,
     decoder_position: u64,
     sink_state: SinkState,
+    cumulative_elapsed: Duration,
 ) -> Checkpoint {
     let url = local_url_for(source_path);
     Checkpoint {
@@ -590,6 +597,7 @@ fn build_local_checkpoint(
         decoder_state: None,
         mode: RunMode::LocalDestructive,
         source_mtime: Some(source_mtime),
+        cumulative_elapsed,
     }
 }
 
@@ -695,17 +703,24 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
     // with a typed error so the user is told *why* resume failed
     // instead of getting a silent re-extract producing garbage.
     let resume_plan = read_local_resume_plan(&args, &ckpt_path, &source_meta)?;
-    let (resumed, resume_decoder_position, resume_used_decoder_state) = match &resume_plan {
-        LocalResumePlan::Fresh => (false, None, false),
-        LocalResumePlan::Resume {
-            decoder_position,
-            decoder_state,
-            sink_state,
-        } => {
-            check_sink_state_matches_output(sink_state, &args.output)?;
-            (true, Some(*decoder_position), decoder_state.is_some())
-        }
-    };
+    let (resumed, resume_decoder_position, resume_used_decoder_state, prior_elapsed) =
+        match &resume_plan {
+            LocalResumePlan::Fresh => (false, None, false, Duration::ZERO),
+            LocalResumePlan::Resume {
+                decoder_position,
+                decoder_state,
+                sink_state,
+                cumulative_elapsed,
+            } => {
+                check_sink_state_matches_output(sink_state, &args.output)?;
+                (
+                    true,
+                    Some(*decoder_position),
+                    decoder_state.is_some(),
+                    *cumulative_elapsed,
+                )
+            }
+        };
 
     if let Some(state) = &args.progress_state {
         // Local-mode progress UX (`internal/old/PLAN_local_file_extract.md` §4):
@@ -856,6 +871,8 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
             source_mtime: source_mtime_val,
             ckpt_path: ckpt_path.clone(),
             writes: 0,
+            prior_elapsed,
+            started,
         })))
     } else {
         None
@@ -935,7 +952,7 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
         resume_used_decoder_state,
         download: Default::default(),
         extraction: stats,
-        elapsed: started.elapsed(),
+        elapsed: prior_elapsed.saturating_add(started.elapsed()),
     })
 }
 
@@ -1047,6 +1064,17 @@ struct LocalCheckpointWriter {
     /// [`CoordinatorError::Aborted`]'s `checkpoints_written`
     /// field when the kill switch trips.
     writes: u64,
+    /// Wall-clock time accumulated across every prior run that
+    /// has contributed to this checkpoint. Seeded from the prior
+    /// `.peel.ckpt` on resume (or [`Duration::ZERO`] on a fresh
+    /// run) and added to `started.elapsed()` at every observer
+    /// invocation so a crash-loop's "total time" accumulates
+    /// monotonically.
+    prior_elapsed: Duration,
+    /// Instant the current run began, used together with
+    /// `prior_elapsed` to compute `cumulative_elapsed` at each
+    /// checkpoint write.
+    started: Instant,
 }
 
 /// Run the extractor and (in destructive mode) persist a
@@ -1082,12 +1110,14 @@ fn run_extractor_with_ckpt<S: Sink>(
             // `decoder_state_into` — the same one-memcpy path the
             // HTTP coordinator uses
             // (`PLAN_checkpoint_blob_dedup.md` Phase 2).
+            let cumulative_elapsed = guard.prior_elapsed.saturating_add(guard.started.elapsed());
             let ckpt = build_local_checkpoint(
                 &guard.source_path,
                 guard.total_size,
                 guard.source_mtime,
                 info.source_position,
                 info.sink_state.clone(),
+                cumulative_elapsed,
             );
             ckpt.write_timed_with(&guard.ckpt_path, 0, |body| {
                 info.decoder.decoder_state_into(body)
