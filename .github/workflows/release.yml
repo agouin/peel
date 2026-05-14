@@ -145,6 +145,41 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Vendor dependencies
+        # Most distro build environments are network-isolated (Fedora
+        # mock, Debian sbuild, Alpine abuild), so they cannot fetch
+        # from crates.io during the build. Shipping a pre-vendored
+        # tarball alongside each release lets each spec / debian/rules
+        # / APKBUILD use the vendored copy and a one-line
+        # `.cargo/config.toml` redirect. See
+        # `internal/PLAN_packaging.md` §0.3 for the rationale.
+        #
+        # Architecture-independent (downloads are not compiles), so
+        # we run this once in the publish job rather than once per
+        # matrix target. `--versioned-dirs` keeps multiple versions
+        # of the same crate from colliding — uncommon but defensive.
+        # cargo writes progress to stderr and the
+        # `[source.crates-io] / [source.vendored-sources]` snippet to
+        # stdout, which we save next to the `vendor/` dir so distros
+        # have a drop-in `.cargo/config.toml`. We vendor to the
+        # relative path `vendor` (not the staging dir) so the
+        # `directory = ...` line in the snippet stays relative — the
+        # path the distro sees after extracting the tarball — and
+        # then move the directory into staging for packaging.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          name="peel-${tag}-vendored"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+          cargo vendor --locked --versioned-dirs vendor \
+            > "${staging}/cargo-vendor-config.toml"
+          mv vendor "${staging}/vendor"
+          ( cd dist && tar -czf "${name}.tar.gz" "${name}" )
+          rm -rf "${staging}"
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
       - name: Aggregate checksums
         shell: bash
         run: |
