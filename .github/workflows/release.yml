@@ -82,6 +82,31 @@ jobs:
         # `internal/PLAN_packaging.md` §0.2.
         run: cargo run --release --example gen_man --locked -- target/man/peel.1
 
+      - name: Strip binary
+        # Hoisted out of the Package step so the cargo-deb step below
+        # consumes the stripped binary too. All matrix hosts can strip
+        # their own architecture (the GHA runners are native, not
+        # cross): ubuntu-22.04 → x86_64, ubuntu-22.04-arm → aarch64,
+        # macos-14 → aarch64-darwin.
+        run: strip target/${{ matrix.target }}/release/peel
+
+      - name: Install cargo-deb
+        # Only the standard Debian/Ubuntu architectures (x86_64-gnu,
+        # aarch64-gnu) get a `.deb`. musl-libc binaries on a glibc
+        # Debian system are an oddball case we don't bless, and macOS
+        # is irrelevant. See `internal/PLAN_packaging.md` §2.4.
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cargo-deb --version "^2" --locked
+
+      - name: Build .deb
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        # `--no-build` skips rebuilding (we already built above).
+        # `--no-strip` skips cargo-deb's own strip (the previous step
+        # did it). Config lives in `[package.metadata.deb]` in
+        # Cargo.toml. Output lands at
+        # `target/<triple>/debian/peel_<version>-1_<arch>.deb`.
+        run: cargo deb --no-build --no-strip --target ${{ matrix.target }}
+
       - name: Package
         shell: bash
         run: |
@@ -92,7 +117,6 @@ jobs:
           mkdir -p "${staging}"
 
           bin="target/${{ matrix.target }}/release/peel"
-          strip "${bin}"
           cp "${bin}" "${staging}/"
           cp README.md "${staging}/"
           # Distro packaging (PLAN_packaging.md §0.5) expects LICENSE-MIT,
@@ -109,6 +133,16 @@ jobs:
 
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
+          # If the cargo-deb step ran for this matrix entry, copy the
+          # resulting `.deb` into `dist/` so the artifact upload picks
+          # it up. The matrix-gate above ensures this only runs for
+          # the gnu Linux targets.
+          deb_dir="target/${{ matrix.target }}/debian"
+          if compgen -G "${deb_dir}/*.deb" > /dev/null; then
+            cp "${deb_dir}"/*.deb dist/
+            ( cd dist && shasum -a 256 *.deb > peel-${tag}-${{ matrix.target }}.deb.sha256 )
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -116,6 +150,8 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -181,10 +217,17 @@ jobs:
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
       - name: Aggregate checksums
+        # SHA256SUMS rolls up every per-file checksum into one file so a
+        # downloader can verify the whole release with a single
+        # `shasum -c SHA256SUMS` from the release page. .deb checksum
+        # files only exist for matrix entries that produced one
+        # (gnu Linux targets — see the cargo-deb gate in the build job),
+        # so use `find` with `-name` to tolerate their absence.
         shell: bash
         run: |
           set -euo pipefail
-          ( cd dist && cat *.tar.gz.sha256 > SHA256SUMS )
+          ( cd dist && find . -maxdepth 1 -name '*.tar.gz.sha256' -o -name '*.deb.sha256' \
+              | sort | xargs cat > SHA256SUMS )
 
       - name: Create or update release
         env:
@@ -199,7 +242,12 @@ jobs:
             prerelease_flag="--prerelease"
           fi
 
-          assets=( dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS )
+          # `nullglob` makes empty globs expand to nothing instead of
+          # the literal pattern (the .deb glob can be empty in the
+          # unlikely case all cargo-deb runs failed; tarballs always
+          # exist because the matrix would fail loudly).
+          shopt -s nullglob
+          assets=( dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.deb dist/*.deb.sha256 dist/SHA256SUMS )
 
           if gh release view "${tag}" >/dev/null 2>&1; then
             gh release upload "${tag}" "${assets[@]}" --clobber

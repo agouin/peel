@@ -15,6 +15,53 @@ readme = "README.md"
 keywords = ["download", "extract", "archive", "streaming", "tar"]
 categories = ["command-line-utilities", "compression", "network-programming"]
 
+# `cargo deb` metadata. `release.yml` runs `cargo deb --no-build
+# --no-strip --target <triple>` after each Linux matrix build, then
+# uploads the resulting `.deb` as a release asset. See
+# `internal/PLAN_packaging.md` §2.4. This is the
+# "drop-in-on-any-Debian-family-distro" path; the (future) official
+# Debian archive package is a separate effort (§2.3 / §3) and will
+# build against the archive's `rustc` and `libzstd1`.
+#
+# `name = "peel"` because the crate is `peel-rs` but the binary,
+# man page, and Debian package name are all `peel` — see
+# `internal/PLAN_packaging.md` §0.1 for why the split exists.
+[package.metadata.deb]
+name = "peel"
+maintainer = "Andrew Gouin <andrew@gouin.io>"
+copyright = "2025-2026 Andrew Gouin <andrew@gouin.io>"
+license-file = ["LICENSE-MIT", "4"]
+section = "utils"
+priority = "optional"
+# `$auto` runs `dpkg-shlibdeps` against the built binary and lists
+# the shared libraries it actually pulls in. With default features
+# (vendored libzstd, statically-linked ring / rustls), this resolves
+# to libc6 and a small handful of standard system libs. The
+# `system-libs` route — used by the future official Debian archive
+# package — would also pick up libzstd1 here.
+depends = "$auto"
+extended-description = """\
+peel downloads compressed archives over HTTP and streams them through
+decompression in a single pass, hole-punching the compressed bytes from
+disk as the decoder advances. A SIGKILL mid-extraction resumes exactly
+where it left off, byte-identical to a clean run.
+
+Supports tar / tar.zst / tar.xz / tar.lz4 / tar.gz / tar.bz2 / zip /
+7z / rar (rar5 + rar3/rar4), plus the raw single-stream forms of those
+codecs."""
+# `assets` lists everything beyond the binary itself (which cargo-deb
+# auto-discovers from `[[bin]]`). Paths are relative to the source
+# tree; the binary's target-specific path is resolved by cargo-deb
+# from the build's actual `--target` triple.
+assets = [
+    ["target/release/peel", "/usr/bin/", "755"],
+    ["target/man/peel.1", "/usr/share/man/man1/peel.1", "644"],
+    ["LICENSE-MIT", "/usr/share/doc/peel/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "/usr/share/doc/peel/LICENSE-APACHE", "644"],
+    ["NOTICE", "/usr/share/doc/peel/NOTICE", "644"],
+    ["README.md", "/usr/share/doc/peel/README.md", "644"],
+]
+
 [lib]
 name = "peel"
 path = "src/lib.rs"
