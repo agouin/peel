@@ -575,26 +575,11 @@ impl StreamingDecoder for Lz4Decoder {
                             .expect("hasher present when content_checksum set");
                         let got = hasher.finalize();
                         if got != expected {
-                            if expected == 0 {
-                                // Some LZ4 producers set the content-checksum
-                                // flag in FLG but write 0x00000000 as a
-                                // placeholder rather than computing the hash.
-                                // Treat all-zero as "producer did not implement
-                                // content checksums" and continue; a genuine
-                                // XXH32-of-zero collision is astronomically
-                                // unlikely (~2.3×10⁻¹⁰).
-                                tracing::warn!(
-                                    "lz4: content checksum is 0x00000000 at offset {} \
-                                     (producer likely did not compute it; skipping validation)",
-                                    self.bytes_consumed,
-                                );
-                            } else {
-                                return Err(self.fail(format!(
-                                    "lz4: content checksum mismatch at offset {} \
-                                     (expected 0x{expected:08X}, got 0x{got:08X})",
-                                    self.bytes_consumed
-                                )));
-                            }
+                            return Err(self.fail(format!(
+                                "lz4: content checksum mismatch at offset {} \
+                                 (expected 0x{expected:08X}, got 0x{got:08X})",
+                                self.bytes_consumed
+                            )));
                         }
                     }
                     if let Some(declared) = ctx.content_size {
@@ -1770,31 +1755,6 @@ mod tests {
             }
         }
         assert!(hit, "expected content checksum mismatch to be detected");
-    }
-
-    /// A frame whose content-checksum flag is set but whose stored
-    /// checksum is 0x00000000 (producer did not compute it) should
-    /// decode successfully rather than fail — the decoder emits a
-    /// warning and continues per the all-zero heuristic.
-    #[test]
-    fn content_checksum_zero_placeholder_is_accepted() {
-        let payload = b"polkachu-snapshot-placeholder".repeat(64);
-        let mut frame = encode_lz4(
-            &payload,
-            EncoderOpts {
-                block_checksum: false,
-                content_size: false,
-                content_checksum: true,
-                compress_block: false,
-            },
-        );
-        // Overwrite the trailing 4-byte checksum with zeros.
-        let cc_off = frame.len() - 4;
-        frame[cc_off..].fill(0x00);
-        let mut decoder = Lz4Decoder::new(Box::new(Cursor::new(frame))).expect("construct");
-        let mut sink = Vec::with_capacity(payload.len());
-        drive_to_eof(&mut decoder, &mut sink);
-        assert_eq!(sink, payload, "payload must be decoded correctly despite zero checksum");
     }
 
     /// A truncated frame surfaces as a `Read` error and never advances
