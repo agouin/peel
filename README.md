@@ -321,15 +321,16 @@ slower per byte than xz, so the baseline pays a proportionally
 larger trailing-decode wall.
 
 At sub-gigabit rates the dnx grid prefers `--workers 1` even more
-strongly than the streaming grid: the baseline pays `wire + extract
-+ rm` while peel pays `wire + a few ms of finalization`, so
-trailing-edge drain on multiple ranged GETs would forfeit the
-extract-overlap win. `--workers 1` keeps the token bucket fully
-utilized through the trailing edge and lets the in-flight decode
-steal the baseline's extract phase outright. 1 Gbps still wins at
-`--workers 1` (the extract-overlap savings are large enough that
-adding parallelism to shave the trailing edge isn't worth the
-drain risk); only at 10 Gbps does `--workers 16` flip in.
+strongly than the streaming grid: the baseline pays
+`wire + extract + rm` while peel pays
+`wire + a few ms of finalization`, so trailing-edge drain on multiple
+ranged GETs would forfeit the extract-overlap win. `--workers 1`
+keeps the token bucket fully utilized through the trailing edge and
+lets the in-flight decode steal the baseline's extract phase
+outright. 1 Gbps still wins at `--workers 1` (the extract-overlap
+savings are large enough that adding parallelism to shave the
+trailing edge isn't worth the drain risk); only at 10 Gbps does
+`--workers 16` flip in.
 
 `zip` is the headline. There is no streaming-pipe baseline for
 `.zip`, so this grid is the only fair head-to-head. At 1 Gbps ×
