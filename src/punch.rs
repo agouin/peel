@@ -240,7 +240,7 @@ mod linux {
     use std::io;
     use std::os::fd::{AsRawFd, BorrowedFd};
     use std::ptr::NonNull;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use super::{PunchError, PunchHole};
     use crate::types::ByteOffset;
@@ -268,6 +268,16 @@ mod linux {
     /// non-tmpfs/non-ext4 filesystems return this for `MADV_REMOVE`.
     const ENOSYS: i32 = 38;
 
+    /// POSIX [`sysconf`] selector for the active system page size.
+    /// 30 on every Linux libc (glibc, musl) across every supported
+    /// architecture — the value is part of the kernel-userspace ABI.
+    const SC_PAGESIZE: i32 = 30;
+
+    /// Fallback alignment when `sysconf(_SC_PAGESIZE)` returns an
+    /// implausible value. 4 KiB is the historical Linux page size and
+    /// what `block_size_hint` returned before this query was wired in.
+    const FALLBACK_PAGE_SIZE: u64 = 4096;
+
     extern "C" {
         // `int fallocate(int fd, int mode, off_t offset, off_t len);` —
         // the Linux-specific syscall wrapper, exposed by both glibc and
@@ -285,6 +295,55 @@ mod linux {
         // of an `mmap`'d shared file range without taking the file
         // descriptor's `fallocate` path.
         fn madvise(addr: *mut c_void, length: usize, advice: i32) -> i32;
+
+        // `long sysconf(int name);` — POSIX runtime configuration
+        // query. We use it solely to discover the active page size,
+        // which the puncher publishes via `block_size_hint` so callers
+        // align their punch ranges to whole pages. On Apple Silicon
+        // Asahi kernels (`+16k`) this is 16 KiB; on conventional
+        // x86_64 kernels it is 4 KiB.
+        fn sysconf(name: i32) -> i64;
+    }
+
+    /// Return the runtime page size reported by the kernel via
+    /// `sysconf(_SC_PAGESIZE)`, cached after the first successful
+    /// query.
+    ///
+    /// `madvise(MADV_REMOVE)` rounds its `length` argument **up** to
+    /// the next page-size boundary and rejects non-page-aligned
+    /// offsets with `EINVAL`. `fallocate(PUNCH_HOLE)` zeroes partial
+    /// filesystem blocks within the requested range but releases only
+    /// whole blocks. The aligned-down boundary the extractor computes
+    /// from this hint is therefore the upper bound on what the kernel
+    /// can safely release without bleeding into the decoder's
+    /// lookahead — under-sized hints (the previously hard-coded 4096
+    /// on 16 KiB-page kernels) cause madvise to over-release and
+    /// zero-fill bytes the decoder has not yet consumed.
+    fn system_page_size() -> u64 {
+        static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+        *PAGE_SIZE.get_or_init(|| {
+            // SAFETY: `sysconf` is a thread-safe pure POSIX query
+            // with no aliasing concerns. We carry the integer name
+            // by value across the C ABI and read only the returned
+            // integer. A negative or zero return signals failure or
+            // an unknown selector, which we ignore in favour of the
+            // safe 4 KiB fallback rather than aborting.
+            let rc = unsafe { sysconf(SC_PAGESIZE) };
+            if rc > 0 {
+                // Sanity-check the upper bound: page sizes above
+                // 1 MiB are not represented on any architecture we
+                // build for and would cause the extractor to over-
+                // align in surprising ways. Treat as a fallback.
+                let v = rc as u64;
+                if v >= FALLBACK_PAGE_SIZE && v <= 1 << 20 && v.is_power_of_two() {
+                    v
+                } else {
+                    FALLBACK_PAGE_SIZE
+                }
+            } else {
+                FALLBACK_PAGE_SIZE
+            }
+        })
     }
 
     /// Linux puncher with two modes (`PLAN_v2.md` §9).
@@ -432,7 +491,11 @@ mod linux {
         }
 
         fn block_size_hint(&self) -> u64 {
-            4096
+            // Runtime-queried so 16 KiB-page kernels (e.g. Asahi on
+            // Apple Silicon) align punches to whole pages and don't
+            // over-release into the decoder's lookahead via
+            // madvise(MADV_REMOVE) length round-up.
+            system_page_size()
         }
     }
 
@@ -517,12 +580,15 @@ mod linux {
         let addr = unsafe { handle.base.0.as_ptr().add(off) };
 
         // SAFETY: `addr` is page-aligned by construction (the caller
-        // aligns `offset` to `block_size_hint()` = 4096, and the mmap
-        // base itself is page-aligned by `mmap(2)`). `len` is unchecked
-        // here for alignment; `madvise` returns `EINVAL` for misaligned
-        // lengths, which we already map to `PunchError::Unsupported`
-        // below. The kernel performs no aliasing-relevant operations on
-        // our memory; it only operates on its own page tables.
+        // aligns `offset` to `block_size_hint()` — the runtime page
+        // size reported by `sysconf(_SC_PAGESIZE)` — and the mmap
+        // base itself is page-aligned by `mmap(2)`). `len` arrives
+        // already a multiple of `block_size_hint()` from the
+        // extractor's per-step `align_down(quiescent_at, block) -
+        // last_punched`, so `madvise` will not round up and release
+        // bytes past the consumed boundary. The kernel performs no
+        // aliasing-relevant operations on our memory; it only
+        // operates on its own page tables.
         let rc = unsafe { madvise(addr.cast::<c_void>(), len, MADV_REMOVE) };
         if rc == 0 {
             return Ok(());
