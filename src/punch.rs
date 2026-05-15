@@ -335,7 +335,7 @@ mod linux {
                 // build for and would cause the extractor to over-
                 // align in surprising ways. Treat as a fallback.
                 let v = rc as u64;
-                if v >= FALLBACK_PAGE_SIZE && v <= 1 << 20 && v.is_power_of_two() {
+                if (FALLBACK_PAGE_SIZE..=1 << 20).contains(&v) && v.is_power_of_two() {
                     v
                 } else {
                     FALLBACK_PAGE_SIZE

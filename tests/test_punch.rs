@@ -174,9 +174,37 @@ fn linux_punch_releases_blocks_when_supported() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_puncher_block_size_hint_is_4096() {
+fn linux_puncher_block_size_hint_matches_system_page_size() {
     use peel::punch::LinuxPuncher;
-    assert_eq!(LinuxPuncher::new().block_size_hint(), 4096);
+    let hint = LinuxPuncher::new().block_size_hint();
+    // The hint must be a power of two ≥ 4 KiB and ≤ 1 MiB. On
+    // conventional kernels (most x86_64, aarch64 4k builds) this is
+    // 4096; on 16 KiB-page kernels (Apple Silicon Asahi `+16k`,
+    // some POWER builds) it is 16384. Anything else would break the
+    // extractor's `align_down(quiescent_at, block)` punch-range
+    // computation against the kernel's actual alignment rules.
+    assert!(hint.is_power_of_two(), "hint {hint} is not a power of two");
+    assert!(hint >= 4096, "hint {hint} below 4 KiB minimum");
+    assert!(hint <= 1 << 20, "hint {hint} above 1 MiB sanity bound");
+    // Cross-check against `sysconf(_SC_PAGESIZE)` via the `getconf`
+    // CLI so a future refactor that hard-codes a wrong value (the
+    // original 4096) is caught even on 4 KiB-page hosts. Falls back
+    // to a no-op assertion if `getconf` is unavailable.
+    if let Ok(output) = std::process::Command::new("getconf")
+        .arg("PAGESIZE")
+        .output()
+    {
+        if output.status.success() {
+            let reported: u64 = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .expect("getconf PAGESIZE returned non-integer");
+            assert_eq!(
+                hint, reported,
+                "block_size_hint {hint} disagrees with sysconf(_SC_PAGESIZE) {reported}",
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
