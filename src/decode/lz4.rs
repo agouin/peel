@@ -58,14 +58,11 @@
 //!   [`DecodeError::Read`] naming the unsupported feature rather than
 //!   silently producing wrong output. Promotion to "linked supported"
 //!   is a follow-on if a real corpus needs it.
-//! - **Zero-byte stream padding between frames is skipped.** The spec
-//!   allows arbitrary padding between concatenated frames; producers
-//!   such as Polkachu's snapshot pipeline emit zero-byte padding for
-//!   alignment. Every valid frame magic (regular `0x184D2204` or
-//!   skippable `0x184D2A5n`) has a non-zero LSB, so the decoder scans
-//!   forward through zero bytes when between frames and treats the
-//!   first non-zero byte as the LSB of the next magic. Non-zero
-//!   "garbage" padding is still rejected as a malformed stream.
+//! - **Stream Padding between frames is not skipped.** The spec allows
+//!   zero-byte padding between concatenated frames; pathological
+//!   producers that emit it will surface as a magic-mismatch on the
+//!   next frame. Real-world `cat`-concatenated streams have no padding
+//!   and decode cleanly.
 //!
 //! [LZ4 Frame Format]: https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
 
@@ -92,14 +89,6 @@ const MAX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// 64 KiB is large enough to amortize the scratch refill while still
 /// bounding the per-call work the way the zstd / xz decoders do.
 const SKIP_CHUNK: usize = 1 << 16;
-
-/// Per-`decode_step` cap on the number of zero-byte stream-padding
-/// bytes the [`State::BetweenFrames`] scan will consume before
-/// yielding control with [`DecodeStatus::MoreData`]. Mirrors
-/// [`SKIP_CHUNK`]'s role for skippable-frame traversal so the
-/// extractor can interleave hole-punching with padding scans on
-/// pathological inputs.
-const PADDING_SCAN_CHUNK: usize = 1 << 16;
 
 /// Streaming lz4-Frame decoder that exposes block-boundary frame
 /// boundaries.
@@ -480,84 +469,52 @@ impl StreamingDecoder for Lz4Decoder {
             }
 
             State::BetweenFrames { mut source } => {
-                // Scan forward through any zero-byte stream padding
-                // until either EOF (clean end of stream), the per-call
-                // PADDING_SCAN_CHUNK budget is exhausted (yield to
-                // caller), or we hit a non-zero byte — which by spec
-                // is the LSB of the next frame's magic, since every
-                // valid magic (regular `0x184D2204`, skippable
-                // `0x184D2A5n`) has a non-zero least-significant byte.
-                let mut scanned = 0usize;
-                let first_magic_byte = loop {
-                    let mut byte = [0u8; 1];
-                    match try_read_exact(&mut source, &mut byte) {
-                        Ok(ReadOutcome::Eof) => {
-                            // Clean source EOF (possibly after
-                            // padding) is a successful end-of-stream.
-                            self.bytes_consumed =
-                                self.bytes_consumed.saturating_add(scanned as u64);
-                            self.state = State::Done;
-                            return Ok(DecodeStatus::Eof);
-                        }
-                        Ok(ReadOutcome::Ok) => {
-                            scanned += 1;
-                            if byte[0] != 0 {
-                                break byte[0];
-                            }
-                            if scanned >= PADDING_SCAN_CHUNK {
-                                // Bounded work: hand control back so
-                                // the extractor can interleave other
-                                // work on pathological inputs.
-                                self.bytes_consumed =
-                                    self.bytes_consumed.saturating_add(scanned as u64);
-                                self.state = State::BetweenFrames { source };
-                                return Ok(DecodeStatus::MoreData);
-                            }
-                        }
-                        Err(err) => return Err(self.fail_with(err)),
+                let mut magic_bytes = [0u8; 4];
+                match try_read_exact(&mut source, &mut magic_bytes) {
+                    Ok(ReadOutcome::Eof) => {
+                        // Clean source EOF *between* frames is a
+                        // successful end-of-stream. If the very first
+                        // byte of the source produces this, the
+                        // overall stream is empty — that's not an
+                        // error in lz4, just a no-op decode.
+                        self.state = State::Done;
+                        Ok(DecodeStatus::Eof)
                     }
-                };
-                self.bytes_consumed = self.bytes_consumed.saturating_add(scanned as u64);
-
-                // `first_magic_byte` is the LSB of the next magic.
-                // Read the remaining 3 bytes to complete it.
-                let mut rest = [0u8; 3];
-                if let Err(err) = source.read_exact(&mut rest) {
-                    return Err(self.fail_with(err));
-                }
-                self.bytes_consumed = self.bytes_consumed.saturating_add(3);
-                let magic =
-                    u32::from_le_bytes([first_magic_byte, rest[0], rest[1], rest[2]]);
-
-                if magic == LZ4_FRAME_MAGIC {
-                    match parse_frame_header(&mut source, &mut self.bytes_consumed) {
-                        Ok(ctx) => {
-                            if ctx.block_max_size as usize > self.output_buf.len() {
-                                self.output_buf.resize(ctx.block_max_size as usize, 0);
+                    Ok(ReadOutcome::Ok) => {
+                        self.bytes_consumed = self.bytes_consumed.saturating_add(4);
+                        let magic = u32::from_le_bytes(magic_bytes);
+                        if magic == LZ4_FRAME_MAGIC {
+                            match parse_frame_header(&mut source, &mut self.bytes_consumed) {
+                                Ok(ctx) => {
+                                    if ctx.block_max_size as usize > self.output_buf.len() {
+                                        self.output_buf.resize(ctx.block_max_size as usize, 0);
+                                    }
+                                    self.state = State::InFrame { source, ctx };
+                                    Ok(DecodeStatus::MoreData)
+                                }
+                                Err(err) => Err(self.fail_with(err)),
                             }
-                            self.state = State::InFrame { source, ctx };
+                        } else if magic & SKIPPABLE_MAGIC_MASK == SKIPPABLE_MAGIC_BASE {
+                            let mut len_bytes = [0u8; 4];
+                            if let Err(err) = source.read_exact(&mut len_bytes) {
+                                return Err(self.fail_with(err));
+                            }
+                            self.bytes_consumed = self.bytes_consumed.saturating_add(4);
+                            let remaining = u32::from_le_bytes(len_bytes) as u64;
+                            self.state = if remaining == 0 {
+                                State::BetweenFrames { source }
+                            } else {
+                                State::SkippingSkippable { source, remaining }
+                            };
                             Ok(DecodeStatus::MoreData)
+                        } else {
+                            Err(self.fail(format!(
+                                "lz4: unrecognized magic 0x{magic:08X} at offset {}",
+                                self.bytes_consumed.saturating_sub(4)
+                            )))
                         }
-                        Err(err) => Err(self.fail_with(err)),
                     }
-                } else if magic & SKIPPABLE_MAGIC_MASK == SKIPPABLE_MAGIC_BASE {
-                    let mut len_bytes = [0u8; 4];
-                    if let Err(err) = source.read_exact(&mut len_bytes) {
-                        return Err(self.fail_with(err));
-                    }
-                    self.bytes_consumed = self.bytes_consumed.saturating_add(4);
-                    let remaining = u32::from_le_bytes(len_bytes) as u64;
-                    self.state = if remaining == 0 {
-                        State::BetweenFrames { source }
-                    } else {
-                        State::SkippingSkippable { source, remaining }
-                    };
-                    Ok(DecodeStatus::MoreData)
-                } else {
-                    Err(self.fail(format!(
-                        "lz4: unrecognized magic 0x{magic:08X} at offset {}",
-                        self.bytes_consumed.saturating_sub(4)
-                    )))
+                    Err(err) => Err(self.fail_with(err)),
                 }
             }
 
@@ -1634,117 +1591,6 @@ mod tests {
             "should observe a boundary at the inter-frame offset",
         );
         assert_eq!(decoder.bytes_consumed().get(), combined_len);
-    }
-
-    /// Zero-byte stream padding before the first frame is skipped
-    /// per spec — the decoder should locate the magic and produce
-    /// the same plaintext as the un-padded stream.
-    #[test]
-    fn zero_padding_before_first_frame_is_skipped() {
-        let payload = b"after-leading-padding".repeat(64);
-        let frame = encode_lz4(
-            &payload,
-            EncoderOpts {
-                block_checksum: false,
-                content_size: false,
-                content_checksum: false,
-                compress_block: false,
-            },
-        );
-        let mut stream = vec![0u8; 17]; // arbitrary odd-length leading padding
-        stream.extend_from_slice(&frame);
-
-        let mut decoder = Lz4Decoder::new(Box::new(Cursor::new(stream))).expect("construct");
-        let mut sink = Vec::with_capacity(payload.len());
-        drive_to_eof(&mut decoder, &mut sink);
-        assert_eq!(sink, payload);
-    }
-
-    /// Zero-byte stream padding between concatenated frames is
-    /// skipped — the canonical Polkachu snapshot shape (each frame's
-    /// content-checksum slot is zero-filled and an alignment gap
-    /// follows before the next magic).
-    #[test]
-    fn zero_padding_between_frames_is_skipped() {
-        let payload_a = b"first-frame-payload-".repeat(400);
-        let payload_b = b"second-frame-payload-".repeat(400);
-        let frame_a = encode_lz4(
-            &payload_a,
-            EncoderOpts {
-                block_checksum: false,
-                content_size: false,
-                content_checksum: false,
-                compress_block: true,
-            },
-        );
-        let frame_b = encode_lz4(
-            &payload_b,
-            EncoderOpts {
-                block_checksum: false,
-                content_size: false,
-                content_checksum: false,
-                compress_block: true,
-            },
-        );
-        let mut combined = frame_a;
-        combined.extend_from_slice(&[0u8; 32]); // 32 bytes of inter-frame padding
-        combined.extend_from_slice(&frame_b);
-
-        let mut decoder =
-            Lz4Decoder::new(Box::new(Cursor::new(combined))).expect("construct");
-        let mut sink = Vec::with_capacity(payload_a.len() + payload_b.len());
-        drive_to_eof(&mut decoder, &mut sink);
-        let mut expected = payload_a.clone();
-        expected.extend_from_slice(&payload_b);
-        assert_eq!(sink, expected);
-    }
-
-    /// Trailing zero padding after the last frame is treated as
-    /// clean EOF, not as a malformed magic.
-    #[test]
-    fn zero_padding_after_last_frame_is_eof() {
-        let payload = b"trailing-padded-payload".repeat(64);
-        let mut stream = encode_lz4(
-            &payload,
-            EncoderOpts {
-                block_checksum: false,
-                content_size: false,
-                content_checksum: false,
-                compress_block: true,
-            },
-        );
-        stream.extend_from_slice(&[0u8; 1024]);
-
-        let mut decoder = Lz4Decoder::new(Box::new(Cursor::new(stream))).expect("construct");
-        let mut sink = Vec::with_capacity(payload.len());
-        drive_to_eof(&mut decoder, &mut sink);
-        assert_eq!(sink, payload);
-    }
-
-    /// Padding larger than `PADDING_SCAN_CHUNK` decodes correctly —
-    /// the decoder yields `MoreData` mid-scan and resumes on the
-    /// next step.
-    #[test]
-    fn zero_padding_exceeding_scan_chunk_decodes() {
-        let payload = b"after-huge-padding".repeat(32);
-        let frame = encode_lz4(
-            &payload,
-            EncoderOpts {
-                block_checksum: false,
-                content_size: false,
-                content_checksum: false,
-                compress_block: false,
-            },
-        );
-        // Use 2.5× the scan chunk so the bounded-work yield path is
-        // exercised more than once before a magic is found.
-        let mut stream = vec![0u8; PADDING_SCAN_CHUNK * 2 + PADDING_SCAN_CHUNK / 2];
-        stream.extend_from_slice(&frame);
-
-        let mut decoder = Lz4Decoder::new(Box::new(Cursor::new(stream))).expect("construct");
-        let mut sink = Vec::with_capacity(payload.len());
-        drive_to_eof(&mut decoder, &mut sink);
-        assert_eq!(sink, payload);
     }
 
     /// Skippable frames are silently consumed, and the wrapped regular
