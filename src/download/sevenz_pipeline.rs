@@ -818,6 +818,7 @@ impl crate::decode::sevenz::folder::FolderSink for HeaderCollectorSink {
         _idx: u32,
         _file_index: u32,
         expected_size: u64,
+        _expected_crc: Option<u32>,
     ) -> Result<(), crate::decode::sevenz::folder::FolderSinkError> {
         self.bytes.reserve(expected_size as usize);
         Ok(())
@@ -831,10 +832,7 @@ impl crate::decode::sevenz::folder::FolderSink for HeaderCollectorSink {
         Ok(())
     }
 
-    fn end_substream(
-        &mut self,
-        _expected_crc: Option<u32>,
-    ) -> Result<(), crate::decode::sevenz::folder::FolderSinkError> {
+    fn end_substream(&mut self) -> Result<(), crate::decode::sevenz::folder::FolderSinkError> {
         Ok(())
     }
 }

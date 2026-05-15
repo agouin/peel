@@ -68,8 +68,13 @@ struct EntryState {
     bytes_written: u64,
     /// Expected total uncompressed size from the archive.
     expected_size: u64,
-    /// Running CRC32 over every byte written.
-    crc: Crc32,
+    /// Running CRC32 over every byte written, paired with the
+    /// `expected_crc` captured at [`FolderSink::begin_substream`].
+    /// `None` when the archive recorded no CRC for this
+    /// substream — skipping the hasher saves ~10 ms per 100 MiB
+    /// of COPY-coded data on aarch64 (`__crc32d` at ~10 GB/s)
+    /// in the common `7z a -mx0` shape that omits CRCs entirely.
+    crc: Option<(Crc32, u32)>,
 }
 
 impl SevenzSink {
@@ -272,6 +277,7 @@ impl FolderSink for SevenzSink {
         _idx: u32,
         file_index: u32,
         expected_size: u64,
+        expected_crc: Option<u32>,
     ) -> Result<(), FolderSinkError> {
         self.poison_check().map_err(sink_err_to_folder_err)?;
         if self.current.is_some() {
@@ -303,7 +309,7 @@ impl FolderSink for SevenzSink {
             file,
             bytes_written: 0,
             expected_size,
-            crc: Crc32::new(),
+            crc: expected_crc.map(|c| (Crc32::new(), c)),
         });
         Ok(())
     }
@@ -329,12 +335,14 @@ impl FolderSink for SevenzSink {
         if let Err(source) = state.file.write_all(buf) {
             return Err(self.poison(FolderSinkError::Io(source)));
         }
-        state.crc.update(buf);
+        if let Some((crc, _)) = state.crc.as_mut() {
+            crc.update(buf);
+        }
         state.bytes_written = projected;
         Ok(())
     }
 
-    fn end_substream(&mut self, expected_crc: Option<u32>) -> Result<(), FolderSinkError> {
+    fn end_substream(&mut self) -> Result<(), FolderSinkError> {
         self.poison_check().map_err(sink_err_to_folder_err)?;
         let state = self.current.take().ok_or_else(|| {
             FolderSinkError::Io(std::io::Error::other(
@@ -350,8 +358,8 @@ impl FolderSink for SevenzSink {
                 state.file_index, state.bytes_written, state.expected_size,
             ))));
         }
-        let computed = state.crc.current();
-        if let Some(expected) = expected_crc {
+        if let Some((crc, expected)) = state.crc {
+            let computed = crc.current();
             if computed != expected {
                 let _ = fs::remove_file(&state.path);
                 self.poisoned = true;

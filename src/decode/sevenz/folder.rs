@@ -63,6 +63,15 @@ pub trait FolderSink {
     /// bytes are owed to (equivalent to
     /// `header.folder_to_files[folder_idx][idx]`).
     ///
+    /// `expected_crc` is the CRC32 the archive recorded for this
+    /// substream (or `None` if absent). Passing it at `begin`
+    /// rather than at `end` lets the sink skip the running
+    /// hasher entirely when no validation will happen — for the
+    /// COPY-coded "STORED 7z" shape (`build_copy_sevenz`-style
+    /// archives, common at `-mx0`) every 100 MiB of payload
+    /// would otherwise spend ~10 ms on a CRC32 whose value is
+    /// thrown away.
+    ///
     /// # Errors
     ///
     /// Implementation-defined; the §7 sink surfaces filesystem
@@ -72,6 +81,7 @@ pub trait FolderSink {
         idx: u32,
         file_index: u32,
         expected_size: u64,
+        expected_crc: Option<u32>,
     ) -> Result<(), FolderSinkError>;
 
     /// Append decoded bytes to the currently-open substream.
@@ -81,17 +91,15 @@ pub trait FolderSink {
     /// Implementation-defined.
     fn write_substream(&mut self, buf: &[u8]) -> Result<(), FolderSinkError>;
 
-    /// Close the currently-open substream.
-    ///
-    /// `expected_crc` is the CRC32 the archive recorded for
-    /// this substream (or `None` if absent). The sink is the
-    /// authoritative validator: it owns the running hasher and
-    /// surfaces a typed mismatch error.
+    /// Close the currently-open substream. The sink validates
+    /// the running hasher against the `expected_crc` it captured
+    /// at [`Self::begin_substream`] time and surfaces a typed
+    /// mismatch error.
     ///
     /// # Errors
     ///
     /// Implementation-defined.
-    fn end_substream(&mut self, expected_crc: Option<u32>) -> Result<(), FolderSinkError>;
+    fn end_substream(&mut self) -> Result<(), FolderSinkError>;
 }
 
 /// Errors a [`FolderSink`] can surface.
@@ -396,7 +404,12 @@ struct SubstreamSplitter<'a> {
 
     current_substream: usize,
     bytes_in_current_substream: u64,
-    folder_crc: Crc32,
+    /// `Some` iff [`Self::folder_unpack_crc`] is `Some` — we
+    /// only run CRC32 over the folder's unpacked bytes when the
+    /// archive recorded a value to compare against. Encrypted
+    /// folders without a stored folder CRC still detect a wrong
+    /// password through the per-substream CRC.
+    folder_crc: Option<Crc32>,
     started: bool,
     finished: bool,
 }
@@ -419,7 +432,7 @@ impl<'a> SubstreamSplitter<'a> {
             encrypted,
             current_substream: 0,
             bytes_in_current_substream: 0,
-            folder_crc: Crc32::new(),
+            folder_crc: folder_unpack_crc.map(|_| Crc32::new()),
             started: false,
             finished: false,
         }
@@ -431,7 +444,12 @@ impl<'a> SubstreamSplitter<'a> {
         debug_assert!(!self.started, "begin_first called twice");
         self.started = true;
         self.sink
-            .begin_substream(0, self.file_indices[0], self.substream_sizes[0])
+            .begin_substream(
+                0,
+                self.file_indices[0],
+                self.substream_sizes[0],
+                self.substream_crcs[0],
+            )
             .map_err(folder_sink_err_to_sevenz)
     }
 
@@ -454,9 +472,8 @@ impl<'a> SubstreamSplitter<'a> {
                 ),
             });
         }
-        let crc = self.substream_crcs[self.current_substream];
         self.sink
-            .end_substream(crc)
+            .end_substream()
             .map_err(folder_sink_err_to_sevenz)?;
         self.current_substream += 1;
         self.finished = true;
@@ -467,7 +484,15 @@ impl<'a> SubstreamSplitter<'a> {
     /// written.
     fn validate_folder_crc(&self) -> Result<(), SevenzError> {
         if let Some(expected) = self.folder_unpack_crc {
-            let computed = self.folder_crc.current();
+            // INVARIANT: `folder_crc` is constructed iff
+            // `folder_unpack_crc.is_some()`, so the `expect`
+            // here cannot fire — it documents the pairing for
+            // future maintenance.
+            let computed = self
+                .folder_crc
+                .as_ref()
+                .expect("folder_crc present when folder_unpack_crc is set")
+                .current();
             if computed != expected {
                 if self.encrypted {
                     return Err(SevenzError::Encryption(EncryptionError::PasswordIncorrect));
@@ -506,13 +531,14 @@ impl Write for SubstreamSplitter<'_> {
             self.sink
                 .write_substream(slice)
                 .map_err(|e| substream_sink_err_to_io(e, self.encrypted))?;
-            self.folder_crc.update(slice);
+            if let Some(crc) = self.folder_crc.as_mut() {
+                crc.update(slice);
+            }
             self.bytes_in_current_substream += take as u64;
             consumed += take;
             if self.bytes_in_current_substream == target_size {
-                let crc = self.substream_crcs[self.current_substream];
                 self.sink
-                    .end_substream(crc)
+                    .end_substream()
                     .map_err(|e| substream_sink_err_to_io(e, self.encrypted))?;
                 self.current_substream += 1;
                 self.bytes_in_current_substream = 0;
@@ -522,6 +548,7 @@ impl Write for SubstreamSplitter<'_> {
                             self.current_substream as u32,
                             self.file_indices[self.current_substream],
                             self.substream_sizes[self.current_substream],
+                            self.substream_crcs[self.current_substream],
                         )
                         .map_err(|e| substream_sink_err_to_io(e, self.encrypted))?;
                 }
@@ -587,7 +614,11 @@ mod tests {
     struct VecSink {
         substreams: Vec<Vec<u8>>,
         current: Option<Vec<u8>>,
-        running_crc: Crc32,
+        /// `Some` iff `begin_substream` received an
+        /// `expected_crc` — mirrors the production sink's
+        /// allocate-on-demand discipline so the test surface
+        /// exercises the same code path the §7 sink uses.
+        running_crc: Option<(Crc32, u32)>,
     }
 
     impl VecSink {
@@ -595,7 +626,7 @@ mod tests {
             Self {
                 substreams: Vec::new(),
                 current: None,
-                running_crc: Crc32::new(),
+                running_crc: None,
             }
         }
     }
@@ -606,23 +637,26 @@ mod tests {
             idx: u32,
             _file_index: u32,
             _expected_size: u64,
+            expected_crc: Option<u32>,
         ) -> Result<(), FolderSinkError> {
             assert_eq!(idx as usize, self.substreams.len());
             self.current = Some(Vec::new());
-            self.running_crc = Crc32::new();
+            self.running_crc = expected_crc.map(|c| (Crc32::new(), c));
             Ok(())
         }
 
         fn write_substream(&mut self, buf: &[u8]) -> Result<(), FolderSinkError> {
-            self.running_crc.update(buf);
+            if let Some((crc, _)) = self.running_crc.as_mut() {
+                crc.update(buf);
+            }
             self.current.as_mut().unwrap().extend_from_slice(buf);
             Ok(())
         }
 
-        fn end_substream(&mut self, expected_crc: Option<u32>) -> Result<(), FolderSinkError> {
+        fn end_substream(&mut self) -> Result<(), FolderSinkError> {
             let bytes = self.current.take().unwrap();
-            let computed = self.running_crc.current();
-            if let Some(expected) = expected_crc {
+            if let Some((crc, expected)) = self.running_crc.take() {
+                let computed = crc.current();
                 if expected != computed {
                     return Err(FolderSinkError::Crc32Mismatch { expected, computed });
                 }
