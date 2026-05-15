@@ -28,6 +28,7 @@
 
 use std::time::{Duration, Instant};
 
+use peel::hash::crc64::Crc64;
 use peel::hash::xxh64::Xxh64;
 
 fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
@@ -130,6 +131,65 @@ fn bench_xxh64_64kib() {
 
     println!(
         "[bench-xxh64] peel::Xxh64 (scalar)  {iters} × 64 KiB = {gib:.2} GiB: {dur:.3}s  \
+         ({gibps:.2} GiB/s, {gbps:.2} GB/s)  digest=0x{pinned_digest:016x}",
+        iters = ITERS,
+        gib = (TOTAL_BYTES as f64) / (1024.0 * 1024.0 * 1024.0),
+        dur = med.as_secs_f64(),
+        gibps = gibps(TOTAL_BYTES, med),
+        gbps = gbps(TOTAL_BYTES, med),
+    );
+}
+
+/// Crc64-XZ throughput on a 64 KiB L1-hot buffer iterated to ~1 GiB
+/// of total work. Anchor for Plan-2 (xz_liblzma Block-check
+/// overhead): liblzma uses PMULL2 carry-less multiply on aarch64
+/// for ~15-30 GB/s; peel's slice-by-16 table lookup should land
+/// in the 3-5 GB/s band on this machine.
+#[test]
+#[ignore = "benchmark; opt-in via --ignored"]
+fn bench_crc64_64kib() {
+    const BUF_LEN: usize = 64 * 1024;
+    const TOTAL_BYTES: u64 = 1 << 30; // 1 GiB worth of work
+    const ITERS: usize = (TOTAL_BYTES / BUF_LEN as u64) as usize;
+
+    let buf = random_bytes(0xCAFEBABE, BUF_LEN);
+
+    let pinned_digest = {
+        let mut h = Crc64::new();
+        h.update(&buf);
+        h.finalize()
+    };
+
+    let mut warm = Crc64::new();
+    warm.update(&buf);
+    std::hint::black_box(warm.finalize());
+
+    let mut times = [Duration::default(); 3];
+    let mut xor_acc: u64 = 0;
+    for slot in times.iter_mut() {
+        let started = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..ITERS {
+            let mut h = Crc64::new();
+            h.update(&buf);
+            acc ^= h.finalize();
+        }
+        xor_acc = acc;
+        *slot = started.elapsed();
+        std::hint::black_box(acc);
+    }
+    times.sort();
+    let med = times[1];
+
+    let expected_xor = if ITERS % 2 == 0 { 0u64 } else { pinned_digest };
+    assert_eq!(
+        xor_acc, expected_xor,
+        "Crc64 produced inconsistent digests across iterations \
+         (pinned digest = 0x{pinned_digest:016x}, accumulated XOR = 0x{xor_acc:016x})",
+    );
+
+    println!(
+        "[bench-crc64] peel::Crc64 (scalar)  {iters} × 64 KiB = {gib:.2} GiB: {dur:.3}s  \
          ({gibps:.2} GiB/s, {gbps:.2} GB/s)  digest=0x{pinned_digest:016x}",
         iters = ITERS,
         gib = (TOTAL_BYTES as f64) / (1024.0 * 1024.0 * 1024.0),

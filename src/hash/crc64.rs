@@ -119,45 +119,74 @@ impl Crc64 {
 
     /// Feed the next chunk of input into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        let mut state = self.state;
-        let mut chunks = data.chunks_exact(16);
-        for chunk in &mut chunks {
-            // INVARIANT: `chunks_exact(16)` yields slices of length 16;
-            // `try_into` cannot fail here.
-            let arr: [u8; 16] = chunk.try_into().unwrap();
-            // First 8 input bytes XOR-into the state; the next 8 are
-            // pure inputs. All 16 lookups are independent, so LLVM is
-            // free to schedule them across the load ports. Indexing
-            // through `u8` indices folds the bounds checks (visible
-            // in `cargo asm` on Apple aarch64).
-            let lo = (state
-                ^ u64::from_le_bytes([
-                    arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7],
-                ]))
-            .to_le_bytes();
-            state = TABLES[15][lo[0] as usize]
-                ^ TABLES[14][lo[1] as usize]
-                ^ TABLES[13][lo[2] as usize]
-                ^ TABLES[12][lo[3] as usize]
-                ^ TABLES[11][lo[4] as usize]
-                ^ TABLES[10][lo[5] as usize]
-                ^ TABLES[9][lo[6] as usize]
-                ^ TABLES[8][lo[7] as usize]
-                ^ TABLES[7][arr[8] as usize]
-                ^ TABLES[6][arr[9] as usize]
-                ^ TABLES[5][arr[10] as usize]
-                ^ TABLES[4][arr[11] as usize]
-                ^ TABLES[3][arr[12] as usize]
-                ^ TABLES[2][arr[13] as usize]
-                ^ TABLES[1][arr[14] as usize]
-                ^ TABLES[0][arr[15] as usize];
-        }
-        for &b in chunks.remainder() {
-            state = TABLE[((state ^ u64::from(b)) & 0xFF) as usize] ^ (state >> 8);
-        }
-        self.state = state;
+        self.state = update_portable(self.state, data);
     }
+}
 
+/// Scalar slicing-by-16 inner loop. Kept as a free function (not a
+/// method) so a future aarch64 PMULL-accelerated path can delegate to
+/// it for the < 16-byte tail without going through
+/// [`Crc64::update`]'s feature-detection branch.
+///
+/// # Known gap
+///
+/// On aarch64 hosts with the `pmull` extension (every M-series CPU
+/// and most modern server cores), liblzma uses PMULL2 carry-less
+/// multiply for CRC-64/XZ at ~20 GB/s. peel's slicing-by-16 runs at
+/// ~2.85 GB/s on those same cores ([`tests/test_bench_hash.rs::bench_crc64_64kib`]).
+/// For 100 MiB of xz output that's ~30 ms of avoidable wall-clock —
+/// most of the peel/`xz -d` gap on the local-decode bench. Closing it
+/// requires a fold-by-1 PMULL implementation with Barrett reduction;
+/// see [Intel "Fast CRC Computation Using PCLMULQDQ Instruction"
+/// (2009)] (the algorithm transcribed to ARM `PMULL`/`PMULL2`) for the
+/// reference structure. Deferred until a focused effort can land a
+/// verified implementation alongside the byte-by-byte differential
+/// test that already covers the slicing-by-16 path.
+///
+/// [Intel "Fast CRC Computation Using PCLMULQDQ Instruction" (2009)]:
+/// https://www.intel.com/content/dam/www/public/us/en/documents/white-papers/fast-crc-computation-generic-polynomials-pclmulqdq-paper.pdf
+#[inline]
+fn update_portable(state: u64, data: &[u8]) -> u64 {
+    let mut state = state;
+    let mut chunks = data.chunks_exact(16);
+    for chunk in &mut chunks {
+        // INVARIANT: `chunks_exact(16)` yields slices of length 16;
+        // `try_into` cannot fail here.
+        let arr: [u8; 16] = chunk.try_into().unwrap();
+        // First 8 input bytes XOR-into the state; the next 8 are
+        // pure inputs. All 16 lookups are independent, so LLVM is
+        // free to schedule them across the load ports. Indexing
+        // through `u8` indices folds the bounds checks (visible
+        // in `cargo asm` on Apple aarch64).
+        let lo = (state
+            ^ u64::from_le_bytes([
+                arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7],
+            ]))
+        .to_le_bytes();
+        state = TABLES[15][lo[0] as usize]
+            ^ TABLES[14][lo[1] as usize]
+            ^ TABLES[13][lo[2] as usize]
+            ^ TABLES[12][lo[3] as usize]
+            ^ TABLES[11][lo[4] as usize]
+            ^ TABLES[10][lo[5] as usize]
+            ^ TABLES[9][lo[6] as usize]
+            ^ TABLES[8][lo[7] as usize]
+            ^ TABLES[7][arr[8] as usize]
+            ^ TABLES[6][arr[9] as usize]
+            ^ TABLES[5][arr[10] as usize]
+            ^ TABLES[4][arr[11] as usize]
+            ^ TABLES[3][arr[12] as usize]
+            ^ TABLES[2][arr[13] as usize]
+            ^ TABLES[1][arr[14] as usize]
+            ^ TABLES[0][arr[15] as usize];
+    }
+    for &b in chunks.remainder() {
+        state = TABLE[((state ^ u64::from(b)) & 0xFF) as usize] ^ (state >> 8);
+    }
+    state
+}
+
+impl Crc64 {
     /// Final CRC-64/XZ over all bytes fed so far.
     #[must_use]
     pub fn finalize(self) -> u64 {
