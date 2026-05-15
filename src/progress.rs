@@ -31,7 +31,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,15 @@ pub struct ProgressState {
     /// `bytes_decoded_input` are pumped from the same `Read` impl
     /// and always agree) for a local extraction.
     local: AtomicBool,
+    /// Wakeup primitive paired with [`Self::done`]. The renderer
+    /// thread parks on this in [`Self::wait_for_done_or_timeout`];
+    /// [`Self::mark_done`] notifies it so the CLI's `join()` returns
+    /// in microseconds instead of paying up to one `SLEEP_SLICE` of
+    /// polling latency. The mutex carries no state — it's the
+    /// rendezvous primitive only — and is never held across user
+    /// code, so contention is bounded to the renderer's own
+    /// wait/wake handshake.
+    done_wait: (Mutex<()>, Condvar),
 }
 
 /// Per-part download counters published in [`ProgressSnapshot::parts`].
@@ -172,6 +181,7 @@ impl ProgressState {
             decode_step_started_ns: AtomicU64::new(0),
             parts: OnceLock::new(),
             local: AtomicBool::new(false),
+            done_wait: (Mutex::new(()), Condvar::new()),
         })
     }
 
@@ -336,9 +346,52 @@ impl ProgressState {
     }
 
     /// Mark the run as finished. The renderer thread stops on its
-    /// next tick.
+    /// next tick — and is woken immediately via the [`Self::done_wait`]
+    /// condvar so the CLI's `render_handle.join()` returns in
+    /// microseconds instead of paying up to one `SLEEP_SLICE` of poll
+    /// latency on every clean exit. This matters most for small local
+    /// extractions where the renderer's natural cadence would otherwise
+    /// dominate the wall-clock (e.g. a 5 ms decode followed by a 20 ms
+    /// poll-rounded join).
     pub fn mark_done(&self) {
         self.done.store(true, Ordering::Release);
+        // Take and immediately release the mutex so any renderer
+        // currently inside `wait_for_done_or_timeout` between its
+        // load and the `wait_timeout` call observes the new value
+        // before parking; the `notify_all` then wakes one already
+        // parked.
+        {
+            let _guard = self.done_wait.0.lock().expect("done_wait mutex poisoned");
+        }
+        self.done_wait.1.notify_all();
+    }
+
+    /// Park the caller until [`Self::done`] is set or `timeout`
+    /// elapses, whichever comes first. Returns `true` iff `done` is
+    /// observed before the timeout.
+    ///
+    /// Used by [`spawn_renderer`]'s sleep loop in place of
+    /// `thread::sleep` so a `mark_done` notification short-circuits
+    /// the wait. The caller still polls `kill_switch` between waits
+    /// — kill notifications are not signaled through this primitive
+    /// — so the practical kill-switch latency stays bounded by the
+    /// renderer's `SLEEP_SLICE`.
+    #[must_use]
+    pub fn wait_for_done_or_timeout(&self, timeout: Duration) -> bool {
+        if self.done.load(Ordering::Acquire) {
+            return true;
+        }
+        let guard = self.done_wait.0.lock().expect("done_wait mutex poisoned");
+        // Re-check under the lock so a `mark_done` that fired
+        // between the load above and the `lock` here doesn't get
+        // lost (the notify happened before we held the lock, so a
+        // subsequent `wait_timeout` would block for the full
+        // timeout without this check).
+        if self.done.load(Ordering::Acquire) {
+            return true;
+        }
+        let _ = self.done_wait.1.wait_timeout(guard, timeout);
+        self.done.load(Ordering::Acquire)
     }
 
     /// Clear the per-run byte counters and worker tallies so the next
@@ -1773,14 +1826,17 @@ where
             // extra final render after the done flag flips so the user
             // sees the final counters.
             //
-            // The sleep is broken into small slices so a `mark_done`
-            // call wakes the join within tens of milliseconds rather
-            // than blocking until the next full `refresh` tick — the
-            // production CLI joins this handle on shutdown, and the
-            // 2 s LogRenderer cadence used in non-TTY runs would
-            // otherwise add up to 2 s of tail latency to every clean
-            // exit (a subprocess `peel <file>` would block 2 s after
-            // the actual work finished).
+            // The sleep is split into [`SLEEP_SLICE`] poll windows so
+            // `kill_switch` (which is not signaled through the
+            // [`ProgressState::done_wait`] condvar) is observed within
+            // bounded latency. The clean-exit path is handled by the
+            // condvar inside [`ProgressState::wait_for_done_or_timeout`]:
+            // [`ProgressState::mark_done`] wakes us immediately, so the
+            // CLI's `join()` returns in microseconds even though the
+            // outer `refresh` cadence for the non-TTY `LogRenderer` is
+            // 2 s. Before this split the renderer added up to one
+            // `SLEEP_SLICE` of tail latency to every clean exit, which
+            // dominated the wall-clock of small local extractions.
             const SLEEP_SLICE: Duration = Duration::from_millis(20);
             loop {
                 // SIGINT/SIGTERM path: the signal handler has already
@@ -1801,11 +1857,13 @@ where
                 }
                 let mut left = refresh;
                 while !left.is_zero() {
-                    if state.is_done() || aborting(&kill_switch) {
+                    if aborting(&kill_switch) {
                         break;
                     }
                     let slice = left.min(SLEEP_SLICE);
-                    thread::sleep(slice);
+                    if state.wait_for_done_or_timeout(slice) {
+                        break;
+                    }
                     left = left.saturating_sub(slice);
                 }
             }
