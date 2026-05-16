@@ -1,0 +1,16 @@
+# mise — project task runner / tool manager.
+#
+# Install mise: https://mise.jdx.dev/getting-started.html
+# Run a task:   `mise run <task>`  (or `mise r <task>`)
+# List tasks:   `mise tasks`
+#
+# Tools (rustc / rust-toolchain) are still managed by `rust-toolchain.toml`
+# so cargo picks up the pinned channel automatically. Add entries under
+# `[tools]` here if we ever need mise to manage additional toolchains
+# (e.g. mdbook, cargo-deb).
+
+[tasks.release]
+description = "Cut a new release: bump version files, commit, tag, push origin."
+# Optional positional arg: explicit version (e.g. `mise run release 0.7.0`).
+# When omitted, the script prompts and defaults to the next patch bump.
+run = "./scripts/release.sh"
