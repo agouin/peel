@@ -538,8 +538,7 @@ mod app_main {
         // VT bit) the helper returns `false` and we drop to the
         // log renderer rather than emitting literal escape codes
         // (`PLAN_v3_windows.md` §7).
-        let stderr_is_tty =
-            std::io::stderr().is_terminal() && peel::progress::tty_supports_ansi();
+        let stderr_is_tty = std::io::stderr().is_terminal() && peel::progress::tty_supports_ansi();
         // Publish the TTY status so the signal handler picks the right
         // message variant — kubelet log capture stores ANSI escapes
         // verbatim, so the non-TTY path needs a clean message.

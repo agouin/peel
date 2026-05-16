@@ -11,13 +11,15 @@ extraction of compressed archives downloaded over HTTP**. It combines:
 - Parallel ranged HTTP downloads (like aria2c)
 - In-flight streaming decompression (decoder consumes prefix while download
   continues at suffix)
-- `fallocate(PUNCH_HOLE)` to release blocks of the compressed file as the
-  decoder advances past them
-- Frame-aligned checkpointing so a `kill -9` mid-extraction can resume
-  exactly where it left off
+- Hole-punching to release blocks of the compressed file as the decoder
+  advances past them — `fallocate(PUNCH_HOLE)` on Linux,
+  `fcntl(F_PUNCHHOLE)` on macOS, `DeviceIoControl(FSCTL_SET_ZERO_DATA)`
+  on Windows / NTFS (`PLAN_v3_windows.md`)
+- Frame-aligned checkpointing so a `kill -9` or `Ctrl-C` mid-extraction can resume exactly where it left off
 
 The end result: download a 10 GB `.tar.zst`, get the extracted contents, never
 use more than ~300 MB of disk for the compressed side, and survive crashes.
+Linux, macOS, and Windows are all first-class targets.
 
 ## Read these before writing code
 

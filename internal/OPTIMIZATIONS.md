@@ -538,15 +538,66 @@ does on ext4.
 
 ### O.15 Windows sparse file + `FSCTL_SET_ZERO_DATA`
 
-**Status: in flight under `PLAN_v3_windows.md` (drafted 2026-05-15).**
-The full Windows port — `FSCTL_SET_SPARSE` on file creation,
-`FSCTL_SET_ZERO_DATA` puncher, `SetConsoleCtrlHandler` signal parity,
-console password-prompt, ANSI VT enablement, atomic
-`MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` checkpoint publish, NTFS
-path-safety, and a Windows crash-test job — is being delivered as a
-single sequenced sub-plan. This entry will move to **delivered** once
-`PLAN_v3_windows.md` §11 lands; until then, do not promote follow-on
-Windows work from this list.
+**Status: delivered in `PLAN_v3_windows.md` §§0–10 (2026-05-16).**
+The full Windows port shipped as a sequenced sub-plan. Highlights:
+
+- [`punch::WindowsPuncher`](../src/punch.rs) — NTFS
+  `DeviceIoControl(FSCTL_SET_ZERO_DATA)` against the borrowed handle;
+  `ERROR_INVALID_FUNCTION` / `ERROR_NOT_SUPPORTED` /
+  `ERROR_INVALID_PARAMETER` mapped to `PunchError::Unsupported` so
+  FAT32 / exFAT / network mounts degrade silently the same way
+  Linux degrades on `EOPNOTSUPP`.
+- [`download::sparse_file`](../src/download/sparse_file.rs) sets the
+  NTFS sparse attribute via `FSCTL_SET_SPARSE` at file-creation time
+  so the matching puncher actually has clusters to release.
+- [`io_backend::BlockingBackend`](../src/io_backend.rs) gains a
+  Windows path using `std::os::windows::fs::FileExt::seek_write` /
+  `seek_read` + `FlushFileBuffers`. Uring and mmap stay Linux-only.
+- [`os_fd::OsFd`](../src/os_fd.rs) portable
+  `BorrowedFd` / `BorrowedHandle` alias used by every cross-platform
+  trait surface, so trait-impl call sites stay one shape across
+  platforms.
+- `SetConsoleCtrlHandler`-based signal parity in
+  [`src/main.rs`](../src/main.rs): `CTRL_C_EVENT` →
+  `128 + SIGINT = 130`, `CTRL_BREAK_EVENT` → 131,
+  `CTRL_CLOSE_EVENT` / `CTRL_LOGOFF_EVENT` / `CTRL_SHUTDOWN_EVENT`
+  → 129. Two-strike escalation via `ExitProcess`, parity with the
+  Unix `_exit` shape. The graceful watchdog is unchanged and works
+  cross-platform.
+- Windows password prompt
+  ([`src/secret/source.rs`](../src/secret/source.rs)) via
+  `GetConsoleMode` / `SetConsoleMode` against `CONIN$`, with a
+  `Drop` guard that restores the saved mode.
+- `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stderr enables ANSI for
+  the TTY renderer
+  ([`progress::tty_supports_ansi`](../src/progress.rs)); the binary
+  falls back to the structured log renderer when the mode-set
+  fails (pre-Windows-10 1607).
+- Atomic checkpoint publish via
+  `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`
+  ([`checkpoint::atomic_publish`](../src/checkpoint.rs)) gives the
+  same durability guarantee NTFS that the Unix path gets from
+  `rename` + parent-directory `fsync`.
+- NTFS path-safety extensions in
+  [`sink::tar::unsafe_component_reason`](../src/sink/tar.rs):
+  reject backslash, NTFS-reserved characters (`< > : " | ? *`),
+  ASCII controls, trailing dot / space, DOS reserved names
+  (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`). Applied on
+  every platform so cross-host extraction behavior is uniform.
+- Crash-test harness
+  ([`tests/test_coordinator_crash.rs`](../tests/test_coordinator_crash.rs))
+  runs cross-platform — the in-process `AtomicBool` kill switch
+  doesn't depend on `SIGKILL` / `TerminateProcess` shelling out.
+- CI matrix gained a `windows-2022` job in
+  [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) running
+  `fmt + clippy + cargo build + cargo test`. Bzip2 fixture
+  generation needs the `bzip2` binary; the job installs it via
+  Chocolatey.
+- Round-two follow-ons (`O.WIN.LONGPATH`, `O.WIN.JUNCTIONS`,
+  `O.WIN.SCHED_PRIORITY`, `O.WIN.CLUSTER_SIZE`,
+  `O.WIN.ALTSTREAMS`) are filed in
+  [`internal/PLAN_v3_windows.md`](PLAN_v3_windows.md) and remain
+  deferred.
 
 **What**: NTFS equivalent of hole punching.
 

@@ -945,10 +945,7 @@ fn is_dos_reserved_stem(stem: &str) -> bool {
                 bytes[1].to_ascii_uppercase(),
                 bytes[2].to_ascii_uppercase(),
             ],
-            [b'C', b'O', b'N']
-                | [b'P', b'R', b'N']
-                | [b'A', b'U', b'X']
-                | [b'N', b'U', b'L']
+            [b'C', b'O', b'N'] | [b'P', b'R', b'N'] | [b'A', b'U', b'X'] | [b'N', b'U', b'L']
         ),
         4 => {
             let prefix = [
@@ -1525,7 +1522,10 @@ mod tests {
 
     #[test]
     fn unsafe_component_rejects_trailing_dot_or_space() {
-        assert_eq!(unsafe_component_reason("foo."), Some("trailing dot or space"));
+        assert_eq!(
+            unsafe_component_reason("foo."),
+            Some("trailing dot or space")
+        );
         assert_eq!(
             unsafe_component_reason("foo "),
             Some("trailing dot or space"),

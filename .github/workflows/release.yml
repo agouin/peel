@@ -35,6 +35,14 @@ jobs:
             os: ubuntu-22.04-arm
           - target: aarch64-apple-darwin
             os: macos-14
+          # Windows binary (`PLAN_v3_windows.md` §11). The runner
+          # ships MSVC and Visual Studio Build Tools, so no extra
+          # toolchain install. The matrix-gated `if:` steps below
+          # skip the POSIX-flavored bits (`strip`, `cargo deb`,
+          # `install -D`, `tar -czf`) and the Windows Package step
+          # produces a `.zip` containing `peel.exe`.
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -87,10 +95,16 @@ jobs:
 
       - name: Strip binary
         # Hoisted out of the Package step so the cargo-deb step below
-        # consumes the stripped binary too. All matrix hosts can strip
-        # their own architecture (the GHA runners are native, not
-        # cross): ubuntu-22.04 → x86_64, ubuntu-22.04-arm → aarch64,
-        # macos-14 → aarch64-darwin.
+        # consumes the stripped binary too. All Unix matrix hosts can
+        # strip their own architecture (the GHA runners are native,
+        # not cross): ubuntu-22.04 → x86_64, ubuntu-22.04-arm →
+        # aarch64, macos-14 → aarch64-darwin. The Windows runner
+        # doesn't ship a portable `strip`; MSVC's release builds
+        # already drop debug info via the linker and pdb sidecar, so
+        # the unstripped `peel.exe` is comparable in size to a
+        # stripped Linux binary. (Filed `O.WIN.PDB` as a future
+        # follow-on if PDB packaging becomes desirable.)
+        if: matrix.os != 'windows-2022'
         run: strip target/${{ matrix.target }}/release/peel
 
       - name: Install cargo-deb
@@ -110,7 +124,8 @@ jobs:
         # `target/<triple>/debian/peel_<version>-1_<arch>.deb`.
         run: cargo deb --no-build --no-strip --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (POSIX)
+        if: matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -149,6 +164,38 @@ jobs:
             ( cd dist && shasum -a 256 *.deb > peel-${tag}-${{ matrix.target }}.deb.sha256 )
           fi
 
+      - name: Package (Windows)
+        # Windows runners use PowerShell by default. We ship a `.zip`
+        # because that's the format Windows users expect from a
+        # release download; the layout inside mirrors the POSIX
+        # tarball (peel.exe + README + licenses + man page). The man
+        # page isn't useful on Windows but shipping it costs nothing
+        # and keeps the layout uniform. (`PLAN_v3_windows.md` §11.)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ steps.tag.outputs.tag }}'
+          $name = "peel-$tag-${{ matrix.target }}"
+          $staging = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          New-Item -ItemType Directory -Force -Path "$staging/share/man/man1" | Out-Null
+
+          $bin = "target/${{ matrix.target }}/release/peel.exe"
+          Copy-Item $bin "$staging/peel.exe"
+          Copy-Item README.md "$staging/"
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, NOTICE "$staging/"
+          Copy-Item target/man/peel.1 "$staging/share/man/man1/peel.1"
+
+          $zip = "dist/$name.zip"
+          Compress-Archive -Path "$staging/*" -DestinationPath $zip -Force
+          Remove-Item -Recurse -Force $staging
+
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          # Match `shasum -a 256`'s "<hex>  <name>" output format so
+          # downstream verifiers see uniform input across platforms.
+          "$sha  $name.zip" | Out-File -Encoding ascii -NoNewline "$zip.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -158,6 +205,8 @@ jobs:
             dist/*.tar.gz.sha256
             dist/*.deb
             dist/*.deb.sha256
+            dist/*.zip
+            dist/*.zip.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -970,6 +1019,9 @@ jobs:
           assets=(
             # Per-target binary tarballs (build matrix).
             dist/peel-*.tar.gz dist/peel-*.tar.gz.sha256
+            # Windows binary zip (build matrix, x86_64-pc-windows-msvc).
+            # `PLAN_v3_windows.md` §11.
+            dist/peel-*.zip dist/peel-*.zip.sha256
             # Drop-in .deb from cargo-deb (build matrix, gnu Linux only).
             dist/peel_*.deb dist/peel-*.deb.sha256
             # Fedora RPMs (binary + source).

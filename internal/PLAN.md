@@ -31,7 +31,7 @@ and produces byte-identical output to a clean run.
 - Linux first (`fallocate(PUNCH_HOLE)`); puncher trait abstracts the OS so
   macOS/Windows can be added later without core changes. macOS shipped in
   `PLAN_v2.md` §12; Windows (`FSCTL_SET_SPARSE` + `FSCTL_SET_ZERO_DATA`)
-  is in flight under `PLAN_v3_windows.md`.
+  shipped in `PLAN_v3_windows.md` (2026-05-16).
 
 ## Module map
 

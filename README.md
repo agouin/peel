@@ -121,6 +121,18 @@ the tar formats.
   binary suffixes) caps aggregate throughput across all workers and
   mirrors via a shared token bucket.
 
+## Supported platforms
+
+Linux, macOS, and Windows are all first-class targets. The hole-
+punching primitive that makes the bounded-disk story work is
+platform-specific — `fallocate(PUNCH_HOLE)` on Linux,
+`fcntl(F_PUNCHHOLE)` on macOS (APFS), and
+`DeviceIoControl(FSCTL_SET_ZERO_DATA)` on Windows (NTFS) — and the
+right one is selected automatically. Filesystems that don't support
+punching (FAT32, exFAT, network mounts, …) degrade silently to a
+no-op puncher: output is still correct, the source just stays on
+disk for the full extraction.
+
 ## Performance, on Linux
 
 - **`io_uring` end-to-end.** The default backend submits the parallel
