@@ -29,7 +29,9 @@ for the broader plan.
    ```bash
    # On a Fedora host or in a fedora:latest container:
    dnf install rpm-build rpmlint
-   # Produce a source RPM from the spec + the two Source tarballs.
+   # Produce a source RPM from the spec + the two Source tarballs
+   # and `peel.rpmlintrc` (all must be staged in `~/rpmbuild/SOURCES/`
+   # — see §4 for the full staging sequence).
    rpmbuild -bs packaging/fedora/peel.spec
    # Result: ~/rpmbuild/SRPMS/peel-<version>-1.fcXX.src.rpm
    ```
@@ -118,6 +120,12 @@ mkdir -p /tmp/peel-vendor-stage/peel-v<version>-vendored
         peel-v<version>-vendored )
 
 cp packaging/fedora/peel.spec /tmp/peel-rpm-staging/SPECS/
+
+# Source2: the per-package rpmlintrc that filters domain-term
+# spelling false-positives. rpmbuild resolves `Source2:` relative
+# to `~/rpmbuild/SOURCES/`, so it must be staged here even though
+# it ships unchanged from the repo.
+cp packaging/fedora/peel.rpmlintrc /tmp/peel-rpm-staging/SOURCES/
 
 # Run the build inside the container's own filesystem (only mount
 # SOURCES + SPECS read-only). `cargo-rpm-macros` pulls in `cargo`

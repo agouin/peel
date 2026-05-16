@@ -298,6 +298,11 @@ jobs:
           vendored=$(find vendor-artifact -name 'peel-*-vendored.tar.gz' | head -1)
           test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
           cp "${vendored}" "/github/home/rpmbuild/SOURCES/peel-${tag}-vendored.tar.gz"
+          # Source2 in the spec is `peel.rpmlintrc`, which rpmbuild
+          # resolves relative to `~/rpmbuild/SOURCES/`. Stage it
+          # alongside the tarballs.
+          cp packaging/fedora/peel.rpmlintrc \
+              /github/home/rpmbuild/SOURCES/peel.rpmlintrc
           # Patch the spec's `Version:` to the tag's version. The
           # committed `peel.spec` carries whatever the last release
           # was (so manual local builds work); CI overrides at build
