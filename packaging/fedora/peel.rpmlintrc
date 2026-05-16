@@ -1,0 +1,23 @@
+# Per-package rpmlint config for the peel RPM.
+#
+# Discovered automatically by rpmlint when present next to the
+# SRPM (rpmlint extracts the SRPM and reads any
+# `<name>.rpmlintrc` it contains) — Source2 in `peel.spec` is what
+# bundles this file into the SRPM.
+#
+# All filters here are domain-term false positives raised by the
+# default Fedora spellcheck dictionary against text in the
+# Summary / %description. Whitelist them rather than reword the
+# package metadata, since each is a real term users will look
+# for:
+#
+#   resumable  — describes the resume-on-SIGKILL behavior (a
+#                load-bearing piece of how the project pitches
+#                itself; reworded synonyms read worse)
+#   zst, xz, gz, rar
+#              — file-extension stems for supported archive
+#                formats; they appear in `--help` output, in
+#                user docs, and on the GitHub project page, so
+#                changing them in the package description only
+#                would create a needless mismatch
+addFilter(r"^peel(\.src|\.[^:]+): E: spelling-error \('(resumable|zst|xz|gz|rar)',")

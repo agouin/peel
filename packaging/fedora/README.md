@@ -17,11 +17,12 @@ for the broader plan.
 
 1. **Get a FAS account** at `accounts.fedoraproject.org`.
 2. **Create a COPR project** at `copr.fedorainfracloud.org`. Enable
-   the chroots you want to ship for (Fedora 41 / 42 / rawhide,
-   EPEL 10 — both `x86_64` and `aarch64`). Configure the project
-   to install `rustup` (or `rust-toolset`) at build time so the
-   `BuildRequires: rust >= 1.85` constraint is satisfied even on
-   Fedora 41 (which ships rust 1.81 in the archive).
+   the chroots you want to ship for (Fedora 42 / 43 / 44 / rawhide,
+   EPEL 10 — both `x86_64` and `aarch64`). Fedora 42+ ships
+   `cargo-rpm-macros` and a `rust` package new enough to satisfy
+   the spec's `BuildRequires: rust >= 1.85`, so no extra chroot
+   configuration is needed. Older chroots (Fedora 41, EPEL 9) lag
+   the MSRV and aren't supported.
 3. **Build a source RPM locally** (or let COPR build from a git
    ref):
 
@@ -119,52 +120,67 @@ mkdir -p /tmp/peel-vendor-stage/peel-v<version>-vendored
 cp packaging/fedora/peel.spec /tmp/peel-rpm-staging/SPECS/
 
 # Run the build inside the container's own filesystem (only mount
-# SOURCES + SPECS read-only). The script installs rust 1.95 via
-# rustup so the spec's `BuildRequires: rust >= 1.85` is satisfied
-# even though Fedora 41's archive rust is 1.81.
+# SOURCES + SPECS read-only). `cargo-rpm-macros` pulls in `cargo`
+# + `rust` (1.95+ on Fedora 44) and provides the %%cargo_prep /
+# %%cargo_build macros the spec uses for hardening RUSTFLAGS.
+# `--without check` flips the spec's `%bcond_without check` so the
+# heavy dev-dep build chain (xz2 → lzma-sys) doesn't run.
 docker run --rm --platform linux/<arch> \
     -v /tmp/peel-rpm-staging/SOURCES:/sources:ro \
     -v /tmp/peel-rpm-staging/SPECS:/specs:ro \
     fedora:latest bash -c '
-        dnf -y install rpm-build rpmlint pkgconf-pkg-config \
-            libzstd-devel gcc rustup > /dev/null
-        rustup-init -y --default-toolchain 1.95.0 --profile minimal \
-            --no-modify-path > /dev/null 2>&1
-        source ~/.cargo/env
+        dnf -y install rpm-build rpmlint cargo-rpm-macros \
+            pkgconf-pkg-config libzstd-devel gcc tar > /dev/null
         mkdir -p /root/rpmbuild/SOURCES /root/rpmbuild/SPECS
         cp /sources/* /root/rpmbuild/SOURCES/
         cp /specs/* /root/rpmbuild/SPECS/
-        rpmlint /root/rpmbuild/SPECS/peel.spec
-        rpmbuild -bb --nodeps /root/rpmbuild/SPECS/peel.spec
+        # Build SRPM + binary RPMs (skip %check; ci.yml already runs cargo test).
+        rpmbuild -bs --without check /root/rpmbuild/SPECS/peel.spec
+        rpmbuild -bb --without check /root/rpmbuild/SPECS/peel.spec
+        # Lint with the bundled rpmlintrc so the five domain-term
+        # spelling false-positives stay filtered. The SRPM auto-
+        # discovers `peel.rpmlintrc` from its own SOURCES dir;
+        # the built-RPM set needs `-r` because rpmlint disables
+        # auto-discovery when more than one rpm is passed at once.
+        cp /sources/peel.rpmlintrc /root/rpmbuild/SRPMS/
+        rpmlint /root/rpmbuild/SRPMS/peel-*.src.rpm
+        rpmlint -r /sources/peel.rpmlintrc /root/rpmbuild/RPMS/*/peel-*.rpm
         find /root/rpmbuild/RPMS -name "*.rpm"
     '
 ```
 
 Expected output: three RPMs (main + `peel-debuginfo` +
-`peel-debugsource`), zero rpmlint errors, and the main RPM's
-`rpm -qlp` listing of `/usr/bin/peel`,
-`/usr/share/man/man1/peel.1.gz`, and
-`/usr/share/licenses/peel/{LICENSE-MIT,LICENSE-APACHE,NOTICE}`.
+`peel-debugsource`), zero rpmlint errors or warnings on either
+the SRPM or the built set, and the main RPM's `rpm -qlp`
+listing of `/usr/bin/peel`, `/usr/share/man/man1/peel.1.gz`,
+and `/usr/share/licenses/peel/{LICENSE-MIT,LICENSE-APACHE,NOTICE}`.
 
-The `--nodeps` flag is needed locally because the spec's
-`BuildRequires: rust >= 1.85` is not satisfied by Fedora's `rust`
-package alone (which ships 1.81 on Fedora 41); the rustup-installed
-toolchain provides 1.95 outside dnf's view. COPR / official-repo
-builds satisfy the constraint via `rust-toolset`.
+To run `%check` locally, add `xz-devel` to the dnf install line
+and drop `--without check`. The dev-dep `xz2` crate
+(`tests/test_xz_native.rs`) links against system liblzma during
+the test build — the runtime `peel` binary does not.
 
 ## §5 What's been validated
 
-The spec was end-to-end-tested in a `fedora:latest` (Fedora 44
-rawhide at validation time) container on aarch64. The full build
-produced:
+The spec was end-to-end-tested in a `fedora:latest` (Fedora 44 at
+validation time, rustc 1.95.0, cargo-rpm-macros 28.4) container
+on aarch64. The full build via `cargo-rpm-macros` produced:
 
 ```
-peel-0.5.0-1.fc44.aarch64.rpm           (main, ~5 MB)
-peel-debuginfo-0.5.0-1.fc44.aarch64.rpm (debug symbols)
-peel-debugsource-0.5.0-1.fc44.aarch64.rpm (source for symbols)
+peel-0.6.12-1.fc44.aarch64.rpm           (main, ~5 MB)
+peel-debuginfo-0.6.12-1.fc44.aarch64.rpm (debug symbols)
+peel-debugsource-0.6.12-1.fc44.aarch64.rpm (source for symbols)
 ```
 
-Zero rpmlint errors. The lint warnings include the standard
-"bogus-date" check (which trips on dates in the future for the
-validation host, harmless) and a "missing-changelog" warning
-for the source RPM phase.
+Verified on the produced binary: PIE executable, `BIND_NOW` +
+full relro, frame pointers preserved, Fedora's `.note.package`
+build-flags fingerprint emitted. `NEEDED libzstd.so.1` confirms
+`-f system-libs` correctly routes to pkg-config.
+
+rpmlint findings: zero errors and zero warnings on the SRPM
+(auto-discovers the bundled `peel.rpmlintrc`) and on the built
+set when invoked as `rpmlint -r packaging/fedora/peel.rpmlintrc
+peel-*.rpm`. The rpmlintrc filters the five domain-term
+spelling false-positives (`resumable`, `zst`, `xz`, `gz`, `rar`)
+that the default Fedora dictionary raises against Summary /
+%%description; see the file header for the per-term rationale.

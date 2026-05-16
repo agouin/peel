@@ -252,16 +252,16 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Install build deps
-        # `rust-toolset` / `rust` packages on Fedora don't always
-        # satisfy the spec's `BuildRequires: rust >= 1.85` (Fedora 41
-        # ships 1.81). Install 1.95 via rustup to match the
-        # `rust-toolchain.toml` pin used in CI.
+        # `cargo-rpm-macros` pulls in `cargo` + `rust` (1.95+ on
+        # Fedora 44, which clears the spec's `BuildRequires: rust >=
+        # 1.85`) and provides %%cargo_prep / %%cargo_build that the
+        # spec relies on for hardening RUSTFLAGS. `gcc` is needed
+        # because a handful of vendored crates' build scripts
+        # compile C shims (notably ring). `git` + `tar` cover the
+        # source-staging step below.
         run: |
-          dnf -y -q install rpm-build pkgconf-pkg-config libzstd-devel \
-              gcc git tar rustup
-          rustup-init -y --default-toolchain 1.95.0 --profile minimal \
-              --no-modify-path > /dev/null 2>&1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          dnf -y -q install rpm-build cargo-rpm-macros \
+              pkgconf-pkg-config libzstd-devel gcc git tar
 
       - name: Download vendored crates
         uses: actions/download-artifact@v4
@@ -308,17 +308,17 @@ jobs:
               /github/home/rpmbuild/SPECS/peel.spec
 
       - name: Build RPMs
-        # `--nocheck` skips the spec's `%check` step (cargo test) —
-        # the main CI workflow already runs tests on every push, and
-        # %check would re-trigger the heavy xz2 → lzma-sys dev-dep
-        # build chain just to repeat what ci.yml already verified.
-        # `--nodeps` because the rust toolchain came from rustup, not
-        # dnf, so the `rust >= 1.85` BuildRequires can't see it.
+        # `--without check` flips the spec's `%bcond_without check`
+        # so %check (cargo test) is skipped — the main CI workflow
+        # already runs tests on every push, and %check would
+        # re-trigger the heavy xz2 → lzma-sys dev-dep build chain
+        # just to repeat what ci.yml already verified. The bcond
+        # also drops the `xz-devel` BR so dnf doesn't need it.
         shell: bash
         run: |
           export HOME=/github/home
-          rpmbuild -bs ~/rpmbuild/SPECS/peel.spec
-          rpmbuild -bb --nocheck --nodeps ~/rpmbuild/SPECS/peel.spec
+          rpmbuild -bs --without check ~/rpmbuild/SPECS/peel.spec
+          rpmbuild -bb --without check ~/rpmbuild/SPECS/peel.spec
 
       - name: Stage outputs
         # The `.src.rpm` is arch-independent and gets rebuilt
