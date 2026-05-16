@@ -44,8 +44,6 @@
 //!   conventions in the table above; users with non-conforming
 //!   filenames pass every volume explicitly.
 
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;

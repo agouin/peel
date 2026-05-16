@@ -6,8 +6,6 @@
 //! profiles, …) is deferred per `internal/PLAN.md` §10.2 and the
 //! "do-not-add-CLI-niceties" rule in `AGENTS.md`.
 
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

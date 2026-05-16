@@ -19,8 +19,6 @@
 //! [`WorkerError::Cancelled`] before its next syscall, instead of
 //! sleeping out the remaining backoff.
 
-#![cfg(unix)]
-
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

@@ -22,15 +22,32 @@
 //!   the original). One-shot, until EOF or newline. Pairs with shell
 //!   process substitution: `peel … --password-from fd:3 3< <(pass …)`.
 
-#![cfg(unix)]
+//! # Cross-platform notes
+//!
+//! `PLAN_v3_windows.md` §3 lifts the file-level `#![cfg(unix)]` so
+//! [`PasswordSource`] and the env/file loaders work on Windows too.
+//! The `fd:N` source is Unix-only (Windows `HANDLE`s are not small
+//! integers; the parser rejects `fd:N` with
+//! [`PasswordSourceParseError::UnsupportedOnPlatform`]). The TTY
+//! prompt's `SetConsoleMode` Windows implementation lands in §6;
+//! until then `Prompt` on Windows returns a clean
+//! [`PasswordLoadError::PlatformUnsupported`] error.
 
-use std::ffi::{c_int, OsString};
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::ffi::c_int;
 
 use thiserror::Error;
 
@@ -47,14 +64,21 @@ use super::Password;
 /// [`PasswordSource::is_interactive`].
 #[derive(Debug, Clone)]
 pub enum PasswordSource {
-    /// Read from `/dev/tty` with echo disabled.
+    /// Read from `/dev/tty` with echo disabled on Unix; from
+    /// `CONIN$` with `ENABLE_ECHO_INPUT` cleared on Windows
+    /// (`PLAN_v3_windows.md` §6).
     Prompt,
     /// Read from the named environment variable.
     Env(OsString),
     /// Read the first line of the file at the given path.
     File(PathBuf),
     /// Read from the given file descriptor (duped before reading
-    /// so the caller's fd remains open).
+    /// so the caller's fd remains open). Unix-only: Windows
+    /// `HANDLE`s are not small integers and the `fd:N` shell idiom
+    /// (`peel … --password-from fd:3 3< <(pass …)`) has no direct
+    /// Windows analog. On Windows the parser rejects `fd:N` with
+    /// [`PasswordSourceParseError::UnsupportedOnPlatform`].
+    #[cfg(unix)]
     Fd(RawFd),
 }
 
@@ -87,6 +111,16 @@ pub enum PasswordSourceParseError {
         /// The substring that failed to parse.
         value: String,
     },
+
+    /// A syntactically valid source variant is not supported on this
+    /// platform. Today the only case is `fd:N` on Windows — Windows
+    /// `HANDLE`s are not numeric file descriptors and shell
+    /// process-substitution (`<(pass …)`) is a Unix idiom.
+    #[error("--password-from {scheme} is not supported on this platform")]
+    UnsupportedOnPlatform {
+        /// The source scheme (e.g. `"fd:N"`).
+        scheme: &'static str,
+    },
 }
 
 /// Errors from loading a password via [`PasswordSource::load`].
@@ -113,6 +147,17 @@ pub enum PasswordLoadError {
     TermiosFailure {
         /// The errno reported by `tcgetattr` / `tcsetattr`.
         errno: i32,
+    },
+
+    /// `GetConsoleMode` / `SetConsoleMode` failed while toggling
+    /// `ENABLE_ECHO_INPUT` on the Windows console handle.
+    /// (`PLAN_v3_windows.md` §6.)
+    #[error("configuring Windows console for password input: {source}")]
+    ConsoleModeFailure {
+        /// The underlying `io::Error` (carries the Win32 last-error
+        /// code via `io::Error::raw_os_error`).
+        #[source]
+        source: io::Error,
     },
 
     /// Reading the password line itself failed.
@@ -152,6 +197,17 @@ pub enum PasswordLoadError {
         #[source]
         source: io::Error,
     },
+
+    /// The requested loader is not implemented on this platform yet.
+    /// Today this fires only on Windows for [`PasswordSource::Prompt`]
+    /// pending `PLAN_v3_windows.md` §6 (the Windows `SetConsoleMode`
+    /// echo-off implementation). Use `--password-from env:NAME` or
+    /// `--password-from file:PATH` as the workaround.
+    #[error("--password-from {source_kind} is not yet implemented on this platform")]
+    PlatformUnsupported {
+        /// Short label of the source variant (e.g. `"prompt"`).
+        source_kind: &'static str,
+    },
 }
 
 impl PasswordSource {
@@ -177,17 +233,28 @@ impl PasswordSource {
             return Ok(Self::File(PathBuf::from(rest)));
         }
         if let Some(rest) = input.strip_prefix("fd:") {
-            let fd: c_int = rest
-                .parse()
-                .map_err(|_| PasswordSourceParseError::InvalidFd {
-                    value: rest.to_string(),
-                })?;
-            if fd < 0 {
-                return Err(PasswordSourceParseError::InvalidFd {
-                    value: rest.to_string(),
-                });
+            // Validate the numeric shape on every platform so the
+            // diagnostic is consistent (`InvalidFd` for bad digits,
+            // `UnsupportedOnPlatform` for "Windows doesn't do fd:N").
+            #[cfg(unix)]
+            {
+                let fd: c_int = rest
+                    .parse()
+                    .map_err(|_| PasswordSourceParseError::InvalidFd {
+                        value: rest.to_string(),
+                    })?;
+                if fd < 0 {
+                    return Err(PasswordSourceParseError::InvalidFd {
+                        value: rest.to_string(),
+                    });
+                }
+                return Ok(Self::Fd(fd));
             }
-            return Ok(Self::Fd(fd));
+            #[cfg(not(unix))]
+            {
+                let _ = rest;
+                return Err(PasswordSourceParseError::UnsupportedOnPlatform { scheme: "fd:N" });
+            }
         }
         Err(PasswordSourceParseError::UnknownScheme {
             input: input.to_string(),
@@ -208,9 +275,13 @@ impl PasswordSource {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
+            #[cfg(unix)]
             Self::Prompt => "/dev/tty".to_string(),
+            #[cfg(not(unix))]
+            Self::Prompt => "console".to_string(),
             Self::Env(name) => format!("env:{}", name.to_string_lossy()),
             Self::File(path) => format!("file:{}", path.display()),
+            #[cfg(unix)]
             Self::Fd(fd) => format!("fd:{fd}"),
         }
     }
@@ -226,9 +297,20 @@ impl PasswordSource {
     /// vars, empty values, and termios errors.
     pub fn load(&self, prompt_message: &str) -> Result<Password, PasswordLoadError> {
         match self {
+            #[cfg(unix)]
             Self::Prompt => prompt_password_tty(prompt_message),
+            #[cfg(windows)]
+            Self::Prompt => prompt_password_console(prompt_message),
+            #[cfg(not(any(unix, windows)))]
+            Self::Prompt => {
+                let _ = prompt_message;
+                Err(PasswordLoadError::PlatformUnsupported {
+                    source_kind: "prompt",
+                })
+            }
             Self::Env(name) => load_from_env(name),
             Self::File(path) => load_from_file(path),
+            #[cfg(unix)]
             Self::Fd(fd) => load_from_fd(*fd),
         }
     }
@@ -239,7 +321,8 @@ fn load_from_env(name: &std::ffi::OsStr) -> Result<Password, PasswordLoadError> 
     let value = std::env::var_os(name).ok_or_else(|| PasswordLoadError::EnvNotSet {
         name: name.to_string_lossy().into_owned(),
     })?;
-    let bytes = strip_trailing_eol(value.as_bytes());
+    let raw = os_str_to_bytes(&value);
+    let bytes = strip_trailing_eol(&raw);
     if bytes.is_empty() {
         return Err(PasswordLoadError::Empty {
             source_label: label,
@@ -248,20 +331,54 @@ fn load_from_env(name: &std::ffi::OsStr) -> Result<Password, PasswordLoadError> 
     Ok(Password::new(bytes.to_vec()))
 }
 
+/// Encode an [`OsStr`] as bytes for password-loading.
+///
+/// On Unix the byte sequence is the kernel-native representation
+/// returned by [`std::os::unix::ffi::OsStrExt::as_bytes`]; non-UTF-8
+/// sequences round-trip exactly. On Windows the underlying value is
+/// WTF-16 and we encode through `to_string_lossy()` — non-decodable
+/// half-surrogates become U+FFFD. Real-world passwords are valid
+/// UTF-8 / UTF-16, so the lossy edge case is academic; the
+/// alternative (refusing non-UTF-8 input) would surprise users with
+/// otherwise-valid passwords containing high-codepoint characters.
+fn os_str_to_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        s.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 fn load_from_file(path: &Path) -> Result<Password, PasswordLoadError> {
     let label = format!("file:{}", path.display());
     let meta = std::fs::metadata(path).map_err(|source| PasswordLoadError::FileMetadata {
         path: path.to_path_buf(),
         source,
     })?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode != 0o600 {
-        tracing::warn!(
-            path = %path.display(),
-            mode = format!("{mode:04o}"),
-            "password file is readable by users beyond the owner; \
-             recommended mode is 0600",
-        );
+    // POSIX mode bits don't exist on Windows (NTFS uses ACLs); the
+    // pre-2026-05-15 0600-recommendation warning is therefore
+    // skipped on Windows. A `Get-Acl` / `icacls`-based equivalent
+    // is filed as a round-two follow-on (see `PLAN_v3_windows.md`
+    // §11 round-two list); for now the file's ACL is the user's
+    // responsibility on Windows.
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{mode:04o}"),
+                "password file is readable by users beyond the owner; \
+                 recommended mode is 0600",
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
     }
     let mut file = File::open(path).map_err(|source| PasswordLoadError::Read {
         source_label: label.clone(),
@@ -271,6 +388,7 @@ fn load_from_file(path: &Path) -> Result<Password, PasswordLoadError> {
     Ok(Password::new(bytes))
 }
 
+#[cfg(unix)]
 fn load_from_fd(fd: RawFd) -> Result<Password, PasswordLoadError> {
     let label = format!("fd:{fd}");
     // SAFETY: we trust the caller's claim that `fd` is a valid open
@@ -357,11 +475,20 @@ fn strip_trailing_eol(bytes: &[u8]) -> &[u8] {
 }
 
 // --- TTY password prompt ---------------------------------------------------
+//
+// The Unix-only block below talks directly to termios via
+// `tcgetattr` / `tcsetattr` on `/dev/tty`. The Windows analogue
+// (`SetConsoleMode` against `CONIN$` with `ENABLE_ECHO_INPUT`
+// cleared) lands in `PLAN_v3_windows.md` §6; until then the
+// `Prompt` variant on Windows returns
+// `PasswordLoadError::PlatformUnsupported`.
 
+#[cfg(unix)]
 /// Bit in `termios::c_lflag` that gates echoing of typed characters.
 /// Same numeric value on Linux and macOS.
 const ECHO: TcFlag = 0o0000010;
 
+#[cfg(unix)]
 /// `tcsetattr` action: drain output, flush input, then apply.
 /// Same numeric value on Linux and macOS.
 const TCSAFLUSH: c_int = 2;
@@ -380,11 +507,11 @@ type Speed = u64;
 #[cfg(target_os = "macos")]
 const NCCS: usize = 20;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 type TcFlag = u32;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 type Speed = u32;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const NCCS: usize = 32;
 
 /// Layout-compatible mirror of `struct termios`.
@@ -395,6 +522,7 @@ const NCCS: usize = 32;
 /// width (u32 on Linux, u64 on macOS). The platform-specific
 /// `cfg`s above keep this struct binary-compatible with the host's
 /// libc `termios`.
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct Termios {
@@ -409,11 +537,13 @@ struct Termios {
     c_ospeed: Speed,
 }
 
+#[cfg(unix)]
 extern "C" {
     fn tcgetattr(fd: c_int, termios_p: *mut Termios) -> c_int;
     fn tcsetattr(fd: c_int, optional_actions: c_int, termios_p: *const Termios) -> c_int;
 }
 
+#[cfg(unix)]
 fn errno() -> i32 {
     // SAFETY: `__errno_location` (glibc/musl) and `__error` (macOS)
     // return a thread-local pointer to the integer errno. We
@@ -447,11 +577,13 @@ fn errno() -> i32 {
 /// skips the restore, but in that case the kernel teardown drops
 /// the controlling-terminal association anyway and the next shell
 /// re-initialises termios on its own prompt.
+#[cfg(unix)]
 struct NoEchoGuard {
     fd: RawFd,
     saved: Termios,
 }
 
+#[cfg(unix)]
 impl NoEchoGuard {
     fn install(fd: RawFd) -> Result<Self, PasswordLoadError> {
         let mut saved = blank_termios();
@@ -476,6 +608,7 @@ impl NoEchoGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for NoEchoGuard {
     fn drop(&mut self) {
         // SAFETY: `self.saved` was populated by an earlier
@@ -489,6 +622,7 @@ impl Drop for NoEchoGuard {
     }
 }
 
+#[cfg(unix)]
 fn blank_termios() -> Termios {
     Termios {
         c_iflag: 0,
@@ -503,6 +637,7 @@ fn blank_termios() -> Termios {
     }
 }
 
+#[cfg(unix)]
 fn prompt_password_tty(prompt_message: &str) -> Result<Password, PasswordLoadError> {
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
@@ -524,7 +659,124 @@ fn prompt_password_tty(prompt_message: &str) -> Result<Password, PasswordLoadErr
     Ok(Password::new(bytes))
 }
 
-#[cfg(test)]
+// --- Windows console password prompt --------------------------------
+//
+// Windows analog of `prompt_password_tty`. Opens the console input
+// (`CONIN$`) and console output (`CONOUT$`) device pair, writes the
+// prompt to the output stream, and disables `ENABLE_ECHO_INPUT` on
+// the input stream for the duration of the read via
+// `NoEchoGuardWindows`. The guard restores the previous console mode
+// on `Drop` — covering normal completion and Rust panic-unwinds.
+// Abrupt termination (`TerminateProcess` / `ExitProcess` from a
+// console-ctrl handler) skips the restore; that's the same Unix
+// posture (a `SIGKILL` skips `tcsetattr`) and the OS resets the
+// console mode on the next shell prompt anyway.
+//
+// `CONIN$` / `CONOUT$` are special filenames the Win32 layer routes
+// to the process's attached console regardless of stdin/stdout
+// redirection — equivalent to Unix's `/dev/tty`. We open them via
+// the high-level `std::fs::OpenOptions` API so error reporting goes
+// through `io::Error` consistently with the rest of the codebase.
+// (`PLAN_v3_windows.md` §6.)
+#[cfg(windows)]
+fn prompt_password_console(prompt_message: &str) -> Result<Password, PasswordLoadError> {
+    use std::io::Write as _;
+
+    let mut conin = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONIN$")
+        .map_err(|source| PasswordLoadError::TtyOpen { source })?;
+    let mut conout = std::fs::OpenOptions::new()
+        .write(true)
+        .open("CONOUT$")
+        .map_err(|source| PasswordLoadError::TtyOpen { source })?;
+
+    conout
+        .write_all(prompt_message.as_bytes())
+        .map_err(|source| PasswordLoadError::TtyWrite { source })?;
+    conout.flush().ok();
+
+    let _guard = NoEchoGuardWindows::install(&conin)?;
+    let bytes = read_password_line(&mut conin, "CONIN$")?;
+
+    // Mirror the Unix path's trailing newline so subsequent output
+    // doesn't land on top of the prompt line.
+    conout.write_all(b"\r\n").ok();
+    Ok(Password::new(bytes))
+}
+
+/// `ENABLE_ECHO_INPUT` from `<wincon.h>`. Numeric value is part of
+/// the stable console-mode ABI. Declared locally rather than pulled
+/// from `windows-sys`'s `Win32_System_Console` constants list so
+/// the import surface stays minimal — same precedent as
+/// `punch::macos::F_PUNCHHOLE`.
+#[cfg(windows)]
+const ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+/// Disables `ENABLE_ECHO_INPUT` on a Windows console handle for the
+/// guard's lifetime, restoring the saved console mode on `Drop`.
+#[cfg(windows)]
+struct NoEchoGuardWindows {
+    handle: std::os::windows::io::RawHandle,
+    saved_mode: u32,
+}
+
+#[cfg(windows)]
+impl NoEchoGuardWindows {
+    fn install(conin: &File) -> Result<Self, PasswordLoadError> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{GetConsoleMode, SetConsoleMode};
+
+        let handle = conin.as_raw_handle();
+        let mut saved_mode: u32 = 0;
+        // SAFETY: `conin` is borrowed for the duration of this call,
+        // so the raw handle is valid. `GetConsoleMode` writes a
+        // `u32` through the pointer on success.
+        let rc = unsafe { GetConsoleMode(handle as _, &mut saved_mode) };
+        if rc == 0 {
+            return Err(PasswordLoadError::ConsoleModeFailure {
+                source: io::Error::last_os_error(),
+            });
+        }
+        let new_mode = saved_mode & !ENABLE_ECHO_INPUT;
+        // SAFETY: same handle-lifetime argument; `SetConsoleMode`
+        // takes a `u32` mode by value.
+        let rc = unsafe { SetConsoleMode(handle as _, new_mode) };
+        if rc == 0 {
+            return Err(PasswordLoadError::ConsoleModeFailure {
+                source: io::Error::last_os_error(),
+            });
+        }
+        Ok(Self { handle, saved_mode })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NoEchoGuardWindows {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::SetConsoleMode;
+        // SAFETY: `self.handle` was valid when the guard was
+        // installed and the guard is dropped before the `File` is
+        // closed (the `File` outlives `_guard` in
+        // `prompt_password_console`'s caller). We ignore the return
+        // value because there's nothing sensible to do on failure
+        // inside `Drop`.
+        unsafe {
+            SetConsoleMode(self.handle as _, self.saved_mode);
+        }
+    }
+}
+
+// The existing test module assumes a Unix-only build: it uses
+// `RawFd`, `pipe(2)`, the termios machinery, and tests the
+// `Fd(RawFd)` variant. `PLAN_v3_windows.md` §3 lifts the file-level
+// `cfg(unix)`, so the parse tests *could* run cross-platform, but
+// splitting them out is a §6 task (paired with adding Windows-side
+// `SetConsoleMode` echo-off tests). Until then the existing tests
+// stay Unix-only; cross-platform parse coverage is exercised
+// indirectly via `cli` tests.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Cursor;

@@ -39,8 +39,6 @@
 //! streaming pipeline's per-frame discipline, but real for very
 //! large entries and graceful elsewhere.
 
-#![cfg(unix)]
-
 use std::collections::HashSet;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -538,11 +538,21 @@ does on ext4.
 
 ### O.15 Windows sparse file + `FSCTL_SET_ZERO_DATA`
 
+**Status: in flight under `PLAN_v3_windows.md` (drafted 2026-05-15).**
+The full Windows port — `FSCTL_SET_SPARSE` on file creation,
+`FSCTL_SET_ZERO_DATA` puncher, `SetConsoleCtrlHandler` signal parity,
+console password-prompt, ANSI VT enablement, atomic
+`MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` checkpoint publish, NTFS
+path-safety, and a Windows crash-test job — is being delivered as a
+single sequenced sub-plan. This entry will move to **delivered** once
+`PLAN_v3_windows.md` §11 lands; until then, do not promote follow-on
+Windows work from this list.
+
 **What**: NTFS equivalent of hole punching.
 
-**Why deferred**: same reason as O.14; orders of magnitude more work
-to also port the rest of the toolchain (fallocate/sparse file
-semantics, signal handling).
+**Why deferred** (historical, pre-`PLAN_v3_windows.md`): same reason
+as O.14; orders of magnitude more work to also port the rest of the
+toolchain (fallocate/sparse file semantics, signal handling).
 
 ---
 

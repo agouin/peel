@@ -40,8 +40,6 @@
 //! configured initial dispatch size, with hysteresis observed from
 //! the resume's start.
 
-#![cfg(unix)]
-
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

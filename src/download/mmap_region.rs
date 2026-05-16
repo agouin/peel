@@ -36,7 +36,13 @@
 //! alive keeps the mapping alive; the
 //! [`crate::punch::LinuxPuncher::for_mmap`] keepalive is exactly that.
 
-#![cfg(unix)]
+// Mmap storage backend. Linux-only: it uses `madvise(MADV_REMOVE)`
+// for hole-punching, which has no portable analog. The
+// `download::sparse_file` mmap path is gated on
+// `target_os = "linux"` end-to-end (`PLAN_v2.md` §9), and any
+// future macOS/Windows mmap variant would land beside this module
+// with its own `cfg`.
+#![cfg(target_os = "linux")]
 
 use std::ffi::c_void;
 use std::io;

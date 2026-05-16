@@ -34,12 +34,18 @@
 //!   most network/FUSE volumes report `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`,
 //!   which is again mapped to [`PunchError::Unsupported`] so callers can
 //!   downgrade to [`NoopPuncher`].
+//! - [`WindowsPuncher`] (Windows only) calls
+//!   `DeviceIoControl(FSCTL_SET_ZERO_DATA)` against the borrowed
+//!   handle (`PLAN_v3_windows.md` §4). NTFS deallocates whole
+//!   clusters within the punched range; FAT32, exFAT, and most
+//!   network mounts return `ERROR_INVALID_FUNCTION` /
+//!   `ERROR_NOT_SUPPORTED` / `ERROR_INVALID_PARAMETER`, all mapped
+//!   to [`PunchError::Unsupported`] so the caller can downgrade to
+//!   [`NoopPuncher`] without aborting. The sparse attribute the
+//!   FSCTL requires is set at file-creation time by
+//!   [`crate::download::sparse_file`] via `FSCTL_SET_SPARSE`.
 //! - [`default_puncher`] picks the best implementation for the running
 //!   platform.
-//!
-//! Other platforms (Windows `FSCTL_SET_ZERO_DATA`) are deferred per
-//! `internal/PLAN.md` §2; the trait is shaped to admit them without changes
-//! to its callers.
 //!
 //! # Alignment
 //!
@@ -49,12 +55,9 @@
 //! [`align_down`] and [`PunchHole::block_size_hint`] before invoking
 //! [`PunchHole::punch`].
 
-#![cfg(unix)]
-
-use std::os::fd::BorrowedFd;
-
 use thiserror::Error;
 
+use crate::os_fd::OsFd;
 use crate::types::ByteOffset;
 
 /// Errors produced by [`PunchHole`] implementations.
@@ -115,7 +118,7 @@ pub trait PunchHole: Send + Sync {
     /// the region, [`PunchError::OffsetOverflow`] if the arguments cannot
     /// fit the underlying syscall's `off_t`, or [`PunchError::Io`] for any
     /// other OS error.
-    fn punch(&self, fd: BorrowedFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError>;
+    fn punch(&self, fd: OsFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError>;
 
     /// Filesystem block alignment expected by this puncher, in bytes.
     /// A conservative default for unknown filesystems is 4096.
@@ -138,12 +141,7 @@ impl NoopPuncher {
 }
 
 impl PunchHole for NoopPuncher {
-    fn punch(
-        &self,
-        _fd: BorrowedFd<'_>,
-        _offset: ByteOffset,
-        _length: u64,
-    ) -> Result<(), PunchError> {
+    fn punch(&self, _fd: OsFd<'_>, _offset: ByteOffset, _length: u64) -> Result<(), PunchError> {
         Ok(())
     }
 
@@ -209,9 +207,11 @@ pub const fn align_up(value: u64, alignment: u64) -> Option<u64> {
 /// Return the best [`PunchHole`] implementation for the current platform.
 ///
 /// On Linux this is a [`LinuxPuncher`]; on macOS it is a
-/// [`MacosPuncher`]; on every other Unix it is a [`NoopPuncher`].
-/// Callers that observe [`PunchError::Unsupported`] from the returned
-/// puncher should replace it with [`NoopPuncher`] and continue.
+/// [`MacosPuncher`]; on Windows it is a [`WindowsPuncher`]
+/// (`PLAN_v3_windows.md` §4); on every other platform without a
+/// hole-punch syscall it is a [`NoopPuncher`]. Callers that observe
+/// [`PunchError::Unsupported`] from the returned puncher should
+/// replace it with [`NoopPuncher`] and continue.
 #[must_use]
 pub fn default_puncher() -> Box<dyn PunchHole> {
     #[cfg(target_os = "linux")]
@@ -222,7 +222,11 @@ pub fn default_puncher() -> Box<dyn PunchHole> {
     {
         Box::new(MacosPuncher::new())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(WindowsPuncher::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Box::new(NoopPuncher::new())
     }
@@ -234,15 +238,18 @@ pub use linux::LinuxPuncher;
 #[cfg(target_os = "macos")]
 pub use macos::MacosPuncher;
 
+#[cfg(target_os = "windows")]
+pub use windows::WindowsPuncher;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::c_void;
     use std::io;
-    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::fd::AsRawFd;
     use std::ptr::NonNull;
     use std::sync::{Arc, OnceLock};
 
-    use super::{PunchError, PunchHole};
+    use super::{OsFd, PunchError, PunchHole};
     use crate::types::ByteOffset;
 
     /// `fallocate` mode flag: keep the file's logical size unchanged.
@@ -475,12 +482,7 @@ mod linux {
     }
 
     impl PunchHole for LinuxPuncher {
-        fn punch(
-            &self,
-            fd: BorrowedFd<'_>,
-            offset: ByteOffset,
-            length: u64,
-        ) -> Result<(), PunchError> {
+        fn punch(&self, fd: OsFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError> {
             if length == 0 {
                 return Ok(());
             }
@@ -499,11 +501,7 @@ mod linux {
         }
     }
 
-    fn fallocate_punch(
-        fd: BorrowedFd<'_>,
-        offset: ByteOffset,
-        length: u64,
-    ) -> Result<(), PunchError> {
+    fn fallocate_punch(fd: OsFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError> {
         let raw_offset = offset.get();
         let i_offset = i64::try_from(raw_offset).map_err(|_| PunchError::OffsetOverflow {
             offset: raw_offset,
@@ -610,9 +608,9 @@ mod linux {
 #[cfg(target_os = "macos")]
 mod macos {
     use std::io;
-    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::fd::AsRawFd;
 
-    use super::{PunchError, PunchHole};
+    use super::{OsFd, PunchError, PunchHole};
     use crate::types::ByteOffset;
 
     /// `fcntl` command number for "deallocate a range of the file"
@@ -701,12 +699,7 @@ mod macos {
     }
 
     impl PunchHole for MacosPuncher {
-        fn punch(
-            &self,
-            fd: BorrowedFd<'_>,
-            offset: ByteOffset,
-            length: u64,
-        ) -> Result<(), PunchError> {
+        fn punch(&self, fd: OsFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError> {
             if length == 0 {
                 return Ok(());
             }
@@ -768,11 +761,161 @@ mod macos {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    use super::{OsFd, PunchError, PunchHole};
+    use crate::types::ByteOffset;
+
+    /// `FSCTL_SET_ZERO_DATA` from `<winioctl.h>`. Hard-coded so we
+    /// don't pull in the `Win32_System_Ioctl` feature of
+    /// `windows-sys`; the constant is part of the stable NT
+    /// device-IO ABI (same precedent as the macos puncher's
+    /// `F_PUNCHHOLE = 99`).
+    const FSCTL_SET_ZERO_DATA: u32 = 0x0009_80C8;
+
+    /// Win32 error codes the puncher maps to
+    /// [`PunchError::Unsupported`]. All three mean "this filesystem
+    /// doesn't do hole-punching" rather than a real failure:
+    ///
+    /// * `ERROR_INVALID_FUNCTION` (1) — FAT32 / exFAT.
+    /// * `ERROR_NOT_SUPPORTED` (50) — most network mounts (SMB,
+    ///   WebDAV) and some FUSE-style drivers.
+    /// * `ERROR_INVALID_PARAMETER` (87) — NTFS volumes where the
+    ///   file is missing the sparse attribute (paired with a
+    ///   `FSCTL_SET_SPARSE` failure in `download::sparse_file`);
+    ///   degrading silently keeps the puncher consistent with the
+    ///   pre-§4 `NoopPuncher` behavior on those volumes.
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    /// `FILE_ZERO_DATA_INFORMATION` from `<winioctl.h>`. Two `i64`s
+    /// describing the half-open `[FileOffset, BeyondFinalZero)` range
+    /// to zero / deallocate. NTFS deallocates whole clusters within
+    /// that range; misaligned tails inside a cluster get zeroed
+    /// without deallocation (mirroring the partial-block behavior of
+    /// `fallocate(PUNCH_HOLE)`).
+    #[repr(C)]
+    struct FileZeroDataInformation {
+        file_offset: i64,
+        beyond_final_zero: i64,
+    }
+
+    /// NTFS hole-punching puncher (`PLAN_v3_windows.md` §4).
+    ///
+    /// Calls `DeviceIoControl(handle, FSCTL_SET_ZERO_DATA, …)` with
+    /// a [`FileZeroDataInformation`] argument struct against the
+    /// borrowed handle. Requires the file have the NTFS sparse
+    /// attribute set (the matching call site is
+    /// [`crate::download::sparse_file::open_at_size`], which calls
+    /// `FSCTL_SET_SPARSE` on every fresh-create). On filesystems
+    /// without sparse support (FAT32, exFAT, most network mounts)
+    /// the puncher surfaces [`PunchError::Unsupported`] so the
+    /// caller can downgrade to [`super::NoopPuncher`] without
+    /// aborting, matching the macOS / Linux contract.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct WindowsPuncher;
+
+    impl WindowsPuncher {
+        /// Construct a fresh [`WindowsPuncher`].
+        #[must_use]
+        pub const fn new() -> Self {
+            Self
+        }
+    }
+
+    impl PunchHole for WindowsPuncher {
+        fn punch(&self, fd: OsFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError> {
+            if length == 0 {
+                return Ok(());
+            }
+
+            let raw_offset = offset.get();
+            let off_i64 = i64::try_from(raw_offset).map_err(|_| PunchError::OffsetOverflow {
+                offset: raw_offset,
+                length,
+            })?;
+            let len_i64 = i64::try_from(length).map_err(|_| PunchError::OffsetOverflow {
+                offset: raw_offset,
+                length,
+            })?;
+            let end_i64 = off_i64
+                .checked_add(len_i64)
+                .ok_or(PunchError::OffsetOverflow {
+                    offset: raw_offset,
+                    length,
+                })?;
+
+            let arg = FileZeroDataInformation {
+                file_offset: off_i64,
+                beyond_final_zero: end_i64,
+            };
+
+            use windows_sys::Win32::System::IO::DeviceIoControl;
+            let mut bytes_returned: u32 = 0;
+            // SAFETY: `fd` is borrowed for the duration of this
+            // call, so the raw handle stays valid. `arg` is a
+            // stack-local `#[repr(C)]` value matching
+            // `FILE_ZERO_DATA_INFORMATION`. We pass `&arg` as the
+            // input buffer (16 bytes) and null+0 for the output
+            // buffer (this FSCTL produces no output). The OVERLAPPED
+            // pointer is null because peel always opens its sparse
+            // files synchronously. `bytes_returned` is required to
+            // be non-null but we discard the value.
+            let rc = unsafe {
+                DeviceIoControl(
+                    fd.as_raw_handle() as _,
+                    FSCTL_SET_ZERO_DATA,
+                    std::ptr::addr_of!(arg).cast(),
+                    std::mem::size_of::<FileZeroDataInformation>() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut bytes_returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(e)
+                    if e == ERROR_INVALID_FUNCTION
+                        || e == ERROR_NOT_SUPPORTED
+                        || e == ERROR_INVALID_PARAMETER =>
+                {
+                    Err(PunchError::Unsupported { errno: e })
+                }
+                _ => Err(PunchError::Io {
+                    offset: raw_offset,
+                    length,
+                    source: err,
+                }),
+            }
+        }
+
+        fn block_size_hint(&self) -> u64 {
+            // NTFS default cluster size on volumes ≤ 16 TiB is
+            // 4096 bytes; the spec allows up to 2 MiB on very
+            // large volumes formatted with `format /A:nK`. The
+            // under-aligned tail of a punch on a non-default
+            // volume is silently retained by NTFS — correct, just
+            // less effective. Querying the actual cluster size via
+            // `GetDiskFreeSpaceW` is filed as `O.WIN.CLUSTER_SIZE`
+            // (round-two follow-on).
+            4096
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::os::fd::AsFd;
+    use crate::os_fd::AsOsFd;
 
     // ---- align_down ---------------------------------------------------
 
@@ -865,7 +1008,7 @@ mod tests {
     fn noop_puncher_returns_ok_for_any_args() {
         // Any borrowed fd will do; stdout is always open.
         let stdout = std::io::stdout();
-        let fd = stdout.as_fd();
+        let fd = stdout.as_os_fd();
         let p = NoopPuncher::new();
         assert!(p.punch(fd, ByteOffset::ZERO, 0).is_ok());
         assert!(p.punch(fd, ByteOffset::new(4096), 4096).is_ok());
@@ -888,7 +1031,7 @@ mod tests {
     #[test]
     fn linux_puncher_rejects_offset_above_i64_max() {
         let stdout = std::io::stdout();
-        let fd = stdout.as_fd();
+        let fd = stdout.as_os_fd();
         let p = LinuxPuncher::new();
         let off = ByteOffset::new(u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1));
         match p.punch(fd, off, 1) {
@@ -904,7 +1047,7 @@ mod tests {
     #[test]
     fn linux_puncher_rejects_length_above_i64_max() {
         let stdout = std::io::stdout();
-        let fd = stdout.as_fd();
+        let fd = stdout.as_os_fd();
         let p = LinuxPuncher::new();
         let len = u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1);
         match p.punch(fd, ByteOffset::ZERO, len) {
@@ -920,7 +1063,7 @@ mod tests {
     #[test]
     fn linux_puncher_zero_length_is_noop_ok() {
         let stdout = std::io::stdout();
-        let fd = stdout.as_fd();
+        let fd = stdout.as_os_fd();
         let p = LinuxPuncher::new();
         // No syscall happens for length 0, so a non-regular fd (stdout)
         // is fine; we are checking the early-return contract.
@@ -970,7 +1113,7 @@ mod tests {
     #[test]
     fn macos_puncher_zero_length_is_noop_ok() {
         let stdout = std::io::stdout();
-        let fd = stdout.as_fd();
+        let fd = stdout.as_os_fd();
         let p = MacosPuncher::new();
         // No syscall happens for length 0, so a non-regular fd (stdout)
         // is fine; we are checking the early-return contract.
@@ -982,7 +1125,7 @@ mod tests {
     #[test]
     fn macos_puncher_rejects_offset_above_i64_max() {
         let stdout = std::io::stdout();
-        let fd = stdout.as_fd();
+        let fd = stdout.as_os_fd();
         let p = MacosPuncher::new();
         let off = ByteOffset::new(u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1));
         match p.punch(fd, off, 1) {
@@ -998,7 +1141,7 @@ mod tests {
     #[test]
     fn macos_puncher_rejects_length_above_i64_max() {
         let stdout = std::io::stdout();
-        let fd = stdout.as_fd();
+        let fd = stdout.as_os_fd();
         let p = MacosPuncher::new();
         let len = u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1);
         match p.punch(fd, ByteOffset::ZERO, len) {
@@ -1007,6 +1150,231 @@ mod tests {
                 assert_eq!(length, len);
             }
             other => panic!("expected OffsetOverflow, got {other:?}"),
+        }
+    }
+
+    // ---- WindowsPuncher (windows-only) -------------------------------
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_puncher_block_size_hint_is_4096() {
+        assert_eq!(WindowsPuncher::new().block_size_hint(), 4096);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_puncher_zero_length_is_noop_ok() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_os_fd();
+        let p = WindowsPuncher::new();
+        // No syscall happens for length 0, so a non-regular handle
+        // (stdout) is fine; we are checking the early-return contract.
+        assert!(p.punch(fd, ByteOffset::ZERO, 0).is_ok());
+        assert!(p.punch(fd, ByteOffset::new(1024), 0).is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_puncher_rejects_offset_above_i64_max() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_os_fd();
+        let p = WindowsPuncher::new();
+        let off = ByteOffset::new(u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1));
+        match p.punch(fd, off, 1) {
+            Err(PunchError::OffsetOverflow { offset, length }) => {
+                assert_eq!(offset, off.get());
+                assert_eq!(length, 1);
+            }
+            other => panic!("expected OffsetOverflow, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_puncher_rejects_length_above_i64_max() {
+        let stdout = std::io::stdout();
+        let fd = stdout.as_os_fd();
+        let p = WindowsPuncher::new();
+        let len = u64::try_from(i64::MAX).unwrap_or(0).wrapping_add(1);
+        match p.punch(fd, ByteOffset::ZERO, len) {
+            Err(PunchError::OffsetOverflow { offset, length }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(length, len);
+            }
+            other => panic!("expected OffsetOverflow, got {other:?}"),
+        }
+    }
+
+    /// End-to-end NTFS demo (`PLAN_v3_windows.md` §4): create a
+    /// sparse file, write into it so disk clusters get allocated,
+    /// punch a prefix, and verify the allocation drops while the
+    /// logical length is preserved. Skipped (not failed) when the
+    /// temp directory is not NTFS or the OS rejects the FSCTL —
+    /// matches the macOS test's "skip on non-APFS" posture.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_puncher_releases_blocks_on_ntfs() {
+        use std::fs::OpenOptions;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        // FSCTL_SET_SPARSE = 0x000900C4 (see `download::sparse_file::set_sparse_attribute`).
+        const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+
+        // 16 MiB is comfortably > a single NTFS cluster (default
+        // 4 KiB on volumes ≤ 16 TiB) and small enough to write
+        // quickly in a unit test. Punching the first 8 MiB then
+        // checking that `AllocationSize` drops by at least 4 MiB
+        // is loose enough to pass on volumes with larger cluster
+        // sizes (which a CI runner might have on a backup-style
+        // disk) while still catching a no-op `WindowsPuncher`.
+        let total: u64 = 16 * 1024 * 1024;
+        let punch_len: u64 = 8 * 1024 * 1024;
+        let min_drop: u64 = 4 * 1024 * 1024;
+
+        let path = unique_temp_path("windows_punch_e2e");
+        let _g = TempCleanup(path.clone());
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("skipping windows_puncher_releases_blocks: open failed: {e}");
+                return;
+            }
+        };
+
+        // Mark the file sparse before extending; otherwise the
+        // `set_len` zero-extension allocates all 16 MiB up front
+        // and there's nothing to punch.
+        let handle = file.as_raw_handle();
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: `file` outlives this call; null buffers because
+        // FSCTL_SET_SPARSE takes no input/output payload in its
+        // default "set true" form.
+        let rc = unsafe {
+            DeviceIoControl(
+                handle as _,
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!(
+                "skipping windows_puncher_releases_blocks: \
+                 filesystem does not support sparse files ({err})",
+            );
+            return;
+        }
+
+        file.set_len(total).expect("set_len 16 MiB");
+
+        // Write actual data so the clusters get allocated on disk
+        // rather than staying as a logical hole. Use `seek_write` so
+        // the file pointer never moves out from under any other test
+        // (defensive — this test is solo against its own temp file).
+        use std::os::windows::fs::FileExt as _;
+        let chunk = vec![0xABu8; 64 * 1024];
+        let mut written: u64 = 0;
+        while written < total {
+            let n = file
+                .seek_write(&chunk, written)
+                .expect("seek_write succeeds");
+            written += n as u64;
+        }
+        file.sync_all().expect("sync_all after fill");
+
+        let alloc_before = file_allocation_size(&file).expect("FILE_STANDARD_INFO before");
+        // Sanity-check the test premise: writes actually allocated
+        // disk space. If the filesystem decided to deduplicate or
+        // skip allocation, the puncher's "release" is meaningless.
+        assert!(
+            alloc_before >= total - 64 * 1024,
+            "expected pre-punch allocation near {total}, got {alloc_before}",
+        );
+
+        let puncher = WindowsPuncher::new();
+        let fd = file.as_os_fd();
+        match puncher.punch(fd, ByteOffset::ZERO, punch_len) {
+            Ok(()) => {}
+            Err(PunchError::Unsupported { errno }) => {
+                eprintln!(
+                    "skipping windows_puncher_releases_blocks: puncher unsupported (errno {errno})",
+                );
+                return;
+            }
+            Err(e) => panic!("punch failed: {e:?}"),
+        }
+
+        let alloc_after = file_allocation_size(&file).expect("FILE_STANDARD_INFO after");
+        let logical_size = file.metadata().expect("metadata").len();
+        assert_eq!(
+            logical_size, total,
+            "logical size must be preserved across punch"
+        );
+        let dropped = alloc_before.saturating_sub(alloc_after);
+        assert!(
+            dropped >= min_drop,
+            "expected allocation to drop by at least {min_drop} bytes, \
+             dropped {dropped} (before {alloc_before}, after {alloc_after})",
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn file_allocation_size(file: &std::fs::File) -> std::io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+        };
+        let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` outlives this call. The Win32 API writes
+        // `size_of::<FILE_STANDARD_INFO>()` bytes into `info`; we
+        // pass the exact size and a matching `info_class` value.
+        let rc = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as _,
+                FileStandardInfo,
+                std::ptr::addr_of_mut!(info).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        };
+        if rc == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.AllocationSize as u64)
+    }
+
+    /// Local helpers reused by the Windows E2E test. Kept in
+    /// `mod tests` so they don't leak into the public surface.
+    #[cfg(target_os = "windows")]
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static UNIQ: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("peel_punch_{label}_{pid}_{nanos}_{n}.bin"))
+    }
+
+    #[cfg(target_os = "windows")]
+    struct TempCleanup(std::path::PathBuf);
+    #[cfg(target_os = "windows")]
+    impl Drop for TempCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
         }
     }
 }

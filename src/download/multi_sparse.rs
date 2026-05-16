@@ -36,14 +36,12 @@
 //! shaped in this file but not wired into the coordinator yet —
 //! `internal/PLAN_multivolume_archives.md` §7 Phase 3 lights that up.
 
-#![cfg(unix)]
-
-use std::os::fd::BorrowedFd;
 use std::path::Path;
 
 use thiserror::Error;
 
 use super::sparse_file::{SparseFile, SparseFileError};
+use crate::os_fd::OsFd;
 use crate::punch::{PunchError, PunchHole};
 use crate::types::ByteOffset;
 
@@ -154,7 +152,7 @@ impl MultiSparse {
 
     /// `true` when this wrapper holds exactly one part (the single-URL
     /// case). Useful for the few call sites that still want to feed a
-    /// single fd to APIs that take [`BorrowedFd`] (e.g. the streaming
+    /// single fd to APIs that take [`OsFd`] (e.g. the streaming
     /// [`crate::extractor::Extractor`]'s `source_fd` parameter); the
     /// routing puncher in [`Self::punch_via`] handles every other
     /// case.
@@ -212,7 +210,7 @@ impl MultiSparse {
     /// Multi-part callers must use [`Self::punch_via`] (the routing
     /// puncher) or [`Self::fd_for_part`] for diagnostics.
     #[must_use]
-    pub fn single_fd(&self) -> Option<BorrowedFd<'_>> {
+    pub fn single_fd(&self) -> Option<OsFd<'_>> {
         if self.parts.len() == 1 {
             Some(self.parts[0].as_fd())
         } else {
@@ -222,7 +220,7 @@ impl MultiSparse {
 
     /// Borrow part `idx`'s fd, or `None` if out of range.
     #[must_use]
-    pub fn fd_for_part(&self, idx: usize) -> Option<BorrowedFd<'_>> {
+    pub fn fd_for_part(&self, idx: usize) -> Option<OsFd<'_>> {
         self.parts.get(idx).map(SparseFile::as_fd)
     }
 
@@ -557,7 +555,7 @@ impl MultiSparse {
 /// Use when wrapping a platform-default puncher (`LinuxPuncher`,
 /// `MacosPuncher`, …) so the streaming
 /// [`crate::extractor::Extractor`] — whose `source_fd` parameter is a
-/// single [`BorrowedFd`] — keeps its existing shape while routing
+/// single [`OsFd`] — keeps its existing shape while routing
 /// punches per-part underneath. The caller's `source_fd` argument is
 /// dropped on every call; the wrapper consults
 /// [`MultiSparse::punch_via`] instead.
@@ -587,12 +585,7 @@ impl RoutingPuncher {
 }
 
 impl PunchHole for RoutingPuncher {
-    fn punch(
-        &self,
-        _fd: BorrowedFd<'_>,
-        offset: ByteOffset,
-        length: u64,
-    ) -> Result<(), PunchError> {
+    fn punch(&self, _fd: OsFd<'_>, offset: ByteOffset, length: u64) -> Result<(), PunchError> {
         self.sparse.punch_via(self.inner.as_ref(), offset, length)
     }
 
@@ -605,8 +598,9 @@ impl PunchHole for RoutingPuncher {
 mod tests {
     use super::*;
 
-    use std::os::fd::AsFd;
     use std::path::PathBuf;
+
+    use crate::os_fd::AsOsFd;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::punch::NoopPuncher;
@@ -767,7 +761,7 @@ mod tests {
         // The fd argument is ignored by the routing puncher; pass
         // stdout's fd as a deliberate sentinel.
         let stdout = std::io::stdout();
-        rp.punch(stdout.as_fd(), ByteOffset::new(1024), 1024)
+        rp.punch(stdout.as_os_fd(), ByteOffset::new(1024), 1024)
             .expect("route");
         assert_eq!(rp.block_size_hint(), NoopPuncher::new().block_size_hint());
     }
@@ -784,7 +778,7 @@ mod tests {
         );
         let rp = RoutingPuncher::new(m, Box::new(NoopPuncher::new()));
         let stdout = std::io::stdout();
-        rp.punch(stdout.as_fd(), ByteOffset::new(3072), 3072)
+        rp.punch(stdout.as_os_fd(), ByteOffset::new(3072), 3072)
             .expect("route");
     }
 

@@ -36,14 +36,11 @@
 //! 7z's trailer, rar's per-entry headers), so a monotonic punch
 //! cursor can't be maintained.
 
-#![cfg(unix)]
-
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 #[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
 use std::io;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 #[cfg(any(feature = "zip", feature = "sevenz", feature = "rar"))]
@@ -83,6 +80,7 @@ use crate::extractor::{
 };
 use crate::http::Url;
 use crate::io_backend::IoBackendChoice;
+use crate::os_fd::AsOsFd;
 use crate::progress::ProgressState;
 use crate::punch::{default_puncher, NoopPuncher, PunchHole};
 #[cfg(feature = "rar")]
@@ -934,7 +932,7 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
             let sink = build_local_raw_sink(path, &resume_plan)?;
             run_extractor_with_ckpt(
                 &extractor,
-                source_file.as_fd(),
+                source_file.as_os_fd(),
                 &mut *decoder,
                 sink,
                 puncher.as_ref(),
@@ -949,7 +947,7 @@ pub fn run(args: LocalRunArgs) -> Result<RunStats, CoordinatorError> {
             let sink = build_local_tar_sink(path, &resume_plan)?;
             run_extractor_with_ckpt(
                 &extractor,
-                source_file.as_fd(),
+                source_file.as_os_fd(),
                 &mut *decoder,
                 sink,
                 puncher.as_ref(),
@@ -1135,7 +1133,7 @@ struct LocalCheckpointWriter {
 /// converts to a `CoordinatorError::Checkpoint`.
 fn run_extractor_with_ckpt<S: Sink>(
     extractor: &Extractor,
-    source_fd: std::os::fd::BorrowedFd<'_>,
+    source_fd: crate::os_fd::OsFd<'_>,
     decoder: &mut dyn StreamingDecoder,
     sink: S,
     puncher: &dyn PunchHole,

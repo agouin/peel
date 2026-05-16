@@ -55,6 +55,74 @@ jobs:
         with:
           command: check
 
+  # Windows build (PLAN_v3_windows.md §0.3). Until §3 lifts the
+  # `#[cfg(unix)]` gates on the coordinator / download / extractor
+  # modules, the public chain that reaches
+  # `http::response::BodyReader::{empty,streaming}` (and the
+  # `BodyState::{Empty,Streaming}` variants / `BodyCommand::NextFrame`
+  # field) is dead on Windows — the items compile, but no pub-from-here
+  # caller exists yet, so `#[warn(unused)]` fires. AGENTS.md forbids
+  # `#[allow(dead_code)]` to silence warnings, so the honest workaround
+  # is to disable the workflow-wide `-D warnings` for the Windows job
+  # only until §3 promotes this gate. At that point the consumers light
+  # up, the dead-code goes away, and the env override below is removed.
+  #
+  # This job runs `fmt --check` and `cargo build` (default features and
+  # `--no-default-features`). Clippy is added in §3, `cargo test` in
+  # §2/§4 per the plan. `system-libs` stays off because the Windows
+  # runners don't ship pkg-config / vcpkg-installed libzstd.
+  windows-build:
+    name: Windows build
+    runs-on: windows-2022
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+      # `decode::bzip2_native::tests` shell out to the `bzip2`
+      # reference encoder to generate round-trip fixtures (the
+      # decoder itself is hand-rolled, so the test exercises the
+      # decoder against a real-world producer). Linux runners ship
+      # `bzip2` in their base image; Windows ones do not, so install
+      # it explicitly. Chocolatey is pre-installed on `windows-2022`.
+      - name: Install bzip2 (test dependency)
+        run: choco install bzip2 --no-progress --yes
+      - name: Rustfmt check
+        run: cargo fmt --all -- --check
+      # `src/main.rs` is `#![cfg(unix)]` for the heavy lift, with a
+      # stub Windows `fn main` (per `PLAN_v3_windows.md` §3) that
+      # prints a "not yet wired" message and exits non-zero. §5
+      # replaces the stub with a `SetConsoleCtrlHandler`-based
+      # parity path.
+      - name: Build lib (no default features)
+        run: cargo build --lib --no-default-features
+      - name: Build (default features, bin + lib)
+        run: cargo build
+      # Promoted in §3 (gate lift). With `coordinator`,
+      # `download/*`, `extractor`, `multivolume`, and `cli` ungated
+      # on Windows, the lint surface matches what Linux/macOS sees.
+      # `--all-targets` covers the integration tests under
+      # `tests/`. The job stays on default features because
+      # `--all-features` enables `system-libs`, which makes
+      # `zstd-sys` shell out to `pkg-config` (absent on Windows CI
+      # without custom vcpkg setup — filed as `O.WIN.PKGCFG`
+      # round-two follow-on).
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      # Promoted in §4 (real NTFS puncher). With the
+      # `WindowsPuncher` in place every integration test that exercises
+      # the full extraction pipeline (sparse file → workers → decoder
+      # → sink → puncher) runs on Windows.
+      - name: Test (default features)
+        run: cargo test
+
   # MSRV check. The declared floor lives in `Cargo.toml` (`rust-version`);
   # rationale and the audit that picked 1.85 are in
   # `internal/PLAN_packaging.md` §0.6. `RUSTUP_TOOLCHAIN` overrides the

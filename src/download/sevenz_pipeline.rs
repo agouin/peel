@@ -30,8 +30,6 @@
 //!    [`SevenzSink::materialize_empty`].
 //! 5. Punch the trailer range. Emit `Complete`.
 
-#![cfg(unix)]
-
 use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -28,8 +28,14 @@
 //! The test runs both the file-output and the tar-output paths so the
 //! resume discipline is exercised against both [`peel::sink::RawSink`]
 //! and [`peel::sink::TarSink`].
-
-#![cfg(unix)]
+//!
+//! The "kill" primitive is a purely in-process `AtomicBool` (the same
+//! flag the binary's signal handler flips), so the harness is
+//! cross-platform — no `SIGKILL` / `TerminateProcess` shelling out.
+//! `PLAN_v3_windows.md` §10 lifts the file-level `cfg(unix)` so the
+//! Windows CI run exercises crash-resume against the Windows
+//! `BlockingBackend` + `WindowsPuncher` + `MoveFileExW`-based
+//! checkpoint publish.
 
 use std::fs;
 use std::path::{Path, PathBuf};

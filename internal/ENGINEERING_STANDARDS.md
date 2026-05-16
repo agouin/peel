@@ -46,6 +46,7 @@ Crates pre-approved for use, with the role they fill:
 | `xz2`          | xz / LZMA decompression                     | Bindings to upstream liblzma; `PLAN_v2.md` §3 |
 | `lz4_flex`     | lz4 frame decompression                     | Pure Rust; `PLAN_v2.md` §4           |
 | `io-uring`     | io_uring submission/completion API          | Linux only; sync API only — no async runtime; `PLAN_v2.md` §7 |
+| `windows-sys`  | Microsoft-maintained Win32 bindings         | Windows only; declared in `[target.'cfg(windows)'.dependencies]` so non-Windows builds are unchanged; load-bearing for `FSCTL_SET_SPARSE`/`FSCTL_SET_ZERO_DATA`, `SetConsoleCtrlHandler`, console-mode and rename primitives; `PLAN_v3_windows.md` §0.1 |
 | `thiserror`    | Library error type derivation               | Library code only                    |
 | `anyhow`       | Application error type                      | Binary/CLI boundary only             |
 | `clap`         | CLI argument parsing                        | Use `derive` feature                 |

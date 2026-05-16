@@ -222,6 +222,39 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", default-features = false }
 
+# Win32 API bindings (PLAN_v3_windows.md §0.1 /
+# internal/ENGINEERING_STANDARDS.md §2.2). Microsoft-maintained, no
+# transitive deps. Windows-only target dep so Linux/macOS builds are
+# unchanged. The feature set is the minimum needed across the §1–§9
+# phases of `PLAN_v3_windows.md`:
+#
+#   * Win32_Foundation        — HANDLE, BOOL, error codes (ERROR_*),
+#                               GetLastError.
+#   * Win32_Storage_FileSystem — FSCTL_SET_SPARSE / FSCTL_SET_ZERO_DATA
+#                               argument structs, MoveFileExW, the
+#                               GetFileInformationByHandleEx surface used
+#                               by the puncher's allocation-size assertion.
+#   * Win32_System_IO         — DeviceIoControl + the OVERLAPPED type it
+#                               takes.
+#   * Win32_System_Console    — SetConsoleCtrlHandler, GetConsoleMode /
+#                               SetConsoleMode, GetStdHandle for the
+#                               signal-handler and password-prompt
+#                               parity paths.
+#   * Win32_System_Threading  — ExitProcess (the async-signal-safe exit
+#                               sibling of `_exit` on Unix).
+#
+# Other Win32 surfaces — long-path support (`\\?\` opt-in), reparse
+# points, ADS — are explicit round-two follow-ons in §11 of the plan
+# and would extend this feature list when promoted.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # Dev-only reference implementation used by `hash::sha256` tests to
 # cross-check the hand-rolled SHA-256 against a battle-tested upstream

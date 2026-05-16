@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use io_uring::{opcode, squeue, types, IoUring};
 
 use super::{IoBackend, NetStream, SocketConfig};
+use crate::os_fd::OsFd;
 
 /// User-data tag bit set on the LinkTimeout SQE that pairs with each
 /// timed socket op. The IO thread's CQE drain checks this bit and
@@ -281,7 +282,7 @@ impl IoBackend for UringBackend {
         "uring"
     }
 
-    fn pwrite_all_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()> {
+    fn pwrite_all_at(&self, fd: OsFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()> {
         let completion = Arc::new(Completion::new());
         let req = OpRequest {
             kind: OpKind::WriteAll,
@@ -298,7 +299,7 @@ impl IoBackend for UringBackend {
         completion.wait().map(|_| ())
     }
 
-    fn pread_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    fn pread_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let completion = Arc::new(Completion::new());
         let req = OpRequest {
             kind: OpKind::ReadShort,
@@ -313,7 +314,7 @@ impl IoBackend for UringBackend {
         completion.wait()
     }
 
-    fn pread_exact_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    fn pread_exact_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let completion = Arc::new(Completion::new());
         let req = OpRequest {
             kind: OpKind::ReadExact,
@@ -328,7 +329,7 @@ impl IoBackend for UringBackend {
         completion.wait().map(|_| ())
     }
 
-    fn sync_all(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+    fn sync_all(&self, fd: OsFd<'_>) -> io::Result<()> {
         let completion = Arc::new(Completion::new());
         let req = OpRequest {
             kind: OpKind::Fsync,

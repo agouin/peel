@@ -33,8 +33,6 @@
 //! workers; the entire surface is lock-free apart from the
 //! short-lived sleep inside `pick_or_wait`.
 
-#![cfg(unix)]
-
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
