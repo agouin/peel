@@ -798,7 +798,7 @@ pub enum CoordinatorError {
     DownloadPanicked,
 
     /// ZIP archives can only extract into a directory; the user
-    /// passed `--output-file` with a file-shaped path.
+    /// passed `--output` with a file-shaped path.
     ///
     /// Superseded by [`Self::OutputShapeMismatch`] for the post-
     /// detection generic check (`internal/PLAN_download_modes.md` §1);

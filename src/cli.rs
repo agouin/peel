@@ -25,8 +25,7 @@ use crate::http::{Client, ClientConfig, HttpVersion, Url, UrlError};
 use crate::io_backend::IoBackendChoice;
 use crate::secret::source::PasswordSource;
 
-/// Long-form help appendix shown by `peel --help`
-/// (`internal/PLAN_multivolume_archives.md` §6 step 3). Documents the
+/// Long-form help appendix shown by `peel --help`. Documents the
 /// three multi-volume filename conventions and the three entry
 /// modes (single-seed auto-discovery, explicit positional list,
 /// `@manifest` file).
@@ -75,6 +74,14 @@ Multi-volume archives:
     // any flag (even just `--workers N` with no URL) still flows
     // through the normal validation and reports `NoUrls` as before.
     arg_required_else_help = true,
+    // Default heading for every flag declared below; advanced flags
+    // override with `help_heading = "Advanced options"`. `-h` / `-V`
+    // are declared manually at the end of the struct so they render
+    // under the trailing `Options` heading rather than being pinned
+    // to the top by clap's auto-add.
+    next_help_heading = "Common options",
+    disable_help_flag = true,
+    disable_version_flag = true,
 )]
 #[command(group(
     // The two format-override flags express *different intents*: one
@@ -86,110 +93,120 @@ Multi-volume archives:
         .args(["forced_format", "force_format_from_magic"]),
 ))]
 pub struct Cli {
-    /// Source URL(s). One URL is the historical single-source case.
-    /// Two or more URLs activate the multi-part split-archive path
-    /// (`internal/PLAN_multi_url_source.md`): the byte-concatenation of
+    /// Source URL(s) or local path.
+    ///
+    /// One URL is the single-source case. Two or more URLs activate
+    /// the multi-part split-archive path: the byte-concatenation of
     /// every URL's body is treated as one logical archive stream,
-    /// and the workers fetch all parts in parallel via ranged GETs.
-    /// Examples: `peel https://host/x.tar.zst -o out/` or
-    /// `peel https://host/x.tar.part0000 https://host/x.tar.part0001 -o out/`.
-    #[arg(num_args = 1..)]
+    /// fetched in parallel via ranged GETs.
+    ///
+    /// Examples:
+    ///   peel https://host/x.tar.zst -o out/
+    ///   peel https://host/x.part0000 https://host/x.part0001 -o out/
+    #[arg(num_args = 1.., help_heading = "Arguments")]
     pub urls: Vec<String>,
 
-    /// Output path. Accepts either a directory (for archive formats
-    /// that produce a directory tree — tar, zip, 7z, rar, and any
-    /// compressed wrapper around tar) or a file (for stream-shaped
-    /// formats — raw `.zst`, `.xz`, `.lz4`, `.gz`).
+    /// Output path. Defaults to the archive's basename with archive
+    /// and compression suffixes stripped, in the current directory.
     ///
-    /// A trailing slash forces directory semantics; otherwise the
-    /// shape is taken from the URL suffix (or `--format`). The
-    /// resolver errors at coordinator entry if the shape and the
-    /// format disagree (`internal/PLAN_download_modes.md` §1).
-    #[arg(short = 'o', long = "output-file", value_name = "PATH")]
+    /// Accepts a directory (for archive formats that produce a tree —
+    /// tar, zip, 7z, rar, and any compressed wrapper around tar) or a
+    /// file (for stream-shaped formats — raw `.zst`, `.xz`, `.lz4`,
+    /// `.gz`). A trailing slash forces directory semantics; otherwise
+    /// the shape is taken from the URL suffix or `--format`.
+    #[arg(short = 'o', long = "output", value_name = "PATH", display_order = 1)]
     pub output_file: Option<PathBuf>,
 
-    /// Migration stub for the removed `-C/--output-dir` flag.
-    /// Hidden from `--help`; any value triggers a hard error pointing
-    /// the user at `-o <path>/` (`internal/PLAN_download_modes.md` §1).
-    #[arg(short = 'C', long = "output-dir", value_name = "DIR", hide = true)]
-    pub output_dir_migration: Option<PathBuf>,
-
     /// Number of parallel download workers.
-    #[arg(long = "workers", default_value_t = DEFAULT_WORKERS)]
+    #[arg(long = "workers", default_value_t = DEFAULT_WORKERS, display_order = 8)]
     pub workers: u32,
 
     /// Chunk size used to slice the source for ranged downloads.
     ///
-    /// This is the bitmap chunk size — the unit of completion
-    /// tracked in checkpoints. With adaptive chunk-sizing enabled
-    /// (the default), the scheduler may coalesce several
-    /// consecutive chunks into a single ranged GET; this flag
-    /// continues to set the *bitmap* unit. Passing `--chunk-size`
-    /// alongside `--no-adaptive-chunk-size` forces a fixed dispatch
-    /// size for the run (`PLAN_v2.md` §8 step 4).
-    #[arg(long = "chunk-size", default_value_t = DEFAULT_CHUNK_SIZE)]
+    /// This is the bitmap chunk size — the unit of completion tracked
+    /// in checkpoints. With adaptive chunk-sizing enabled (the
+    /// default), the scheduler may coalesce several consecutive chunks
+    /// into a single ranged GET; this flag still sets the *bitmap*
+    /// unit. Pair with `--no-adaptive-chunk-size` to force a fixed
+    /// dispatch size.
+    #[arg(long = "chunk-size", default_value_t = DEFAULT_CHUNK_SIZE, help_heading = "Advanced options")]
     pub chunk_size: u64,
 
-    /// Disable the adaptive chunk-size policy (`PLAN_v2.md` §8).
+    /// Disable the adaptive chunk-size policy.
     ///
-    /// When set, the scheduler dispatches one bitmap chunk per
-    /// worker task, with no growth or shrink decisions over the
-    /// lifetime of the run. The `--chunk-size` value is the
-    /// fixed-size dispatch unit. Useful for benchmarking and
-    /// reproducible test runs where adaptive behaviour would
-    /// change observed throughput.
-    #[arg(long = "no-adaptive-chunk-size", default_value_t = false)]
+    /// The scheduler dispatches one bitmap chunk per worker task with
+    /// no growth or shrink decisions; `--chunk-size` becomes the fixed
+    /// dispatch unit. Useful for benchmarking and reproducible test
+    /// runs.
+    #[arg(
+        long = "no-adaptive-chunk-size",
+        default_value_t = false,
+        help_heading = "Advanced options"
+    )]
     pub no_adaptive_chunk_size: bool,
 
     /// Minimum gap between in-loop hole-punch syscalls.
-    #[arg(long = "punch-threshold", default_value_t = DEFAULT_PUNCH_THRESHOLD)]
+    #[arg(long = "punch-threshold", default_value_t = DEFAULT_PUNCH_THRESHOLD, help_heading = "Advanced options")]
     pub punch_threshold: u64,
 
     /// Minimum source-byte progress between checkpoint writes.
-    #[arg(long = "checkpoint-min-bytes", default_value_t = 8 * 1024 * 1024)]
+    #[arg(long = "checkpoint-min-bytes", default_value_t = 8 * 1024 * 1024, help_heading = "Advanced options")]
     pub checkpoint_min_bytes: u64,
 
     /// Minimum wall-clock interval between checkpoint writes, in
     /// seconds (fractional).
-    #[arg(long = "checkpoint-min-secs", default_value_t = 2.0)]
+    #[arg(
+        long = "checkpoint-min-secs",
+        default_value_t = 2.0,
+        help_heading = "Advanced options"
+    )]
     pub checkpoint_min_secs: f64,
 
     /// Target wall-clock interval between checkpoints, in seconds.
-    /// Used to scale the byte floor up at high download rates so the
-    /// cadence stays below this target wall-clock interval. `0`
-    /// disables rate-aware scaling.
-    /// (`PLAN_checkpoint_cadence_throughput.md` Phase 2.)
-    #[arg(long = "checkpoint-target-secs", default_value_t = 0.2)]
+    ///
+    /// Scales the byte floor up at high download rates so the cadence
+    /// stays under this target. `0` disables rate-aware scaling.
+    #[arg(
+        long = "checkpoint-target-secs",
+        default_value_t = 0.2,
+        help_heading = "Advanced options"
+    )]
     pub checkpoint_target_secs: f64,
 
-    /// Force a specific decoder by name, bypassing both URL-suffix
-    /// and magic-byte detection. Use this when the URL has no
-    /// usable suffix (e.g. opaque query-string downloads). Mutually
-    /// exclusive with `--force-format-from-magic`.
-    #[arg(long = "format", value_name = "NAME")]
+    /// Force a specific decoder by name, bypassing detection.
+    ///
+    /// Use when the URL has no usable suffix (e.g. opaque query-string
+    /// downloads). Mutually exclusive with `--force-format-from-magic`.
+    #[arg(
+        long = "format",
+        value_name = "NAME",
+        help_heading = "Advanced options"
+    )]
     pub forced_format: Option<String>,
 
+    /// Trust magic bytes over URL suffix on disagreement.
+    ///
     /// When the URL suffix and the source's magic bytes disagree,
     /// trust the magic instead of returning `FormatMismatch`.
     /// Mutually exclusive with `--format`.
-    #[arg(long = "force-format-from-magic", default_value_t = false)]
+    #[arg(
+        long = "force-format-from-magic",
+        default_value_t = false,
+        help_heading = "Advanced options"
+    )]
     pub force_format_from_magic: bool,
 
-    /// File-IO backend selection (PLAN_v2.md §7 + §9).
+    /// File-IO backend selection.
     ///
-    /// `auto` (default) on Linux selects `mmap` for the sparse part
-    /// file (workers `memcpy` into a `MAP_SHARED` region; puncher
-    /// uses `madvise(MADV_REMOVE)`) and tries `io_uring` for the HTTP
-    /// client's sockets, falling back to the blocking socket backend
-    /// with an info log when the kernel rejects ring construction
-    /// (e.g. cri-o's default seccomp profile). On non-Linux `auto` is
-    /// the blocking backend for both sockets and file IO. `blocking`
-    /// forces the pre-§7 `pwrite`/`pread` path everywhere (useful for
-    /// A/B comparison). `uring` requires `io_uring` for sockets and
-    /// errors out if it is unavailable. `mmap` selects the §9
-    /// memory-mapped sparse-file path explicitly with the blocking
-    /// socket backend.
-    #[arg(long = "io-backend", value_enum, default_value_t = IoBackendArg::Auto)]
+    /// `auto` (default) picks the best for the platform: on Linux,
+    /// `mmap` for the sparse part file and `io_uring` for sockets
+    /// (falling back to blocking sockets when the kernel rejects ring
+    /// construction); blocking for both on non-Linux. `blocking`
+    /// forces the `pwrite`/`pread` path everywhere. `uring` requires
+    /// `io_uring` for sockets and errors out if unavailable. `mmap`
+    /// selects the memory-mapped sparse-file path with blocking
+    /// sockets.
+    #[arg(long = "io-backend", value_enum, default_value_t = IoBackendArg::Auto, help_heading = "Advanced options")]
     pub io_backend: IoBackendArg,
 
     /// HTTP version to use for downloads.
@@ -202,221 +219,229 @@ pub struct Cli {
     /// over plaintext it forces HTTP/2 prior-knowledge ("h2c") which
     /// only works against servers that explicitly speak it. Most
     /// users want `auto`.
-    #[arg(long = "http-version", value_enum, default_value_t = HttpVersionArg::Auto)]
+    #[arg(long = "http-version", value_enum, default_value_t = HttpVersionArg::Auto, help_heading = "Advanced options")]
     pub http_version: HttpVersionArg,
 
     /// SHA-256 digest(s) the source must match. Repeatable.
     ///
-    /// Single-URL runs (`PLAN_v2.md` §10): pass `--sha256 <hex>`
-    /// once; the coordinator hashes the assembled compressed source
-    /// as it streams and aborts at clean completion if the digest
-    /// disagrees. The hash state is checkpointed across resumes, so
-    /// a `kill -9` and follow-up resume produce a digest
-    /// byte-identical to a clean run.
+    /// Single-URL runs: pass `--sha256 <hex>` once; the coordinator
+    /// hashes the assembled compressed source as it streams and
+    /// aborts at clean completion on mismatch. Hash state is
+    /// checkpointed across resumes.
     ///
-    /// Multi-URL runs (`internal/PLAN_multi_url_source.md`): pass
-    /// `--sha256` either zero times (no verification) or exactly
+    /// Multi-URL runs: pass `--sha256` either zero times or exactly
     /// once per URL, paired by order. The hashes are per-part
-    /// digests of each part's bytes — the coordinator verifies each
-    /// one at its part-boundary as the decoder advances (planned in
-    /// §4 of that doc; phase 3 lands the CLI surface, phase 4 wires
-    /// the runtime).
+    /// digests, verified at part boundaries.
     ///
     /// Streaming pipeline only; `.zip` archives extract per-entry
-    /// and integrity checking does not extend to that path in
-    /// round-one of `PLAN_v2.md`.
-    #[arg(long = "sha256", value_name = "HEX")]
+    /// and are not covered by this flag.
+    #[arg(long = "sha256", value_name = "HEX", display_order = 5)]
     pub expected_sha256s: Vec<String>,
 
-    /// Additional mirror URL serving the same file
-    /// (`PLAN_v2.md` §13). The flag is repeatable; the positional
-    /// `url` is the primary, and every `--mirror` is an alternate.
-    /// At startup the coordinator runs `HEAD` against every URL in
-    /// parallel and drops mirrors whose `Content-Length` (or, when
-    /// `--sha256` is unset, `ETag` / `Last-Modified`) does not
-    /// agree with the primary. Surviving mirrors are picked from
-    /// per ranged GET, biased toward the fastest live one; failures
-    /// exclude a mirror for 30 s before it is retried.
-    #[arg(long = "mirror", value_name = "URL")]
+    /// Additional mirror URL serving the same file. Repeatable.
+    ///
+    /// The positional URL is the primary, every `--mirror` is an
+    /// alternate. At startup peel `HEAD`s every URL in parallel and
+    /// drops mirrors whose `Content-Length` (or `ETag`/`Last-Modified`
+    /// when `--sha256` is unset) disagrees with the primary. Per-chunk
+    /// picks are biased toward the fastest live mirror; failures
+    /// exclude a mirror for 30s before retry.
+    #[arg(long = "mirror", value_name = "URL", display_order = 6)]
     pub mirrors: Vec<String>,
 
-    /// Aggregate bandwidth cap (`PLAN_v2.md` §14). Accepts decimal
-    /// suffixes (`K`/`M`/`G`/`T`, 1000-based per network
-    /// convention) and binary suffixes (`Ki`/`Mi`/`Gi`/`Ti`,
-    /// 1024-based). A trailing `B` and `/s` are accepted and
-    /// ignored. Examples: `10MB/s`, `1.5GB/s`, `512KiB/s`,
-    /// `1000000`. The cap is aggregate across all mirrors, not
-    /// per-mirror.
-    #[arg(long = "max-bandwidth", value_name = "RATE")]
+    /// Aggregate bandwidth cap across all mirrors.
+    ///
+    /// Accepts decimal suffixes (`K`/`M`/`G`/`T`, 1000-based) and
+    /// binary suffixes (`Ki`/`Mi`/`Gi`/`Ti`, 1024-based). A trailing
+    /// `B` and `/s` are accepted and ignored. Examples: `10MB/s`,
+    /// `1.5GB/s`, `512KiB/s`, `1000000`.
+    #[arg(
+        long = "max-bandwidth",
+        value_name = "RATE",
+        help_heading = "Advanced options"
+    )]
     pub max_bandwidth: Option<String>,
 
     /// Cap on the on-disk lookahead — bytes downloaded but not yet
-    /// consumed by the decoder. When the gap reaches this value the
-    /// download scheduler stops dispatching new chunks until the
-    /// decoder catches up, bounding the size of the `.peel.part`
-    /// file when the network is faster than the disk. Accepts the
-    /// same size syntax as `--max-bandwidth` (e.g. `512MiB`,
-    /// `2GB`); pass `none` (or `off` / `disabled`) to disable. The
-    /// default (`1GiB`) is high enough that it rarely engages on a
-    /// healthy disk and low enough that a slow disk doesn't fill
-    /// `/tmp` on a multi-GiB archive.
-    #[arg(long = "max-disk-buffer", value_name = "SIZE", default_value = "1GiB")]
+    /// consumed by the decoder.
+    ///
+    /// When the gap reaches this value the scheduler stops dispatching
+    /// new chunks until the decoder catches up, bounding the
+    /// `.peel.part` size when the network is faster than the disk.
+    /// Same size syntax as `--max-bandwidth` (e.g. `512MiB`, `2GB`);
+    /// pass `none` (or `off`/`disabled`) to disable.
+    #[arg(
+        long = "max-disk-buffer",
+        value_name = "SIZE",
+        default_value = "1GiB",
+        display_order = 7
+    )]
     pub max_disk_buffer: String,
 
     /// Directory for the `.peel.part` and `.peel.ckpt` sidecar files.
     ///
-    /// Default places them as siblings of the output (`<output>.peel.part`
-    /// / `<output>.peel.ckpt`). Override when the output and the resumable
-    /// state should live in different places — for example, extracting
-    /// to slow HDD-backed storage while keeping the in-flight compressed
-    /// bytes on faster SSD, or pinning the sidecars *inside* a Kubernetes
-    /// PersistentVolume mount when the output's parent is on ephemeral
-    /// container storage.
-    ///
-    /// The directory is created if missing. The basenames stay the same
-    /// (`<output_name>.peel.part` / `<output_name>.peel.ckpt`); only
-    /// their parent directory changes.
-    #[arg(long = "workdir", value_name = "DIR")]
+    /// Defaults to placing them as siblings of the output. Override
+    /// when the output and the resumable state should live on
+    /// different disks — e.g. extracting onto slow HDD storage while
+    /// keeping in-flight compressed bytes on a fast NVMe, or pinning
+    /// sidecars inside a Kubernetes PVC mount when the output's parent
+    /// is on ephemeral storage. The directory is created if missing.
+    #[arg(
+        long = "workdir",
+        value_name = "DIR",
+        help_heading = "Advanced options"
+    )]
     pub workdir: Option<PathBuf>,
 
-    /// Keep the source archive on disk alongside the extracted
-    /// output (`internal/PLAN_download_modes.md` §3).
+    /// Keep the source archive on disk alongside the extracted output.
     ///
     /// HTTP-source forms:
-    ///   * `-k` / `--keep-archive` (bare) — preserve the archive
-    ///     as a sibling of `-o`, named after the URL basename.
-    ///   * `-k=<PATH>` / `--keep-archive=<PATH>` — preserve the
-    ///     archive at the explicit path. The `=` is required because
-    ///     bare `-k` followed by a positional URL is otherwise
-    ///     ambiguous.
-    ///   * flag absent — default behaviour: the source bytes are
-    ///     dropped (sparse hole-punching trims them as the decoder
-    ///     advances; the part file is removed on success).
+    ///   * `-k` / `--keep-archive` (bare) — preserve as a sibling of
+    ///     `-o`, named after the URL basename.
+    ///   * `-k=<PATH>` / `--keep-archive=<PATH>` — preserve at an
+    ///     explicit path. The `=` is required (bare `-k` followed by
+    ///     a positional URL is otherwise ambiguous).
+    ///   * flag absent — source bytes are dropped (sparse hole-
+    ///     punching trims them as the decoder advances; the part
+    ///     file is removed on success).
     ///
-    /// Local-source mode preserves the source by default, so `-k`
-    /// is a harmless no-op there (kept for scripts that pass `-k`
-    /// across both HTTP and local sources). Pass `-d/--destructive`
-    /// in local mode to opt into hole-punching + delete-on-success.
-    /// The `-k=<PATH>` value form is rejected in local mode because
-    /// the archive is already at the positional path.
-    ///
-    /// With `-k` the puncher is forced to no-op and the archive is
-    /// preserved at its full `Content-Length` size. Redundant with
-    /// `--no-extract` (which already preserves the source); the CLI
-    /// logs an info-level note in that case rather than erroring.
+    /// Local-source mode preserves the source by default, so `-k` is
+    /// a harmless no-op there. Pass `-d/--destructive` in local mode
+    /// to opt into hole-punching + delete-on-success. With `-k` the
+    /// puncher is forced to no-op and the archive is preserved at its
+    /// full `Content-Length`.
     #[arg(
         short = 'k',
         long = "keep-archive",
         value_name = "PATH",
         num_args = 0..=1,
         require_equals = true,
-        default_missing_value = ""
+        default_missing_value = "",
+        display_order = 2,
     )]
     pub keep_archive: Option<String>,
 
     /// Skip extraction; download the source bytes verbatim to a
-    /// single file (`internal/PLAN_download_modes.md` §2).
+    /// single file.
     ///
     /// The remote object is fetched in parallel via ranged GETs (the
     /// same scheduler / mirror / resume machinery the extract mode
     /// uses) and renamed into place on success. No decoder runs; no
-    /// holes are punched in the sparse file. Useful for arbitrary
-    /// remote downloads, non-archive objects (`.deb`, raw binaries,
-    /// checksum lists), and for keeping the on-disk archive when you
-    /// plan to extract it later with a different tool.
+    /// holes are punched. Useful for arbitrary remote downloads or
+    /// non-archive objects (`.deb`, raw binaries, checksum lists).
     ///
-    /// Mutually exclusive with `--format`,
-    /// `--force-format-from-magic`, and `--punch-threshold` (they
-    /// are extractor knobs; nothing extracts in this mode). The
-    /// `--download-only` alias is provided for users coming from
-    /// `aria2c`.
-    #[arg(long = "no-extract", alias = "download-only", default_value_t = false)]
+    /// Mutually exclusive with `--format`, `--force-format-from-magic`,
+    /// and `--punch-threshold`. `--download-only` is a compatibility
+    /// alias.
+    #[arg(
+        long = "no-extract",
+        alias = "download-only",
+        default_value_t = false,
+        display_order = 4
+    )]
     pub no_extract: bool,
 
-    /// Treat unrecognized formats as a hard error
-    /// (`internal/PLAN_download_modes.md` §4).
+    /// Treat unrecognized formats as a hard error.
     ///
     /// Default behaviour, when format detection (URL suffix + magic
     /// bytes) cannot identify a registered decoder, is to warn and
-    /// fall through to `--no-extract` (the remote object is saved
-    /// to disk under its URL basename). `--strict-format` flips this
-    /// to an error — useful in CI when an upstream object changing
-    /// shape unexpectedly should fail the build instead of producing
-    /// a different artifact.
+    /// fall through to `--no-extract` (the object is saved under its
+    /// URL basename). `--strict-format` flips this to an error —
+    /// useful in CI when an upstream object changing shape should
+    /// fail the build instead of producing a different artifact.
     ///
-    /// Incompatible with `--no-extract` (no detection runs when not
-    /// extracting); compatible with `-k/--keep-archive`.
-    #[arg(long = "strict-format", default_value_t = false)]
+    /// Incompatible with `--no-extract`; compatible with
+    /// `-k/--keep-archive`.
+    #[arg(
+        long = "strict-format",
+        default_value_t = false,
+        help_heading = "Advanced options"
+    )]
     pub strict_format: bool,
 
-    /// Password source for encrypted archives
-    /// (`internal/PLAN_archive_encryption.md` §1).
+    /// Password source for encrypted archives.
     ///
-    /// Accepts one of:
-    ///   * `prompt` — read from `/dev/tty` with echo disabled.
-    ///     Up to 3 attempts on a wrong password before giving up.
+    /// One of:
+    ///   * `prompt` — read from `/dev/tty` with echo disabled. Up to
+    ///     3 attempts on a wrong password before giving up.
     ///   * `env:NAME` — read from the named environment variable.
     ///   * `file:PATH` — read the first line of the file. Modes
     ///     other than `0600` emit a one-shot warning.
     ///   * `fd:N` — read from file descriptor N (until EOF or
-    ///     newline). Compatible with shell process substitution
-    ///     (`peel … --password-from fd:3 3< <(pass …)`).
+    ///     newline). Compatible with shell process substitution:
+    ///     `peel … --password-from fd:3 3< <(pass …)`.
     ///
-    /// peel deliberately does not accept the password on the
-    /// command line — `argv` is visible to every process on the
-    /// host and is the wrong default. Users who really need a
-    /// non-interactive single-step invocation can pipe one through
-    /// `env:`, `file:`, or `fd:`.
-    #[arg(long = "password-from", value_name = "SOURCE")]
+    /// peel deliberately does not accept the password on the command
+    /// line — `argv` is visible to every process on the host.
+    #[arg(
+        long = "password-from",
+        value_name = "SOURCE",
+        help_heading = "Advanced options"
+    )]
     pub password_from: Option<String>,
 
-    /// Skip multi-volume auto-discovery
-    /// (`internal/PLAN_multivolume_archives.md` §1 / §6).
+    /// Skip multi-volume auto-discovery.
     ///
-    /// Normally, when the user passes a single positional URL whose
-    /// basename matches one of the recognised multi-volume patterns
-    /// (`<base>.part<N>.rar`, `<base>.7z.<NNN>`, `<base>.z<NN>` or
-    /// `<base>.zip`), peel HEAD-probes the origin to discover the
-    /// full ordered volume set before any download starts. The
-    /// resolved set is then routed through the multi-part storage
-    /// path the same way an explicit positional URL list would be.
+    /// Normally, when a single positional URL's basename matches a
+    /// recognised multi-volume pattern (`<base>.part<N>.rar`,
+    /// `<base>.7z.<NNN>`, `<base>.z<NN>` or `<base>.zip`), peel HEAD-
+    /// probes the origin for the full ordered volume set before any
+    /// download starts. `--no-auto-discover` forces the seed to be
+    /// treated as a single source instead.
     ///
-    /// `--no-auto-discover` forces the seed to be treated as a
-    /// single-source URL even when its basename matches a
-    /// multi-volume pattern. Useful when:
-    ///
-    /// - The seed's filename matches one of the conventions but is
-    ///   not actually a multi-volume archive — e.g. an unrelated
-    ///   `.zip` file you do not want peel to probe for `.z01`
-    ///   siblings.
-    /// - Discovery would fan out to many failed HEAD probes against
-    ///   a high-latency origin and the operator already knows the
-    ///   seed is a single source.
-    ///
-    /// Has no effect when the user supplied multiple positional
-    /// URLs — that path already opts out of auto-discovery.
-    #[arg(long = "no-auto-discover", default_value_t = false)]
+    /// Useful for unrelated `.zip` files that should not be probed
+    /// for `.z01` siblings, or against high-latency origins where the
+    /// HEAD fan-out is wasted. Has no effect when multiple positional
+    /// URLs are supplied — that path already opts out.
+    #[arg(
+        long = "no-auto-discover",
+        default_value_t = false,
+        help_heading = "Advanced options"
+    )]
     pub no_auto_discover: bool,
 
-    /// Destroy the source archive as extraction proceeds
-    /// (`internal/old/PLAN_local_file_extract.md` §1).
+    /// Destroy the source archive as extraction proceeds.
     ///
     /// Local-file mode is non-destructive by default — `peel
     /// abc.tar.xz` extracts into `./abc/` and leaves `abc.tar.xz`
     /// untouched. Passing `-d/--destructive` opts in to the
     /// disk-pressure contract of the HTTP path: the source is
-    /// progressively hole-punched as the decoder advances and
-    /// deleted on clean completion, freeing the archive's blocks
-    /// before the extracted tree is fully written. `-d` overrides
-    /// `-k` in local mode (info-logged; non-destructive is the
-    /// default so `-k` is already a no-op there).
+    /// progressively hole-punched as the decoder advances and deleted
+    /// on clean completion. `-d` overrides `-k` in local mode.
     ///
-    /// HTTP runs are destructive by default already, so `-d` is a
-    /// harmless no-op for an HTTP source (info-logged). Passing
-    /// `-d` *and* `-k/--keep-archive` together with an HTTP source
-    /// is an error — the two intents are contradictory.
-    #[arg(short = 'd', long = "destructive", default_value_t = false)]
+    /// HTTP runs are destructive by default, so `-d` is a no-op for
+    /// an HTTP source. Passing `-d` together with `-k/--keep-archive`
+    /// on an HTTP source is an error — the two intents conflict.
+    #[arg(
+        short = 'd',
+        long = "destructive",
+        default_value_t = false,
+        display_order = 3
+    )]
     pub destructive: bool,
+
+    // Manually re-add `-h`/`-V` after every flag so they render under
+    // a trailing `Options` heading instead of clap's default top-of-
+    // help placement. The field values are never read; the
+    // `ArgAction::Help` / `Version` actions consume and exit on
+    // match.
+    /// Print help (see more with '--help').
+    #[arg(
+        short = 'h',
+        long = "help",
+        action = clap::ArgAction::Help,
+        help_heading = "Options",
+    )]
+    pub _help: Option<bool>,
+
+    /// Print version.
+    #[arg(
+        short = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+        help_heading = "Options",
+    )]
+    pub _version: Option<bool>,
 }
 
 /// CLI form of [`IoBackendChoice`].
@@ -527,25 +552,16 @@ pub enum CliError {
     #[error("--max-disk-buffer value is not a valid size")]
     InvalidDiskBuffer(#[source] ParseBandwidthError),
 
-    /// `-o/--output-file` was not given and the URL did not parse as
+    /// `-o/--output` was not given and the URL did not parse as
     /// a valid URL — so no default output path could be derived.
     #[error("URL is not valid; pass -o <PATH> explicitly")]
     InvalidUrl(#[source] UrlError),
 
-    /// `-o/--output-file` was not given and the URL has no usable
+    /// `-o/--output` was not given and the URL has no usable
     /// basename (e.g. it ends in `/`) so no default output path
     /// could be derived.
     #[error("URL has no filename to derive a default output path from; pass -o <PATH> explicitly")]
     NoDefaultOutput,
-
-    /// `-C/--output-dir` was passed. The flag was removed in favour
-    /// of a unified `-o <PATH>` (`internal/PLAN_download_modes.md` §1);
-    /// the stub exists only to emit a clear migration error.
-    #[error(
-        "-C/--output-dir was removed; use -o <PATH> instead \
-         (a trailing slash on PATH means directory)"
-    )]
-    OutputDirRemoved,
 
     /// `--no-extract` was combined with an extractor-only knob
     /// (`--format`, `--force-format-from-magic`, or
@@ -1554,15 +1570,6 @@ impl Cli {
     /// constructed, or [`CliError::InvalidSha256`] if the
     /// `--sha256 <HEX>` argument failed to parse.
     pub fn into_run_args(self) -> Result<RunArgs, CliError> {
-        // Hard cutover migration error for the removed `-C` flag
-        // (`internal/PLAN_download_modes.md` §1). Surfaces *before* URL
-        // and SHA-256 validation so a user passing `-C foo/` doesn't
-        // also have to fix other arg shape before seeing the migration
-        // hint.
-        if self.output_dir_migration.is_some() {
-            return Err(CliError::OutputDirRemoved);
-        }
-
         // `--no-extract` is mutually exclusive with extractor-only
         // flags (`internal/PLAN_download_modes.md` §2.1). Detect explicit
         // setting:
@@ -1836,14 +1843,6 @@ impl Cli {
     /// used in local mode, or any of the variants
     /// [`Self::into_run_args`] surfaces.
     pub fn into_dispatch(mut self) -> Result<Dispatch, CliError> {
-        // Hard cutover migration error for the removed `-C` flag
-        // — surfaces *before* source classification so a user who
-        // is mixing legacy flags still sees the migration hint
-        // first.
-        if self.output_dir_migration.is_some() {
-            return Err(CliError::OutputDirRemoved);
-        }
-
         // Manifest expansion (`internal/PLAN_multivolume_archives.md`
         // §1 step 4 / §6): `peel @volumes.txt` is rewritten into
         // the explicit list of URLs / paths from the manifest
@@ -2066,29 +2065,6 @@ mod tests {
                 || msg.contains("unrecognized")
                 || msg.contains("--password")
         );
-    }
-
-    #[test]
-    fn dash_c_flag_returns_migration_error() {
-        // `-C` is removed; clap accepts it (hidden stub) so we can
-        // emit a typed migration error in `into_run_args`.
-        let cli = Cli::try_parse_from(["peel", "https://example.com/x.tar.zst", "-C", "/tmp/out"])
-            .expect("clap accepts hidden -C stub");
-        let err = cli.into_run_args().err().expect("must error");
-        assert!(matches!(err, CliError::OutputDirRemoved));
-    }
-
-    #[test]
-    fn long_output_dir_flag_returns_migration_error() {
-        let cli = Cli::try_parse_from([
-            "peel",
-            "https://example.com/x.tar.zst",
-            "--output-dir",
-            "/tmp/out",
-        ])
-        .expect("clap accepts hidden --output-dir stub");
-        let err = cli.into_run_args().err().expect("must error");
-        assert!(matches!(err, CliError::OutputDirRemoved));
     }
 
     #[test]

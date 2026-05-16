@@ -586,7 +586,7 @@ should fail the build).
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `-o, --output-file <PATH>` | URL basename, suffixes stripped | Output path. Directory for tree-shaped formats (tar / zip / 7z / rar / any `.tar.<x>` wrapper); file for stream-shaped formats (raw `.zst`, `.xz`, `.lz4`, `.gz`). A trailing slash forces directory semantics. |
+| `-o, --output <PATH>` | URL basename, suffixes stripped | Output path. Directory for tree-shaped formats (tar / zip / 7z / rar / any `.tar.<x>` wrapper); file for stream-shaped formats (raw `.zst`, `.xz`, `.lz4`, `.gz`). A trailing slash forces directory semantics. |
 | `--no-extract` (alias: `--download-only`) | off | Skip extraction; download the source bytes verbatim. |
 | `-k, --keep-archive[=<PATH>]` | off | Extract AND keep the source archive on disk. Bare `-k` places the archive as a sibling of `-o`; `-k=<PATH>` is explicit. |
 | `-d, --destructive` | off | Hole-punch and delete the source archive as extraction proceeds. Required to enable destructive behavior in local mode (preservation is the default there); a no-op for HTTP runs, which are destructive by default. Combining `-d` with `-k` for an HTTP source is an error. |

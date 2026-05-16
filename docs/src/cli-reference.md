@@ -33,7 +33,7 @@ One or more source URLs or local file paths.
 
 ## Output and destination
 
-### `-o, --output-file <PATH>`
+### `-o, --output <PATH>`
 
 Destination for the extracted contents. Accepts a directory for
 archive formats that produce a tree (`tar`, `zip`, `7z`, `rar`, and any
@@ -351,7 +351,7 @@ Print the version.
 
 | Flag | Purpose | Default |
 | --- | --- | --- |
-| `-o, --output-file <PATH>` | Output path | URL basename, suffixes stripped |
+| `-o, --output <PATH>` | Output path | URL basename, suffixes stripped |
 | `--workdir <DIR>` | Sidecar (`.peel.part` / `.peel.ckpt`) location | Sibling of output |
 | `-k, --keep-archive[=<PATH>]` | Extract AND keep the source | off |
 | `--no-extract` | Download without extracting | off |
