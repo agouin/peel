@@ -42,8 +42,6 @@
 //! [`std::io::Read`] loop and the limiter blocks the calling thread
 //! directly.
 
-#![cfg(unix)]
-
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

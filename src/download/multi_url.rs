@@ -21,8 +21,6 @@
 //! code constructs a one-element source and routes through the same
 //! seam (`internal/PLAN_multi_url_source.md` §1 step 2).
 
-#![cfg(unix)]
-
 use thiserror::Error;
 
 use super::worker::SourceFingerprint;

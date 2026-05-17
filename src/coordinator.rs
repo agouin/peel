@@ -145,8 +145,6 @@
 //! either overwritten by the resumed download (if the resumed
 //! bitmap doesn't have them) or harmlessly ignored.
 
-#![cfg(unix)]
-
 pub mod local;
 
 use std::fs;

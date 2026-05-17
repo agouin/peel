@@ -41,14 +41,12 @@
 // codebase. The HTTP path itself no longer touches
 // `crate::io_backend`; that boundary moved out with the migration
 // to hyper.
-#[cfg(unix)]
 pub mod client;
 pub mod range;
 pub mod request;
 pub mod response;
 pub mod url;
 
-#[cfg(unix)]
 pub use client::{Client, ClientConfig, ClientError, HttpVersion};
 pub use range::{ContentRange, RangeError};
 pub use request::Method;

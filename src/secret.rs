@@ -25,10 +25,8 @@
 //! line at all (no `--password=…` flag — process-list visibility is
 //! the wrong default). Beyond that we rely on the operating system.
 
-#[cfg(unix)]
 pub mod source;
 
-#[cfg(unix)]
 pub use source::{PasswordLoadError, PasswordSource, PasswordSourceParseError};
 
 use std::fmt;

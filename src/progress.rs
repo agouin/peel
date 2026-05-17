@@ -1797,6 +1797,70 @@ impl DecodeStepStallDetector {
 ///
 /// A [`StallDetector`] runs in lockstep with the renderer so a frozen
 /// pipeline produces a structured `tracing::warn!` event independent of
+/// `true` if `stderr` accepts ANSI escape sequences such that the
+/// [`TtyRenderer`] can redraw in place.
+///
+/// On Unix every modern terminal accepts ANSI, and the answer is
+/// trivially `true`. On Windows 10 1607+ the console must opt into
+/// virtual-terminal processing via
+/// `SetConsoleMode(stderr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)`;
+/// pre-1607 Windows and pre-Windows-Terminal `conhost` do not
+/// support it. This function tries to flip the bit and returns
+/// whether it succeeded.
+///
+/// The renderer-selection logic in `main` calls this *after* the
+/// `io::stderr().is_terminal()` check; if `is_terminal` says we
+/// have a console but `tty_supports_ansi` returns `false`, fall
+/// back to the [`LogRenderer`] so a pre-1607 Windows user sees
+/// structured log lines instead of literal escape codes
+/// (`PLAN_v3_windows.md` §7).
+///
+/// Idempotent: calling multiple times is harmless. The console
+/// mode is *not* restored on process exit — the inherited mode
+/// state lives on the shell's console handle, and modern shells
+/// re-initialise their mode on the next prompt regardless of what
+/// the child left behind.
+#[must_use]
+pub fn tty_supports_ansi() -> bool {
+    #[cfg(unix)]
+    {
+        true
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        };
+
+        // `std::io::stderr()` returns the live process stderr;
+        // `as_raw_handle()` is the console handle when stderr is a
+        // terminal. If stderr was redirected (e.g. `2> file`) the
+        // handle points at a regular file and `GetConsoleMode`
+        // fails — the caller's `is_terminal()` filter prevents that
+        // path in practice, but we still degrade gracefully here.
+        let stderr = std::io::stderr();
+        let handle = stderr.as_raw_handle();
+        let mut mode: u32 = 0;
+        // SAFETY: `stderr` is borrowed for the duration of this
+        // call; `GetConsoleMode` writes a `u32` through the pointer
+        // on success and reads no other state.
+        let rc = unsafe { GetConsoleMode(handle as _, &mut mode) };
+        if rc == 0 {
+            return false;
+        }
+        // SAFETY: same handle-lifetime argument; `SetConsoleMode`
+        // takes the new mode by value and returns non-zero on
+        // success.
+        let rc = unsafe { SetConsoleMode(handle as _, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) };
+        rc != 0
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 /// the chosen renderer. The interval honors
 /// `PEEL_STALL_WARN_INTERVAL_SECS`; see [`StallDetector::from_env`].
 ///

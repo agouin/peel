@@ -105,6 +105,35 @@ pub enum SinkError {
         root: PathBuf,
     },
 
+    /// A tar entry contains a path component the sink refuses to
+    /// extract because it would produce an unsafe or ambiguous file
+    /// on at least one supported platform.
+    ///
+    /// Applied uniformly on every platform (Unix and Windows) so an
+    /// archive that extracts cleanly on Linux also extracts cleanly
+    /// on Windows, instead of silently succeeding on one and failing
+    /// on the other. Reasons include: backslash inside a tar entry
+    /// name (tar uses `/` exclusively; `\` in a single component
+    /// would create a subdirectory on Windows), NTFS-reserved
+    /// characters (`< > : " | ? *`) or ASCII controls (`\x00..=\x1F`),
+    /// trailing `.` or trailing space (NTFS silently strips both,
+    /// causing two distinct entries to collide on disk), and DOS
+    /// reserved names (`CON`, `PRN`, `AUX`, `NUL`, `COM0..9`,
+    /// `LPT0..9`, with or without an extension). (`PLAN_v3_windows.md`
+    /// §8.)
+    #[error("entry {entry:?} contains unsafe component {component:?}: {reason}")]
+    UnsafePath {
+        /// The original entry name from the archive.
+        entry: String,
+        /// The specific path component that tripped the rule.
+        component: String,
+        /// Short label of the rule that fired (e.g.
+        /// `"backslash in tar component"`,
+        /// `"NTFS-reserved character"`, `"trailing dot or space"`,
+        /// `"DOS reserved name"`, `"ASCII control"`).
+        reason: &'static str,
+    },
+
     /// A tar header was malformed (bad magic, non-octal numeric field,
     /// invalid PAX framing, etc.).
     #[error("malformed tar header at archive offset {archive_offset}: {reason}")]

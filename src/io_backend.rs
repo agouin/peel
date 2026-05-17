@@ -23,25 +23,34 @@
 //! `Send + Sync`; the blocking impl is in fact zero-sized and the
 //! `Arc` is just type-machinery.
 //!
-//! # Why `BorrowedFd`
+//! # Why [`OsFd`]
 //!
-//! The trait operates on a [`BorrowedFd`] rather than `&File` so the
+//! The trait operates on an [`OsFd`] rather than `&File` so the
 //! io_uring backend can submit SQEs against the kernel-side fd
 //! directly. The blocking backend rebuilds a temporary [`File`] handle
 //! around the borrowed fd via [`ManuallyDrop`] so we get the safe
 //! [`FileExt`] surface without taking ownership of the underlying
-//! descriptor.
-
-#![cfg(unix)]
+//! descriptor. `OsFd<'_>` is the [`crate::os_fd`] portable alias:
+//! [`std::os::fd::BorrowedFd`] on Unix today and
+//! [`std::os::windows::io::BorrowedHandle`] on Windows once the §2
+//! Windows blocking backend lands (`PLAN_v3_windows.md` §0.2 / §2).
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
-use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as UnixFileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as WindowsFileExt;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::os_fd::OsFd;
 
 #[cfg(target_os = "linux")]
 pub mod uring;
@@ -123,7 +132,7 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Returns the underlying [`io::Error`] for any OS-level failure
     /// (e.g. `EIO`, `ENOSPC`).
-    fn pwrite_all_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()>;
+    fn pwrite_all_at(&self, fd: OsFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()>;
 
     /// Read up to `buf.len()` bytes starting at `offset` and return
     /// the number actually read.
@@ -135,7 +144,7 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Returns the underlying [`io::Error`] for any OS-level failure.
-    fn pread_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
+    fn pread_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 
     /// Read exactly `buf.len()` bytes starting at `offset`, looping on
     /// short reads.
@@ -147,7 +156,7 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     /// Returns [`io::ErrorKind::UnexpectedEof`] if EOF is reached
     /// before the buffer is filled, or any other [`io::Error`] for an
     /// OS-level failure.
-    fn pread_exact_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+    fn pread_exact_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()>;
 
     /// Force the file's data and metadata to durable storage.
     ///
@@ -156,7 +165,7 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Returns the underlying [`io::Error`] for any OS-level failure.
-    fn sync_all(&self, fd: BorrowedFd<'_>) -> io::Result<()>;
+    fn sync_all(&self, fd: OsFd<'_>) -> io::Result<()>;
 
     /// Order pending writes against a subsequent durability event,
     /// without forcing a device-level flush.
@@ -181,7 +190,7 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Returns the underlying [`io::Error`] for any OS-level failure.
-    fn order_writes(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+    fn order_writes(&self, fd: OsFd<'_>) -> io::Result<()> {
         self.sync_all(fd)
     }
 
@@ -380,23 +389,23 @@ impl IoBackend for BlockingBackend {
         "blocking"
     }
 
-    fn pwrite_all_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()> {
-        with_file(fd, |f| f.write_all_at(buf, offset))
+    fn pwrite_all_at(&self, fd: OsFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()> {
+        with_file(fd, |f| f.pwrite_all_at(buf, offset))
     }
 
-    fn pread_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        with_file(fd, |f| f.read_at(buf, offset))
+    fn pread_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        with_file(fd, |f| f.pread_at(buf, offset))
     }
 
-    fn pread_exact_at(&self, fd: BorrowedFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        with_file(fd, |f| f.read_exact_at(buf, offset))
+    fn pread_exact_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        with_file(fd, |f| f.pread_exact_at(buf, offset))
     }
 
-    fn sync_all(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+    fn sync_all(&self, fd: OsFd<'_>) -> io::Result<()> {
         with_file(fd, File::sync_all)
     }
 
-    fn order_writes(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+    fn order_writes(&self, fd: OsFd<'_>) -> io::Result<()> {
         order_writes_blocking(fd)
     }
 
@@ -411,22 +420,111 @@ impl IoBackend for BlockingBackend {
 
 /// Run `f` against a [`File`] view of `fd` without taking ownership.
 ///
-/// `BorrowedFd<'_>` only carries the lifetime invariant that the fd is
-/// open for the borrow's duration. To call the safe [`FileExt`] /
-/// [`File::sync_all`] surface we need a `&File`, which would normally
-/// own the fd. We construct one via [`File::from_raw_fd`] and wrap it
-/// in [`ManuallyDrop`] so the destructor — which would `close(2)` the
-/// fd — never fires. The borrowed fd's lifetime governs the whole call.
-fn with_file<R>(fd: BorrowedFd<'_>, f: impl FnOnce(&File) -> R) -> R {
-    // SAFETY: `BorrowedFd<'_>` guarantees `fd.as_raw_fd()` is a valid,
-    // open file descriptor for the duration of the borrow. We hand it
-    // to `File::from_raw_fd`, which would normally take ownership and
-    // close the fd on drop; wrapping the result in `ManuallyDrop`
-    // suppresses the destructor so the fd stays open and the borrow is
-    // honored. The closure receives only an `&File`, never an owned
-    // `File`, so it cannot escape the wrapper.
+/// `OsFd<'_>` only carries the lifetime invariant that the underlying
+/// OS handle is open for the borrow's duration. To call the safe
+/// [`File::sync_all`] / [`FileOps`] surface we need a `&File`, which
+/// would normally own the handle. We construct one via the
+/// platform-specific `From*Raw*` route and wrap it in [`ManuallyDrop`]
+/// so the destructor — which would close the handle — never fires.
+/// The borrowed fd's lifetime governs the whole call.
+fn with_file<R>(fd: OsFd<'_>, f: impl FnOnce(&File) -> R) -> R {
+    // SAFETY: `OsFd<'_>` guarantees the underlying raw fd (Unix) /
+    // handle (Windows) is valid and open for the duration of the
+    // borrow. `File::from_raw_fd` / `from_raw_handle` would normally
+    // take ownership and close the handle on drop; wrapping the
+    // result in `ManuallyDrop` suppresses the destructor so the
+    // handle stays open and the borrow is honored. The closure
+    // receives only `&File`, never an owned `File`, so it cannot
+    // escape the wrapper.
+    #[cfg(unix)]
     let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
+    #[cfg(windows)]
+    let file = ManuallyDrop::new(unsafe { File::from_raw_handle(fd.as_raw_handle()) });
     f(&file)
+}
+
+/// Portable positional file IO mirroring POSIX `pread`/`pwrite` on
+/// both platforms.
+///
+/// Unix `std::os::unix::fs::FileExt::{write_all_at, read_at,
+/// read_exact_at}` already provides the right shape. Windows
+/// `std::os::windows::fs::FileExt::{seek_write, seek_read}` provides
+/// the equivalent `WriteFile`/`ReadFile` with explicit `OVERLAPPED.Offset`,
+/// but only the single-call form — looping until the buffer is
+/// drained is the caller's job. This trait hides the difference so
+/// the `BlockingBackend` impl looks the same on every platform.
+///
+/// **Windows file-pointer side effect.** `seek_read` /
+/// `seek_write` use `OVERLAPPED.Offset`, so the bytes land at the
+/// requested absolute offset regardless of any concurrent call;
+/// but Windows then updates the file pointer to
+/// `offset + bytes_transferred`. peel's workers always pass an
+/// explicit offset on every call (the sparse file is never read
+/// or written via the file pointer), so the post-call cursor
+/// position is unobserved and races between threads are harmless.
+/// This matches the way the Unix path already worked.
+trait FileOps {
+    fn pwrite_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    fn pread_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+    fn pread_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+impl FileOps for File {
+    fn pwrite_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.write_all_at(buf, offset)
+    }
+
+    fn pread_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.read_at(buf, offset)
+    }
+
+    fn pread_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.read_exact_at(buf, offset)
+    }
+}
+
+#[cfg(windows)]
+impl FileOps for File {
+    fn pwrite_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            // `seek_write` may write fewer bytes than requested
+            // (matching POSIX `pwrite` semantics). A short write of
+            // zero — possible on a write to a disk that just went
+            // read-only — is reported as `ErrorKind::WriteZero`,
+            // mirroring `std::io::Write::write_all`'s contract.
+            let n = self.seek_write(buf, offset)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "seek_write returned 0 with bytes remaining",
+                ));
+            }
+            buf = &buf[n..];
+            // INVARIANT: `n <= buf.len() <= usize::MAX <= u64::MAX`,
+            // and the offset arithmetic is bounded by the file size
+            // the caller validated. `as u64` is therefore lossless.
+            offset = offset.saturating_add(n as u64);
+        }
+        Ok(())
+    }
+
+    fn pread_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.seek_read(buf, offset)
+    }
+
+    fn pread_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            let n = self.seek_read(buf, offset)?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let split = buf;
+            buf = &mut split[n..];
+            offset = offset.saturating_add(n as u64);
+        }
+        Ok(())
+    }
 }
 
 /// Platform-specific implementation of the
@@ -445,7 +543,7 @@ fn with_file<R>(fd: BorrowedFd<'_>, f: impl FnOnce(&File) -> R) -> R {
 /// `fsync` would do is safe.
 ///
 /// Other Unix: full `sync_all`.
-pub(crate) fn order_writes_blocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+pub(crate) fn order_writes_blocking(fd: OsFd<'_>) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         // Darwin: F_BARRIERFSYNC = 85. Defined in
@@ -498,8 +596,9 @@ mod tests {
     use super::*;
 
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::AsFd;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::os_fd::AsOsFd;
 
     /// Process-unique counter so concurrent test threads do not collide
     /// on temp filenames.
@@ -554,7 +653,7 @@ mod tests {
         let backend = BlockingBackend::new();
         let payload: Vec<u8> = (0u8..32).collect();
         backend
-            .pwrite_all_at(file.as_fd(), 64, &payload)
+            .pwrite_all_at(file.as_os_fd(), 64, &payload)
             .expect("pwrite");
         file.seek(SeekFrom::Start(64)).expect("seek");
         let mut got = vec![0u8; 32];
@@ -571,7 +670,7 @@ mod tests {
         let backend = BlockingBackend::new();
         let mut got = [0u8; 16];
         let n = backend
-            .pread_at(file.as_fd(), 100, &mut got)
+            .pread_at(file.as_os_fd(), 100, &mut got)
             .expect("pread");
         assert_eq!(n, 16);
         assert_eq!(got, payload);
@@ -582,7 +681,9 @@ mod tests {
         let (file, _cleanup) = open_temp("pread_eof", 32);
         let backend = BlockingBackend::new();
         let mut got = vec![0u8; 64];
-        let n = backend.pread_at(file.as_fd(), 16, &mut got).expect("pread");
+        let n = backend
+            .pread_at(file.as_os_fd(), 16, &mut got)
+            .expect("pread");
         assert_eq!(n, 16);
     }
 
@@ -592,7 +693,7 @@ mod tests {
         let backend = BlockingBackend::new();
         let mut got = vec![0u8; 64];
         let err = backend
-            .pread_exact_at(file.as_fd(), 16, &mut got)
+            .pread_exact_at(file.as_os_fd(), 16, &mut got)
             .expect_err("expected EOF");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
@@ -601,7 +702,7 @@ mod tests {
     fn sync_all_succeeds_on_regular_file() {
         let (file, _cleanup) = open_temp("sync_all", 32);
         let backend = BlockingBackend::new();
-        backend.sync_all(file.as_fd()).expect("sync_all");
+        backend.sync_all(file.as_os_fd()).expect("sync_all");
     }
 
     #[test]
@@ -613,7 +714,7 @@ mod tests {
         // on a freshly-truncated regular file.
         let (file, _cleanup) = open_temp("order_writes", 32);
         let backend = BlockingBackend::new();
-        backend.order_writes(file.as_fd()).expect("order_writes");
+        backend.order_writes(file.as_os_fd()).expect("order_writes");
     }
 
     #[test]
@@ -624,9 +725,9 @@ mod tests {
         let (file, _cleanup) = open_temp("order_writes_after_pwrite", 64);
         let backend = BlockingBackend::new();
         backend
-            .pwrite_all_at(file.as_fd(), 0, b"hello world\n")
+            .pwrite_all_at(file.as_os_fd(), 0, b"hello world\n")
             .expect("pwrite");
-        backend.order_writes(file.as_fd()).expect("order_writes");
+        backend.order_writes(file.as_os_fd()).expect("order_writes");
     }
 
     #[test]
@@ -664,7 +765,7 @@ mod tests {
         let backend: Arc<dyn IoBackend> = default_backend();
         let payload: Vec<u8> = (0u8..64).collect();
         let backend2 = Arc::clone(&backend);
-        let fd = file.as_fd();
+        let fd = file.as_os_fd();
         backend.pwrite_all_at(fd, 0, &payload).expect("write");
         let mut got = vec![0u8; payload.len()];
         backend2.pread_exact_at(fd, 0, &mut got).expect("read");

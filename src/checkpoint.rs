@@ -104,7 +104,7 @@
 //! # Ok::<(), peel::checkpoint::CheckpointError>(())
 //! ```
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -112,6 +112,75 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use crate::types::ByteOffset;
+
+/// Atomically publish `tmp` over `dst`, replacing any existing entry
+/// at `dst`. The data already written to `tmp` is the visible
+/// `dst` afterward; concurrent observers see either the old or the
+/// new content, never a partial mix.
+///
+/// On Unix this is `rename(2)`, which atomically replaces the target
+/// directory entry on the same filesystem.
+///
+/// On Windows `std::fs::rename` fails by default when the destination
+/// exists; the equivalent atomic-replace primitive is
+/// `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`. `WRITE_THROUGH`
+/// commits the rename to disk before returning, which on NTFS gives
+/// the same durability guarantee the Unix path gets from the
+/// caller's parent-directory `fsync` (the Unix path that runs after
+/// the rename on first publish). (`PLAN_v3_windows.md` §9.)
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] for any OS-level
+/// failure.
+fn atomic_publish(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(tmp, dst)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        // Convert both paths to NUL-terminated UTF-16 buffers per
+        // the Win32 wide-string contract. `encode_wide()` does the
+        // OsStr → UTF-16 encoding; we append the trailing NUL.
+        let to_wide = |p: &Path| -> Vec<u16> {
+            let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
+            v.push(0);
+            v
+        };
+        let src_w = to_wide(tmp);
+        let dst_w = to_wide(dst);
+
+        // SAFETY: `src_w` and `dst_w` are NUL-terminated UTF-16
+        // buffers owned by the caller for the duration of this
+        // call; `MoveFileExW` reads them by pointer and never
+        // retains them past return. The flags are valid bits per
+        // <fileapi.h>. The function returns non-zero on success.
+        let rc = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if rc == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Other platforms (e.g. WASI) fall back to plain `rename`
+        // and accept whatever atomicity guarantees the host's libc
+        // provides.
+        std::fs::rename(tmp, dst)
+    }
+}
 
 /// Magic bytes at the start of every checkpoint file.
 ///
@@ -2248,7 +2317,7 @@ impl Checkpoint {
         drop(file);
 
         let rename_start = Instant::now();
-        fs::rename(&tmp_path, path).map_err(|source| CheckpointError::Io {
+        atomic_publish(&tmp_path, path).map_err(|source| CheckpointError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -2279,6 +2348,9 @@ impl Checkpoint {
 
         Ok(t)
     }
+
+    // (helper `atomic_publish` lives at module scope below so it
+    // doesn't accidentally pull in `&self`-related state.)
 
     /// Read a checkpoint from `path` if one exists.
     ///
@@ -2815,9 +2887,9 @@ mod tests {
     struct CleanupOnDrop(PathBuf);
     impl Drop for CleanupOnDrop {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(&self.0);
             let tmp = tmp_path_for(&self.0);
-            let _ = fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -4483,6 +4555,14 @@ mod tests {
         assert_eq!(parsed, second);
     }
 
+    // Windows has no `open(parent_dir).sync_all()` equivalent — the
+    // implementation comment in `write_timed_with` ("On platforms
+    // where opening a directory for fsync is unsupported (Windows)
+    // the open silently fails and we skip") makes the assertion
+    // below Unix-specific by design. `MoveFileExW(WRITE_THROUGH)`
+    // gives the equivalent durability guarantee on the Windows
+    // rename path (see `PLAN_v3_windows.md` §9).
+    #[cfg(unix)]
     #[test]
     fn write_timed_fsyncs_parent_dir_only_on_first_write() {
         // `PLAN_checkpoint_cadence_throughput.md` Phase 1: the
@@ -4522,7 +4602,7 @@ mod tests {
         let path = unique_temp("stale-tmp");
         let _g = CleanupOnDrop(path.clone());
         let tmp = tmp_path_for(&path);
-        fs::write(&tmp, b"\xDE\xAD\xBE\xEF garbage from crashed run").unwrap();
+        std::fs::write(&tmp, b"\xDE\xAD\xBE\xEF garbage from crashed run").unwrap();
 
         let ckpt = sample_raw();
         ckpt.write(&path).expect("write");
@@ -4540,7 +4620,7 @@ mod tests {
         let mut bytes = sample_raw().serialize();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x80;
-        fs::write(&path, &bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
 
         match Checkpoint::read(&path).unwrap_err() {
             CheckpointError::BodyChecksumMismatch { .. } => {}

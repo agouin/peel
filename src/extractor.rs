@@ -26,14 +26,11 @@
 //! the caller, owns the read side. The accompanying
 //! `examples/extract_demo.rs` opens the source twice (one read handle
 //! for the decoder, one read-write handle for punching) and passes the
-//! latter's [`BorrowedFd`] to [`Extractor::extract`]. The §10
+//! latter's [`OsFd`] to [`Extractor::extract`]. The §10
 //! coordinator follows the same shape, plumbing the fd through the
 //! [`crate::download::SparseFile`] it already owns.
 
-#![cfg(unix)]
-
 use std::io::Write;
-use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +39,7 @@ use thiserror::Error;
 
 use crate::checkpoint::SinkState;
 use crate::decode::{DecodeError, DecodeStatus, StreamingDecoder};
+use crate::os_fd::OsFd;
 use crate::progress::ProgressState;
 use crate::punch::{align_down, PunchError, PunchHole};
 use crate::sink::{Sink, SinkError};
@@ -535,7 +533,7 @@ impl Extractor {
     /// requires it). The caller typically opens the source twice — one
     /// read-only handle for the decoder and one read-write handle for
     /// the puncher — and hands the read-write handle's
-    /// [`BorrowedFd`] in here.
+    /// [`OsFd`] in here.
     ///
     /// # Errors
     ///
@@ -546,7 +544,7 @@ impl Extractor {
     /// reclamation.
     pub fn extract<S: Sink>(
         &self,
-        source_fd: BorrowedFd<'_>,
+        source_fd: OsFd<'_>,
         decoder: &mut dyn StreamingDecoder,
         sink: S,
         puncher: &dyn PunchHole,
@@ -581,7 +579,7 @@ impl Extractor {
     /// `on_checkpoint` returns `Err`.
     pub fn extract_with_callback<S, F>(
         &self,
-        source_fd: BorrowedFd<'_>,
+        source_fd: OsFd<'_>,
         decoder: &mut dyn StreamingDecoder,
         mut sink: S,
         puncher: &dyn PunchHole,
@@ -601,7 +599,7 @@ impl Extractor {
     /// returns and the borrow is released.
     fn run_loop<S, F>(
         &self,
-        source_fd: BorrowedFd<'_>,
+        source_fd: OsFd<'_>,
         decoder: &mut dyn StreamingDecoder,
         sink: &mut S,
         puncher: &dyn PunchHole,
@@ -906,7 +904,7 @@ impl Extractor {
     #[allow(clippy::too_many_arguments)]
     fn maybe_punch(
         &self,
-        source_fd: BorrowedFd<'_>,
+        source_fd: OsFd<'_>,
         puncher: &dyn PunchHole,
         block: u64,
         quiescent_at: u64,
@@ -1025,8 +1023,9 @@ mod tests {
     use super::*;
 
     use std::io::{Cursor, Read};
-    use std::os::fd::AsFd;
     use std::path::PathBuf;
+
+    use crate::os_fd::AsOsFd;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     use crate::decode::zstd::ZstdDecoder;
@@ -1164,7 +1163,7 @@ mod tests {
         // non-regular fd like stdout is fine.
         let extractor = Extractor::with_defaults();
         let stats = extractor
-            .extract(stdout.as_fd(), &mut decoder, sink, &NoopPuncher::new())
+            .extract(stdout.as_os_fd(), &mut decoder, sink, &NoopPuncher::new())
             .expect("extract");
 
         assert_eq!(stats.bytes_in, len);
@@ -1196,7 +1195,7 @@ mod tests {
 
         let stdout = std::io::stdout();
         let stats = Extractor::with_defaults()
-            .extract(stdout.as_fd(), &mut decoder, sink, &NoopPuncher::new())
+            .extract(stdout.as_os_fd(), &mut decoder, sink, &NoopPuncher::new())
             .expect("extract");
 
         assert_eq!(stats.bytes_in, len);
@@ -1234,7 +1233,7 @@ mod tests {
 
         let stats = Extractor::with_defaults()
             .extract(
-                std::io::stdout().as_fd(),
+                std::io::stdout().as_os_fd(),
                 &mut decoder,
                 sink,
                 &NoopPuncher::new(),
@@ -1262,7 +1261,7 @@ mod tests {
         };
 
         let result = Extractor::with_defaults().extract(
-            std::io::stdout().as_fd(),
+            std::io::stdout().as_os_fd(),
             &mut decoder,
             sink,
             &NoopPuncher::new(),
@@ -1320,7 +1319,7 @@ mod tests {
         std::thread::spawn(move || {
             // stdout fd is fine — the NoopPuncher never touches it.
             let result = extractor.extract(
-                std::io::stdout().as_fd(),
+                std::io::stdout().as_os_fd(),
                 &mut decoder,
                 sink,
                 &NoopPuncher::new(),
@@ -1358,7 +1357,7 @@ mod tests {
         impl PunchHole for CountingPuncher {
             fn punch(
                 &self,
-                _fd: BorrowedFd<'_>,
+                _fd: OsFd<'_>,
                 _offset: ByteOffset,
                 _length: u64,
             ) -> Result<(), PunchError> {
@@ -1377,7 +1376,7 @@ mod tests {
         };
 
         let result = Extractor::with_defaults().extract(
-            std::io::stdout().as_fd(),
+            std::io::stdout().as_os_fd(),
             &mut decoder,
             sink,
             &puncher,
@@ -1411,7 +1410,7 @@ mod tests {
         // count matches.
         let stats = Extractor::with_defaults()
             .extract(
-                std::io::stdout().as_fd(),
+                std::io::stdout().as_os_fd(),
                 &mut decoder,
                 sink,
                 &NoopPuncher::new(),
@@ -1459,7 +1458,7 @@ mod tests {
         impl PunchHole for CountingPuncher {
             fn punch(
                 &self,
-                _fd: BorrowedFd<'_>,
+                _fd: OsFd<'_>,
                 _offset: ByteOffset,
                 length: u64,
             ) -> Result<(), PunchError> {
@@ -1487,7 +1486,7 @@ mod tests {
             ..ExtractorConfig::default()
         };
         let stats = Extractor::new(cfg)
-            .extract(punch_handle.as_fd(), &mut decoder, sink, &puncher)
+            .extract(punch_handle.as_os_fd(), &mut decoder, sink, &puncher)
             .expect("extract");
 
         let calls = puncher.0.load(Ordering::Relaxed);
@@ -1510,7 +1509,7 @@ mod tests {
         impl PunchHole for UnsupportedPuncher {
             fn punch(
                 &self,
-                _fd: BorrowedFd<'_>,
+                _fd: OsFd<'_>,
                 _offset: ByteOffset,
                 _length: u64,
             ) -> Result<(), PunchError> {
@@ -1548,7 +1547,7 @@ mod tests {
             ..ExtractorConfig::default()
         };
         let stats = Extractor::new(cfg)
-            .extract(rw.as_fd(), &mut decoder, sink, &UnsupportedPuncher)
+            .extract(rw.as_os_fd(), &mut decoder, sink, &UnsupportedPuncher)
             .expect("extract");
 
         assert!(stats.punch_unsupported);
@@ -1564,7 +1563,7 @@ mod tests {
         impl PunchHole for BrokenPuncher {
             fn punch(
                 &self,
-                _fd: BorrowedFd<'_>,
+                _fd: OsFd<'_>,
                 offset: ByteOffset,
                 length: u64,
             ) -> Result<(), PunchError> {
@@ -1603,7 +1602,7 @@ mod tests {
             punch_threshold: 4096,
             ..ExtractorConfig::default()
         };
-        let result = Extractor::new(cfg).extract(rw.as_fd(), &mut decoder, sink, &BrokenPuncher);
+        let result = Extractor::new(cfg).extract(rw.as_os_fd(), &mut decoder, sink, &BrokenPuncher);
         match result {
             Err(ExtractorError::Punch { source, .. }) => {
                 assert!(matches!(source, PunchError::Io { .. }));
@@ -1710,7 +1709,7 @@ mod tests {
         // Default config: punch enabled, no checkpoint throttle.
         let stats = Extractor::with_defaults()
             .extract_with_callback(
-                scratch.as_fd(),
+                scratch.as_os_fd(),
                 &mut decoder,
                 sink,
                 &NoopPuncher::new(),
@@ -1794,7 +1793,7 @@ mod tests {
         };
         let stats = Extractor::new(cfg)
             .extract_with_callback(
-                scratch.as_fd(),
+                scratch.as_os_fd(),
                 &mut decoder,
                 sink,
                 &NoopPuncher::new(),
@@ -1882,7 +1881,7 @@ mod tests {
         impl PunchHole for RecordingPuncher {
             fn punch(
                 &self,
-                _fd: BorrowedFd<'_>,
+                _fd: OsFd<'_>,
                 offset: ByteOffset,
                 length: u64,
             ) -> Result<(), PunchError> {
@@ -1924,11 +1923,17 @@ mod tests {
             checkpoint_min_interval: Duration::from_secs(60 * 60),
         };
         let stats = Extractor::new(cfg)
-            .extract_with_callback(punch_handle.as_fd(), &mut decoder, sink, &puncher, |info| {
-                observer_calls.set(observer_calls.get() + 1);
-                persisted.set(Some(info.source_position));
-                Ok(())
-            })
+            .extract_with_callback(
+                punch_handle.as_os_fd(),
+                &mut decoder,
+                sink,
+                &puncher,
+                |info| {
+                    observer_calls.set(observer_calls.get() + 1);
+                    persisted.set(Some(info.source_position));
+                    Ok(())
+                },
+            )
             .expect("extract");
 
         assert_eq!(
@@ -1982,7 +1987,7 @@ mod tests {
         let sink = RawSink::create(&dst_path).expect("dst");
 
         let stats = Extractor::with_defaults()
-            .extract(rw.as_fd(), &mut decoder, sink, &NoopPuncher::new())
+            .extract(rw.as_os_fd(), &mut decoder, sink, &NoopPuncher::new())
             .expect("extract");
 
         assert_eq!(stats.bytes_out, payload.len() as u64);

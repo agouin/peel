@@ -44,11 +44,8 @@
 //! base + length into a [`crate::punch::LinuxPuncher::for_mmap`]
 //! instance.
 
-#![cfg(unix)]
-
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,6 +54,7 @@ use thiserror::Error;
 #[cfg(target_os = "linux")]
 use super::mmap_region::MmapRegion;
 use crate::io_backend::{default_backend, IoBackend};
+use crate::os_fd::{AsOsFd, OsFd};
 #[cfg(target_os = "linux")]
 use crate::punch::LinuxPuncher;
 use crate::punch::{PunchError, PunchHole};
@@ -375,8 +373,8 @@ impl SparseFile {
     /// directly (e.g., bypassing the [`PunchHole`] trait in a test).
     /// Prefer [`Self::punch`] for hole punching.
     #[must_use]
-    pub fn as_fd(&self) -> BorrowedFd<'_> {
-        self.file.as_fd()
+    pub fn as_fd(&self) -> OsFd<'_> {
+        self.file.as_os_fd()
     }
 
     /// The diagnostic name of the storage backend handling this file's
@@ -474,7 +472,7 @@ impl SparseFile {
 
         match &self.storage {
             Storage::Pwrite { backend } => backend
-                .pwrite_all_at(self.file.as_fd(), raw_offset, buf)
+                .pwrite_all_at(self.file.as_os_fd(), raw_offset, buf)
                 .map_err(|source| SparseFileError::Io {
                     offset: raw_offset,
                     len,
@@ -524,7 +522,7 @@ impl SparseFile {
 
         match &self.storage {
             Storage::Pwrite { backend } => backend
-                .pread_at(self.file.as_fd(), raw_offset, buf)
+                .pread_at(self.file.as_os_fd(), raw_offset, buf)
                 .map_err(|source| SparseFileError::Io {
                     offset: raw_offset,
                     len,
@@ -564,7 +562,7 @@ impl SparseFile {
 
         match &self.storage {
             Storage::Pwrite { backend } => backend
-                .pread_exact_at(self.file.as_fd(), raw_offset, buf)
+                .pread_exact_at(self.file.as_os_fd(), raw_offset, buf)
                 .map_err(|source| SparseFileError::Io {
                     offset: raw_offset,
                     len,
@@ -644,7 +642,7 @@ impl SparseFile {
         match &self.storage {
             Storage::Pwrite { backend } => {
                 backend
-                    .sync_all(self.file.as_fd())
+                    .sync_all(self.file.as_os_fd())
                     .map_err(|source| SparseFileError::Io {
                         offset: 0,
                         len: self.total_size,
@@ -694,7 +692,7 @@ impl SparseFile {
         match &self.storage {
             Storage::Pwrite { backend } => {
                 backend
-                    .order_writes(self.file.as_fd())
+                    .order_writes(self.file.as_os_fd())
                     .map_err(|source| SparseFileError::Io {
                         offset: 0,
                         len: self.total_size,
@@ -730,6 +728,18 @@ fn open_at_size(path: &Path, total_size: u64) -> Result<std::fs::File, SparseFil
             source,
         })?;
 
+    // On Windows the sparse attribute must be set *before* `set_len`
+    // for the zero-extension below to leave the file logically
+    // `total_size` bytes long without allocating physical clusters
+    // for the zeroed range. Without this, NTFS allocates the full
+    // `total_size` up-front and the hole-punching workflow has
+    // nothing to release. Best-effort: filesystems that reject the
+    // FSCTL (FAT32, exFAT, network mounts) get a warning and we fall
+    // back to the non-sparse layout — output is still correct, just
+    // without the in-flight disk savings (`PLAN_v3_windows.md` §3).
+    #[cfg(windows)]
+    set_sparse_attribute(&file, path);
+
     file.set_len(total_size)
         .map_err(|source| SparseFileError::SetLen {
             path: path.to_path_buf(),
@@ -737,6 +747,76 @@ fn open_at_size(path: &Path, total_size: u64) -> Result<std::fs::File, SparseFil
             source,
         })?;
     Ok(file)
+}
+
+/// Mark `file` as an NTFS sparse file via
+/// `DeviceIoControl(FSCTL_SET_SPARSE)` (`PLAN_v3_windows.md` §3).
+///
+/// Best-effort: filesystems without sparse-file support
+/// (FAT32, exFAT, most network mounts) return `ERROR_INVALID_FUNCTION`,
+/// `ERROR_NOT_SUPPORTED`, or `ERROR_INVALID_PARAMETER`; in that case
+/// the file remains non-sparse, future `set_len` zero-extensions
+/// allocate physical clusters, and the
+/// [`crate::punch::WindowsPuncher`] (`PLAN_v3_windows.md` §4) will
+/// surface its own `Unsupported` from `FSCTL_SET_ZERO_DATA`. Both
+/// degradations are warning-grade, not fatal.
+#[cfg(windows)]
+fn set_sparse_attribute(file: &std::fs::File, path: &Path) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // `FSCTL_SET_SPARSE` from `<winioctl.h>`. Hard-coded so we don't
+    // need the `Win32_System_Ioctl` feature in `windows-sys` —
+    // matches the pattern `punch::macos` uses for `F_PUNCHHOLE`. The
+    // value is part of the stable NT control-code ABI.
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: `file` outlives this call, so the raw handle is valid.
+    // Input buffer is null + length 0, which `FSCTL_SET_SPARSE`
+    // accepts as "set sparse to true" per the Win32 docs. The output
+    // buffer is null + length 0 because this FSCTL returns no data;
+    // `bytes_returned` is required to be non-null but we discard the
+    // value. No `OVERLAPPED` (synchronous handle).
+    let rc = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc == 0 {
+        // ERROR_INVALID_FUNCTION (1), ERROR_NOT_SUPPORTED (50),
+        // ERROR_INVALID_PARAMETER (87) — all are "the filesystem
+        // doesn't do sparse files"; downgrade silently the same way
+        // the Linux puncher downgrades on `EOPNOTSUPP`. Anything
+        // else is unexpected; surface at `warn` so a real bug isn't
+        // lost in the noise.
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(1) | Some(50) | Some(87) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "filesystem does not support sparse files; \
+                     proceeding without space-saving holes",
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "FSCTL_SET_SPARSE failed unexpectedly; \
+                     proceeding without sparse attribute",
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

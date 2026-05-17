@@ -1,0 +1,20 @@
+# `PLAN_v3_windows.md` defensive: stop git's autocrlf on Windows
+# from mangling test fixtures. Most fixtures are binary blobs
+# (`.rar`, `.tar.zst`, `.lz4`, …) where line-ending conversion
+# would silently corrupt the bytes; the plaintext fixtures
+# (`.txt`) are paired with binary archives whose embedded
+# content is LF-terminated, and a CRLF rewrite on checkout would
+# make the round-trip assertion `assert_eq!(decoded, EXPECTED)`
+# fail in `decode::rar_legacy::tests` and similar.
+#
+# Marking the whole `tests/fixtures/` and `internal/fixtures/`
+# trees as `binary` short-circuits text/eol conversion regardless
+# of the user's `core.autocrlf` setting (default `true` on many
+# Git for Windows distributions).
+tests/fixtures/** binary
+internal/fixtures/** binary
+
+# `Cargo.lock` is checked in for reproducible release builds
+# (per `internal/PLAN_packaging.md` §0.3); pin LF so a Windows
+# clone matches the Linux/macOS hash that `--locked` audits.
+Cargo.lock text eol=lf

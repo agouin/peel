@@ -789,6 +789,8 @@ impl TarSink {
         Ok(())
     }
 
+    // `unsafe_component_reason` is a free fn (not a method) so it
+    // can be unit-tested without constructing a `TarSink`.
     /// Resolve an entry name to an absolute path under `self.root`,
     /// rejecting anything that escapes.
     ///
@@ -838,6 +840,17 @@ impl TarSink {
                     root: self.root.clone(),
                 });
             }
+            // NTFS-portable safety check (`PLAN_v3_windows.md` §8).
+            // Applied on every platform so an archive's behavior is
+            // uniform across hosts: a path that would silently
+            // collide on Windows is rejected on Linux too.
+            if let Some(reason) = unsafe_component_reason(component) {
+                return Err(SinkError::UnsafePath {
+                    entry: entry.to_string(),
+                    component: component.to_string(),
+                    reason,
+                });
+            }
             out.push(component);
         }
         // Empty resolved path means the entry was `.`, `./`, or
@@ -849,6 +862,101 @@ impl TarSink {
         // with a clean "Is a directory" IO error — matched behaviour
         // is fine.
         Ok(out)
+    }
+}
+
+/// Per-component portability check used by [`TarSink::resolve_entry_path`]
+/// (`PLAN_v3_windows.md` §8).
+///
+/// Returns `Some(reason)` when `component` cannot safely become a
+/// single path segment on every supported host, or `None` when the
+/// component is portable. The rules are the union of the strictest
+/// shape from Windows and POSIX, applied uniformly: an archive that
+/// extracts cleanly on Linux should also extract cleanly on Windows,
+/// instead of one platform succeeding and the other failing late
+/// inside `OpenOptions::open`.
+///
+/// Caller pre-conditions:
+/// - `component` is non-empty (the caller `continue`s on `""` /
+///   `"."`).
+/// - `component` does not contain `/` (it is a tar entry split by
+///   `/` already; the function trusts that contract).
+/// - `component` is not `".."` (the caller already rejected that
+///   as `PathEscape`).
+/// - `component` is not a `std::path::Component` other than
+///   `Normal` (the caller already rejected those as `PathEscape`).
+fn unsafe_component_reason(component: &str) -> Option<&'static str> {
+    // Backslash isn't a valid character in a tar entry name (tar
+    // uses `/` exclusively). On Windows the OS treats `\` as a
+    // path separator, so a `\` in a single component would create
+    // a subdirectory — path-traversal-adjacent.
+    if component.contains('\\') {
+        return Some("backslash in tar component");
+    }
+    // Windows-reserved characters and ASCII controls.
+    // `< > : " | ? *` cannot appear in NTFS path components;
+    // controls `\x00..=\x1F` are likewise rejected. On POSIX
+    // these are technically valid file names, but a tar archive
+    // containing them is almost certainly mis-encoded or
+    // adversarial.
+    for &b in component.as_bytes() {
+        match b {
+            b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*' => {
+                return Some("NTFS-reserved character");
+            }
+            0x00..=0x1F => return Some("ASCII control character"),
+            _ => {}
+        }
+    }
+    // Trailing `.` or trailing space cause NTFS to silently strip
+    // the suffix (`foo.` becomes `foo`), allowing two distinct
+    // archive entries to collide on disk. Reject as ambiguous.
+    // INVARIANT: `component` is non-empty per the caller contract,
+    // so the last-byte index is in-bounds.
+    let last = component.as_bytes()[component.len() - 1];
+    if last == b'.' || last == b' ' {
+        return Some("trailing dot or space");
+    }
+    // DOS reserved names: CON, PRN, AUX, NUL, COM0-9, LPT0-9, plus
+    // the same names with any extension (`CON.txt` is just as
+    // reserved as `CON`). NTFS rejects them at `open()` time; FAT
+    // silently aliases. Reject everywhere so the archive's
+    // behavior is the same across hosts.
+    let stem = component.split('.').next().unwrap_or(component);
+    if is_dos_reserved_stem(stem) {
+        return Some("DOS reserved name");
+    }
+    None
+}
+
+/// `stem` is one of the DOS-reserved device-name stems, case-
+/// insensitively. Helper for [`unsafe_component_reason`].
+fn is_dos_reserved_stem(stem: &str) -> bool {
+    // The reserved set is small enough to inline; using a fixed
+    // ASCII-uppercase pass keeps the comparison cheap.
+    if !stem.is_ascii() {
+        return false;
+    }
+    let bytes = stem.as_bytes();
+    match bytes.len() {
+        3 => matches!(
+            [
+                bytes[0].to_ascii_uppercase(),
+                bytes[1].to_ascii_uppercase(),
+                bytes[2].to_ascii_uppercase(),
+            ],
+            [b'C', b'O', b'N'] | [b'P', b'R', b'N'] | [b'A', b'U', b'X'] | [b'N', b'U', b'L']
+        ),
+        4 => {
+            let prefix = [
+                bytes[0].to_ascii_uppercase(),
+                bytes[1].to_ascii_uppercase(),
+                bytes[2].to_ascii_uppercase(),
+            ];
+            let digit = bytes[3];
+            matches!(prefix, [b'C', b'O', b'M'] | [b'L', b'P', b'T']) && digit.is_ascii_digit()
+        }
+        _ => false,
     }
 }
 
@@ -1365,6 +1473,103 @@ mod test_helpers {
 mod tests {
     use super::test_helpers::*;
     use super::*;
+
+    // ---- unsafe_component_reason (PLAN_v3_windows.md §8) ------
+
+    #[test]
+    fn unsafe_component_accepts_ordinary_names() {
+        assert!(unsafe_component_reason("README.md").is_none());
+        assert!(unsafe_component_reason("subdir").is_none());
+        assert!(unsafe_component_reason("file.with.many.dots").is_none());
+        assert!(unsafe_component_reason("name with spaces").is_none());
+        assert!(unsafe_component_reason("ünïçødę").is_none());
+    }
+
+    #[test]
+    fn unsafe_component_rejects_backslash() {
+        assert_eq!(
+            unsafe_component_reason("foo\\bar"),
+            Some("backslash in tar component"),
+        );
+    }
+
+    #[test]
+    fn unsafe_component_rejects_ntfs_reserved_chars() {
+        for c in ['<', '>', ':', '"', '|', '?', '*'] {
+            let name = format!("file{c}");
+            assert_eq!(
+                unsafe_component_reason(&name),
+                Some("NTFS-reserved character"),
+                "expected rejection for {name:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_component_rejects_ascii_controls() {
+        // Tab (0x09), DEL would NOT trigger (0x7F is outside the
+        // 0x00..=0x1F range; the check is specifically about
+        // controls Windows uses as path-separators or terminators).
+        assert_eq!(
+            unsafe_component_reason("foo\tbar"),
+            Some("ASCII control character"),
+        );
+        assert_eq!(
+            unsafe_component_reason("foo\x01bar"),
+            Some("ASCII control character"),
+        );
+    }
+
+    #[test]
+    fn unsafe_component_rejects_trailing_dot_or_space() {
+        assert_eq!(
+            unsafe_component_reason("foo."),
+            Some("trailing dot or space")
+        );
+        assert_eq!(
+            unsafe_component_reason("foo "),
+            Some("trailing dot or space"),
+        );
+    }
+
+    #[test]
+    fn unsafe_component_rejects_dos_reserved_names() {
+        for name in ["CON", "con", "Con", "PRN", "AUX", "NUL"] {
+            assert_eq!(
+                unsafe_component_reason(name),
+                Some("DOS reserved name"),
+                "expected rejection for {name:?}",
+            );
+        }
+        for stem in ["COM1", "COM9", "LPT0", "lpt5"] {
+            assert_eq!(
+                unsafe_component_reason(stem),
+                Some("DOS reserved name"),
+                "expected rejection for {stem:?}",
+            );
+            // Same names with any extension are still reserved.
+            let with_ext = format!("{stem}.txt");
+            assert_eq!(
+                unsafe_component_reason(&with_ext),
+                Some("DOS reserved name"),
+                "expected rejection for {with_ext:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_component_accepts_names_that_only_start_like_reserved() {
+        // `CON` is reserved; `CONFIG` is not. The check matches
+        // exact 3-char / 4-char stems only.
+        assert!(unsafe_component_reason("CONFIG").is_none());
+        // No-digit 4-char names are not reserved.
+        assert!(unsafe_component_reason("COMA").is_none());
+        assert!(unsafe_component_reason("LPTX").is_none());
+        // Names that merely contain a reserved substring but have
+        // a different stem are fine: `mycom1` has stem `mycom1`,
+        // not `COM1`.
+        assert!(unsafe_component_reason("mycom1").is_none());
+    }
 
     /// Minimal sanity check on the PAX parser: a single `path` record
     /// round-trips.

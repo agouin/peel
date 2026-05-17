@@ -129,14 +129,21 @@ impl PeelCmd {
 /// the fixture matches the documented quiet path: no spurious warning
 /// in stderr that an assertion might trip on.
 pub fn write_password_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
     std::fs::write(&path, bytes).expect("write password file");
-    let mut perms = std::fs::metadata(&path)
-        .expect("stat password file")
-        .permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(&path, perms).expect("chmod 0600");
+    // POSIX mode bits don't exist on Windows; the corresponding
+    // `--password-from file:` mode-check warning is also skipped on
+    // Windows (see `src/secret/source.rs`'s `load_from_file`).
+    // `PLAN_v3_windows.md` §3.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat password file")
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod 0600");
+    }
     path
 }
 

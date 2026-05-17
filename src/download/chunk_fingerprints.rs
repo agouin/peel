@@ -24,8 +24,6 @@
 //! That matches the bitmap's discipline and gives us the same
 //! happens-before edge for consumers.
 
-#![cfg(unix)]
-
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::types::ChunkIndex;

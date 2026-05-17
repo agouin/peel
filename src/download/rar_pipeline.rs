@@ -48,8 +48,6 @@
 //! 4. After the last entry, punch the trailing region (header +
 //!    end-of-archive bytes the entries didn't cover).
 
-#![cfg(unix)]
-
 use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

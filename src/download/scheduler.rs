@@ -33,8 +33,6 @@
 //! indices entirely. The caller wires resume by loading the bitmap
 //! from a checkpoint before calling [`run`].
 
-#![cfg(unix)]
-
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
