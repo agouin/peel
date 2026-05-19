@@ -3,14 +3,21 @@
 #
 # Invoked via `mise run release [VERSION]`. With no argument, prompts for
 # the new version and defaults to the next patch bump from the current
-# Cargo.toml version. Updates every file that carries the version, then
-# commits, tags, and pushes to origin.
+# Cargo.toml version. Accepts stable (X.Y.Z) and prerelease
+# (X.Y.Z-beta.N / X.Y.Z-rc.N) versions. Updates every file that carries
+# the version, commits the bump on a `release/vX.Y.Z[-...]` branch,
+# pushes the branch, and prints a PR URL.
+#
+# Tagging and the GitHub release happen automatically when that PR
+# merges into main — see `.github/workflows/release-on-merge.yml`.
 #
 # Preconditions enforced:
 #   1. Working tree is clean (no staged or unstaged changes).
 #   2. HEAD is on `main`.
 #   3. `main` matches `origin/main` after a `git fetch`.
 #   4. The target tag does not already exist locally or remotely.
+#   5. The target release branch does not already exist locally or
+#      remotely.
 
 set -euo pipefail
 
@@ -57,7 +64,10 @@ next_patch() {
 }
 
 validate_version() {
-    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version must be X.Y.Z, got: $1"
+    # Stable: X.Y.Z. Prerelease: X.Y.Z-beta.N or X.Y.Z-rc.N. The
+    # release-on-merge workflow uses the same regex on the branch name.
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$ ]] \
+        || die "Version must be X.Y.Z or X.Y.Z-(beta|rc).N, got: $1"
 }
 
 CUR="$(current_version)"
@@ -77,7 +87,8 @@ validate_version "$NEW"
 [ "$NEW" != "$CUR" ] || die "New version equals current version ($CUR)"
 
 TAG="v$NEW"
-info "Releasing ${BOLD}$CUR${RESET} → ${BOLD}$NEW${RESET} (tag: $TAG)"
+BRANCH="release/$TAG"
+info "Releasing ${BOLD}$CUR${RESET} → ${BOLD}$NEW${RESET} (branch: $BRANCH, tag-on-merge: $TAG)"
 
 # --- preconditions ----------------------------------------------------------
 
@@ -90,8 +101,8 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 # On main.
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[ "$BRANCH" = "main" ] || die "Must be on 'main', currently on '$BRANCH'"
+CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+[ "$CUR_BRANCH" = "main" ] || die "Must be on 'main', currently on '$CUR_BRANCH'"
 
 # In sync with origin/main.
 info "Fetching origin"
@@ -103,7 +114,9 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
     die "Local main ($LOCAL_SHA) does not match origin/main ($REMOTE_SHA) — pull/push first"
 fi
 
-# Tag does not already exist (local or remote).
+# Tag does not already exist (local or remote). The merge workflow will
+# create the tag; if it's already present, the workflow would fail later
+# anyway — catch it now.
 if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
     die "Local tag $TAG already exists"
 fi
@@ -111,7 +124,20 @@ if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; the
     die "Remote tag $TAG already exists on origin"
 fi
 
+# Release branch does not already exist (local or remote).
+if git rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null; then
+    die "Local branch $BRANCH already exists"
+fi
+if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+    die "Remote branch $BRANCH already exists on origin"
+fi
+
 ok "Git state clean, on main, in sync with origin"
+
+# --- release branch --------------------------------------------------------
+
+info "Creating branch $BRANCH"
+git checkout -b "$BRANCH"
 
 # --- file edits -------------------------------------------------------------
 
@@ -141,8 +167,11 @@ awk -v new="$NEW" '
 
 # Cargo.lock — bump the peel-rs package entry. `name = "peel-rs"` is unique
 # (it's the workspace root crate), and the next `version = "..."` line is
-# always its version.
-sed -i '/^name = "peel-rs"$/{n;s/^version = ".*"$/version = "'"$NEW"'"/;}' Cargo.lock
+# always its version. Read-then-write via tmp file for BSD/GNU sed portability
+# (BSD `sed -i` requires an explicit backup-suffix arg; the in-place form
+# below works on both without leaving .bak debris).
+sed '/^name = "peel-rs"$/{n;s/^version = ".*"$/version = "'"$NEW"'"/;}' Cargo.lock \
+    > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
 
 # Fedora spec — Version field and a new %changelog entry at the top of the
 # changelog section.
@@ -176,11 +205,14 @@ awk -v new="$NEW" -v date="$FEDORA_DATE" -v author="$AUTHOR" '
 
 # Alpine APKBUILD — pkgver only. (pkgrel is left alone; bump manually if the
 # packaging itself changed without an upstream version bump.)
-sed -i -E "s/^pkgver=.*$/pkgver=$NEW/" packaging/alpine/APKBUILD
+sed -E "s/^pkgver=.*$/pkgver=$NEW/" packaging/alpine/APKBUILD \
+    > packaging/alpine/APKBUILD.tmp && mv packaging/alpine/APKBUILD.tmp packaging/alpine/APKBUILD
 
 # AUR PKGBUILDs — pkgver only, same rationale.
-sed -i -E "s/^pkgver=.*$/pkgver=$NEW/" packaging/aur/peel/PKGBUILD
-sed -i -E "s/^pkgver=.*$/pkgver=$NEW/" packaging/aur/peel-bin/PKGBUILD
+sed -E "s/^pkgver=.*$/pkgver=$NEW/" packaging/aur/peel/PKGBUILD \
+    > packaging/aur/peel/PKGBUILD.tmp && mv packaging/aur/peel/PKGBUILD.tmp packaging/aur/peel/PKGBUILD
+sed -E "s/^pkgver=.*$/pkgver=$NEW/" packaging/aur/peel-bin/PKGBUILD \
+    > packaging/aur/peel-bin/PKGBUILD.tmp && mv packaging/aur/peel-bin/PKGBUILD.tmp packaging/aur/peel-bin/PKGBUILD
 
 ok "Files updated"
 
@@ -195,18 +227,18 @@ ok "cargo metadata ok"
 info "Pending changes:"
 git --no-pager diff --stat
 
-printf '\n%sProceed?%s Will commit "%s", tag %s, and push origin main + tag. [y/N] ' \
-    "$BOLD" "$RESET" "$TAG" "$TAG"
+printf '\n%sProceed?%s Will commit "%s" on %s and push the branch to origin. [y/N] ' \
+    "$BOLD" "$RESET" "$TAG" "$BRANCH"
 read -r reply
 case "${reply,,}" in
     y|yes) ;;
     *)
-        warn "Aborted. File edits are still on disk — review with 'git diff', then commit manually or 'git checkout -- .' to discard."
+        warn "Aborted. You are on branch $BRANCH with the file edits staged on disk. Review with 'git diff', then either commit manually, switch back to main with 'git checkout main' and 'git branch -D $BRANCH' to discard, or 'git checkout -- .' to drop the edits and stay on the branch."
         exit 1
         ;;
 esac
 
-# --- commit, tag, push ------------------------------------------------------
+# --- commit and push branch -------------------------------------------------
 
 info "Committing"
 git add Cargo.toml Cargo.lock packaging/fedora/peel.spec \
@@ -214,11 +246,26 @@ git add Cargo.toml Cargo.lock packaging/fedora/peel.spec \
     packaging/aur/peel/PKGBUILD packaging/aur/peel-bin/PKGBUILD
 git commit -m "$TAG"
 
-info "Tagging $TAG"
-git tag -a "$TAG" -m "$TAG"
+info "Pushing $BRANCH to origin"
+git push -u origin "$BRANCH"
 
-info "Pushing main + tag to origin"
-git push origin main
-git push origin "$TAG"
+# --- PR URL -----------------------------------------------------------------
 
-ok "Released $TAG"
+# Derive the github.com/<owner>/<repo> path from origin's URL so we can
+# print a "create PR" link. Supports both SSH (git@github.com:owner/repo.git)
+# and HTTPS (https://github.com/owner/repo[.git]) remotes.
+remote_url="$(git remote get-url origin)"
+remote_url="${remote_url%.git}"
+PR_URL=""
+if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/]+)$ ]]; then
+    repo="${BASH_REMATCH[1]}"
+    PR_URL="https://github.com/$repo/compare/main...$BRANCH?expand=1"
+fi
+
+ok "Pushed $BRANCH"
+if [ -n "$PR_URL" ]; then
+    printf '\n%sOpen the release PR:%s\n  %s\n' "$BOLD" "$RESET" "$PR_URL"
+    printf '\nMerging that PR triggers .github/workflows/release-on-merge.yml,\nwhich tags %s and starts the release build.\n' "$TAG"
+else
+    warn "Could not parse origin URL; open a PR from $BRANCH to main manually."
+fi
