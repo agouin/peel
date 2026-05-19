@@ -6,7 +6,8 @@
 # Cargo.toml version. Accepts stable (X.Y.Z) and prerelease
 # (X.Y.Z-beta.N / X.Y.Z-rc.N) versions. Updates every file that carries
 # the version, commits the bump on a `release/vX.Y.Z[-...]` branch,
-# pushes the branch, and prints a PR URL.
+# pushes the branch, and opens the PR with `gh pr create`. If `gh` is
+# unavailable or the call fails, prints a compare URL as a fallback.
 #
 # Tagging and the GitHub release happen automatically when that PR
 # merges into main — see `.github/workflows/release-on-merge.yml`.
@@ -249,23 +250,44 @@ git commit -m "$TAG"
 info "Pushing $BRANCH to origin"
 git push -u origin "$BRANCH"
 
-# --- PR URL -----------------------------------------------------------------
+# --- open PR ----------------------------------------------------------------
 
-# Derive the github.com/<owner>/<repo> path from origin's URL so we can
-# print a "create PR" link. Supports both SSH (git@github.com:owner/repo.git)
-# and HTTPS (https://github.com/owner/repo[.git]) remotes.
-remote_url="$(git remote get-url origin)"
-remote_url="${remote_url%.git}"
-PR_URL=""
-if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/]+)$ ]]; then
-    repo="${BASH_REMATCH[1]}"
-    PR_URL="https://github.com/$repo/compare/main...$BRANCH?expand=1"
-fi
+PR_BODY="Release $TAG.
+
+Merging this PR triggers \`.github/workflows/release-on-merge.yml\`, which
+tags the merge commit \`$TAG\` and dispatches \`release.yml\` to build
+and publish the GitHub release."
 
 ok "Pushed $BRANCH"
-if [ -n "$PR_URL" ]; then
-    printf '\n%sOpen the release PR:%s\n  %s\n' "$BOLD" "$RESET" "$PR_URL"
-    printf '\nMerging that PR triggers .github/workflows/release-on-merge.yml,\nwhich tags %s and starts the release build.\n' "$TAG"
+
+if command -v gh >/dev/null 2>&1; then
+    info "Opening pull request with gh"
+    # gh pr create prints the PR URL on success; capture it so we can
+    # echo it back even though gh already prints it.
+    if PR_URL="$(gh pr create --base main --head "$BRANCH" \
+            --title "$TAG" --body "$PR_BODY")"; then
+        ok "PR opened: $PR_URL"
+    else
+        warn "gh pr create failed — falling back to a compare URL"
+        gh_failed=1
+    fi
 else
-    warn "Could not parse origin URL; open a PR from $BRANCH to main manually."
+    warn "gh CLI not found — falling back to a compare URL"
+    gh_failed=1
+fi
+
+if [ "${gh_failed:-0}" = "1" ]; then
+    # Derive the github.com/<owner>/<repo> path from origin's URL so we
+    # can print a "create PR" link as a fallback. Supports both SSH
+    # (git@github.com:owner/repo.git) and HTTPS
+    # (https://github.com/owner/repo[.git]) remotes.
+    remote_url="$(git remote get-url origin)"
+    remote_url="${remote_url%.git}"
+    if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/]+)$ ]]; then
+        repo="${BASH_REMATCH[1]}"
+        printf '\n%sOpen the release PR:%s\n  https://github.com/%s/compare/main...%s?expand=1\n' \
+            "$BOLD" "$RESET" "$repo" "$BRANCH"
+    else
+        warn "Could not parse origin URL; open a PR from $BRANCH to main manually."
+    fi
 fi
