@@ -19,7 +19,7 @@
 %bcond_without check
 
 Name:           peel
-Version:        0.7.0
+Version:        0.7.1
 Release:        1%{?dist}
 Summary:        Streaming, resumable, space-efficient HTTP archive extractor
 
@@ -165,6 +165,9 @@ install -D -m0644 target/man/peel.1   %{buildroot}%{_mandir}/man1/peel.1
 %{_mandir}/man1/peel.1*
 
 %changelog
+* Tue May 19 2026 Andrew Gouin <andrew@gouin.io> - 0.7.1-1
+- Release v0.7.1.
+
 * Tue May 19 2026 Andrew Gouin <andrew@gouin.io> - 0.7.0-1
 - Release v0.7.0.
 
