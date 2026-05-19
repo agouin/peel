@@ -1,0 +1,88 @@
+name: Tag release on merge
+
+# When a PR whose head branch is `release/vX.Y.Z[-(beta|rc).N]` merges
+# into main, tag the merge commit and kick off `release.yml` to build
+# and publish the GitHub release.
+#
+# We push the tag with GITHUB_TOKEN, which by GitHub's design does not
+# fire downstream `on: push: tags` triggers — so we explicitly
+# `gh workflow run release.yml` after pushing. The same token can
+# dispatch workflows in this repo provided `actions: write` is set
+# below.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag-and-release:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract and validate version
+        id: extract
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          tag="${HEAD_REF#release/}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$ ]]; then
+            echo "::error::Head branch '$HEAD_REF' is not in the form release/vX.Y.Z(-beta.N|-rc.N)?"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Verify Cargo.toml version matches branch
+        env:
+          TAG: ${{ steps.extract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          expected="${TAG#v}"
+          actual="$(awk '
+            /^\[package\]/ { in_pkg = 1; next }
+            /^\[/          { in_pkg = 0 }
+            in_pkg && /^version[[:space:]]*=/ {
+              match($0, /"[^"]+"/);
+              print substr($0, RSTART + 1, RLENGTH - 2);
+              exit
+            }
+          ' Cargo.toml)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Cargo.toml version ($actual) does not match branch ($expected). Re-run scripts/release.sh or fix the branch."
+            exit 1
+          fi
+
+      - name: Create and push tag
+        env:
+          TAG: ${{ steps.extract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
+      - name: Dispatch release workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.extract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # --ref must be the tag we just pushed so release.yml checks
+          # out the tagged commit; -f tag=... feeds the workflow_dispatch
+          # input release.yml already exposes.
+          gh workflow run release.yml --ref "$TAG" -f tag="$TAG"
