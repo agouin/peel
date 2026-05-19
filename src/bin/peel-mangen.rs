@@ -24,8 +24,12 @@
 //! `build.rs` `#[path]` include can't compile it without the lib already
 //! being built — a circular dep. A bin sits naturally above the lib in
 //! cargo's compile order.
-
-#![cfg(unix)]
+//!
+//! Cross-platform: the binary only writes troff bytes to a file via
+//! `std::fs`, so it builds and runs identically on Linux, macOS, and
+//! Windows. `release.yml` invokes it host-native on every matrix entry
+//! (including the `windows-2022` runner) so each tarball / zip ships a
+//! `peel.1` with no cross-host artifact shuffling.
 
 use std::env;
 use std::fs;
