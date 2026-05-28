@@ -481,6 +481,12 @@ pub fn chunk_count(total_size: u64, chunk_size: u64) -> Result<u32, SchedulerErr
 /// that strip `Content-Length` from redirect responses or refuse
 /// `HEAD` outright.
 ///
+/// If that ranged probe comes back `200` (the server ignored the
+/// `Range` header — i.e. no range support at all), discovery falls
+/// back once more to a plain `GET`, reads the size from
+/// `Content-Length`, and reports `accept_ranges = false` so the
+/// download runs in single-stream mode.
+///
 /// # Errors
 ///
 /// Returns [`SchedulerError::Head`] if the `HEAD` request fails at the
@@ -538,12 +544,22 @@ fn discover_via_range_probe(client: &Client, url: &Url) -> Result<DownloadInfo, 
         // `0 + 1` overflows `u64`, which it cannot.
         None => unreachable!("0..1 is always a valid ByteRange"),
     };
-    let resp = client
-        .get_range(url, probe)
-        .map_err(|source| SchedulerError::Head {
-            url: url.to_string(),
-            source,
-        })?;
+    let resp = match client.get_range(url, probe) {
+        Ok(resp) => resp,
+        // A `200` to a `Range` request means the server ignored the
+        // header — it has no range support. Fall back to a plain
+        // streaming `GET`: discover the size from the full response
+        // and let `run` single-stream the download.
+        Err(ClientError::UnexpectedStatus { status: 200, .. }) => {
+            return discover_via_full_get(client, url);
+        }
+        Err(source) => {
+            return Err(SchedulerError::Head {
+                url: url.to_string(),
+                source,
+            });
+        }
+    };
     let cr_value = resp
         .headers
         .get("content-range")
@@ -567,6 +583,57 @@ fn discover_via_range_probe(client: &Client, url: &Url) -> Result<DownloadInfo, 
         total_size,
         fingerprint,
         accept_ranges: true,
+        source,
+    })
+}
+
+/// Last-resort discovery for a server that supports neither a usable
+/// `HEAD` nor range requests: the `Range` probe came back `200` (range
+/// ignored). Issue a plain `GET`, read the total from `Content-Length`,
+/// and report `accept_ranges = false` so [`run`] drives the
+/// single-stream path. The body is dropped unread — hyper closes the
+/// connection rather than streaming the whole file just to size it.
+///
+/// # Errors
+///
+/// [`SchedulerError::Head`] if the `GET` fails at the transport layer
+/// or returns a non-2xx status, or [`SchedulerError::MissingContentLength`]
+/// if the response carries no usable `Content-Length` (e.g. a chunked
+/// `200` with no length — single-stream cannot size the file).
+fn discover_via_full_get(client: &Client, url: &Url) -> Result<DownloadInfo, SchedulerError> {
+    let resp = client
+        .get_full(url)
+        .map_err(|source| SchedulerError::Head {
+            url: url.to_string(),
+            source,
+        })?;
+    if !resp.status.is_success() {
+        return Err(SchedulerError::Head {
+            url: url.to_string(),
+            source: ClientError::UnexpectedStatus {
+                method: crate::http::Method::Get,
+                url: url.to_string(),
+                status: resp.status.code,
+            },
+        });
+    }
+    let total_size = resp
+        .headers
+        .get("content-length")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|t| *t > 0)
+        .ok_or_else(|| SchedulerError::MissingContentLength {
+            url: url.to_string(),
+        })?;
+    let fingerprint = SourceFingerprint::from_headers(&resp.headers);
+    drop(resp.body);
+    let source = MultiPartSource::from_single(url.clone(), total_size, fingerprint.clone(), None)
+        .map_err(SchedulerError::MultiPart)?;
+    Ok(DownloadInfo {
+        url: url.clone(),
+        total_size,
+        fingerprint,
+        accept_ranges: false,
         source,
     })
 }
