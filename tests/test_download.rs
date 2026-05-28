@@ -688,6 +688,65 @@ fn run_falls_back_to_single_stream_when_ranges_unsupported() {
     assert_eq!(read_full(&path), body_clone);
 }
 
+#[test]
+fn discover_falls_back_to_full_get_when_head_broken_and_no_ranges() {
+    // Issue #6: the server gives no usable Content-Length via HEAD
+    // *and* ignores Range requests (no range support at all). The
+    // ranged probe comes back 200; discovery must fall back once more
+    // to a plain GET — size from Content-Length, accept_ranges=false —
+    // and the download must single-stream cleanly.
+    let body = make_body(7000);
+    let body_clone = body.clone();
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            // Presigned-GET-only object behind a range-less origin:
+            // HEAD is rejected with no usable length.
+            return MockResponse::Reply {
+                status: 403,
+                reason: "Forbidden",
+                headers: vec![("Content-Length".into(), "0".into())],
+                body: Vec::new(),
+            };
+        }
+        // Range-less origin: ignore any Range header, always reply 200
+        // with the full body (`Reply` auto-adds Content-Length).
+        MockResponse::Reply {
+            status: 200,
+            reason: "OK",
+            headers: vec![],
+            body: body.clone(),
+        }
+    });
+    let client = build_client();
+
+    let info = discover(&client, &url(&server, "/")).expect("discover via full-GET fallback");
+    assert_eq!(info.total_size, body_clone.len() as u64);
+    assert!(!info.accept_ranges);
+
+    let chunk_size = 2000;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    let path = temp_path("full_get_fallback");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    let stats = run(
+        &client,
+        &info,
+        &sparse,
+        &bitmap,
+        &cursor,
+        &cfg(chunk_size, 2),
+    )
+    .expect("run");
+    assert!(matches!(stats.mode, DownloadMode::SingleStream));
+    assert_eq!(stats.bytes_downloaded as usize, body_clone.len());
+    assert_eq!(read_full(&path), body_clone);
+}
+
 // ---- run: resume from prior checkpoint --------------------------------
 
 #[test]
