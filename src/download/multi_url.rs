@@ -142,6 +142,32 @@ impl MultiPartSource {
         }])
     }
 
+    /// Build a single-part source whose size is **not yet known** — the
+    /// unknown-size single-stream path (`run` dispatched on
+    /// `!DownloadInfo::size_known`, issue #8). The size is learned by
+    /// streaming the body to EOF.
+    ///
+    /// The returned source is a placeholder for the unknown phase: it
+    /// reports `total_size() == 0` and **must not** be used for
+    /// [`locate`](Self::locate) / [`dispatch_range`](Self::dispatch_range)
+    /// routing — the unknown single-stream writer reads
+    /// `DownloadInfo::url` directly and never routes by part. Once the
+    /// size is resolved (at EOF), callers rebuild a normal source via
+    /// [`from_single`](Self::from_single).
+    #[must_use]
+    pub fn single_unknown(url: Url, fingerprint: SourceFingerprint) -> Self {
+        Self {
+            parts: vec![PartDescriptor {
+                url,
+                size: 0,
+                fingerprint,
+                expected_sha256: None,
+            }],
+            boundaries: vec![0, 0],
+            total_size: 0,
+        }
+    }
+
     /// Total virtual size, i.e. the sum of all part sizes.
     #[must_use]
     pub fn total_size(&self) -> u64 {

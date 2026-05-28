@@ -1072,6 +1072,11 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
     }
 
     let prior = Checkpoint::read(&ckpt_path).map_err(CoordinatorError::Checkpoint)?;
+    // An unknown-size run (range-less server with no Content-Length,
+    // issue #8) can't resume — single-stream has no ranged-read
+    // capability and the size isn't known until EOF — and never writes
+    // a checkpoint, so ignore any stale sidecar and always start fresh.
+    let prior = if info.size_known { prior } else { None };
     // Wall-clock time accumulated by prior runs that contributed
     // to this checkpoint. Seeds the v15 `cumulative_elapsed`
     // trailer so the final `[done]` line reports total time
@@ -1525,6 +1530,37 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             #[cfg(not(feature = "rar"))]
             let is_rar = false;
 
+            let is_random_access = is_zip || is_rar || is_sevenz;
+
+            // Unknown-size random-access archive (issue #8): zip/rar/7z
+            // pipelines need the trailer/central directory, which only
+            // arrives once the whole body has been streamed. Wait for the
+            // single-stream download to finish, resolve the real size
+            // from the growable file's high-water, and rebuild a
+            // fully-complete bitmap so the pipeline's range-waits pass
+            // immediately. (Streaming formats keep the concurrent path
+            // below — they decode front-to-back as bytes arrive.)
+            let (total_size, bitmap) = if !info.size_known && is_random_access {
+                wait_for_download_complete(
+                    &download_done,
+                    &download_outcome,
+                    config.reader_poll_interval,
+                    kill_switch.as_ref(),
+                )?;
+                let resolved = sparse.total_size();
+                let resolved_chunks = chunk_count(resolved, chunk_size).map_err(|e| match e {
+                    SchedulerError::TooManyChunks { chunks, .. } => {
+                        CoordinatorError::TooManyChunks { chunks }
+                    }
+                    other => CoordinatorError::Scheduler(other),
+                })?;
+                let full = Arc::new(ChunkBitmap::new(resolved_chunks));
+                full.complete_range(ChunkIndex::ZERO, ChunkIndex::new(resolved_chunks));
+                (resolved, full)
+            } else {
+                (total_size, Arc::clone(&bitmap))
+            };
+
             // A random-access container (zip/rar/7z) can only be
             // extracted once its trailer/central directory has arrived.
             // On a server without range support the whole archive must
@@ -1725,6 +1761,14 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 let reader = match kill_switch.clone() {
                     Some(flag) => reader.with_kill_switch(flag),
                     None => reader,
+                };
+                // Unknown-size source (issue #8): the bitmap is empty and
+                // `total_size` is 0, so gate reads on the growable file's
+                // live high-water instead.
+                let reader = if info.size_known {
+                    reader
+                } else {
+                    reader.with_unknown_size()
                 };
 
                 // Interpose a HashingReader between the source and
@@ -2552,6 +2596,15 @@ fn run_one<S: Sink>(
                 if flag.load(Ordering::Acquire) {
                     return Err(io::Error::other(KILL_SENTINEL));
                 }
+            }
+
+            // Unknown-size runs (issue #8) can't resume — single-stream
+            // has no ranged read and the size isn't known until EOF — and
+            // the part file's bytes are released by hole-punching as the
+            // decoder advances anyway. Skip the durable write entirely
+            // rather than persist a misleading `total_size = 0` sidecar.
+            if !info.size_known {
+                return Ok(());
             }
 
             let observer_start = Instant::now();
@@ -4334,6 +4387,14 @@ fn open_sources(
         ensure_parent_dir(p)?;
     }
     if !multi {
+        // Unknown-size source (issue #8): the size isn't known up front,
+        // so open a growable part file that extends as bytes arrive
+        // rather than pre-`set_len`-ing it to a (zero) total.
+        if !info.size_known {
+            let single =
+                SparseFile::open_growable(&paths[0]).map_err(CoordinatorError::SparseFile)?;
+            return Ok((MultiSparse::from_single_growable(single), paths));
+        }
         let single = open_sparse_part(&paths[0], info.total_size, config, io_backend)?;
         return Ok((MultiSparse::from_single(single), paths));
     }
@@ -4480,6 +4541,11 @@ pub struct BlockingSparseReader {
     /// Optional passive counters used by throughput diagnostics to
     /// split source-side sparse reads from bitmap waits.
     source_metrics: Option<Arc<SourceReadMetrics>>,
+    /// When `true` the source size was not known up front (issue #8):
+    /// the reader ignores `total_size` and the bitmap and instead gates
+    /// on the growable sparse file's live high-water
+    /// (`MultiSparse::total_size`). EOF is `download_done && pos >= hw`.
+    unknown_size: bool,
 }
 
 impl BlockingSparseReader {
@@ -4510,7 +4576,17 @@ impl BlockingSparseReader {
             progress_state: None,
             kill_switch: None,
             source_metrics: None,
+            unknown_size: false,
         }
+    }
+
+    /// Switch the reader into unknown-size mode (issue #8): EOF and
+    /// byte-availability are driven by the growable sparse file's live
+    /// high-water rather than `total_size` and the chunk bitmap.
+    #[must_use]
+    fn with_unknown_size(mut self) -> Self {
+        self.unknown_size = true;
+        self
     }
 
     /// Hook the reader up to a shared progress state so cursor
@@ -4545,8 +4621,77 @@ impl BlockingSparseReader {
     }
 }
 
+impl BlockingSparseReader {
+    /// Unknown-size read path (issue #8): there is no `total_size` and
+    /// no chunk bitmap, so availability and EOF are decided by the
+    /// growable sparse file's live high-water. A byte at `pos` is
+    /// readable once `pos < sparse.total_size()`; EOF is reached when
+    /// the download has finished and the cursor has caught up to the
+    /// final high-water.
+    fn read_unknown(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(flag) = self.kill_switch.as_ref() {
+                if flag.load(Ordering::Acquire) {
+                    return Err(io::Error::other(KILL_SENTINEL));
+                }
+            }
+            let pos = self.cursor.load(Ordering::Acquire);
+            let high_water = self.sparse.total_size();
+            if pos < high_water {
+                let want = (high_water - pos).min(buf.len() as u64) as usize;
+                let sparse_read_started = Instant::now();
+                let n = self
+                    .sparse
+                    .read_at(ByteOffset::new(pos), &mut buf[..want])
+                    .map_err(|e| io::Error::other(format!("sparse read: {e}")))?;
+                if let Some(metrics) = self.source_metrics.as_ref() {
+                    metrics.record_sparse_read(n as u64, sparse_read_started.elapsed());
+                }
+                if n == 0 {
+                    // The bytes up to `high_water` are durable by the
+                    // Release/Acquire edge on `pwrite_at`, so a zero read
+                    // below the high-water is not expected; re-poll
+                    // rather than report a spurious EOF.
+                    thread::sleep(self.poll_interval);
+                    continue;
+                }
+                let new_pos = self.cursor.fetch_add(n as u64, Ordering::Release) + n as u64;
+                if let Some(p) = self.progress_state.as_ref() {
+                    p.set_bytes_decoded_input(new_pos);
+                }
+                return Ok(n);
+            }
+            // Caught up to the writer. If the download is finished, a
+            // re-read of the high-water (it is published Release *before*
+            // `download_done`) tells us whether this is real EOF.
+            if self.download_done.load(Ordering::Acquire) {
+                if pos >= self.sparse.total_size() {
+                    if let Ok(mut slot) = self.download_outcome.lock() {
+                        if let Some(Err(e)) = slot.take() {
+                            return Err(io::Error::other(e));
+                        }
+                    }
+                    return Ok(0);
+                }
+                // The high-water advanced between the two loads; read it.
+                continue;
+            }
+            if let Some(metrics) = self.source_metrics.as_ref() {
+                metrics.record_poll_sleep();
+            }
+            thread::sleep(self.poll_interval);
+        }
+    }
+}
+
 impl Read for BlockingSparseReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.unknown_size {
+            return self.read_unknown(buf);
+        }
         // §1.3: enter a debug-level span around the source-read poll
         // loop so a stuck decoder shows up in the per-component
         // breakdown when the operator runs with `RUST_LOG=peel=debug`.
@@ -4809,6 +4954,7 @@ fn select_decoder_factory(
             download_outcome,
             config.reader_poll_interval,
             kill_switch,
+            !info.size_known,
         )?
     };
     let magic_lookup = registry.lookup_by_prefix(&prefix);
@@ -4959,6 +5105,43 @@ pub(crate) fn verify_output_shape_local(
     verify_output_shape(shape, output)
 }
 
+/// Block until the download thread sets `download_done`, polling the
+/// kill switch so a SIGTERM unblocks promptly. Used by the unknown-size
+/// random-access path (issue #8), which must have the whole archive on
+/// disk before the pipeline can read its trailer / central directory.
+///
+/// Surfaces a download-side failure as [`CoordinatorError::Scheduler`]
+/// and a kill as [`CoordinatorError::Aborted`]. On success the
+/// `download_outcome` slot is left intact (only an error is taken) so
+/// the caller can still read the download stats afterwards.
+fn wait_for_download_complete(
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    poll_interval: Duration,
+    kill_switch: Option<&Arc<AtomicBool>>,
+) -> Result<(), CoordinatorError> {
+    loop {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(CoordinatorError::Aborted {
+                    checkpoints_written: 0,
+                });
+            }
+        }
+        if download_done.load(Ordering::Acquire) {
+            if let Ok(mut slot) = download_outcome.lock() {
+                if matches!(slot.as_ref(), Some(Err(_))) {
+                    if let Some(Err(e)) = slot.take() {
+                        return Err(CoordinatorError::Scheduler(e));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        thread::sleep(poll_interval);
+    }
+}
+
 /// Wait for the chunks covering `[0, min(max_window, total_size))` to
 /// be marked complete in `bitmap`, then read the prefix from `sparse`.
 ///
@@ -4977,27 +5160,31 @@ fn sniff_prefix(
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     poll_interval: Duration,
     kill_switch: Option<&Arc<AtomicBool>>,
+    unknown_size: bool,
 ) -> Result<Vec<u8>, CoordinatorError> {
-    if max_window == 0 || total_size == 0 || chunk_size == 0 {
+    if max_window == 0 || chunk_size == 0 {
         return Ok(Vec::new());
     }
-    let want = (max_window as u64).min(total_size);
+    if !unknown_size && total_size == 0 {
+        return Ok(Vec::new());
+    }
+    // For an unknown-size source `total_size` is `0` and meaningless; we
+    // want the first `max_window` bytes (or fewer if the body is shorter).
+    let want = if unknown_size {
+        max_window as u64
+    } else {
+        (max_window as u64).min(total_size)
+    };
     // §1.3: span around the sniff-prefix poll so a slow first chunk is
     // visible in the per-component breakdown.
-    let span = tracing::debug_span!(target: "peel::sniff", "sniff_prefix", want);
+    let span = tracing::debug_span!(target: "peel::sniff", "sniff_prefix", want, unknown_size);
     let _enter = span.enter();
-    // Number of chunks required to cover offset 0..want. For typical
-    // configs this is exactly 1 (chunk_size ≫ max_window).
-    // INVARIANT: chunk_size > 0 (checked above) so div_ceil is sound.
-    let chunks_needed = u32::try_from(want.div_ceil(chunk_size).max(1)).unwrap_or(u32::MAX);
-    for i in 0..chunks_needed {
-        let idx = ChunkIndex::new(i);
+
+    if unknown_size {
+        // No bitmap to wait on: poll the growable file's live high-water
+        // until it covers `want`, or the download finishes (a body
+        // shorter than the magic window reads short).
         loop {
-            // §2.2: a SIGTERM during sniff (slow connect / TLS / DNS)
-            // would otherwise hang until the chunk arrives. Surface
-            // the kill switch as a typed `Aborted` with zero
-            // checkpoints written, since nothing has been persisted
-            // at this point in the run.
             if let Some(flag) = kill_switch {
                 if flag.load(Ordering::Acquire) {
                     return Err(CoordinatorError::Aborted {
@@ -5005,26 +5192,68 @@ fn sniff_prefix(
                     });
                 }
             }
-            if bitmap.is_complete(idx) {
+            if sparse.total_size() >= want {
                 break;
             }
             if download_done.load(Ordering::Acquire) {
-                let detail = match download_outcome.lock() {
-                    Ok(slot) => match &*slot {
-                        Some(Err(e)) => format!("download failed: {e}"),
-                        _ => format!(
-                            "download finished but chunk {i} (needed for format detection) \
-                             is not complete"
-                        ),
-                    },
-                    Err(_) => "download outcome poisoned".to_string(),
-                };
-                return Err(CoordinatorError::Io {
-                    path: PathBuf::from("<sniff-prefix>"),
-                    source: io::Error::new(io::ErrorKind::UnexpectedEof, detail),
-                });
+                if let Ok(slot) = download_outcome.lock() {
+                    if let Some(Err(e)) = &*slot {
+                        return Err(CoordinatorError::Io {
+                            path: PathBuf::from("<sniff-prefix>"),
+                            source: io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!("download failed: {e}"),
+                            ),
+                        });
+                    }
+                }
+                // Clean finish with fewer than `want` bytes — read what
+                // arrived.
+                break;
             }
             thread::sleep(poll_interval);
+        }
+    } else {
+        // Number of chunks required to cover offset 0..want. For typical
+        // configs this is exactly 1 (chunk_size ≫ max_window).
+        // INVARIANT: chunk_size > 0 (checked above) so div_ceil is sound.
+        let chunks_needed = u32::try_from(want.div_ceil(chunk_size).max(1)).unwrap_or(u32::MAX);
+        for i in 0..chunks_needed {
+            let idx = ChunkIndex::new(i);
+            loop {
+                // §2.2: a SIGTERM during sniff (slow connect / TLS / DNS)
+                // would otherwise hang until the chunk arrives. Surface
+                // the kill switch as a typed `Aborted` with zero
+                // checkpoints written, since nothing has been persisted
+                // at this point in the run.
+                if let Some(flag) = kill_switch {
+                    if flag.load(Ordering::Acquire) {
+                        return Err(CoordinatorError::Aborted {
+                            checkpoints_written: 0,
+                        });
+                    }
+                }
+                if bitmap.is_complete(idx) {
+                    break;
+                }
+                if download_done.load(Ordering::Acquire) {
+                    let detail = match download_outcome.lock() {
+                        Ok(slot) => match &*slot {
+                            Some(Err(e)) => format!("download failed: {e}"),
+                            _ => format!(
+                                "download finished but chunk {i} (needed for format detection) \
+                                 is not complete"
+                            ),
+                        },
+                        Err(_) => "download outcome poisoned".to_string(),
+                    };
+                    return Err(CoordinatorError::Io {
+                        path: PathBuf::from("<sniff-prefix>"),
+                        source: io::Error::new(io::ErrorKind::UnexpectedEof, detail),
+                    });
+                }
+                thread::sleep(poll_interval);
+            }
         }
     }
     // INVARIANT: want <= usize::MAX because want <= max_window: usize.
@@ -5079,6 +5308,7 @@ mod tests {
             total_size,
             fingerprint,
             accept_ranges: true,
+            size_known: true,
             source,
         }
     }

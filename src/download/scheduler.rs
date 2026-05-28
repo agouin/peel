@@ -292,6 +292,12 @@ pub struct DownloadInfo {
     /// it, parallel ranged GETs are not safe; the run falls back to
     /// the single-stream path (which only supports a single URL).
     pub accept_ranges: bool,
+    /// True when `total_size` is the real source size. `false` only for
+    /// the unknown-size single-stream path: a range-less server that
+    /// also omitted `Content-Length` (chunked / HTTP-2 / close-delimited).
+    /// In that case `total_size` is `0` on entry and the real size is
+    /// only learned by streaming the body to EOF (`internal` issue #8).
+    pub size_known: bool,
     /// The full per-part view. For single-URL runs this is a
     /// one-element source whose fields agree with the legacy fields
     /// above; for multi-URL runs it carries every part with its own
@@ -524,6 +530,7 @@ pub fn discover(client: &Client, url: &Url) -> Result<DownloadInfo, SchedulerErr
                     total_size,
                     fingerprint,
                     accept_ranges,
+                    size_known: true,
                     source,
                 });
             }
@@ -583,23 +590,29 @@ fn discover_via_range_probe(client: &Client, url: &Url) -> Result<DownloadInfo, 
         total_size,
         fingerprint,
         accept_ranges: true,
+        size_known: true,
         source,
     })
 }
 
 /// Last-resort discovery for a server that supports neither a usable
 /// `HEAD` nor range requests: the `Range` probe came back `200` (range
-/// ignored). Issue a plain `GET`, read the total from `Content-Length`,
-/// and report `accept_ranges = false` so [`run`] drives the
-/// single-stream path. The body is dropped unread — hyper closes the
-/// connection rather than streaming the whole file just to size it.
+/// ignored). Issue a plain `GET` and report `accept_ranges = false` so
+/// [`run`] drives the single-stream path. The body is dropped unread —
+/// hyper closes the connection rather than streaming the whole file
+/// just to size it; `run_single_stream` / `run_single_stream_unknown`
+/// re-fetches it.
+///
+/// When the `GET` carries a usable `Content-Length` the size is known
+/// up front (`size_known = true`). When it does not — chunked transfer-
+/// encoding, HTTP/2 without a length, or HTTP/1.1 close-delimited — the
+/// size is unknown and is learned by streaming the body to EOF
+/// (`size_known = false`, issue #8).
 ///
 /// # Errors
 ///
 /// [`SchedulerError::Head`] if the `GET` fails at the transport layer
-/// or returns a non-2xx status, or [`SchedulerError::MissingContentLength`]
-/// if the response carries no usable `Content-Length` (e.g. a chunked
-/// `200` with no length — single-stream cannot size the file).
+/// or returns a non-2xx status.
 fn discover_via_full_get(client: &Client, url: &Url) -> Result<DownloadInfo, SchedulerError> {
     let resp = client
         .get_full(url)
@@ -621,21 +634,34 @@ fn discover_via_full_get(client: &Client, url: &Url) -> Result<DownloadInfo, Sch
         .headers
         .get("content-length")
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|t| *t > 0)
-        .ok_or_else(|| SchedulerError::MissingContentLength {
-            url: url.to_string(),
-        })?;
+        .filter(|t| *t > 0);
     let fingerprint = SourceFingerprint::from_headers(&resp.headers);
     drop(resp.body);
-    let source = MultiPartSource::from_single(url.clone(), total_size, fingerprint.clone(), None)
-        .map_err(SchedulerError::MultiPart)?;
-    Ok(DownloadInfo {
-        url: url.clone(),
-        total_size,
-        fingerprint,
-        accept_ranges: false,
-        source,
-    })
+    match total_size {
+        Some(total_size) => {
+            let source =
+                MultiPartSource::from_single(url.clone(), total_size, fingerprint.clone(), None)
+                    .map_err(SchedulerError::MultiPart)?;
+            Ok(DownloadInfo {
+                url: url.clone(),
+                total_size,
+                fingerprint,
+                accept_ranges: false,
+                size_known: true,
+                source,
+            })
+        }
+        // No usable Content-Length: stream the body to EOF and learn
+        // the size as we go (issue #8).
+        None => Ok(DownloadInfo {
+            url: url.clone(),
+            total_size: 0,
+            fingerprint: fingerprint.clone(),
+            accept_ranges: false,
+            size_known: false,
+            source: MultiPartSource::single_unknown(url.clone(), fingerprint),
+        }),
+    }
 }
 
 /// Discover N parts in parallel and bundle them into a multi-part
@@ -732,6 +758,7 @@ pub fn discover_multi(client: &Client, urls: &[Url]) -> Result<DownloadInfo, Sch
         total_size,
         fingerprint: primary.fingerprint.clone(),
         accept_ranges: all_accept_ranges,
+        size_known: true,
         source,
     })
 }
@@ -922,6 +949,22 @@ pub fn run(
     }
 
     let started = Instant::now();
+
+    // Unknown source size (range-less server that also omitted
+    // `Content-Length`): stream the body to EOF, learning the size as we
+    // go (issue #8). This path can't size the chunk bitmap, so it
+    // bypasses it entirely; the growable sparse file's live high-water
+    // (`MultiSparse::total_size`) is what the reader gates on.
+    if !info.size_known {
+        if let Some(p) = config.progress.as_ref() {
+            p.set_total_workers(1);
+            p.set_max_disk_buffer(config.max_disk_buffer.unwrap_or(0));
+        }
+        let mut stats = run_single_stream_unknown(client, info, sparse, config)?;
+        stats.elapsed = started.elapsed();
+        return Ok(stats);
+    }
+
     let total_chunks = chunk_count(info.total_size, config.chunk_size)?;
     if bitmap.len() != total_chunks {
         return Err(SchedulerError::BitmapLengthMismatch {
@@ -1704,6 +1747,125 @@ fn run_single_stream(
         if last < total_chunks && !bitmap.is_complete(ChunkIndex::new(last)) {
             bitmap.mark_complete(ChunkIndex::new(last));
             stats.chunks_completed = stats.chunks_completed.saturating_add(1);
+        }
+    }
+
+    stats.bytes_downloaded = written;
+    Ok(stats)
+}
+
+/// Single-stream download of a source whose size is **not known** up
+/// front — a range-less server that also omitted `Content-Length`
+/// (issue #8). Streams the body sequentially into the growable sparse
+/// file until EOF, learning the size as it goes.
+///
+/// Unlike [`run_single_stream`] there is no `total_size` stop condition
+/// and no length-mismatch check: a clean EOF (`read` returns `0`) is the
+/// terminator. Truncation safety rests on the body layer — a truncated
+/// chunked / `Content-Length` / HTTP-2 body surfaces as an `io::Error`
+/// from [`crate::http::BodyReader`] and propagates here; an HTTP/1.1
+/// close-delimited body is indistinguishable from a complete one and is
+/// caught downstream by decode failure / `--sha256` instead.
+///
+/// No chunk bitmap is touched: the bitmap can't be sized without the
+/// total. The reader gates on the growable file's live high-water
+/// (`MultiSparse::total_size`) instead, which each `pwrite_at` advances.
+fn run_single_stream_unknown(
+    client: &Client,
+    info: &DownloadInfo,
+    sparse: &MultiSparse,
+    config: &SchedulerConfig,
+) -> Result<DownloadStats, SchedulerError> {
+    let mut stats = DownloadStats {
+        mode: DownloadMode::SingleStream,
+        ..DownloadStats::default()
+    };
+
+    let mut resp = client
+        .get_full(&info.url)
+        .map_err(|source| SchedulerError::SingleStream {
+            url: info.url.to_string(),
+            source,
+        })?;
+
+    if resp.status.code != 200 {
+        return Err(SchedulerError::SingleStream {
+            url: info.url.to_string(),
+            source: ClientError::UnexpectedStatus {
+                method: crate::http::Method::Get,
+                url: info.url.to_string(),
+                status: resp.status.code,
+            },
+        });
+    }
+
+    if !info.fingerprint.is_empty() {
+        let actual = SourceFingerprint::from_headers(&resp.headers);
+        if let Some(expected_etag) = &info.fingerprint.etag {
+            if actual.etag.as_deref() != Some(expected_etag.as_str()) {
+                return Err(SchedulerError::ChunkFailed {
+                    chunk: ChunkIndex::ZERO,
+                    attempts: 1,
+                    source: WorkerError::SourceChanged {
+                        chunk: ChunkIndex::ZERO,
+                        expected_etag: Some(expected_etag.clone()),
+                        actual_etag: actual.etag.clone(),
+                        expected_last_modified: info.fingerprint.last_modified.clone(),
+                        actual_last_modified: actual.last_modified.clone(),
+                    },
+                });
+            }
+        }
+    }
+
+    let mut written: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    if let Some(p) = config.progress.as_ref() {
+        p.worker_started();
+    }
+    let single_stream_progress = config.progress.clone();
+    let _ss_guard = SingleStreamGuard {
+        progress: single_stream_progress.as_deref(),
+    };
+    let ss_cancel = AtomicBool::new(false);
+    loop {
+        if let Some(flag) = config.abort.as_ref() {
+            if flag.load(Ordering::Acquire) {
+                ss_cancel.store(true, Ordering::Release);
+                return Err(SchedulerError::ChunkFailed {
+                    chunk: ChunkIndex::ZERO,
+                    attempts: 1,
+                    source: WorkerError::Cancelled {
+                        chunk: ChunkIndex::ZERO,
+                    },
+                });
+            }
+        }
+        let n = match config.rate_limiter.as_ref() {
+            Some(limiter) => {
+                let mut limited =
+                    RateLimitedReader::new(&mut resp.body, Arc::clone(limiter), &ss_cancel);
+                limited.read(&mut buf).map_err(SchedulerError::BodyIo)?
+            }
+            None => resp.body.read(&mut buf).map_err(SchedulerError::BodyIo)?,
+        };
+        if n == 0 {
+            // Clean EOF — the whole body has been streamed.
+            break;
+        }
+        let pwrite_started = Instant::now();
+        // `pwrite_at` on the growable file extends it and advances the
+        // live high-water (Release), so the reader sees these bytes once
+        // it observes the new `total_size`.
+        sparse
+            .pwrite_at(ByteOffset::new(written), &buf[..n])
+            .map_err(SchedulerError::SparseFile)?;
+        stats.pwrite_time = stats.pwrite_time.saturating_add(pwrite_started.elapsed());
+        stats.pwrite_bytes = stats.pwrite_bytes.saturating_add(n as u64);
+        written += n as u64;
+        if let Some(p) = config.progress.as_ref() {
+            p.add_downloaded(n as u64);
         }
     }
 

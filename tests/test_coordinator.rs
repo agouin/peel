@@ -401,6 +401,89 @@ fn happy_path_zst_to_file_round_trips_bytes() {
     assert!(!work.join("out.bin.peel.ckpt").exists());
 }
 
+// ---- issue #8: unknown-size (no Content-Length) streaming ----------
+
+/// Handler for a range-less origin that also omits `Content-Length`:
+/// HEAD is 403 with no usable length, and every GET ignores `Range` and
+/// replies `200` close-delimited (no length, no chunked) carrying the
+/// full `body`. This is the unknown-size single-stream case (issue #8).
+fn unknown_size_handler(
+    body: Vec<u8>,
+) -> impl Fn(&MockRequest, u64) -> MockResponse + Send + Sync + 'static {
+    move |req, _| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 403,
+                reason: "Forbidden",
+                headers: vec![("Content-Length".into(), "0".into())],
+                body: Vec::new(),
+            };
+        }
+        let mut raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        raw.extend_from_slice(&body);
+        MockResponse::RawBytesThenClose(raw)
+    }
+}
+
+#[test]
+fn unknown_size_streaming_zst_round_trips() {
+    // A streaming format (.zst) over a server that gives no size and no
+    // ranges: peel streams to EOF and decodes concurrently.
+    let payload = b"unknown-size streaming payload, ".repeat(2048);
+    let body = encode_zstd(&payload);
+    let server = MockServer::start(unknown_size_handler(body));
+
+    let work = unique_dir("unknown_zst");
+    let _g = CleanupDir(work.clone());
+    let out_path = work.join("out.bin");
+
+    let args = make_args(
+        &server,
+        "data.zst",
+        OutputTarget::File(out_path.clone()),
+        coord_config_for_test(8 * 1024),
+    );
+
+    let stats = run(args).expect("unknown-size streaming run");
+    assert!(!stats.resumed);
+    assert_eq!(stats.extraction.bytes_out, payload.len() as u64);
+    assert_eq!(fs::read(&out_path).expect("read"), payload);
+    // Unknown-size runs never write a checkpoint and clean up the part.
+    assert!(!work.join("out.bin.peel.part").exists());
+    assert!(!work.join("out.bin.peel.ckpt").exists());
+}
+
+#[test]
+fn unknown_size_zip_downloads_then_extracts() {
+    // A random-access format (.zip) over a server with no size and no
+    // ranges: peel must download the whole archive first (to reach the
+    // central directory), then extract — byte-identical.
+    let entry_a = b"first entry payload for unknown-size zip".to_vec();
+    let entry_b = b"second entry payload, a bit longer than the first one".repeat(64);
+    let archive = build_zip(&[
+        ZipEntrySpec::stored("a.txt", entry_a.clone()),
+        ZipEntrySpec::deflate("nested/b.txt", entry_b.clone()),
+    ]);
+    let server = MockServer::start(unknown_size_handler(archive));
+
+    let work = unique_dir("unknown_zip");
+    let _g = CleanupDir(work.clone());
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let args = make_args(
+        &server,
+        "release.zip",
+        OutputTarget::Dir(out_dir.clone()),
+        coord_config_for_test(8 * 1024),
+    );
+
+    let stats = run(args).expect("unknown-size zip run");
+    assert!(!stats.resumed);
+    assert_eq!(fs::read(out_dir.join("a.txt")).unwrap(), entry_a);
+    assert_eq!(fs::read(out_dir.join("nested/b.txt")).unwrap(), entry_b);
+}
+
 // ---- §2: --no-extract download-only mode ---------------------------
 
 #[test]

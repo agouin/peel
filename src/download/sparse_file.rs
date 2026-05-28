@@ -47,6 +47,7 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -197,6 +198,17 @@ pub struct SparseFile {
     /// existing zip/7z/rar pipelines (via [`crate::download::multi_sparse::MultiSparse`])
     /// without granting any write authority.
     readonly: bool,
+    /// When `true` the file was opened by [`SparseFile::open_growable`]
+    /// for the unknown-size single-stream path (issue #8): the source
+    /// size is not known up front, so `pwrite_at` performs **no** upper-
+    /// bound check and the file grows as bytes arrive. [`Self::total_size`]
+    /// then reports the live high-water from [`Self::current_len`]
+    /// instead of the fixed `total_size`.
+    growable: bool,
+    /// Live high-water (largest written end offset) for a growable file.
+    /// Unused for fixed-size files. Updated with `fetch_max(Release)`
+    /// after each `pwrite_at`; read with `Acquire` by [`Self::total_size`].
+    current_len: AtomicU64,
 }
 
 /// Internal: the storage backend a [`SparseFile`] dispatches to.
@@ -261,6 +273,36 @@ impl SparseFile {
             path: path.to_path_buf(),
             storage: Storage::Pwrite { backend },
             readonly: false,
+            growable: false,
+            current_len: AtomicU64::new(total_size),
+        })
+    }
+
+    /// Open `path` for read-write with **no fixed size** — the
+    /// unknown-size single-stream path (issue #8). The file starts empty
+    /// and `pwrite_at` extends it as bytes arrive, performing no upper-
+    /// bound check. [`Self::total_size`] reports the live high-water.
+    ///
+    /// Always uses the default blocking backend: the unknown-size path
+    /// is a single sequential writer, so the io_uring worker pool that
+    /// motivates backend selection never applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparseFileError::Open`] if the file cannot be opened or
+    /// [`SparseFileError::SetLen`] if the initial `ftruncate` to 0 fails.
+    pub fn open_growable(path: &Path) -> Result<Self, SparseFileError> {
+        let file = open_at_size(path, 0)?;
+        Ok(Self {
+            file,
+            total_size: 0,
+            path: path.to_path_buf(),
+            storage: Storage::Pwrite {
+                backend: default_backend(),
+            },
+            readonly: false,
+            growable: true,
+            current_len: AtomicU64::new(0),
         })
     }
 
@@ -309,6 +351,8 @@ impl SparseFile {
                 backend: default_backend(),
             },
             readonly: true,
+            growable: false,
+            current_len: AtomicU64::new(total_size),
         })
     }
 
@@ -353,13 +397,22 @@ impl SparseFile {
                 region: Arc::new(region),
             },
             readonly: false,
+            growable: false,
+            current_len: AtomicU64::new(total_size),
         })
     }
 
-    /// The configured total logical size of the file, in bytes.
+    /// The total logical size of the file, in bytes. For a growable
+    /// file (unknown-size path) this is the live high-water — the
+    /// largest byte offset written so far — which equals the final
+    /// source size once the download has reached EOF.
     #[must_use]
     pub fn total_size(&self) -> u64 {
-        self.total_size
+        if self.growable {
+            self.current_len.load(Ordering::Acquire)
+        } else {
+            self.total_size
+        }
     }
 
     /// The on-disk path the file was opened from, useful for error
@@ -462,7 +515,10 @@ impl SparseFile {
                 offset: raw_offset,
                 len,
             })?;
-        if end > self.total_size {
+        // A growable file (unknown-size path) has no fixed upper bound:
+        // `pwrite`/`seek_write` past EOF extends the file, and the
+        // high-water is tracked in `current_len` below.
+        if !self.growable && end > self.total_size {
             return Err(SparseFileError::OutOfBounds {
                 offset: raw_offset,
                 len,
@@ -470,7 +526,7 @@ impl SparseFile {
             });
         }
 
-        match &self.storage {
+        let result = match &self.storage {
             Storage::Pwrite { backend } => backend
                 .pwrite_all_at(self.file.as_os_fd(), raw_offset, buf)
                 .map_err(|source| SparseFileError::Io {
@@ -488,7 +544,15 @@ impl SparseFile {
                         source,
                     })
             }
+        };
+        // Publish the new high-water *after* the bytes are durable in
+        // the kernel, mirroring the bitmap's Release-after-pwrite edge:
+        // a reader that loads `current_len` (Acquire) and sees `end`
+        // is guaranteed to observe the bytes this call wrote.
+        if result.is_ok() && self.growable {
+            self.current_len.fetch_max(end, Ordering::Release);
         }
+        result
     }
 
     /// Read up to `buf.len()` bytes starting at `offset`, returning the
