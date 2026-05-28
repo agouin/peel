@@ -1525,6 +1525,30 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
             #[cfg(not(feature = "rar"))]
             let is_rar = false;
 
+            // A random-access container (zip/rar/7z) can only be
+            // extracted once its trailer/central directory has arrived.
+            // On a server without range support the whole archive must
+            // be downloaded sequentially first, so `max_disk_buffer`
+            // cannot be honored: the full compressed archive is resident
+            // before extraction (and the hole-punching it drives) can
+            // begin. Hole-punching still reclaims blocks as entries
+            // extract, so the peak is the archive size, not archive +
+            // extracted — but the buffer cap is silently exceeded, so
+            // warn. (`0` is the "disabled" sentinel for the cap.)
+            let disk_buffer_cap = config.max_disk_buffer.unwrap_or(0);
+            if (is_zip || is_rar || is_sevenz)
+                && !info.accept_ranges
+                && disk_buffer_cap != 0
+                && total_size > disk_buffer_cap
+            {
+                tracing::warn!(
+                    "server does not support range requests, so the full {total_size}-byte \
+                     archive must be downloaded before extraction can begin; the configured \
+                     disk buffer of {disk_buffer_cap} bytes cannot be honored and on-disk \
+                     usage will peak at the full archive size"
+                );
+            }
+
             // §3 (`internal/PLAN_download_modes.md`): when `-k` is set
             // the user is asking for the source archive on disk, so
             // no holes are punched. Force a NoopPuncher regardless

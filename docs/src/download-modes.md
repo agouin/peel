@@ -41,6 +41,18 @@ Behaviour:
 Peak compressed-side disk: roughly `--max-disk-buffer` (default 1 GiB).
 Peak total disk: `extracted_size + lookahead_window`.
 
+> **Range-less servers.** The compressed-side cap above assumes the
+> server honors `Range` requests. If it doesn't, `peel` falls back to a
+> single streaming GET. Streaming formats (`.tar.zst`, `.tar.gz`, …)
+> still hole-punch behind the decoder, but a random-access archive
+> (`.zip`, `.7z`, `.rar`) can only be extracted once its trailer /
+> central directory arrives — i.e. after the whole archive has been
+> downloaded — so `--max-disk-buffer` cannot be honored and peak
+> compressed-side disk equals the full archive size. `peel` logs a
+> warning when this applies. (Hole-punching still reclaims blocks as
+> entries extract, so peak total disk stays near the larger of the two
+> sides, not their sum.)
+
 ## `-k` / `--keep-archive`: extract and keep the archive
 
 ```sh
