@@ -239,9 +239,14 @@ The percentage is `streamed_bytes / Content-Length`. Two pitfalls:
 
 - For [multi-part URLs](./multi-part-urls.md), the denominator is
   the sum of all parts' `Content-Length` values (accurate).
-- For a server that does not return `Content-Length` (rare, mostly
-  badly-configured proxies), `peel` falls back to a chunk-count
-  progress estimate. The percentage will be approximate.
+- For a server that does not return `Content-Length` but does support
+  ranges, `peel` recovers the size from a ranged probe, so the
+  percentage stays accurate.
+- For a server that returns neither `Content-Length` nor range support
+  (rare; chunked or connection-close responses, mostly badly-configured
+  proxies), the total size isn't known until the transfer finishes, so
+  `peel` streams to EOF and reports bytes transferred without a
+  percentage.
 
 ## Getting better diagnostics
 

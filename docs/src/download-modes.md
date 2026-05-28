@@ -52,6 +52,17 @@ Peak total disk: `extracted_size + lookahead_window`.
 > warning when this applies. (Hole-punching still reclaims blocks as
 > entries extract, so peak total disk stays near the larger of the two
 > sides, not their sum.)
+>
+> **No `Content-Length`.** If a range-less server also omits
+> `Content-Length` (chunked transfer-encoding, HTTP/2, or HTTP/1.1
+> connection-close framing), `peel` streams the body to EOF, learning
+> the size as it goes. Streaming formats decode as bytes arrive;
+> random-access archives are downloaded in full first, then extracted.
+> Such runs cannot resume (the size isn't known and the server can't be
+> ranged) and write no checkpoint. Truncation of a chunked / HTTP-2
+> body is detected as a transfer error; an HTTP/1.1 close-delimited body
+> that is cut short can't be distinguished from a complete one, so pass
+> `--sha256` if you need that guarantee.
 
 ## `-k` / `--keep-archive`: extract and keep the archive
 

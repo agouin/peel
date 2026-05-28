@@ -88,6 +88,11 @@ pub struct MultiSparse {
     /// `boundaries[parts.len()] == total_size`.
     boundaries: Vec<u64>,
     total_size: u64,
+    /// `true` for a single growable part (unknown-size path, issue #8):
+    /// the cached `total_size`/`boundaries` are placeholders, so
+    /// [`Self::total_size`] reads the part's live high-water and
+    /// [`Self::pwrite_at`] performs no upper-bound check.
+    growable: bool,
 }
 
 impl MultiSparse {
@@ -99,6 +104,21 @@ impl MultiSparse {
             boundaries: vec![0, total_size],
             parts: vec![part],
             total_size,
+            growable: false,
+        }
+    }
+
+    /// Wrap a single **growable** [`SparseFile`] — the unknown-size
+    /// single-stream case (issue #8). The size is not known up front, so
+    /// reads/writes route directly to the one part with no upper-bound
+    /// check, and [`Self::total_size`] reports the part's live high-water.
+    #[must_use]
+    pub fn from_single_growable(part: SparseFile) -> Self {
+        Self {
+            boundaries: vec![0, 0],
+            parts: vec![part],
+            total_size: 0,
+            growable: true,
         }
     }
 
@@ -135,13 +155,21 @@ impl MultiSparse {
             parts,
             boundaries,
             total_size: acc,
+            growable: false,
         })
     }
 
-    /// Total virtual size in bytes — the sum of every part's size.
+    /// Total virtual size in bytes — the sum of every part's size. For
+    /// a growable single-part wrapper (unknown-size path) this is the
+    /// part's live high-water, which equals the final source size once
+    /// the download reaches EOF.
     #[must_use]
     pub fn total_size(&self) -> u64 {
-        self.total_size
+        if self.growable {
+            self.parts[0].total_size()
+        } else {
+            self.total_size
+        }
     }
 
     /// Number of parts (always ≥ 1).
@@ -271,7 +299,9 @@ impl MultiSparse {
                 offset: raw_offset,
                 len,
             })?;
-        if end > self.total_size {
+        // A growable wrapper (unknown-size path) has no fixed bound; the
+        // single underlying part extends as bytes arrive.
+        if !self.growable && end > self.total_size {
             return Err(SparseFileError::OutOfBounds {
                 offset: raw_offset,
                 len,

@@ -322,6 +322,73 @@ fn discover_falls_back_when_head_2xx_has_zero_content_length() {
     assert_eq!(info.total_size, body.len() as u64);
 }
 
+#[test]
+fn discover_marks_size_unknown_when_no_content_length() {
+    // Issue #8: HEAD gives no usable length and the origin ignores Range
+    // *and* omits Content-Length (chunked / close-delimited). Discovery
+    // must report an unknown size to be streamed to EOF, not error.
+    let body = make_body(5000);
+    let body_clone = body.clone();
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 403,
+                reason: "Forbidden",
+                headers: vec![("Content-Length".into(), "0".into())],
+                body: Vec::new(),
+            };
+        }
+        // Ignore Range; reply 200 with no Content-Length, close-delimited.
+        let mut raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        raw.extend_from_slice(&body_clone);
+        MockResponse::RawBytesThenClose(raw)
+    });
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/")).expect("discover unknown-size");
+    assert!(!info.size_known, "size must be reported unknown");
+    assert!(!info.accept_ranges);
+    assert_eq!(info.total_size, 0);
+}
+
+#[test]
+fn run_streams_unknown_size_body_to_growable_sparse() {
+    // Issue #8: an unknown-size DownloadInfo drives `run` down the
+    // single-stream-unknown path, which writes the whole body into a
+    // growable sparse file (learning the size at EOF).
+    let body = make_body(20_000);
+    let body_clone = body.clone();
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 403,
+                reason: "Forbidden",
+                headers: vec![("Content-Length".into(), "0".into())],
+                body: Vec::new(),
+            };
+        }
+        let mut raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        raw.extend_from_slice(&body_clone);
+        MockResponse::RawBytesThenClose(raw)
+    });
+    let client = build_client();
+    let info = discover(&client, &url(&server, "/")).expect("discover unknown-size");
+    assert!(!info.size_known);
+
+    let path = temp_path("unknown_growable");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse =
+        MultiSparse::from_single_growable(SparseFile::open_growable(&path).expect("growable"));
+    // No bitmap for the unknown path.
+    let bitmap = ChunkBitmap::new(0);
+    let cursor = AtomicU64::new(0);
+
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg(4096, 2)).expect("run");
+    assert!(matches!(stats.mode, DownloadMode::SingleStream));
+    assert_eq!(stats.bytes_downloaded as usize, body.len());
+    assert_eq!(sparse.total_size(), body.len() as u64);
+    assert_eq!(read_full(&path), body);
+}
+
 // ---- run: parallel happy path -----------------------------------------
 
 #[test]
