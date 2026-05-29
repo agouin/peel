@@ -61,6 +61,7 @@ Crates pre-approved for use, with the role they fill:
 | `tokio`        | current-thread runtime owned by `http::Client` | `rt`, `net`, `time`, `macros` features only; see §2.5 |
 | `tempfile`     | Test scratch files                          | Dev-dependency only                  |
 | `sha2`         | SHA-256 reference for cross-checking tests  | Dev-dependency only — runtime SHA-256 is hand-rolled in `hash/sha256.rs`; `PLAN_v2.md` §10 |
+| `tokio-rustls` | rustls server acceptor for the TLS test server | Dev-dependency only — already resolves transitively via `hyper-rustls`; promoted to a direct dev-dep for the `--insecure` E2E test (`tests/test_http_insecure.rs`); server-side counterpart to the `hyper-rustls` row (§2.4) |
 
 `h2` arrives transitively via `hyper`'s `http2` feature; it is not a
 direct dependency and does not need its own row.
