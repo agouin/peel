@@ -120,6 +120,12 @@ the tar formats.
 - **Bandwidth limiting.** `--max-bandwidth 50MB/s` (decimal or `MiB`
   binary suffixes) caps aggregate throughput across all workers and
   mirrors via a shared token bucket.
+- **Encrypted archives.** `--password-from <SOURCE>` decrypts ZIP
+  (WinZip-AES and legacy ZipCrypto), RAR5 (AES-256, header and
+  per-file encryption), and 7z (AES-256). The password is read from
+  `prompt`, `env:NAME`, `file:PATH`, or `fd:N` — never from the
+  command line, since `argv` is visible to every process on the host.
+  A wrong password fails fast with exit code 4.
 
 ## Supported platforms
 
@@ -572,6 +578,16 @@ peel \
 # URL has no useful suffix? Pin the decoder.
 peel "https://example.com/download?id=42" --format zstd -o ./out.bin
 
+# Encrypted archive: read the password from an env var (also
+# accepts prompt, file:PATH, or fd:N — never from argv).
+PW=hunter2 peel https://example.com/secret.7z --password-from env:PW -o ./out/
+
+# Multi-volume set from a manifest file (one URL/path per line).
+peel @volumes.txt -o ./out/
+
+# Self-signed / internal host: skip TLS verification (like curl -k).
+peel https://internal.lan/dataset.tar.zst --insecure -o ./out/
+
 # A/B against the pre-uring path
 peel https://example.com/dataset.tar.zst --io-backend blocking -o ./out/
 ```
@@ -596,6 +612,8 @@ basename. Pass `--strict-format` to make that case a hard error
 instead (useful in CI when an upstream object changing shape
 should fail the build).
 
+**Output and mode**
+
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `-o, --output <PATH>` | URL basename, suffixes stripped | Output path. Directory for tree-shaped formats (tar / zip / 7z / rar / any `.tar.<x>` wrapper); file for stream-shaped formats (raw `.zst`, `.xz`, `.lz4`, `.gz`). A trailing slash forces directory semantics. |
@@ -603,20 +621,42 @@ should fail the build).
 | `-k, --keep-archive[=<PATH>]` | off | Extract AND keep the source archive on disk. Bare `-k` places the archive as a sibling of `-o`; `-k=<PATH>` is explicit. |
 | `-d, --destructive` | off | Hole-punch and delete the source archive as extraction proceeds. Required to enable destructive behavior in local mode (preservation is the default there); a no-op for HTTP runs, which are destructive by default. Combining `-d` with `-k` for an HTTP source is an error. |
 | `--strict-format` | off | Treat unrecognized formats as a hard error rather than falling back to download-only. |
-| `--workers <N>` | 8 | Parallel download workers. |
+| `--workdir <DIR>` | siblings of `-o` | Directory for the `.peel.part` / `.peel.ckpt` sidecars. Override to keep in-flight bytes and resume state off the output disk. |
+
+**Format detection**
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--format <NAME>` | — | Force a decoder, bypassing suffix and magic detection. |
+| `--force-format-from-magic` | off | Trust magic bytes when they disagree with the URL suffix. Mutually exclusive with `--format`. |
+| `--no-auto-discover` | off | Skip multi-volume auto-discovery for a single seed whose basename matches a multi-volume pattern (`.part<N>.rar`, `.7z.<NNN>`, `.z<NN>`/`.zip`). |
+
+**Download and integrity**
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--workers <N>` | 4 | Parallel download workers. |
 | `--chunk-size <BYTES>` | 4 MiB | Bitmap unit. With adaptive sizing, dispatch may coalesce several. |
 | `--no-adaptive-chunk-size` | off | Lock dispatch to the bitmap unit. |
-| `--io-backend <auto\|blocking\|uring\|mmap>` | `auto` | Linux: `auto` ≈ `mmap` for files + `uring` for sockets. |
-| `--format <NAME>` | — | Force a decoder, bypassing suffix and magic detection. |
-| `--force-format-from-magic` | off | Trust magic bytes when they disagree with the URL suffix. |
-| `--sha256 <HEX>` | — | Verify the assembled compressed source against this 64-hex digest. |
+| `--max-bandwidth <RATE>` | — | Aggregate cap; `K`/`M`/`G`/`T` (decimal) or `Ki`/`Mi`/`Gi`/`Ti` (binary). |
+| `--max-disk-buffer <SIZE>` | 1 GiB | Cap on downloaded-but-not-yet-decoded lookahead; bounds the `.peel.part` size. `none`/`off`/`disabled` removes the cap. |
 | `--mirror <URL>` (repeatable) | — | Additional source URLs for the same file. |
-| `--max-bandwidth <RATE>` | — | Aggregate cap; `K`/`M`/`G` (decimal) or `Ki`/`Mi`/`Gi` (binary). |
-| `--punch-threshold <BYTES>` | tuned | Minimum gap between in-loop hole-punch syscalls. |
+| `--sha256 <HEX>` (repeatable) | — | Verify the assembled compressed source against this 64-hex digest (one per URL on multi-part runs). |
+| `--io-backend <auto\|blocking\|uring\|mmap>` | `auto` | Linux: `auto` ≈ `mmap` for files + `uring` for sockets. |
+| `--http-version <auto\|h1\|h2>` | `auto` | `auto` ALPN-negotiates H1/H2 over TLS; `h1`/`h2` force a version. |
+| `--insecure` | off | Skip TLS certificate verification (like `curl -k`). Disables MITM protection — use only against hosts you trust. |
+| `--password-from <SOURCE>` | — | Password source for encrypted archives: `prompt`, `env:NAME`, `file:PATH`, or `fd:N`. Never accepted on `argv`. |
+
+**Checkpoint and hole-punch tuning** (advanced)
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--punch-threshold <BYTES>` | 4 MiB | Minimum gap between in-loop hole-punch syscalls. |
 | `--checkpoint-min-bytes <BYTES>` | 8 MiB | Minimum source progress between checkpoint writes. |
 | `--checkpoint-min-secs <SECS>` | 2 | Minimum wall-clock interval between checkpoint writes. |
+| `--checkpoint-target-secs <SECS>` | 0.2 | Target checkpoint interval; scales the byte floor up at high download rates. `0` disables rate-aware scaling. |
 
-`peel --help` for the full list and exact defaults.
+`peel -h` for one-line summaries; `peel --help` for the full prose and exact defaults.
 
 ### Local-file extraction
 
@@ -658,7 +698,7 @@ from scratch against the still-intact source.
 A few HTTP-only flags are rejected at parse time in local mode
 (`--mirror`, `--sha256`, `--workers`, `--chunk-size`,
 `--no-adaptive-chunk-size`, `--max-bandwidth`, `--max-disk-buffer`,
-`--http-version`, `--no-extract`, `--strict-format`). Every format
+`--http-version`, `--insecure`, `--no-extract`, `--strict-format`). Every format
 peel supports works through the local path today: the streaming
 shapes (`.tar.zst`, `.tar.xz`, `.tar.lz4`, `.tar.gz`, raw `.zst` /
 `.xz` / `.lz4` / `.gz`, plain uncompressed `.tar`) flow through the
