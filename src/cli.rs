@@ -220,6 +220,21 @@ pub struct Cli {
     #[arg(long = "http-version", value_enum, default_value_t = HttpVersionArg::Auto, help_heading = "Advanced options")]
     pub http_version: HttpVersionArg,
 
+    /// Skip TLS certificate verification (insecure; like `curl -k`).
+    ///
+    /// Accepts self-signed, expired, untrusted, and hostname-mismatched
+    /// certificates over `https://`. This disables protection against
+    /// man-in-the-middle attacks — only use it against hosts you control
+    /// or trust on an otherwise secure network. Prefer installing the
+    /// server's CA certificate into your system trust store over making
+    /// this a habit.
+    #[arg(
+        long = "insecure",
+        default_value_t = false,
+        help_heading = "Advanced options"
+    )]
+    pub insecure: bool,
+
     /// SHA-256 digest(s) the source must match. Repeatable.
     ///
     /// Single-URL runs: pass `--sha256 <hex>` once; the coordinator
@@ -694,7 +709,7 @@ pub enum CliError {
     /// is HTTP-only (`internal/old/PLAN_local_file_extract.md` §1 step 2).
     /// All download knobs — `--mirror`, `--sha256`, `--workers`,
     /// `--chunk-size`, `--max-bandwidth`, `--max-disk-buffer`,
-    /// `--http-version`, `--no-adaptive-chunk-size`,
+    /// `--http-version`, `--insecure`, `--no-adaptive-chunk-size`,
     /// `--no-extract`, `--strict-format` — surface this variant.
     #[error(
         "flag `{flag}` does not apply to local-file mode \
@@ -1483,6 +1498,9 @@ fn reject_http_only_flags(cli: &Cli) -> Result<(), CliError> {
             flag: "--http-version",
         });
     }
+    if cli.insecure {
+        return Err(CliError::LocalFlagNotApplicable { flag: "--insecure" });
+    }
     if cli.no_extract {
         return Err(CliError::LocalFlagNotApplicable {
             flag: "--no-extract",
@@ -1745,8 +1763,18 @@ impl Cli {
         // via an `eprintln!` before the progress renderer starts (the
         // subscriber suppresses INFO on a TTY); see `http_version_banner`.
         tracing::info!("{}", http_version_banner(http_version));
+        if self.insecure {
+            // Surface the downgrade prominently: this is shown at WARN
+            // (visible even on a TTY where INFO is suppressed) so the
+            // operator can't miss that certificate verification is off.
+            tracing::warn!(
+                "TLS certificate verification is DISABLED (--insecure): \
+                 the connection is not protected against man-in-the-middle attacks"
+            );
+        }
         let client = Client::with_config(ClientConfig {
             http_version,
+            insecure: self.insecure,
             ..ClientConfig::default()
         })?;
 
@@ -2424,6 +2452,26 @@ mod tests {
             HttpVersion::from(HttpVersionArg::H2),
             HttpVersion::Http2Only
         );
+    }
+
+    #[test]
+    fn parses_insecure_default_off() {
+        let cli = Cli::try_parse_from(["peel", "https://example.com/x.zst", "-o", "/tmp/o"])
+            .expect("parse");
+        assert!(!cli.insecure);
+    }
+
+    #[test]
+    fn parses_insecure_flag() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "--insecure",
+        ])
+        .expect("parse");
+        assert!(cli.insecure);
     }
 
     #[test]
@@ -3548,6 +3596,20 @@ mod tests {
         assert!(matches!(
             err,
             CliError::LocalFlagNotApplicable { flag: "--workers" }
+        ));
+    }
+
+    #[test]
+    fn dispatch_local_rejects_insecure_flag() {
+        let p = make_local_fixture("dispatch_insecure");
+        let cli =
+            Cli::try_parse_from(["peel", p.to_str().expect("utf8"), "--insecure"]).expect("parse");
+        let result = cli.into_dispatch();
+        let _ = std::fs::remove_file(&p);
+        let err = result.err().expect("must error");
+        assert!(matches!(
+            err,
+            CliError::LocalFlagNotApplicable { flag: "--insecure" }
         ));
     }
 
