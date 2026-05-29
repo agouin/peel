@@ -169,6 +169,26 @@ If more volumes are expected than the probe found:
 
 Use the explicit positional list or an `@manifest.txt` file instead.
 
+## "TLS / certificate error connecting to host"
+
+```text
+error: hyper transport error to "host":443: client error (Connect)
+```
+
+The server's TLS certificate could not be verified against the system
+trust store — it may be self-signed, expired, issued for a different
+hostname, or signed by a CA `peel` doesn't trust.
+
+The right fix is almost always to make the certificate trustworthy:
+install the issuing CA into your system trust store, or renew/reissue
+the server's certificate.
+
+If you understand the risk and are talking to a host you control or
+trust on an otherwise secure network, `--insecure` skips certificate
+verification (like `curl -k`). See
+[`--insecure`](./cli-reference.md#--insecure) — it disables MITM
+protection, so it is a last resort, not a default.
+
 ## "Wrong format detected"
 
 ```text

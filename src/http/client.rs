@@ -287,6 +287,14 @@ pub struct ClientConfig {
     /// Which HTTP version(s) to use. Defaults to
     /// [`HttpVersion::Auto`] (ALPN-negotiated H1 / H2).
     pub http_version: HttpVersion,
+    /// Skip TLS certificate and hostname verification (`curl -k`).
+    ///
+    /// When `true`, the rustls client is configured with a verifier
+    /// that accepts any presented certificate chain and any hostname.
+    /// This disables protection against man-in-the-middle attacks and
+    /// is only ever set when the user explicitly opts in via
+    /// `--insecure`. Defaults to `false`.
+    pub insecure: bool,
 }
 
 impl Default for ClientConfig {
@@ -303,6 +311,7 @@ impl Default for ClientConfig {
             read_buffer_bytes: DEFAULT_READ_BUFFER_BYTES,
             user_agent: None,
             http_version: HttpVersion::Auto,
+            insecure: false,
         }
     }
 }
@@ -370,7 +379,7 @@ impl Client {
     ///
     /// Returns [`ClientError::Tls`] if rustls fails to initialize.
     pub fn with_config(config: ClientConfig) -> Result<Self, ClientError> {
-        let tls = build_tls_config()?;
+        let tls = build_tls_config(config.insecure)?;
         let (request_tx, request_rx) = mpsc::unbounded_channel::<RequestEnvelope>();
         let runtime_thread = spawn_runtime_thread(tls, &config, request_rx);
         Ok(Self {
@@ -596,9 +605,22 @@ fn map_send_error(err: SendError, host: String, port: u16) -> ClientError {
     }
 }
 
-fn build_tls_config() -> Result<rustls::ClientConfig, ClientError> {
+fn build_tls_config(insecure: bool) -> Result<rustls::ClientConfig, ClientError> {
     // Install the default crypto provider once per process.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    if insecure {
+        // `--insecure` / `-k`-equivalent: accept any certificate chain
+        // and any hostname. Routed through the `dangerous()` builder so
+        // the call site reads as deliberately unsafe. `NoCertVerification`
+        // still delegates the handshake *signature* checks to the crypto
+        // provider so the connection is encrypted — it only drops trust
+        // (chain + hostname) verification.
+        return Ok(rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertVerification::new()))
+            .with_no_client_auth());
+    }
 
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -606,6 +628,74 @@ fn build_tls_config() -> Result<rustls::ClientConfig, ClientError> {
     Ok(rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth())
+}
+
+/// A rustls [`ServerCertVerifier`] that accepts any certificate chain
+/// and any server name without checking it against a trust anchor.
+///
+/// Installed only when the user passes `--insecure`. It disables the
+/// protection TLS gives against man-in-the-middle attacks: a proxy or
+/// attacker presenting *any* certificate is accepted. The transport is
+/// still encrypted (the handshake signatures are verified against the
+/// presented key via the crypto provider), but the peer's *identity*
+/// is not authenticated. Mirrors `curl -k` / `wget --no-check-certificate`.
+///
+/// The signature-verification methods delegate to the standard webpki
+/// helpers using the process default crypto provider's algorithms, so
+/// only chain/name trust is skipped — not the cryptographic integrity
+/// of the handshake itself.
+#[derive(Debug)]
+struct NoCertVerification {
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl NoCertVerification {
+    fn new() -> Self {
+        // INVARIANT: `with_config` calls `install_default()` before this
+        // runs, so a process default provider is always present. Fall back
+        // to the ring provider's algorithm set if (defensively) it is not.
+        let supported = rustls::crypto::CryptoProvider::get_default()
+            .map(|p| p.signature_verification_algorithms)
+            .unwrap_or_else(|| {
+                rustls::crypto::ring::default_provider().signature_verification_algorithms
+            });
+        Self { supported }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
+    }
 }
 
 fn spawn_runtime_thread(
@@ -924,4 +1014,70 @@ fn canonical_header_name(name: &HeaderName) -> String {
     // case-insensitive so this does not alter caller-visible
     // behavior.
     name.as_str().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_secure_tls_config_by_default() {
+        // The default (verifying) path must construct without error and
+        // is what every normal run uses.
+        assert!(build_tls_config(false).is_ok());
+    }
+
+    #[test]
+    fn builds_insecure_tls_config() {
+        // `--insecure` swaps in the `NoCertVerification` verifier via the
+        // `dangerous()` builder; constructing it must succeed.
+        assert!(build_tls_config(true).is_ok());
+    }
+
+    #[test]
+    fn client_builds_with_insecure_flag() {
+        let client = Client::with_config(ClientConfig {
+            insecure: true,
+            ..ClientConfig::default()
+        });
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn insecure_defaults_off() {
+        assert!(!ClientConfig::default().insecure);
+    }
+
+    #[test]
+    fn no_cert_verification_accepts_supported_schemes() {
+        // The verifier must advertise a non-empty scheme list pulled from
+        // the process default crypto provider, or the handshake would have
+        // nothing to negotiate.
+        let verifier = NoCertVerification::new();
+        use rustls::client::danger::ServerCertVerifier;
+        assert!(!verifier.supported_verify_schemes().is_empty());
+    }
+
+    #[test]
+    fn no_cert_verification_accepts_an_untrusted_cert() {
+        // The core security-relevant behaviour of `--insecure`: the
+        // verifier accepts a certificate that no real trust store would
+        // (here, arbitrary bytes that aren't even a valid X.509 cert) for
+        // a hostname that doesn't match anything. `verify_server_cert`
+        // never parses the chain — it unconditionally asserts success —
+        // so junk bytes exercise exactly the "trust is skipped" path.
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = NoCertVerification::new();
+        let bogus = CertificateDer::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let name = ServerName::try_from("not-a-real-host.invalid").expect("server name");
+
+        let result = verifier.verify_server_cert(&bogus, &[], &name, &[], UnixTime::now());
+        assert!(
+            result.is_ok(),
+            "insecure verifier must accept an untrusted certificate",
+        );
+    }
 }

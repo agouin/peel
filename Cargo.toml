@@ -291,6 +291,20 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # for `cargo test` and does not affect release binaries. Cargo unions
 # features between dev and runtime for test builds.
 hyper = { version = "1", default-features = false, features = ["server"] }
+# Dev-only: rustls TLS *server* acceptor for the in-process
+# self-signed-cert server in `tests/support/tls_server.rs`, used by
+# `tests/test_http_insecure.rs` to prove `--insecure` completes a TLS
+# handshake against an untrusted certificate (over both H1 and H2
+# ALPN) while the default verifying client rejects it. `tokio-rustls`
+# already resolves transitively via the `hyper-rustls` connector, so
+# this only promotes an already-locked crate to a direct dev-dep — no
+# new code enters the tree and the runtime binary does not link it.
+# Sits under the `hyper-rustls` row in
+# `internal/ENGINEERING_STANDARDS.md` §2.2 as the server-side TLS
+# counterpart, dev-scoped. The cert/key are static PEM fixtures under
+# `tests/support/testdata/` (no runtime cert generation — no `rcgen`),
+# matching the "std/hand-rolled first" bias of §2.1.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 # Dev-only reference implementations used by `src/crypto/` tests and
 # `tests/test_crypto_diff.rs` to cross-check the hand-rolled SHA-1,
 # HMAC, and PBKDF2 against battle-tested upstreams

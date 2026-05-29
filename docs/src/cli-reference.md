@@ -216,6 +216,23 @@ HTTP version to use for downloads.
 
 `auto` is the default.
 
+### `--insecure`
+
+Skip TLS certificate verification, equivalent to `curl -k` /
+`wget --no-check-certificate`. Accepts self-signed, expired, untrusted,
+and hostname-mismatched certificates over `https://`.
+
+> **Warning.** This disables protection against man-in-the-middle
+> attacks: any host presenting *any* certificate is trusted. The
+> transport stays encrypted, but the server's identity is no longer
+> authenticated. `peel` prints a `WARN` line on every run started with
+> `--insecure`. Only use it against hosts you control or trust on an
+> otherwise secure network. Prefer installing the server's CA
+> certificate into your system trust store over making this a habit.
+
+Off by default. HTTP-only — passing it with a local-file source is an
+error.
+
 ### `--no-auto-discover`
 
 Skip [multi-volume](./multi-volume.md) auto-discovery.
@@ -364,6 +381,7 @@ Print the version.
 | `--max-bandwidth <RATE>` | Aggregate token-bucket cap | none |
 | `--max-disk-buffer <SIZE>` | Lookahead window cap | 1 GiB |
 | `--http-version <auto\|h1\|h2>` | HTTP version | auto |
+| `--insecure` | Skip TLS certificate verification | off |
 | `--no-auto-discover` | Skip multi-volume HEAD probes | off |
 | `--sha256 <HEX>` (repeat) | Verify hash | none |
 | `--password-from <SOURCE>` | Password source | none |

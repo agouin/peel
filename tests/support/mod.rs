@@ -9,6 +9,11 @@
 
 pub mod h2c_server;
 pub mod mock_server;
+// In-process self-signed TLS server for the `--insecure` E2E test
+// (`tests/test_http_insecure.rs`). Speaks real TLS with ALPN so the
+// test crosses the certificate-verification boundary on both H1 and
+// H2.
+pub mod tls_server;
 // CLI-subprocess harness for `tests/test_cli_*.rs`: spawns the real
 // `peel` binary so the argv → CoordinatorConfig wiring and exit-code
 // contract are under test (the in-process integration suite only
