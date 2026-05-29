@@ -1057,4 +1057,27 @@ mod tests {
         use rustls::client::danger::ServerCertVerifier;
         assert!(!verifier.supported_verify_schemes().is_empty());
     }
+
+    #[test]
+    fn no_cert_verification_accepts_an_untrusted_cert() {
+        // The core security-relevant behaviour of `--insecure`: the
+        // verifier accepts a certificate that no real trust store would
+        // (here, arbitrary bytes that aren't even a valid X.509 cert) for
+        // a hostname that doesn't match anything. `verify_server_cert`
+        // never parses the chain — it unconditionally asserts success —
+        // so junk bytes exercise exactly the "trust is skipped" path.
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = NoCertVerification::new();
+        let bogus = CertificateDer::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let name = ServerName::try_from("not-a-real-host.invalid").expect("server name");
+
+        let result = verifier.verify_server_cert(&bogus, &[], &name, &[], UnixTime::now());
+        assert!(
+            result.is_ok(),
+            "insecure verifier must accept an untrusted certificate",
+        );
+    }
 }
