@@ -7,7 +7,7 @@
 
 pkgname=peel-bin
 _binname=peel
-pkgver=0.7.3
+pkgver=0.7.4
 pkgrel=1
 pkgdesc='Streaming, resumable, space-efficient HTTP archive extractor (prebuilt binary)'
 arch=('x86_64' 'aarch64')
