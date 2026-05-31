@@ -69,6 +69,145 @@ fn registry_factory_decodes_multi_frame_zst_stream() {
     assert_eq!(decoder.bytes_consumed().get(), combined_len);
 }
 
+/// Regression: one large, *multi-block* zstd frame must round-trip.
+///
+/// Every prior zstd test — and every cohort `.coh` package that first
+/// exercised this decoder in the wild — used a payload small enough to
+/// compress to a *single* compressed block. A real package (a multi-MiB
+/// binary) produces many blocks inside one frame and fills the sliding
+/// window past its `windowLog`-23 (8 MiB) capacity, so the decoder has to
+/// carry repeat-offset / FSE-`Repeat_Mode` state across block boundaries
+/// and resolve match offsets that reach back into the wrapped window. The
+/// payload below forces exactly that: high-entropy runs (real FSE/Huffman
+/// blocks) interleaved with verbatim copies of far-earlier segments (large
+/// match offsets), totalling 12 MiB so the window wraps. The reference
+/// `zstd` round-trips it; the hand-rolled decoder must too.
+#[cfg(feature = "zstd")]
+#[test]
+fn registry_factory_decodes_large_multi_block_zst_frame() {
+    let payload = multi_block_payload(12 << 20);
+    let compressed = zstd::encode_all(&payload[..], 19).expect("encode");
+    // The reference decoder accepts what we just produced — so any failure
+    // below is the hand-rolled decoder's, not a malformed fixture.
+    assert_eq!(
+        zstd::decode_all(&compressed[..]).expect("reference decode"),
+        payload,
+        "fixture is not a valid zstd round-trip",
+    );
+
+    let registry = DecoderRegistry::with_defaults();
+    let factory = registry
+        .factory_for_name("dataset.zst")
+        .expect("registry registers .zst");
+    let mut decoder = factory(Box::new(Cursor::new(compressed))).expect("factory constructs");
+
+    let mut sink: Vec<u8> = Vec::with_capacity(payload.len());
+    loop {
+        let status = decoder.decode_step(&mut sink).expect("decode_step");
+        if status == DecodeStatus::Eof {
+            break;
+        }
+    }
+    assert_eq!(sink.len(), payload.len(), "decoded length mismatch");
+    assert!(sink == payload, "decoded bytes differ from the original");
+}
+
+/// Deterministic payload of exactly `target` bytes that compresses to many
+/// zstd blocks, mixing high-entropy regions (real compressed blocks) with
+/// long-distance back-references (large match offsets that fill the
+/// sliding window). Used by the multi-block regression test above.
+#[cfg(feature = "zstd")]
+fn multi_block_payload(target: usize) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(target + 4096);
+    let mut s: u64 = 0x243F_6A88_85A3_08D3;
+    let mut next = move || {
+        // xorshift64 — deterministic, dependency-free.
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    while payload.len() < target {
+        if payload.len() > (1 << 20) && (next() & 0b11) == 0 {
+            // Verbatim copy of a far-earlier segment → a large match offset.
+            let span = payload.len() - 1;
+            let dist = ((next() as usize) % span) + 1;
+            let start = payload.len() - dist;
+            let seg_len = ((next() as usize) % 4096) + 64;
+            let end = (start + seg_len).min(payload.len());
+            let seg = payload[start..end].to_vec();
+            payload.extend_from_slice(&seg);
+        } else {
+            // High-entropy run → forces a real FSE/Huffman compressed block.
+            let run = ((next() as usize) % 256) + 32;
+            for _ in 0..run {
+                payload.push((next() >> 24) as u8);
+            }
+        }
+    }
+    payload.truncate(target);
+    payload
+}
+
+/// Regression: Compressed_Literals_Block with *direct-encoded* Huffman
+/// weights and an **odd** `Number_of_Weights` must round-trip.
+///
+/// RFC 8478 §4.2.1.1 encodes a direct Huffman tree as a header byte
+/// `Header_Byte = 127 + Number_of_Weights`, followed by
+/// `ceil(Number_of_Weights / 2)` bytes of 4-bit weights — where
+/// `Number_of_Weights` counts the weights written *explicitly* (the
+/// final symbol's weight is implied). A decoder that mistakes that
+/// count for the *total* symbol count reads one weight too few and,
+/// when `Number_of_Weights` is odd, advances one byte too few — landing
+/// the Huffman sub-stream cursor (and, for a 4-stream block, the 6-byte
+/// jump table) on the wrong offset and corrupting the decode.
+///
+/// A high-entropy payload over a small literal alphabet is the reliable
+/// trigger: zstd Huffman-codes the literals with a handful of symbols
+/// (frequently an odd weight count) and, once the literals section is
+/// large enough, uses the 4-stream layout. The reference `zstd`
+/// round-trips it; the hand-rolled decoder must too.
+#[cfg(feature = "zstd")]
+#[test]
+fn registry_factory_decodes_huffman_direct_weight_literals() {
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // ~48 KiB over an 8-symbol alphabet → large 4-stream Huffman literals.
+    let mut payload = Vec::with_capacity(48 << 10);
+    for _ in 0..(48 << 10) {
+        payload.push((next() % 8) as u8);
+    }
+    // Low level keeps zstd in the predefined/direct-weight regime that
+    // tripped the bug; the reference decoder anchors the fixture.
+    let compressed = zstd::encode_all(&payload[..], 3).expect("encode");
+    assert_eq!(
+        zstd::decode_all(&compressed[..]).expect("reference decode"),
+        payload,
+        "fixture is not a valid zstd round-trip",
+    );
+
+    let registry = DecoderRegistry::with_defaults();
+    let factory = registry
+        .factory_for_name("alphabet.zst")
+        .expect("registry registers .zst");
+    let mut decoder = factory(Box::new(Cursor::new(compressed))).expect("factory constructs");
+
+    let mut sink: Vec<u8> = Vec::with_capacity(payload.len());
+    loop {
+        let status = decoder.decode_step(&mut sink).expect("decode_step");
+        if status == DecodeStatus::Eof {
+            break;
+        }
+    }
+    assert_eq!(sink.len(), payload.len(), "decoded length mismatch");
+    assert!(sink == payload, "decoded bytes differ from the original");
+}
+
 /// `.tar.zst` and `.zst` registered side-by-side: the longer suffix
 /// must win for a `.tar.zst` path even though `.zst` would also match.
 /// We use a custom factory that is distinguishable from the default

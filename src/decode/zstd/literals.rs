@@ -264,16 +264,14 @@ fn parse_tree_description(bytes: &[u8]) -> Result<(HuffmanTree, usize), ZstdErro
         let tree = HuffmanTree::from_direct_weights(&weights)?;
         return Ok((tree, consumed));
     }
-    // Direct encoding: header_byte - 127 = total number of
-    // symbols, with the last weight implicit. Number of weights
-    // explicitly on the wire is therefore `total - 1`.
-    let n_symbols_total = u32::from(header_byte - 127);
-    if n_symbols_total < 2 {
-        return Err(ZstdError::MalformedFrameHeader(
-            "Huffman direct encoding: need at least 2 symbols",
-        ));
-    }
-    let n_explicit = (n_symbols_total - 1) as usize;
+    // Direct encoding (RFC 8478 §4.2.1.1): `header_byte - 127` is
+    // `Number_of_Weights` — the count of weights written *explicitly*
+    // on the wire. The final symbol's weight is implied (reconstructed
+    // from the sum invariant), so the total number of symbols is
+    // `Number_of_Weights + 1`. `parse_direct_weights` reads the
+    // explicit weights and appends the implicit one. `header_byte >=
+    // 128` here, so `n_explicit >= 1` always holds.
+    let n_explicit = u32::from(header_byte - 127) as usize;
     let (weights, weight_bytes) = parse_direct_weights(&bytes[1..], n_explicit)?;
     let tree = HuffmanTree::from_direct_weights(&weights)?;
     Ok((tree, 1 + weight_bytes))
@@ -573,7 +571,10 @@ mod tests {
     #[test]
     fn decode_compressed_direct_weights_one_stream() {
         // Tree: 3 symbols (sym 0 weight 2, sym 1 weight 1, sym 2 weight 1).
-        //   header_byte = 127 + 3 = 130
+        //   RFC 8478 §4.2.1.1: header_byte - 127 = Number_of_Weights, the
+        //   count of weights written *explicitly* on the wire (the last
+        //   symbol's weight is implied). Two explicit weights here, so
+        //   header_byte = 127 + 2 = 129.
         //   explicit weights on wire: [2, 1] (the implicit is 1)
         //   direct-weight bytes: 1 byte (high nibble 2, low nibble 1) = 0x21.
         //
@@ -595,8 +596,8 @@ mod tests {
         // = 0b0_1_1_0_0_0_1_0 = 0x62
         //
         // Payload = [tree desc header, weight bytes, stream byte]
-        //         = [130, 0x21, 0x62] = 3 bytes total.
-        let payload = [130u8, 0x21, 0x62];
+        //         = [129, 0x21, 0x62] = 3 bytes total.
+        let payload = [129u8, 0x21, 0x62];
         let h = LiteralsHeader {
             block_type: LiteralsBlockType::Compressed,
             regenerated_size: 3,
