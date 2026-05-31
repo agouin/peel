@@ -102,7 +102,8 @@ pub const PREDEFINED_LL: ([i16; 36], u32) = (
 
 /// Predefined Match_Length distribution (RFC §3.1.1.4.1.2).
 ///
-/// `accuracy_log = 6`, 53 symbols.
+/// `accuracy_log = 6`, 53 symbols. The low-probability (`-1`) tail covers
+/// symbols 46..=52 (seven entries) — matching zstd's `ML_defaultNorm`.
 pub const PREDEFINED_ML: ([i16; 53], u32) = (
     [
         1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -113,10 +114,14 @@ pub const PREDEFINED_ML: ([i16; 53], u32) = (
 
 /// Predefined Offset distribution (RFC §3.1.1.4.1.3).
 ///
-/// `accuracy_log = 5`, 29 symbols.
+/// `accuracy_log = 5`, 29 symbols. The low-probability (`-1`) tail covers
+/// symbols 24..=28 (five entries) — matching zstd's `OF_defaultNorm`. A
+/// missing `-1` here silently mis-spreads the table (it still sums to 32),
+/// corrupting `Predefined_Mode` offset decoding for any sequence whose OF
+/// state lands in the shifted region.
 pub const PREDEFINED_OF: ([i16; 29], u32) = (
     [
-        1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
+        1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
     ],
     5,
 );
@@ -633,6 +638,45 @@ mod tests {
         assert_eq!(sum, 1 << al);
     }
 
+    /// The predefined distributions must match zstd's `LL/ML/OF_defaultNorm`
+    /// *exactly* — RFC 8478 §3.1.1.4.1. A sum-only check (above) is not
+    /// enough: a misplaced `-1` (e.g. one too few in the offset table) still
+    /// sums to `1 << accuracy_log` but mis-spreads the table, silently
+    /// corrupting `Predefined_Mode` decoding for any sequence whose FSE state
+    /// lands in the shifted region — exactly the class of bug this guards.
+    #[test]
+    fn predefined_distributions_match_zstd_defaults() {
+        // RFC 8478 §3.1.1.4.1.1 — LL_defaultNorm (accuracy_log 6); -1 at 32..=35.
+        assert_eq!(
+            PREDEFINED_LL.0,
+            [
+                4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1,
+                1, 1, 1, 1, -1, -1, -1, -1,
+            ]
+        );
+        assert_eq!(PREDEFINED_LL.1, 6);
+        // RFC §3.1.1.4.1.2 — ML_defaultNorm (accuracy_log 6); -1 at 46..=52.
+        assert_eq!(
+            PREDEFINED_ML.0,
+            [
+                1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
+            ]
+        );
+        assert_eq!(PREDEFINED_ML.1, 6);
+        // RFC §3.1.1.4.1.3 — OF_defaultNorm (accuracy_log 5); -1 at 24..=28
+        // (five entries). The original transcription had only four (missing
+        // index 24), which is the bug this test was added to catch.
+        assert_eq!(
+            PREDEFINED_OF.0,
+            [
+                1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1,
+                -1, -1,
+            ]
+        );
+        assert_eq!(PREDEFINED_OF.1, 5);
+    }
+
     // ---- Table builder ------------------------------------------
 
     #[test]
@@ -648,15 +692,12 @@ mod tests {
         let (counts, al) = PREDEFINED_OF;
         let t = FseTable::build(&counts, al).expect("build");
         assert_eq!(t.table_size(), 32);
-        // -1 symbols (25..=28) live at the high end. They each
-        // claim exactly one cell.
-        let high_4_syms: Vec<u8> = (28..32).map(|s| t.cells[s].symbol).collect();
-        // Order at the high end is the order they were placed —
-        // from sym=25 (first -1) to sym=28 (last -1), with
-        // high_threshold decrementing each time. So high_threshold
-        // walked 31, 30, 29, 28; cells[31].symbol = 25, cells[30] = 26,
-        // cells[29] = 27, cells[28] = 28.
-        assert_eq!(high_4_syms, vec![28, 27, 26, 25]);
+        // The five low-probability (-1) symbols 24..=28 each claim exactly
+        // one cell at the high end, placed in increasing symbol order as
+        // high_threshold walks down 31, 30, 29, 28, 27. So cells[31] = 24,
+        // cells[30] = 25, cells[29] = 26, cells[28] = 27, cells[27] = 28.
+        let high_5_syms: Vec<u8> = (27..32).map(|s| t.cells[s].symbol).collect();
+        assert_eq!(high_5_syms, vec![28, 27, 26, 25, 24]);
     }
 
     #[test]
