@@ -1342,6 +1342,19 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         .clone()
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
+    // Known-size + range-less ⇒ the scheduler runs `run_single_stream`,
+    // which writes the body strictly `0..total` in order. In that mode
+    // we hand the scheduler a sequential write frontier and gate the
+    // reader / format-sniff on it instead of the coarse `chunk_size`
+    // bitmap, so a streaming archive extracts concurrently with the
+    // download rather than only after it finishes
+    // (`internal/PLAN_single_stream_concurrent_extract.md`). Parallel
+    // (ranged) and unknown-size paths keep their existing gating: the
+    // bitmap (chunks complete out of order) and the growable high-water
+    // respectively, so the frontier stays `None` for them.
+    let single_stream_known = info.size_known && !info.accept_ranges;
+    let write_frontier = single_stream_known.then(|| Arc::new(AtomicU64::new(0)));
+
     let scheduler_cfg = SchedulerConfig {
         chunk_size: config.chunk_size,
         workers: config.workers,
@@ -1354,6 +1367,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
         rate_limiter: rate_limiter.clone(),
         max_disk_buffer: config.max_disk_buffer,
         abort: Some(Arc::clone(&download_abort)),
+        write_frontier: write_frontier.clone(),
     };
 
     let download_done = Arc::new(AtomicBool::new(false));
@@ -1468,6 +1482,7 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                 &download_done,
                 &download_outcome,
                 kill_switch.as_ref(),
+                write_frontier.as_ref(),
             );
             let (format_shape, factory) = match detection {
                 Ok(ok) => ok,
@@ -1762,13 +1777,23 @@ pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
                     Some(flag) => reader.with_kill_switch(flag),
                     None => reader,
                 };
-                // Unknown-size source (issue #8): the bitmap is empty and
-                // `total_size` is 0, so gate reads on the growable file's
-                // live high-water instead.
-                let reader = if info.size_known {
-                    reader
-                } else {
+                // Pick the read-availability gate:
+                //   - unknown-size (issue #8): the bitmap is empty and
+                //     `total_size` is 0, so gate on the growable file's
+                //     live high-water;
+                //   - known-size single-stream: gate on the scheduler's
+                //     sequential write frontier so extraction runs
+                //     concurrently with the download
+                //     (`internal/PLAN_single_stream_concurrent_extract.md`);
+                //   - known-size parallel (ranged): gate on the chunk
+                //     bitmap, the only correct signal when chunks land
+                //     out of order.
+                let reader = if !info.size_known {
                     reader.with_unknown_size()
+                } else if let Some(frontier) = write_frontier.clone() {
+                    reader.with_write_frontier(frontier)
+                } else {
+                    reader
                 };
 
                 // Interpose a HashingReader between the source and
@@ -4546,6 +4571,18 @@ pub struct BlockingSparseReader {
     /// on the growable sparse file's live high-water
     /// (`MultiSparse::total_size`). EOF is `download_done && pos >= hw`.
     unknown_size: bool,
+    /// Sequential write frontier for known-size **single-stream** mode
+    /// (`internal/PLAN_single_stream_concurrent_extract.md`). When set,
+    /// byte-availability is gated on this live frontier — the
+    /// scheduler's sequential `pwrite_at` position — instead of the
+    /// coarse `chunk_size` bitmap, so the decoder advances byte-for-byte
+    /// with the download rather than waiting for whole chunks (or, for
+    /// an archive ≤ `chunk_size`, the entire download). `None` for
+    /// parallel / random-access modes, where chunks complete out of
+    /// order and the bitmap is the only correct availability signal.
+    /// Ignored when `unknown_size` is set (that path uses the growable
+    /// high-water).
+    write_frontier: Option<Arc<AtomicU64>>,
 }
 
 impl BlockingSparseReader {
@@ -4577,6 +4614,7 @@ impl BlockingSparseReader {
             kill_switch: None,
             source_metrics: None,
             unknown_size: false,
+            write_frontier: None,
         }
     }
 
@@ -4586,6 +4624,20 @@ impl BlockingSparseReader {
     #[must_use]
     fn with_unknown_size(mut self) -> Self {
         self.unknown_size = true;
+        self
+    }
+
+    /// Drive a known-size **single-stream** read off the scheduler's
+    /// sequential write frontier instead of the chunk bitmap
+    /// (`internal/PLAN_single_stream_concurrent_extract.md`). The body
+    /// is written strictly `0..total_size` in order, so the frontier is
+    /// an exact, byte-granular availability signal — the bitmap's 4 MiB
+    /// chunk granularity would otherwise force the decoder to wait a
+    /// full chunk behind the download (and the whole download for an
+    /// archive ≤ `chunk_size`).
+    #[must_use]
+    fn with_write_frontier(mut self, frontier: Arc<AtomicU64>) -> Self {
+        self.write_frontier = Some(frontier);
         self
     }
 
@@ -4669,9 +4721,18 @@ impl BlockingSparseReader {
             // `download_done`) tells us whether this is real EOF.
             if self.download_done.load(Ordering::Acquire) {
                 if pos >= self.sparse.total_size() {
+                    // Surface a download-side error if there is one, but
+                    // leave a successful `Ok(stats)` in the slot: the
+                    // coordinator reads it after the reader hits EOF to
+                    // report `bytes_downloaded`. An unconditional `take()`
+                    // here drops the `Ok` and the run reports `0 bytes
+                    // downloaded` (same contract as
+                    // `wait_for_download_complete`).
                     if let Ok(mut slot) = self.download_outcome.lock() {
-                        if let Some(Err(e)) = slot.take() {
-                            return Err(io::Error::other(e));
+                        if matches!(slot.as_ref(), Some(Err(_))) {
+                            if let Some(Err(e)) = slot.take() {
+                                return Err(io::Error::other(e));
+                            }
                         }
                     }
                     return Ok(0);
@@ -4685,12 +4746,134 @@ impl BlockingSparseReader {
             thread::sleep(self.poll_interval);
         }
     }
+
+    /// Known-size **single-stream** read path
+    /// (`internal/PLAN_single_stream_concurrent_extract.md`). The body
+    /// is written strictly sequentially `0..total_size`, so
+    /// byte-availability is the scheduler's live write frontier — far
+    /// finer than the `chunk_size` bitmap the default path gates on.
+    /// Structurally this mirrors [`Self::read_unknown`], but EOF is the
+    /// known `total_size` and the frontier (not the growable
+    /// high-water) is the availability signal.
+    fn read_sequential(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // INVARIANT: `read` only dispatches here when `write_frontier`
+        // is `Some` (set via `with_write_frontier` for single-stream).
+        let Some(frontier) = self.write_frontier.clone() else {
+            return Err(io::Error::other(
+                "read_sequential entered without a write frontier",
+            ));
+        };
+        // Time spent blocked on the network within this `read` call.
+        // Mirrors the bitmap path's `record_wait` accounting so
+        // `RunStats::source_wait_time` reflects genuine source-wait time
+        // during concurrent single-stream extraction (rather than the
+        // old "0 because everything was already on disk").
+        let mut wait_started: Option<Instant> = None;
+        loop {
+            if let Some(flag) = self.kill_switch.as_ref() {
+                if flag.load(Ordering::Acquire) {
+                    if let (Some(metrics), Some(started)) =
+                        (self.source_metrics.as_ref(), wait_started.take())
+                    {
+                        metrics.record_wait(started.elapsed());
+                    }
+                    return Err(io::Error::other(KILL_SENTINEL));
+                }
+            }
+            let pos = self.cursor.load(Ordering::Acquire);
+            if pos >= self.total_size {
+                return Ok(0);
+            }
+            let high_water = frontier.load(Ordering::Acquire);
+            if pos < high_water {
+                if let (Some(metrics), Some(started)) =
+                    (self.source_metrics.as_ref(), wait_started.take())
+                {
+                    metrics.record_wait(started.elapsed());
+                }
+                let want = (high_water - pos)
+                    .min(self.total_size - pos)
+                    .min(buf.len() as u64) as usize;
+                let sparse_read_started = Instant::now();
+                let n = self
+                    .sparse
+                    .read_at(ByteOffset::new(pos), &mut buf[..want])
+                    .map_err(|e| io::Error::other(format!("sparse read: {e}")))?;
+                if let Some(metrics) = self.source_metrics.as_ref() {
+                    metrics.record_sparse_read(n as u64, sparse_read_started.elapsed());
+                }
+                if n == 0 {
+                    // Bytes below the frontier are durable by the
+                    // Release/Acquire edge on the scheduler's
+                    // `pwrite_at`/`store`, so a zero read here is not
+                    // expected; re-poll rather than report spurious EOF.
+                    thread::sleep(self.poll_interval);
+                    continue;
+                }
+                let new_pos = self.cursor.fetch_add(n as u64, Ordering::Release) + n as u64;
+                if let Some(p) = self.progress_state.as_ref() {
+                    p.set_bytes_decoded_input(new_pos);
+                }
+                return Ok(n);
+            }
+            // Caught up to the writer. If the download finished, decide
+            // real EOF vs. a short body. The frontier is published
+            // `Release` *before* `download_done`, so re-reading it after
+            // observing `download_done` cannot miss a final advance.
+            if self.download_done.load(Ordering::Acquire) {
+                if pos < frontier.load(Ordering::Acquire) {
+                    continue;
+                }
+                if let (Some(metrics), Some(started)) =
+                    (self.source_metrics.as_ref(), wait_started.take())
+                {
+                    metrics.record_wait(started.elapsed());
+                }
+                if let Ok(mut slot) = self.download_outcome.lock() {
+                    // Only take a download-side *error*; leave a
+                    // successful `Ok(stats)` in the slot for the
+                    // coordinator to report (see `read_unknown`). Preserve
+                    // the typed SchedulerError as the io::Error source so
+                    // the outer retry path can walk `Error::source()`
+                    // (same contract as the bitmap path below).
+                    if matches!(slot.as_ref(), Some(Err(_))) {
+                        if let Some(Err(e)) = slot.take() {
+                            return Err(io::Error::other(e));
+                        }
+                    }
+                }
+                if pos < self.total_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "download finished but only {pos} of {} bytes are available",
+                            self.total_size
+                        ),
+                    ));
+                }
+                return Ok(0);
+            }
+            if wait_started.is_none() {
+                wait_started = Some(Instant::now());
+            }
+            if let Some(metrics) = self.source_metrics.as_ref() {
+                metrics.record_poll_sleep();
+            }
+            thread::sleep(self.poll_interval);
+        }
+    }
 }
 
 impl Read for BlockingSparseReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.unknown_size {
             return self.read_unknown(buf);
+        }
+        if self.write_frontier.is_some() {
+            return self.read_sequential(buf);
         }
         // §1.3: enter a debug-level span around the source-read poll
         // loop so a stuck decoder shows up in the per-component
@@ -4759,14 +4942,19 @@ impl Read for BlockingSparseReader {
                         metrics.record_wait(started.elapsed());
                     }
                     if let Ok(mut slot) = self.download_outcome.lock() {
-                        if let Some(Err(e)) = slot.take() {
-                            // Wrap the typed scheduler error as the io::Error
-                            // source rather than stringifying it. The outer-loop
-                            // retry path in `main` walks `Error::source()` and
-                            // matches on the `SchedulerError` / `WorkerError`
-                            // types to decide whether to restart from checkpoint;
-                            // collapsing to a `String` here would erase that.
-                            return Err(io::Error::other(e));
+                        // Only take a download-side *error*; a successful
+                        // `Ok(stats)` is left for the coordinator to report
+                        // (see `read_unknown`). Wrap the typed scheduler
+                        // error as the io::Error source rather than
+                        // stringifying it: the outer-loop retry path in
+                        // `main` walks `Error::source()` and matches on the
+                        // `SchedulerError` / `WorkerError` types to decide
+                        // whether to restart from checkpoint; collapsing to
+                        // a `String` here would erase that.
+                        if matches!(slot.as_ref(), Some(Err(_))) {
+                            if let Some(Err(e)) = slot.take() {
+                                return Err(io::Error::other(e));
+                            }
                         }
                     }
                     return Err(io::Error::new(
@@ -4905,6 +5093,7 @@ fn select_decoder_factory(
     download_done: &Arc<AtomicBool>,
     download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
     kill_switch: Option<&Arc<AtomicBool>>,
+    write_frontier: Option<&Arc<AtomicU64>>,
 ) -> Result<(FormatShape, DecoderFactory), CoordinatorError> {
     if let Some(name) = config.forced_format.as_deref() {
         let factory = registry.factory_for_format_name(name).ok_or_else(|| {
@@ -4955,6 +5144,7 @@ fn select_decoder_factory(
             config.reader_poll_interval,
             kill_switch,
             !info.size_known,
+            write_frontier,
         )?
     };
     let magic_lookup = registry.lookup_by_prefix(&prefix);
@@ -5161,6 +5351,7 @@ fn sniff_prefix(
     poll_interval: Duration,
     kill_switch: Option<&Arc<AtomicBool>>,
     unknown_size: bool,
+    write_frontier: Option<&Arc<AtomicU64>>,
 ) -> Result<Vec<u8>, CoordinatorError> {
     if max_window == 0 || chunk_size == 0 {
         return Ok(Vec::new());
@@ -5209,6 +5400,48 @@ fn sniff_prefix(
                 }
                 // Clean finish with fewer than `want` bytes — read what
                 // arrived.
+                break;
+            }
+            thread::sleep(poll_interval);
+        }
+    } else if let Some(frontier) = write_frontier {
+        // Known-size single-stream: the body is written sequentially
+        // `0..total_size`, so poll the scheduler's live write frontier
+        // until it covers `want` rather than waiting on the chunk
+        // bitmap — whose only completion for an archive ≤ chunk_size is
+        // the post-download mark, which would stall format detection
+        // (and therefore extraction) until the whole download finished
+        // (`internal/PLAN_single_stream_concurrent_extract.md`).
+        loop {
+            if let Some(flag) = kill_switch {
+                if flag.load(Ordering::Acquire) {
+                    return Err(CoordinatorError::Aborted {
+                        checkpoints_written: 0,
+                    });
+                }
+            }
+            if frontier.load(Ordering::Acquire) >= want {
+                break;
+            }
+            if download_done.load(Ordering::Acquire) {
+                // Re-read the frontier (published `Release` before
+                // `download_done`) before concluding it fell short.
+                if frontier.load(Ordering::Acquire) >= want {
+                    break;
+                }
+                if let Ok(slot) = download_outcome.lock() {
+                    if let Some(Err(e)) = &*slot {
+                        return Err(CoordinatorError::Io {
+                            path: PathBuf::from("<sniff-prefix>"),
+                            source: io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!("download failed: {e}"),
+                            ),
+                        });
+                    }
+                }
+                // Clean finish with fewer than `want` bytes — read what
+                // arrived (a body shorter than the magic window).
                 break;
             }
             thread::sleep(poll_interval);
@@ -5820,6 +6053,146 @@ mod tests {
         let err = result.expect_err("must surface kill sentinel");
         assert_eq!(err.to_string(), "peel:kill-switch-tripped");
         handle.join().expect("worker join");
+    }
+
+    #[test]
+    fn blocking_reader_sequential_extracts_up_to_frontier_before_chunk_complete() {
+        // Regression
+        // (`internal/PLAN_single_stream_concurrent_extract.md`): a
+        // known-size single-stream archive ≤ chunk_size has exactly one
+        // bitmap chunk, which the scheduler marks complete only *after*
+        // the download finishes. The frontier-gated reader must extract
+        // the bytes already written without waiting on that chunk bit —
+        // i.e. extraction runs concurrently with the download.
+        let path = unique_temp("seq-frontier");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
+        // The whole body is on disk, but the writer has only *published*
+        // the first 16 bytes via the frontier.
+        sparse
+            .pwrite_at(ByteOffset::ZERO, b"abcdefghijklmnopqrstuvwxyz012345")
+            .expect("write");
+        // One chunk for the whole 32-byte file, left INCOMPLETE: the
+        // bitmap-gated path would block here indefinitely.
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        let download_done = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let frontier = Arc::new(AtomicU64::new(16));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            64, // chunk_size > total_size ⇒ a single bitmap chunk
+            32,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        )
+        .with_write_frontier(Arc::clone(&frontier));
+
+        // Reads are capped at the published frontier, never the whole
+        // file, even though every byte is physically present.
+        let mut buf = [0u8; 32];
+        let mut prefix = Vec::new();
+        while prefix.len() < 16 {
+            let n = reader.read(&mut buf).expect("read prefix");
+            assert!(n > 0 && prefix.len() + n <= 16, "read past frontier: {n}");
+            prefix.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&prefix, b"abcdefghijklmnop");
+
+        // Advance the frontier (download made more progress) and drain
+        // the tail through to a clean EOF at total_size.
+        frontier.store(32, Ordering::Release);
+        let mut tail = Vec::new();
+        loop {
+            let n = reader.read(&mut buf).expect("read tail");
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&tail, b"qrstuvwxyz012345");
+    }
+
+    #[test]
+    fn blocking_reader_sequential_errors_on_short_body() {
+        // download_done is set, the frontier never reached total_size,
+        // and the outcome carries no error: surface UnexpectedEof rather
+        // than silently treating a truncated body as complete.
+        let path = unique_temp("seq-short");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        let download_done = Arc::new(AtomicBool::new(true));
+        let outcome = Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
+        let frontier = Arc::new(AtomicU64::new(16)); // only 16 of 32 published
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            64,
+            32,
+            16, // cursor starts at the frontier (everything published consumed)
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        )
+        .with_write_frontier(Arc::clone(&frontier));
+        let mut buf = [0u8; 32];
+        let err = reader.read(&mut buf).expect_err("short body must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn blocking_reader_unknown_eof_preserves_download_stats() {
+        // Regression: the reader's clean-EOF path must surface a
+        // download-side *error* but leave a successful `Ok(DownloadStats)`
+        // in the shared slot — the coordinator reads it after EOF to
+        // report `bytes_downloaded`. An unconditional `slot.take()` here
+        // dropped the `Ok`, so no-`Content-Length` runs printed
+        // `[done] 0 bytes downloaded`.
+        let path = unique_temp("unknown-eof-stats");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single_growable(
+            SparseFile::open_growable(&path).expect("growable"),
+        ));
+        sparse
+            .pwrite_at(ByteOffset::ZERO, b"hello world")
+            .expect("write"); // high-water = 11
+        let bitmap = Arc::new(ChunkBitmap::new(0));
+        let download_done = Arc::new(AtomicBool::new(true));
+        let stats = DownloadStats {
+            bytes_downloaded: 11,
+            ..DownloadStats::default()
+        };
+        let outcome = Arc::new(Mutex::new(Some(Ok(stats))));
+        let mut reader = BlockingSparseReader::new(
+            Arc::clone(&sparse),
+            bitmap,
+            64,
+            0,
+            0,
+            download_done,
+            Arc::clone(&outcome),
+            Duration::from_millis(1),
+        )
+        .with_unknown_size();
+
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).expect("read body");
+        assert_eq!(&buf[..n], b"hello world");
+        assert_eq!(reader.read(&mut buf).expect("eof"), 0);
+
+        // The successful stats must survive the EOF read.
+        let slot = outcome.lock().expect("lock");
+        match &*slot {
+            Some(Ok(s)) => assert_eq!(s.bytes_downloaded, 11),
+            other => panic!("download stats consumed at EOF: {other:?}"),
+        }
     }
 
     struct TmpFile(PathBuf);

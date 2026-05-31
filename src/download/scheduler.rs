@@ -74,6 +74,12 @@ pub const DEFAULT_PROBE_INTERVAL: u32 = 32;
 /// worker doesn't loop forever.
 const MAX_WORKER_RESPAWNS: u32 = 100;
 
+/// How long [`run_single_stream`] sleeps between `max_disk_buffer`
+/// re-checks while the on-disk lookahead is at the cap. Matches the
+/// parallel dispatcher's 50 ms completion-poll cadence so the
+/// single-stream throttle has the same responsiveness.
+const SINGLE_STREAM_THROTTLE_POLL: Duration = Duration::from_millis(50);
+
 /// Why a `--mirror` URL was rejected during the agreement check.
 ///
 /// Not a [`SchedulerError`]: discovery only *drops* disagreeing
@@ -383,6 +389,23 @@ pub struct SchedulerConfig {
     /// unwind, rather than waiting for the reader → extractor →
     /// `CancelOnDrop` chain.
     pub abort: Option<Arc<AtomicBool>>,
+    /// Sequential write frontier published by [`run_single_stream`]
+    /// (the known-size single-stream path). After each durable
+    /// `pwrite_at` the scheduler stores the new end offset here with
+    /// `Release` ordering; the reader gates byte-availability on this
+    /// live frontier (`Acquire`) instead of the coarse `chunk_size`
+    /// bitmap, so a streaming decoder advances in lockstep with the
+    /// download rather than waiting for whole 4 MiB chunks (or, for an
+    /// archive ≤ `chunk_size`, the entire download) to land. The
+    /// chunk bitmap is still maintained for resume/accounting; this
+    /// only changes what extraction *waits* on.
+    ///
+    /// `None` for parallel / random-access modes, where chunks
+    /// complete out of order and the bitmap is the only correct
+    /// availability signal. Inert in [`run_parallel`] and
+    /// [`run_single_stream_unknown`] — only [`run_single_stream`]
+    /// advances it.
+    pub write_frontier: Option<Arc<AtomicU64>>,
 }
 
 impl Default for SchedulerConfig {
@@ -399,6 +422,7 @@ impl Default for SchedulerConfig {
             rate_limiter: None,
             max_disk_buffer: None,
             abort: None,
+            write_frontier: None,
         }
     }
 }
@@ -1495,6 +1519,53 @@ fn is_disk_buffer_full(config: &SchedulerConfig) -> bool {
         >= max
 }
 
+/// Disk-buffer backpressure for the single-stream paths
+/// (`max_disk_buffer`). Unlike the parallel dispatcher there are no
+/// in-flight chunks to withhold, so we throttle by *pausing the socket
+/// read*: blocking here lets TCP flow-control slow the sender while the
+/// decoder drains the lookahead and advances `bytes_decoded_input`,
+/// which shrinks `bytes_downloaded - bytes_decoded_input` back below the
+/// cap. No deadlock — the reader consumes already-written bytes and
+/// advances the cursor independently of this loop, so the throttle
+/// always releases. Inert when `max_disk_buffer` or `progress` is unset
+/// (`is_disk_buffer_full` returns false), so non-throttled runs pay only
+/// one `is_disk_buffer_full` check per body read.
+///
+/// Returns [`WorkerError::Cancelled`] (wrapped) if the run is aborted
+/// while parked, mirroring the abort handling in the body-read loops, so
+/// a kill switch unblocks a throttled single-stream download promptly.
+fn single_stream_backpressure(
+    config: &SchedulerConfig,
+    ss_cancel: &AtomicBool,
+) -> Result<(), SchedulerError> {
+    let mut parked = false;
+    while is_disk_buffer_full(config) {
+        if let Some(flag) = config.abort.as_ref() {
+            if flag.load(Ordering::Acquire) {
+                ss_cancel.store(true, Ordering::Release);
+                return Err(SchedulerError::ChunkFailed {
+                    chunk: ChunkIndex::ZERO,
+                    attempts: 1,
+                    source: WorkerError::Cancelled {
+                        chunk: ChunkIndex::ZERO,
+                    },
+                });
+            }
+        }
+        if let Some(p) = config.progress.as_ref() {
+            p.set_disk_bound(true);
+        }
+        parked = true;
+        thread::sleep(SINGLE_STREAM_THROTTLE_POLL);
+    }
+    if parked {
+        if let Some(p) = config.progress.as_ref() {
+            p.set_disk_bound(false);
+        }
+    }
+    Ok(())
+}
+
 /// Map the policy's current target byte size to a chunk count
 /// (rounded down). Returns `1` when the policy is absent — the
 /// pre-§8 behaviour.
@@ -1676,6 +1747,11 @@ fn run_single_stream(
     // blocking behaviour.
     let ss_cancel = AtomicBool::new(false);
     while written < total_size {
+        // Disk-buffer backpressure (`max_disk_buffer`): pause the socket
+        // read while the on-disk lookahead is at the cap so streaming
+        // extraction bounds peak compressed-side disk even on a
+        // range-less source (`single_stream_backpressure`).
+        single_stream_backpressure(config, &ss_cancel)?;
         if let Some(flag) = config.abort.as_ref() {
             if flag.load(Ordering::Acquire) {
                 // Wake the limiter (if any) so the next `read` call's
@@ -1738,6 +1814,17 @@ fn run_single_stream(
             stats.chunks_completed = stats.chunks_completed.saturating_add(hi.saturating_sub(lo));
         }
         written = new_end;
+        // Publish the sequential write frontier so the reader can
+        // extract bytes `[0, written)` immediately, without waiting for
+        // the next 4 MiB chunk boundary. `Release` pairs with the
+        // reader's `Acquire` load: observing this value guarantees the
+        // preceding `pwrite_at` is visible. The chunk bitmap above is
+        // still the durable record used for resume; the frontier is a
+        // finer, in-process availability hint that never outlives the
+        // run.
+        if let Some(frontier) = config.write_frontier.as_ref() {
+            frontier.store(written, Ordering::Release);
+        }
     }
 
     // Final (possibly partial) chunk if total_size isn't a multiple of
@@ -1830,6 +1917,13 @@ fn run_single_stream_unknown(
     };
     let ss_cancel = AtomicBool::new(false);
     loop {
+        // Disk-buffer backpressure (`max_disk_buffer`). The unknown-size
+        // path already extracts concurrently (the reader gates on the
+        // growable high-water), but like the known-size path it must
+        // also pause the socket read while the lookahead is at the cap,
+        // or a fast no-`Content-Length` source would still balloon
+        // peak compressed-side disk to the full archive size.
+        single_stream_backpressure(config, &ss_cancel)?;
         if let Some(flag) = config.abort.as_ref() {
             if flag.load(Ordering::Acquire) {
                 ss_cancel.store(true, Ordering::Release);
