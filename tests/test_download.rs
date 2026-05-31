@@ -82,6 +82,7 @@ fn cfg(chunk_size: u64, workers: u32) -> SchedulerConfig {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     }
 }
 
@@ -756,6 +757,64 @@ fn run_falls_back_to_single_stream_when_ranges_unsupported() {
 }
 
 #[test]
+fn single_stream_publishes_sequential_write_frontier() {
+    // `internal/PLAN_single_stream_concurrent_extract.md`: the
+    // known-size single-stream path must advance a sequential write
+    // frontier so the reader can extract bytes as they land rather than
+    // waiting for whole 4 MiB chunks (or, for a small archive, the
+    // entire download). Here we confirm the scheduler drives the
+    // frontier to the full size while still maintaining the bitmap.
+    let body = make_body(7000);
+    let body_clone = body.clone();
+    let server = MockServer::start(move |req: &MockRequest, _n| {
+        if req.method == "HEAD" {
+            return MockResponse::Reply {
+                status: 200,
+                reason: "OK",
+                headers: vec![("Content-Length".into(), body.len().to_string())],
+                body: Vec::new(),
+            };
+        }
+        MockResponse::Reply {
+            status: 200,
+            reason: "OK",
+            headers: vec![],
+            body: body.clone(),
+        }
+    });
+    let client = build_client();
+
+    let info = discover(&client, &url(&server, "/")).expect("discover");
+    assert!(!info.accept_ranges);
+    // chunk_size larger than the whole body ⇒ exactly one bitmap chunk,
+    // the worst case from the report: the bitmap never flips mid-loop.
+    let chunk_size = 8192;
+    let total_chunks = chunk_count(info.total_size, chunk_size).unwrap();
+    assert_eq!(total_chunks, 1);
+    let path = temp_path("single_stream_frontier");
+    let _cleanup = CleanupOnDrop(path.clone());
+    let sparse = MultiSparse::from_single(
+        SparseFile::open_or_create(&path, info.total_size).expect("sparse"),
+    );
+    let bitmap = ChunkBitmap::new(total_chunks);
+    let cursor = AtomicU64::new(0);
+
+    let frontier = Arc::new(AtomicU64::new(0));
+    let scheduler_cfg = SchedulerConfig {
+        write_frontier: Some(Arc::clone(&frontier)),
+        ..cfg(chunk_size, 2)
+    };
+
+    let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run");
+    assert!(matches!(stats.mode, DownloadMode::SingleStream));
+    // Frontier reached the full size, independent of the (single) chunk
+    // bitmap completion.
+    assert_eq!(frontier.load(Ordering::SeqCst), info.total_size);
+    assert!(bitmap.is_complete(ChunkIndex::new(0)));
+    assert_eq!(read_full(&path), body_clone);
+}
+
+#[test]
 fn discover_falls_back_to_full_get_when_head_broken_and_no_ranges() {
     // Issue #6: the server gives no usable Content-Length via HEAD
     // *and* ignores Range requests (no range support at all). The
@@ -989,6 +1048,7 @@ fn run_rejects_zero_chunk_size() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidChunkSize));
@@ -1019,6 +1079,7 @@ fn run_rejects_zero_workers() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     let err = run(&client, &info, &sparse, &bitmap, &cursor, &bad).expect_err("must error");
     assert!(matches!(err, SchedulerError::InvalidWorkerCount));
@@ -1087,6 +1148,7 @@ fn run_with_policy_extracts_byte_identical_output() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -1143,6 +1205,7 @@ fn run_with_policy_coalesces_dispatches_into_fewer_range_requests() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive run");
@@ -1199,6 +1262,7 @@ fn run_without_policy_keeps_one_range_per_chunk() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
 
     run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("baseline run");
@@ -1263,6 +1327,7 @@ fn run_with_policy_resume_honors_existing_bitmap() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("adaptive resume");
@@ -1311,6 +1376,7 @@ fn scheduler_records_per_chunk_crc32c_when_fingerprints_configured() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("download");
     assert_eq!(stats.chunks_completed, total_chunks);
@@ -1388,6 +1454,7 @@ fn scheduler_aborts_on_probe_drift_with_typed_error() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     let err =
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect_err("must abort");
@@ -1462,6 +1529,7 @@ fn probe_completion_does_not_inflate_bytes_downloaded() {
         // by the small-cap tests in `test_coordinator.rs`.
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
 
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
@@ -1620,6 +1688,7 @@ fn run_routes_chunks_across_two_mirrors() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run");
 
@@ -1705,6 +1774,7 @@ fn run_falls_back_when_one_mirror_dies() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg)
         .expect("run completes despite mirror A failing");
@@ -1801,6 +1871,7 @@ fn run_completes_after_all_mirrors_recover() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("recovers");
     assert_eq!(read_full(&path), body_clone);
@@ -1843,6 +1914,7 @@ fn run_parallel_with_rate_limiter_extracts_byte_identical() {
         rate_limiter: Some(Arc::clone(&limiter)),
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");
     assert_eq!(read_full(&path), body_clone);
@@ -1883,6 +1955,7 @@ fn run_parallel_with_rate_limiter_paces_below_uncapped_rate() {
             rate_limiter: limiter,
             max_disk_buffer: None,
             abort: None,
+            write_frontier: None,
         };
         let started = std::time::Instant::now();
         run(&client, &info, &sparse, &bitmap, &cursor, &scheduler_cfg).expect("run ok");
@@ -2133,6 +2206,7 @@ fn run_clamps_adaptive_coalesce_at_part_boundaries() {
         rate_limiter: None,
         max_disk_buffer: None,
         abort: None,
+        write_frontier: None,
     };
     let stats = run(&client, &info, &sparse, &bitmap, &cursor, &cfg).expect("run ok");
 
