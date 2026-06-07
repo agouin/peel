@@ -33,14 +33,14 @@
 //!   path exceeds the 100/255-byte ustar limits. The bytes following
 //!   the `L` header are read as a NUL-terminated path and applied
 //!   to the next entry, matching what GNU `tar` does on extract.
-//!   `K` (long link target) is consumed and discarded — peel does
-//!   not extract symlinks today.
-//! - **Regular files** (`0`, `\0`) and **directories** (`5`).
+//!   `K` (long link target) is read the same way and applied to the
+//!   next entry's link target, so symlinks / hard links whose target
+//!   exceeds the 100-byte `linkname` field extract correctly.
+//! - **Regular files** (`0`, `\0`, `7`), **directories** (`5`),
+//!   **symbolic links** (`2`) and **hard links** (`1`).
 //!
-//! Everything else — symlinks (`2`), hard links (`1`), device nodes
-//! (`3`/`4`), FIFOs (`6`), PAX global headers (`g`) — is rejected
-//! with [`SinkError::UnsupportedEntry`]. `internal/PLAN.md` §7 explicitly
-//! defers these and `OPTIMIZATIONS.md` tracks them.
+//! Everything else — device nodes (`3`/`4`), FIFOs (`6`), PAX global
+//! headers (`g`) — is rejected with [`SinkError::UnsupportedEntry`].
 //!
 //! # Path safety
 //!
@@ -52,11 +52,38 @@
 //! - Empty entry names.
 //! - Entry names containing NUL bytes.
 //!
-//! There is no attempt to canonicalize through the filesystem; we never
-//! create symlinks, so a lexical guarantee is a complete one. This
-//! deliberately rejects archives whose entries cancel out a `..` later
-//! — a stricter posture than `bsdtar` and the right default for the
-//! MVP.
+//! Once the sink can create symbolic links, that lexical guarantee is
+//! no longer *complete* on its own: a hostile archive can create a
+//! symlink (`evil -> /`) and then write a later entry named
+//! `evil/passwd`, whose name passes every lexical check yet lands
+//! outside the root once the OS follows `evil`. peel defends against
+//! this by **never following a symlink it (or anything else) created
+//! when placing an entry**:
+//!
+//! - Parent directories are materialized one component at a time with
+//!   [`fs::create_dir`]; any existing component that `lstat`s as a
+//!   symlink aborts the entry with [`SinkError::SymlinkTraversal`]
+//!   rather than being traversed.
+//! - A regular file / symlink / hard-link whose *final* path
+//!   component already exists as a symlink removes that symlink first,
+//!   so an `O_TRUNC` open can never write through it.
+//! - Symbolic-link targets themselves are recreated **verbatim**,
+//!   exactly as archived — including absolute (`/usr/lib`) and
+//!   upward (`../sibling`) targets — because peel's own writes never
+//!   traverse them. This matches GNU `tar`'s faithful behavior; the
+//!   safety boundary is "peel writes nothing outside the root," not
+//!   "the root contains no pointers outside it."
+//! - Hard-link targets, by contrast, *are* constrained: a hard link
+//!   must resolve to an already-extracted regular file inside the
+//!   root, reached without traversing any symlink, else
+//!   [`SinkError::UnsafeLink`].
+//!
+//! The lexical resolver still rejects archives whose entries cancel
+//! out a `..` later — a stricter posture than `bsdtar`. The symlink
+//! checks are `lstat`-based rather than `openat2`-based, so a *local*
+//! attacker racing the extraction could in principle win a TOCTOU
+//! window; the threat model peel defends is a hostile *archive*, not
+//! a hostile concurrent process mutating the extraction root.
 //!
 //! # Streaming guarantees
 //!
@@ -66,6 +93,7 @@
 //! and a per-entry data cursor, both of which advance independently of
 //! the call boundaries.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -98,6 +126,17 @@ pub struct TarSink {
     pending_path: Option<String>,
     /// PAX `size=` override applying to the next non-PAX entry.
     pending_size: Option<u64>,
+    /// Link-target override (PAX `linkpath=` or a GNU `K` long-link
+    /// extension) applying to the next symlink / hard-link entry.
+    pending_linkpath: Option<String>,
+    /// Directory paths already materialized as *real* directories
+    /// under [`Self::root`] and verified not to be symlinks. Lets the
+    /// per-entry parent-directory walk skip the `lstat` + `mkdir`
+    /// syscalls for ancestors it has already vetted (tar entries are
+    /// overwhelmingly grouped by directory, so the hit rate is high).
+    /// Not part of the checkpoint: a resumed sink rebuilds it lazily
+    /// from the on-disk tree, which is the authoritative state.
+    ensured_dirs: HashSet<PathBuf>,
     /// Sticky failure flag. Once a write errors, every subsequent
     /// write returns an error too — partial extraction is never silently
     /// continued.
@@ -153,18 +192,17 @@ enum State {
     },
     /// Collecting a GNU long-name ('L') or long-link ('K') extension.
     /// The body is a NUL-terminated path that overrides the *next*
-    /// entry's name field. 'K' (long link target) is consumed and
-    /// discarded — peel does not extract symlinks today.
+    /// entry's name ('L') or link-target ('K') field.
     LongName {
         /// Bytes of body still to receive.
         remaining: u64,
         /// Bytes of trailing zero padding still to consume.
         padding: u16,
-        /// Accumulator for the long path; empty for 'K' since we drop
-        /// the bytes inline rather than allocate.
+        /// Accumulator for the long path / link target.
         buf: Vec<u8>,
-        /// `true` for 'K' (long link target, discarded), `false` for
-        /// 'L' (long path, applied to the next entry).
+        /// `true` for 'K' (long link target, applied to the next
+        /// entry's `pending_linkpath`), `false` for 'L' (long path,
+        /// applied to the next entry's `pending_path`).
         is_link: bool,
     },
     /// End-of-archive marker observed; further bytes other than zeros
@@ -201,6 +239,8 @@ impl TarSink {
             zero_blocks_seen: 0,
             pending_path: None,
             pending_size: None,
+            pending_linkpath: None,
+            ensured_dirs: HashSet::new(),
             poisoned: false,
         })
     }
@@ -357,6 +397,8 @@ impl TarSink {
             zero_blocks_seen: state.zero_blocks_seen,
             pending_path: state.pending_path.clone(),
             pending_size: state.pending_size,
+            pending_linkpath: state.pending_linkpath.clone(),
+            ensured_dirs: HashSet::new(),
             poisoned: false,
         })
     }
@@ -472,18 +514,18 @@ impl TarSink {
                     remaining,
                     padding,
                     buf,
-                    is_link,
+                    is_link: _,
                 } => {
                     if *remaining > 0 {
                         let want = usize::try_from(*remaining)
                             .unwrap_or(usize::MAX)
                             .min(input.len());
-                        // 'L' captures the path; 'K' discards inline
-                        // so an oversized link target cannot grow the
-                        // buffer unbounded.
-                        if !*is_link {
-                            buf.extend_from_slice(&input[..want]);
-                        }
+                        // Both 'L' (long path) and 'K' (long link
+                        // target) buffer the payload; the allocation
+                        // is capped at `process_header` time so an
+                        // oversized extension cannot grow the buffer
+                        // unbounded.
+                        buf.extend_from_slice(&input[..want]);
                         *remaining -= want as u64;
                         if *remaining == 0 && *padding == 0 {
                             self.finish_long_name_state()?;
@@ -567,6 +609,11 @@ impl TarSink {
             Some(p) => p,
             None => parsed.combined_name()?,
         };
+        // The link-target override (PAX `linkpath=` / GNU `K`) is
+        // consumed for *every* entry, not just link entries, so a
+        // stray override can't leak forward onto an unrelated later
+        // entry. Only the symlink / hard-link arms below read it.
+        let entry_link = self.pending_linkpath.take();
 
         match type_flag {
             // Regular file. '\0' is the historical encoding, '0' the
@@ -575,12 +622,13 @@ impl TarSink {
             // semantic-free on every modern filesystem.
             0 | b'0' | b'7' => {
                 let path = self.resolve_entry_path(&entry_name)?;
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).map_err(|source| SinkError::Io {
-                        path: parent.to_path_buf(),
-                        source,
-                    })?;
-                }
+                self.ensure_parent_dirs(&entry_name, &path)?;
+                // If the final component already exists as a symlink
+                // (left by an earlier entry, or pre-seeded), remove it
+                // first so the `O_TRUNC` open below writes a fresh
+                // regular file instead of following the link and
+                // truncating its target.
+                self.unlink_if_symlink(&path)?;
                 let file = OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -613,10 +661,7 @@ impl TarSink {
             // Directory.
             b'5' => {
                 let path = self.resolve_entry_path(&entry_name)?;
-                fs::create_dir_all(&path).map_err(|source| SinkError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
+                self.ensure_dir(&entry_name, &path)?;
                 // Directory entries should declare size=0; some
                 // archives in the wild ignore that. We honor whatever
                 // the header (or PAX) said and skip that many bytes
@@ -644,6 +689,47 @@ impl TarSink {
                 };
                 Ok(())
             }
+            // Symbolic link. The target lives in the `linkname` field
+            // (or a PAX `linkpath=` / GNU `K` override) and is
+            // recreated verbatim — absolute and upward targets
+            // included — because peel never *follows* a symlink it
+            // created when placing a later entry (see the module-level
+            // path-safety notes). Symlinks declare size 0; we tolerate
+            // (and skip) a stray body the way the directory arm does.
+            b'2' => {
+                let target = self.link_target(&entry_name, entry_link, &parsed)?;
+                let path = self.resolve_entry_path(&entry_name)?;
+                self.ensure_parent_dirs(&entry_name, &path)?;
+                // Clear any file or symlink already sitting at the
+                // final path so `symlink(2)` does not fail with
+                // EEXIST (last-entry-wins, matching the regular-file
+                // arm's `O_TRUNC`).
+                self.remove_existing_nondir(&path)?;
+                create_symlink(Path::new(&target), &path).map_err(|source| SinkError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                self.state = self.skip_body_state(entry_size);
+                Ok(())
+            }
+            // Hard link. Unlike a symlink, the target must resolve to
+            // an already-extracted regular file *inside* the root,
+            // reached without crossing a symlink — otherwise `link(2)`
+            // could alias a file the archive never legitimately
+            // produced. Hard links declare size 0.
+            b'1' => {
+                let target = self.link_target(&entry_name, entry_link, &parsed)?;
+                let link_path = self.resolve_entry_path(&entry_name)?;
+                let target_path = self.resolve_hardlink_target(&entry_name, &target)?;
+                self.ensure_parent_dirs(&entry_name, &link_path)?;
+                self.remove_existing_nondir(&link_path)?;
+                fs::hard_link(&target_path, &link_path).map_err(|source| SinkError::Io {
+                    path: link_path.clone(),
+                    source,
+                })?;
+                self.state = self.skip_body_state(entry_size);
+                Ok(())
+            }
             // PAX extended header for the next entry. Body is a
             // sequence of `<len> <key>=<value>\n` records we'll parse
             // in finish_pax_state.
@@ -668,9 +754,9 @@ impl TarSink {
             // GNU long-name ('L') / long-link ('K') extensions. The
             // header's "./@LongLink" name is ignored; the body holds
             // the real path. 'L' overrides the next entry's name; 'K'
-            // is discarded because peel does not extract symlinks.
-            // Pre-cap the allocation so a hostile archive can't ask
-            // us to reserve gigabytes of memory.
+            // overrides the next entry's link target. Pre-cap the
+            // allocation so a hostile archive can't ask us to reserve
+            // gigabytes of memory.
             b'L' | b'K' => {
                 let is_link = type_flag == b'K';
                 let padding = padding_for(entry_size);
@@ -686,11 +772,7 @@ impl TarSink {
                     State::LongName {
                         remaining: entry_size,
                         padding,
-                        buf: if is_link {
-                            Vec::new()
-                        } else {
-                            Vec::with_capacity(cap_hint)
-                        },
+                        buf: Vec::with_capacity(cap_hint),
                         is_link,
                     }
                 };
@@ -728,24 +810,26 @@ impl TarSink {
             // INVARIANT: only called from within the LongName arm.
             return Ok(());
         };
-        if is_link {
-            // 'K' bytes were never buffered; nothing to do.
-            return Ok(());
-        }
         // GNU stores the path NUL-terminated and pads to a 512-byte
         // boundary with zeros. Trim at the first NUL so the override
         // we apply matches what `tar` itself would.
         let trimmed = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         let bytes = &buf[..trimmed];
-        let path = std::str::from_utf8(bytes).map_err(|_| SinkError::MalformedHeader {
+        let kind = if is_link { "long-link" } else { "long-name" };
+        let value = std::str::from_utf8(bytes).map_err(|_| SinkError::MalformedHeader {
             archive_offset: self.archive_offset,
-            reason: "GNU long-name payload is not valid UTF-8".into(),
+            reason: format!("GNU {kind} payload is not valid UTF-8"),
         })?;
-        // PAX 'path=' takes precedence if both extensions are present
-        // for the same entry — PAX is the modern spec and any archive
-        // emitting both is signaling the PAX value as authoritative.
-        if self.pending_path.is_none() {
-            self.pending_path = Some(path.to_string());
+        // PAX 'path=' / 'linkpath=' take precedence if both the PAX
+        // and GNU extensions are present for the same entry — PAX is
+        // the modern spec and any archive emitting both is signaling
+        // the PAX value as authoritative.
+        if is_link {
+            if self.pending_linkpath.is_none() {
+                self.pending_linkpath = Some(value.to_string());
+            }
+        } else if self.pending_path.is_none() {
+            self.pending_path = Some(value.to_string());
         }
         Ok(())
     }
@@ -771,6 +855,7 @@ impl TarSink {
             for (key, value) in records {
                 match key.as_str() {
                     "path" => self.pending_path = Some(value),
+                    "linkpath" => self.pending_linkpath = Some(value),
                     "size" => {
                         self.pending_size =
                             Some(value.parse::<u64>().map_err(|_| SinkError::MalformedPax {
@@ -855,7 +940,7 @@ impl TarSink {
         }
         // Empty resolved path means the entry was `.`, `./`, or
         // similar — that's the archive root itself. Return
-        // `self.root`; the caller's `create_dir_all` is a no-op
+        // `self.root`; the caller's directory-ensure is a no-op
         // because the root already exists. A file entry whose name
         // resolves to the root (vanishingly rare; would have to be
         // `./` with type-flag `0`) would fail at `OpenOptions::write`
@@ -863,6 +948,319 @@ impl TarSink {
         // is fine.
         Ok(out)
     }
+
+    /// Resolve the link target for a symlink / hard-link entry.
+    ///
+    /// Precedence: a `pending_linkpath` override (PAX `linkpath=` or a
+    /// GNU `K` long-link) wins over the 100-byte header `linkname`
+    /// field, matching what GNU `tar` applies on extract. The string
+    /// is returned *verbatim*; the caller decides how to interpret it
+    /// (a symlink writes it as-is, a hard link resolves it under the
+    /// root). Empty or NUL-bearing targets are malformed.
+    fn link_target(
+        &self,
+        entry: &str,
+        pending: Option<String>,
+        parsed: &ParsedHeader<'_>,
+    ) -> Result<String, SinkError> {
+        let target = match pending {
+            Some(t) => t,
+            None => parsed.link_name_str()?,
+        };
+        if target.is_empty() {
+            return Err(SinkError::MalformedHeader {
+                archive_offset: self.archive_offset,
+                reason: format!("link entry {entry:?} has an empty target"),
+            });
+        }
+        if target.contains('\0') {
+            return Err(SinkError::MalformedHeader {
+                archive_offset: self.archive_offset,
+                reason: format!("link entry {entry:?} target contains a NUL byte"),
+            });
+        }
+        Ok(target)
+    }
+
+    /// The parser state to enter after a header whose body the sink
+    /// wants to *skip*. Symlinks / hard links should declare size 0,
+    /// but we tolerate (and discard) a stray body the way the
+    /// directory arm does. Returns `Header` when there is nothing to
+    /// skip, else a discard buffer sized to the body.
+    fn skip_body_state(&self, entry_size: u64) -> State {
+        let padding = padding_for(entry_size);
+        if entry_size == 0 && padding == 0 {
+            State::Header {
+                filled: 0,
+                buf: Box::new([0u8; BLOCK]),
+            }
+        } else {
+            // An empty `buf` marks PaxData as a pure discard sink (see
+            // finish_pax_state); the bytes are dropped on the floor.
+            State::PaxData {
+                remaining: entry_size,
+                padding,
+                buf: Vec::new(),
+            }
+        }
+    }
+
+    /// Materialize the parent directory chain of `target` as real
+    /// directories, refusing to follow any symlink on the way.
+    fn ensure_parent_dirs(&mut self, entry: &str, target: &Path) -> Result<(), SinkError> {
+        if let Some(parent) = target.parent() {
+            self.ensure_dir_path(entry, parent)?;
+        }
+        Ok(())
+    }
+
+    /// Materialize `target` itself (and its ancestors) as a real
+    /// directory, refusing to follow any symlink on the way.
+    fn ensure_dir(&mut self, entry: &str, target: &Path) -> Result<(), SinkError> {
+        self.ensure_dir_path(entry, target)
+    }
+
+    /// Walk `dir` component-by-component from [`Self::root`], creating
+    /// each missing level with [`fs::create_dir`] and verifying every
+    /// existing level is a real directory — never a symlink. This is
+    /// the load-bearing traversal defense: a symlink left by an
+    /// earlier entry (or pre-seeded into the root) surfaces as
+    /// [`SinkError::SymlinkTraversal`] instead of being followed, so
+    /// peel never writes an entry through a symbolic link.
+    ///
+    /// `dir` is `self.root` or an absolute path beneath it built from
+    /// `Normal` components — every caller routes through
+    /// [`Self::resolve_entry_path`], which guarantees that.
+    fn ensure_dir_path(&mut self, entry: &str, dir: &Path) -> Result<(), SinkError> {
+        if dir == self.root || self.ensured_dirs.contains(dir) {
+            return Ok(());
+        }
+        let rel = dir
+            .strip_prefix(&self.root)
+            .map_err(|_| SinkError::PathEscape {
+                entry: entry.to_string(),
+                root: self.root.clone(),
+            })?;
+        let mut cur = self.root.clone();
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                // INVARIANT: resolve_entry_path only ever produces
+                // Normal components beneath the root.
+                return Err(SinkError::PathEscape {
+                    entry: entry.to_string(),
+                    root: self.root.clone(),
+                });
+            };
+            cur.push(name);
+            if self.ensured_dirs.contains(&cur) {
+                continue;
+            }
+            match fs::symlink_metadata(&cur) {
+                Ok(md) => {
+                    let ft = md.file_type();
+                    if ft.is_symlink() {
+                        return Err(SinkError::SymlinkTraversal {
+                            entry: entry.to_string(),
+                            component: self.component_label(&cur),
+                        });
+                    }
+                    if !ft.is_dir() {
+                        return Err(SinkError::Io {
+                            path: cur.clone(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                "path component exists and is not a directory",
+                            ),
+                        });
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&cur).map_err(|source| SinkError::Io {
+                        path: cur.clone(),
+                        source,
+                    })?;
+                }
+                Err(source) => {
+                    return Err(SinkError::Io {
+                        path: cur.clone(),
+                        source,
+                    });
+                }
+            }
+            self.ensured_dirs.insert(cur.clone());
+        }
+        Ok(())
+    }
+
+    /// Render a path beneath the root as a root-relative label for
+    /// diagnostics, falling back to the lossy full path if the strip
+    /// fails (it should not, given the caller contract).
+    fn component_label(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Remove the final path component if it currently exists as a
+    /// symbolic link, so the subsequent create/open writes a fresh
+    /// object rather than following the link. A regular file or
+    /// directory already at the path is left untouched (the file arm
+    /// truncates a real file in place via `O_TRUNC`).
+    fn unlink_if_symlink(&self, path: &Path) -> Result<(), SinkError> {
+        match fs::symlink_metadata(path) {
+            Ok(md) if md.file_type().is_symlink() => {
+                remove_path(path, md.file_type()).map_err(|source| SinkError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(SinkError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Remove whatever currently exists at `path` *unless* it is a
+    /// real directory, so a `symlink(2)` / `link(2)` create won't fail
+    /// with EEXIST (last-entry-wins, matching the regular-file arm's
+    /// `O_TRUNC`). A real directory is preserved — it may hold
+    /// already-extracted entries — and the create then fails with a
+    /// clean IO error, the correct "the archive disagrees with
+    /// itself" signal.
+    fn remove_existing_nondir(&self, path: &Path) -> Result<(), SinkError> {
+        match fs::symlink_metadata(path) {
+            Ok(md) if md.file_type().is_dir() => Ok(()),
+            Ok(md) => remove_path(path, md.file_type()).map_err(|source| SinkError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(SinkError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Resolve a hard-link target to an absolute path under the root.
+    ///
+    /// The target is archive-root-relative (GNU `tar` stores hard-link
+    /// targets that way). It must resolve lexically inside the root
+    /// (no `..`, not absolute — reusing [`Self::resolve_entry_path`]),
+    /// reach an existing **regular file**, and not cross any symbolic
+    /// link on the way: `link(2)` follows symlinks in non-final path
+    /// components, so a symlinked ancestor would let the new link
+    /// alias a file outside the root.
+    fn resolve_hardlink_target(&self, entry: &str, target: &str) -> Result<PathBuf, SinkError> {
+        let target_path = self
+            .resolve_entry_path(target)
+            .map_err(|_| SinkError::UnsafeLink {
+                entry: entry.to_string(),
+                target: target.to_string(),
+                reason: "target escapes the extraction root",
+            })?;
+        // Verify no ancestor (everything but the final component) is a
+        // symlink that `link(2)` would silently follow.
+        if let Some(parent) = target_path.parent() {
+            if let Ok(rel) = parent.strip_prefix(&self.root) {
+                let mut cur = self.root.clone();
+                for component in rel.components() {
+                    let Component::Normal(name) = component else {
+                        continue;
+                    };
+                    cur.push(name);
+                    if let Ok(md) = fs::symlink_metadata(&cur) {
+                        if md.file_type().is_symlink() {
+                            return Err(SinkError::UnsafeLink {
+                                entry: entry.to_string(),
+                                target: target.to_string(),
+                                reason: "target reached through a symbolic link",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        match fs::symlink_metadata(&target_path) {
+            Ok(md) if md.file_type().is_file() => Ok(target_path),
+            Ok(_) => Err(SinkError::UnsafeLink {
+                entry: entry.to_string(),
+                target: target.to_string(),
+                reason: "target is not a regular file",
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(SinkError::UnsafeLink {
+                entry: entry.to_string(),
+                target: target.to_string(),
+                reason: "target does not exist",
+            }),
+            Err(source) => Err(SinkError::Io {
+                path: target_path,
+                source,
+            }),
+        }
+    }
+}
+
+/// Create a symbolic link at `link` pointing to `target`, recreating
+/// the target verbatim.
+///
+/// On Unix this is a single [`std::os::unix::fs::symlink`] call. On
+/// Windows the OS needs to know at creation time whether the target is
+/// a directory, so the (possibly relative) target is probed against
+/// `link`'s parent; a target that does not resolve to a directory —
+/// including a dangling or external one — becomes a file symlink.
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+    let resolved = match link.parent() {
+        Some(parent) => parent.join(target),
+        None => target.to_path_buf(),
+    };
+    let is_dir = fs::metadata(&resolved).map(|m| m.is_dir()).unwrap_or(false);
+    if is_dir {
+        symlink_dir(target, link)
+    } else {
+        symlink_file(target, link)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symbolic links are not supported on this platform",
+    ))
+}
+
+/// Remove a file or symbolic link at `path`. `ft` is the
+/// [`fs::symlink_metadata`] file type the caller already observed; on
+/// Windows a *directory* symlink must be removed with
+/// [`fs::remove_dir`] rather than [`fs::remove_file`], so the type is
+/// consulted there. On Unix [`fs::remove_file`] unlinks any symlink
+/// (the link itself, never its target) and any regular file, so the
+/// type is unused. Never called for a real directory.
+#[cfg(windows)]
+fn remove_path(path: &Path, ft: std::fs::FileType) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+    if ft.is_dir() || ft.is_symlink_dir() {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_path(path: &Path, _ft: std::fs::FileType) -> std::io::Result<()> {
+    fs::remove_file(path)
 }
 
 /// Per-component portability check used by [`TarSink::resolve_entry_path`]
@@ -1035,6 +1433,7 @@ impl Sink for TarSink {
                 zero_blocks_seen: self.zero_blocks_seen,
                 pending_path: self.pending_path.clone(),
                 pending_size: self.pending_size,
+                pending_linkpath: self.pending_linkpath.clone(),
                 state: parser_state,
             }),
         }
@@ -1150,6 +1549,12 @@ fn validate_checksum(header: &[u8; BLOCK], offset: u64) -> Result<(), SinkError>
 struct ParsedHeader<'h> {
     name: &'h [u8],
     prefix: &'h [u8],
+    /// The `linkname` field (bytes 157..257), trimmed at the first
+    /// NUL. Holds the target of a symlink (`2`) / hard-link (`1`)
+    /// entry when it fits the 100-byte field; longer targets arrive
+    /// via PAX `linkpath=` or a GNU `K` extension instead. Empty for
+    /// every other entry type.
+    link_name: &'h [u8],
     size: u64,
     type_flag: u8,
     archive_offset: u64,
@@ -1168,14 +1573,26 @@ impl<'h> ParsedHeader<'h> {
             reason: "size field is not a valid octal or base-256 value".into(),
         })?;
         let type_flag = header[156];
+        let link_name = trim_nul(&header[157..257]);
         let prefix = trim_nul(&header[345..500]);
         Ok(Self {
             name,
             prefix,
+            link_name,
             size,
             type_flag,
             archive_offset,
         })
+    }
+
+    /// Decode the `linkname` field as UTF-8.
+    fn link_name_str(&self) -> Result<String, SinkError> {
+        std::str::from_utf8(self.link_name)
+            .map(str::to_string)
+            .map_err(|e| SinkError::MalformedHeader {
+                archive_offset: self.archive_offset,
+                reason: format!("linkname is not valid UTF-8: {e}"),
+            })
     }
 
     fn combined_name(&self) -> Result<String, SinkError> {
@@ -1421,6 +1838,21 @@ mod test_helpers {
         h[148..156].fill(b' ');
         let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
         // 6 octal digits + NUL + space, classic tar form.
+        let chk = format!("{sum:06o}\0 ");
+        h[148..148 + chk.len()].copy_from_slice(chk.as_bytes());
+        h
+    }
+
+    /// Build a symlink (`2`) / hard-link (`1`) header carrying
+    /// `target` in the `linkname` field (truncated to 100 bytes),
+    /// recomputing the checksum afterward.
+    pub fn build_link_header(name: &str, target: &str, type_flag: u8) -> [u8; BLOCK] {
+        let mut h = build_header(name, 0, type_flag);
+        let tb = target.as_bytes();
+        let n = tb.len().min(100);
+        h[157..157 + n].copy_from_slice(&tb[..n]);
+        h[148..156].fill(b' ');
+        let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
         let chk = format!("{sum:06o}\0 ");
         h[148..148 + chk.len()].copy_from_slice(chk.as_bytes());
         h
@@ -1715,6 +2147,21 @@ mod tests {
         validate_checksum(&h, 0).expect("checksum must validate");
         let parsed = ParsedHeader::from_bytes(&h, 0).expect("size must parse");
         assert_eq!(parsed.size, huge);
+    }
+
+    /// A symlink header's `linkname` field (bytes 157..257) is parsed
+    /// and surfaces through `link_name_str`; a non-link header reports
+    /// an empty target.
+    #[test]
+    fn parsed_header_reads_linkname() {
+        let link = build_link_header("a/b/c", "../target/path", b'2');
+        let parsed = ParsedHeader::from_bytes(&link, 0).expect("parse");
+        assert_eq!(parsed.type_flag, b'2');
+        assert_eq!(parsed.link_name_str().expect("utf8"), "../target/path");
+
+        let plain = build_header("file.txt", 3, b'0');
+        let parsed = ParsedHeader::from_bytes(&plain, 0).expect("parse");
+        assert_eq!(parsed.link_name_str().expect("utf8"), "");
     }
 
     #[test]

@@ -83,6 +83,45 @@ pub fn build_header_with_magic(
     h
 }
 
+/// Build a symlink (`2`) or hard-link (`1`) header whose `linkname`
+/// field carries `target` (truncated to the 100-byte field). Link
+/// entries declare size 0. The checksum is recomputed after the
+/// linkname bytes are written so the header validates.
+pub fn build_link_header(name: &str, target: &str, type_flag: u8) -> [u8; BLOCK] {
+    let mut h = build_header(name, 0, type_flag);
+    let tb = target.as_bytes();
+    let n = tb.len().min(100);
+    h[157..157 + n].copy_from_slice(&tb[..n]);
+    // The linkname bytes participate in the checksum; redo the
+    // spaces-then-sum dance `build_header` performs.
+    h[148..156].fill(b' ');
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    let chk = format!("{sum:06o}\0 ");
+    h[148..148 + chk.len()].copy_from_slice(chk.as_bytes());
+    h
+}
+
+/// Build a GNU `K` (long-link) extension preamble followed by a link
+/// header: emits a `K` header whose body holds the NUL-terminated
+/// long link target, then `link_header` (whose own `linkname` field
+/// holds a truncated stub the sink ignores in favor of the `K`
+/// payload). Mirrors [`build_gnu_long_name_entry`] for link targets.
+pub fn build_gnu_long_link_entry(long_target: &str, link_header: &[u8; BLOCK]) -> Vec<u8> {
+    let mut payload = long_target.as_bytes().to_vec();
+    payload.push(0);
+    let k_header = build_header_with_magic(
+        "././@LongLink",
+        payload.len() as u64,
+        b'K',
+        HeaderMagic::OldGnu,
+    );
+    let mut out = Vec::new();
+    out.extend_from_slice(&k_header);
+    out.extend_from_slice(&pad_block(&payload));
+    out.extend_from_slice(link_header);
+    out
+}
+
 /// Build a PAX 'x' extended header body (the bytes that go inside
 /// the PAX entry's data block). Each record encodes as
 /// `<len> <key>=<value>\n` where `<len>` is the total length of the

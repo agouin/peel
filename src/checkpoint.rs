@@ -313,7 +313,19 @@ pub const MAGIC: [u8; 8] = *b"peelckpt";
 /// with `Duration::ZERO`) keep their v8..=v14 layouts. Older
 /// binaries refuse v15 files with
 /// [`CheckpointError::UnsupportedVersion`].
-pub const FORMAT_VERSION: u32 = 15;
+///
+/// **v16** — extends [`TarSinkState`] with an optional
+/// `pending_linkpath` field carrying a buffered symlink / hard-link
+/// target override (PAX `linkpath=` or a GNU `K` long-link) that was
+/// captured between the extension header and the link entry it
+/// applies to. v16 readers parse v1..=v15 files transparently with
+/// the field defaulting to `None`. The writer only bumps the on-disk
+/// version to 16 when an in-flight tar state actually carries a
+/// `pending_linkpath`, so the overwhelmingly common quiescent /
+/// mid-file checkpoints keep their v6..=v15 layouts byte-identically.
+/// Older binaries refuse v16 files with
+/// [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 16;
 
 /// Pre-§F1 max format version, written when no SinkState payload
 /// uses v11-only fields. Keeping the on-disk version dynamic
@@ -360,6 +372,15 @@ const FORMAT_VERSION_MULTIVOLUME: u32 = 14;
 /// 15 && cursor.remaining() > 0`". Zero-valued checkpoints keep
 /// writing the v8..=v14 layout byte-identically.
 const FORMAT_VERSION_CUMULATIVE_ELAPSED: u32 = 15;
+
+/// Format version the writer upgrades to when a
+/// [`SinkState::Tar`]'s in-flight state carries a
+/// [`TarSinkState::pending_linkpath`]. The optional `linkpath`
+/// override string is written inside the tar-sink-state body
+/// (right after `pending_size`) and read back under a
+/// `format_version >= 16` guard; checkpoints without a buffered
+/// link target keep writing the v6..=v15 tar layout byte-identically.
+const FORMAT_VERSION_TAR_LINKPATH: u32 = 16;
 
 /// Fixed-size header length, in bytes.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
@@ -737,6 +758,12 @@ pub struct TarSinkState {
     /// PAX `size=` override applying to the next non-PAX entry, if
     /// any.
     pub pending_size: Option<u64>,
+    /// Link-target override (PAX `linkpath=` or a GNU `K` long-link)
+    /// applying to the next symlink / hard-link entry, if any was
+    /// buffered when the checkpoint fired. Serialized only from
+    /// [`FORMAT_VERSION_TAR_LINKPATH`] (v16) onward; older readers
+    /// reconstruct it as `None`.
+    pub pending_linkpath: Option<String>,
     /// The parser's driving state.
     pub state: TarMemberState,
 }
@@ -1306,7 +1333,7 @@ impl Checkpoint {
                 match in_flight {
                     Some(s) => {
                         body.push(1);
-                        write_tar_sink_state(&mut body, s);
+                        write_tar_sink_state(&mut body, s, on_disk_version);
                     }
                     None => body.push(0),
                 }
@@ -1587,10 +1614,23 @@ impl Checkpoint {
         } else {
             0
         };
+        // v16: a buffered tar symlink / hard-link target override
+        // forces v16 so the reader's `format_version >= 16` dispatch
+        // picks up the extra `pending_linkpath` field. A `None`
+        // override (every quiescent / mid-file / mid-PAX checkpoint
+        // that does not sit between a `K`/`linkpath` header and its
+        // link entry) keeps the v6..=v15 tar layout.
+        let linkpath_version = match &self.sink_state {
+            SinkState::Tar {
+                in_flight: Some(s), ..
+            } if s.pending_linkpath.is_some() => FORMAT_VERSION_TAR_LINKPATH,
+            _ => 0,
+        };
         mode_version
             .max(sink_version)
             .max(parts_version)
             .max(elapsed_version)
+            .max(linkpath_version)
     }
 
     /// Parse a checkpoint from its on-disk binary representation.
@@ -1815,7 +1855,7 @@ impl Checkpoint {
                     let presence = cursor.read_u8("sink.tar.in_flight.is_some")?;
                     match presence {
                         0 => None,
-                        1 => Some(read_tar_sink_state(&mut cursor)?),
+                        1 => Some(read_tar_sink_state(&mut cursor, format_version)?),
                         other => {
                             return Err(CheckpointError::InvalidPresence {
                                 field: "sink.tar.in_flight",
@@ -2459,7 +2499,7 @@ fn write_optional_string(buf: &mut Vec<u8>, s: Option<&str>) {
     }
 }
 
-fn write_tar_sink_state(buf: &mut Vec<u8>, s: &TarSinkState) {
+fn write_tar_sink_state(buf: &mut Vec<u8>, s: &TarSinkState, format_version: u32) {
     write_u64(buf, s.archive_offset);
     buf.push(s.zero_blocks_seen);
     write_optional_string(buf, s.pending_path.as_deref());
@@ -2469,6 +2509,13 @@ fn write_tar_sink_state(buf: &mut Vec<u8>, s: &TarSinkState) {
             write_u64(buf, v);
         }
         None => buf.push(0),
+    }
+    // v16: the `pending_linkpath` override is written only when the
+    // on-disk version was bumped to v16 (which `required_format_version`
+    // does exactly when this field is `Some`). Below v16 the field is
+    // absent from the wire and the reader reconstructs it as `None`.
+    if format_version >= FORMAT_VERSION_TAR_LINKPATH {
+        write_optional_string(buf, s.pending_linkpath.as_deref());
     }
     write_tar_member_state(buf, &s.state);
 }
@@ -2687,7 +2734,10 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn read_tar_sink_state(cursor: &mut Cursor<'_>) -> Result<TarSinkState, CheckpointError> {
+fn read_tar_sink_state(
+    cursor: &mut Cursor<'_>,
+    format_version: u32,
+) -> Result<TarSinkState, CheckpointError> {
     let archive_offset = cursor.read_u64("sink.tar.in_flight.archive_offset")?;
     let zero_blocks_seen = cursor.read_u8("sink.tar.in_flight.zero_blocks_seen")?;
     let pending_path = cursor.read_optional_string("sink.tar.in_flight.pending_path")?;
@@ -2701,12 +2751,24 @@ fn read_tar_sink_state(cursor: &mut Cursor<'_>) -> Result<TarSinkState, Checkpoi
             });
         }
     };
+    // v16: the `pending_linkpath` override sits here, between
+    // `pending_size` and the parser state. Files written below v16
+    // never carried it, so the field defaults to `None`. (A v16 body
+    // is only produced when the field is `Some`, so a v6..=v15 reader
+    // — which would misread the bytes — never encounters one: it
+    // refuses the v16 version outright.)
+    let pending_linkpath = if format_version >= FORMAT_VERSION_TAR_LINKPATH {
+        cursor.read_optional_string("sink.tar.in_flight.pending_linkpath")?
+    } else {
+        None
+    };
     let state = read_tar_member_state(cursor)?;
     Ok(TarSinkState {
         archive_offset,
         zero_blocks_seen,
         pending_path,
         pending_size,
+        pending_linkpath,
         state,
     })
 }
@@ -3153,12 +3215,13 @@ mod tests {
         // `internal/old/PLAN_local_file_extract.md` §5's
         // [`RunMode::LocalDestructive`] + `source_mtime` trailer
         // (v13), `internal/PLAN_multivolume_archives.md` §5's
-        // per-`PartRecord` [`VolumeRole`] tag (v14), and the v15
-        // `cumulative_elapsed` trailer each bumped this when an
-        // optional trailer landed. If a future change resets it,
+        // per-`PartRecord` [`VolumeRole`] tag (v14), the v15
+        // `cumulative_elapsed` trailer, and the v16 tar
+        // `pending_linkpath` override each bumped this when an
+        // optional field landed. If a future change resets it,
         // this guards against silently dropping the
         // upgrade-required signal older readers depend on.
-        assert_eq!(FORMAT_VERSION, 15);
+        assert_eq!(FORMAT_VERSION, 16);
     }
 
     // ---- §5: RunMode round-trip + forward-compat -----------------------
@@ -3889,6 +3952,7 @@ mod tests {
                     zero_blocks_seen: 0,
                     pending_path: Some("pax-overrides-this-name".into()),
                     pending_size: Some(987_654_321),
+                    pending_linkpath: None,
                     state: TarMemberState::File {
                         remaining: 100_000,
                         padding: 384,
@@ -3913,6 +3977,7 @@ mod tests {
                     zero_blocks_seen: 0,
                     pending_path: None,
                     pending_size: None,
+                    pending_linkpath: None,
                     state: TarMemberState::PaxData {
                         remaining: 256,
                         padding: 256,
@@ -3926,6 +3991,68 @@ mod tests {
         assert_eq!(parsed, ckpt);
     }
 
+    /// v16: a buffered symlink / hard-link target override
+    /// (`pending_linkpath`) — captured between a `K` / PAX `linkpath`
+    /// header and the link entry it applies to — bumps the on-disk
+    /// version to 16 and round-trips through serialize/deserialize.
+    #[test]
+    fn round_trip_tar_in_flight_pending_linkpath() {
+        let mut ckpt = sample_tar();
+        match &mut ckpt.sink_state {
+            SinkState::Tar { in_flight, .. } => {
+                *in_flight = Some(TarSinkState {
+                    archive_offset: 1024,
+                    zero_blocks_seen: 0,
+                    pending_path: None,
+                    pending_size: None,
+                    pending_linkpath: Some("nested/long/symlink/target.bin".into()),
+                    state: TarMemberState::Header {
+                        filled: 0,
+                        buf: Vec::new(),
+                    },
+                });
+            }
+            _ => panic!("sample_tar should produce Tar"),
+        }
+        let bytes = ckpt.serialize();
+        // The presence of pending_linkpath forces the v16 on-disk
+        // version (read straight from the header at bytes 8..12).
+        assert_eq!(read_u32(&bytes[8..12]), FORMAT_VERSION_TAR_LINKPATH);
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    /// A tar checkpoint *without* a buffered link target keeps the
+    /// pre-v16 on-disk layout — the field must not silently bump the
+    /// version (older readers depend on that).
+    #[test]
+    fn tar_without_pending_linkpath_stays_pre_v16() {
+        let mut ckpt = sample_tar();
+        match &mut ckpt.sink_state {
+            SinkState::Tar { in_flight, .. } => {
+                *in_flight = Some(TarSinkState {
+                    archive_offset: 1024,
+                    zero_blocks_seen: 0,
+                    pending_path: None,
+                    pending_size: None,
+                    pending_linkpath: None,
+                    state: TarMemberState::Header {
+                        filled: 0,
+                        buf: Vec::new(),
+                    },
+                });
+            }
+            _ => panic!("sample_tar should produce Tar"),
+        }
+        let bytes = ckpt.serialize();
+        assert!(
+            read_u32(&bytes[8..12]) < FORMAT_VERSION_TAR_LINKPATH,
+            "a None pending_linkpath must not bump the on-disk version",
+        );
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
     #[test]
     fn deserialize_rejects_tar_header_filled_over_512() {
         let mut ckpt = sample_tar();
@@ -3936,6 +4063,7 @@ mod tests {
                     zero_blocks_seen: 0,
                     pending_path: None,
                     pending_size: None,
+                    pending_linkpath: None,
                     state: TarMemberState::Header {
                         filled: 0,
                         buf: Vec::new(),
@@ -4721,6 +4849,15 @@ mod tests {
                         } else {
                             None
                         };
+                        // v16 field: exercise both the `Some` path
+                        // (which forces the on-disk version to 16) and
+                        // the `None` path (v6..=v15 layout) so the
+                        // round-trip covers the version-gated read.
+                        let pending_linkpath = if rng.next_bool() {
+                            Some(random_string(&mut rng, 32))
+                        } else {
+                            None
+                        };
                         let header_buf = random_bytes(&mut rng, 512);
                         // `filled == buf.len()` is the deserialize
                         // invariant; bind them together here.
@@ -4729,6 +4866,7 @@ mod tests {
                             zero_blocks_seen,
                             pending_path,
                             pending_size,
+                            pending_linkpath,
                             state: TarMemberState::Header {
                                 filled: header_buf.len() as u32,
                                 buf: header_buf,

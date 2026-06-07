@@ -351,9 +351,12 @@ fn cumulative_elapsed_round_trip_via_disk() {
     assert_eq!(parsed, original);
     assert_eq!(parsed.cumulative_elapsed, Duration::new(3_725, 250_000_000),);
 
-    // Sanity: the on-disk header advertises v15 when the trailer
-    // is populated.
+    // Sanity: the on-disk header advertises exactly v15 when the
+    // cumulative-elapsed trailer is populated — the writer bumps the
+    // version only as far as the payload requires, so a checkpoint
+    // with no v16 tar `pending_linkpath` stays at v15 rather than
+    // riding `FORMAT_VERSION` upward as later format revisions land.
     let raw = fs::read(&path).expect("re-read raw bytes");
     let format_version = u32::from_le_bytes(raw[8..12].try_into().unwrap());
-    assert_eq!(format_version, FORMAT_VERSION);
+    assert_eq!(format_version, 15);
 }

@@ -19,8 +19,9 @@ use peel::sink::{RawSink, Sink, SinkError, TarSink};
 mod support;
 
 use support::tar_fixtures::{
-    build_gnu_long_name_entry, build_header, build_header_with_magic, build_pax_body,
-    build_simple_archive, end_of_archive, pad_block, HeaderMagic, BLOCK,
+    build_gnu_long_link_entry, build_gnu_long_name_entry, build_header, build_header_with_magic,
+    build_link_header, build_pax_body, build_simple_archive, end_of_archive, pad_block,
+    HeaderMagic, BLOCK,
 };
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -288,24 +289,286 @@ fn tar_sink_rejects_absolute_path() {
     }
 }
 
-/// Symbolic links are deferred (`OPTIMIZATIONS.md`); the sink rejects
-/// them with `UnsupportedEntry`.
+/// A symbolic link entry is recreated on disk pointing at its
+/// (relative, in-root) target.
 #[test]
-fn tar_sink_rejects_symlink_entry() {
-    let dir = fresh_dir("tar_symlink");
+fn tar_sink_extracts_symlink() {
+    let dir = fresh_dir("tar_symlink_ok");
     let _g = CleanupOnDrop(dir.clone());
 
     let mut archive = Vec::new();
-    archive.extend_from_slice(&build_header("link.txt", 0, b'2'));
+    // A real file the link points at, then the link itself.
+    archive.extend_from_slice(&build_header("real.txt", 5, b'0'));
+    archive.extend_from_slice(b"hello");
+    archive.extend(std::iter::repeat_n(0u8, BLOCK - 5));
+    archive.extend_from_slice(&build_link_header("link.txt", "real.txt", b'2'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    feed_byte_by_byte(&mut sink, &archive).expect("write");
+    sink.close().expect("close");
+
+    let link = dir.join("link.txt");
+    let meta = fs::symlink_metadata(&link).expect("lstat link");
+    assert!(meta.file_type().is_symlink(), "link.txt must be a symlink");
+    assert_eq!(
+        fs::read_link(&link).expect("readlink"),
+        PathBuf::from("real.txt"),
+    );
+    // Following the link reads the real file's contents.
+    let mut s = String::new();
+    fs::File::open(&link)
+        .expect("open via link")
+        .read_to_string(&mut s)
+        .expect("read via link");
+    assert_eq!(s, "hello");
+}
+
+/// A symlink target that points *outside* the root (absolute, or
+/// upward) is recreated verbatim — peel is faithful to the archive
+/// and relies on never *following* the link when placing later
+/// entries (see `tar_sink_refuses_write_through_symlink`).
+#[test]
+fn tar_sink_extracts_external_symlink_verbatim() {
+    let dir = fresh_dir("tar_symlink_external");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_link_header("escape", "/etc/passwd", b'2'));
+    archive.extend_from_slice(&build_link_header("up", "../../sibling", b'2'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive).expect("write");
+    sink.close().expect("close");
+
+    assert_eq!(
+        fs::read_link(dir.join("escape")).expect("readlink"),
+        PathBuf::from("/etc/passwd"),
+    );
+    assert_eq!(
+        fs::read_link(dir.join("up")).expect("readlink"),
+        PathBuf::from("../../sibling"),
+    );
+}
+
+/// A symlink target longer than the 100-byte `linkname` field arrives
+/// via a GNU `K` long-link extension and is applied to the next entry.
+#[test]
+fn tar_sink_symlink_target_via_gnu_long_link() {
+    let dir = fresh_dir("tar_symlink_longlink");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let long_target = format!("nested/{}/leaf.bin", "seg".repeat(60)); // > 100 bytes
+    let link_header = build_link_header("the-link", "stub-ignored", b'2');
+
+    let mut archive = build_gnu_long_link_entry(&long_target, &link_header);
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    feed_byte_by_byte(&mut sink, &archive).expect("write");
+    sink.close().expect("close");
+
+    assert_eq!(
+        fs::read_link(dir.join("the-link")).expect("readlink"),
+        PathBuf::from(&long_target),
+    );
+}
+
+/// A symlink target supplied by a PAX `linkpath=` record overrides the
+/// header `linkname` field.
+#[test]
+fn tar_sink_symlink_target_via_pax_linkpath() {
+    let dir = fresh_dir("tar_symlink_pax");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let pax_body = build_pax_body(&[("linkpath", "pax/target/path.bin")]);
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_header("pax_hdr", pax_body.len() as u64, b'x'));
+    archive.extend_from_slice(&pad_block(&pax_body));
+    // Header linkname says something else; PAX must win.
+    archive.extend_from_slice(&build_link_header("paxlink", "header-says-this", b'2'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    feed_byte_by_byte(&mut sink, &archive).expect("write");
+    sink.close().expect("close");
+
+    assert_eq!(
+        fs::read_link(dir.join("paxlink")).expect("readlink"),
+        PathBuf::from("pax/target/path.bin"),
+    );
+}
+
+/// The classic traversal attack: an archive creates a symlink to the
+/// parent of the root, then writes a file *through* it. peel must
+/// refuse the second entry with `SymlinkTraversal` rather than
+/// following the link out of the root.
+#[test]
+fn tar_sink_refuses_write_through_symlink() {
+    let dir = fresh_dir("tar_symlink_traverse");
+    let _g = CleanupOnDrop(dir.clone());
+    // A sibling directory that the attack would try to write into.
+    let outside = fresh_dir("tar_symlink_traverse_OUT");
+    let _g2 = CleanupOnDrop(outside.clone());
+
+    let mut archive = Vec::new();
+    // `evil` -> the sibling escape directory (absolute, external).
+    archive.extend_from_slice(&build_link_header("evil", outside.to_str().unwrap(), b'2'));
+    // Then try to drop a file "through" it.
+    archive.extend_from_slice(&build_header("evil/pwned.txt", 4, b'0'));
+    archive.extend_from_slice(b"boom");
+    archive.extend(std::iter::repeat_n(0u8, BLOCK - 4));
     archive.extend_from_slice(&end_of_archive());
 
     let mut sink = TarSink::new(&dir).expect("new");
     match sink.write(&archive) {
-        Err(SinkError::UnsupportedEntry { type_flag, entry }) => {
-            assert_eq!(type_flag, b'2');
-            assert_eq!(entry, "link.txt");
+        Err(SinkError::SymlinkTraversal { entry, component }) => {
+            assert_eq!(entry, "evil/pwned.txt");
+            assert_eq!(component, "evil");
         }
-        other => panic!("expected UnsupportedEntry, got {other:?}"),
+        other => panic!("expected SymlinkTraversal, got {other:?}"),
+    }
+    // The escape file must NOT have been created outside the root.
+    assert!(
+        !outside.join("pwned.txt").exists(),
+        "write escaped the root through the symlink",
+    );
+}
+
+/// A regular-file entry whose name collides with an earlier symlink
+/// replaces the symlink with a real file instead of following it and
+/// truncating the link's target.
+#[test]
+fn tar_sink_regular_file_replaces_symlink_at_final_component() {
+    let dir = fresh_dir("tar_symlink_replace");
+    let _g = CleanupOnDrop(dir.clone());
+    let outside = fresh_dir("tar_symlink_replace_OUT");
+    let _g2 = CleanupOnDrop(outside.clone());
+    let victim = outside.join("victim.txt");
+    fs::write(&victim, b"do not touch").expect("seed victim");
+
+    let mut archive = Vec::new();
+    // `x` -> outside/victim.txt, then a regular file also named `x`.
+    archive.extend_from_slice(&build_link_header("x", victim.to_str().unwrap(), b'2'));
+    archive.extend_from_slice(&build_header("x", 3, b'0'));
+    archive.extend_from_slice(b"new");
+    archive.extend(std::iter::repeat_n(0u8, BLOCK - 3));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    sink.write(&archive).expect("write");
+    sink.close().expect("close");
+
+    // The victim outside the root is untouched; `x` is now a real file.
+    assert_eq!(fs::read(&victim).expect("victim"), b"do not touch");
+    let x = dir.join("x");
+    assert!(!fs::symlink_metadata(&x).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(&x).expect("x"), b"new");
+}
+
+/// A hard-link entry creates a second name for an already-extracted
+/// regular file inside the root.
+#[test]
+fn tar_sink_extracts_hardlink() {
+    let dir = fresh_dir("tar_hardlink_ok");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_header("orig.txt", 6, b'0'));
+    archive.extend_from_slice(b"shared");
+    archive.extend(std::iter::repeat_n(0u8, BLOCK - 6));
+    archive.extend_from_slice(&build_link_header("hard.txt", "orig.txt", b'1'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    feed_byte_by_byte(&mut sink, &archive).expect("write");
+    sink.close().expect("close");
+
+    let orig = dir.join("orig.txt");
+    let hard = dir.join("hard.txt");
+    assert_eq!(fs::read(&hard).expect("read hard"), b"shared");
+    // Same inode: hard link, not a copy.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&orig).unwrap().ino(),
+            fs::metadata(&hard).unwrap().ino(),
+        );
+    }
+}
+
+/// A hard link whose target does not exist (was never extracted) is
+/// rejected with `UnsafeLink`.
+#[test]
+fn tar_sink_hardlink_missing_target_rejected() {
+    let dir = fresh_dir("tar_hardlink_missing");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_link_header("hard.txt", "nope.txt", b'1'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    match sink.write(&archive) {
+        Err(SinkError::UnsafeLink {
+            entry,
+            target,
+            reason,
+        }) => {
+            assert_eq!(entry, "hard.txt");
+            assert_eq!(target, "nope.txt");
+            assert_eq!(reason, "target does not exist");
+        }
+        other => panic!("expected UnsafeLink, got {other:?}"),
+    }
+}
+
+/// A hard link whose target is reached *through* a symlink is
+/// rejected: `link(2)` resolves symlinks in non-final path
+/// components, so following one could alias a file outside the root.
+#[test]
+fn tar_sink_hardlink_through_symlink_rejected() {
+    let dir = fresh_dir("tar_hardlink_thru_symlink");
+    let _g = CleanupOnDrop(dir.clone());
+    let outside = fresh_dir("tar_hardlink_thru_symlink_OUT");
+    let _g2 = CleanupOnDrop(outside.clone());
+    fs::write(outside.join("secret.txt"), b"secret").expect("seed");
+
+    let mut archive = Vec::new();
+    // `s` -> the external directory, then try to hard-link through it.
+    archive.extend_from_slice(&build_link_header("s", outside.to_str().unwrap(), b'2'));
+    archive.extend_from_slice(&build_link_header("hard.txt", "s/secret.txt", b'1'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    match sink.write(&archive) {
+        Err(SinkError::UnsafeLink { reason, .. }) => {
+            assert_eq!(reason, "target reached through a symbolic link");
+        }
+        other => panic!("expected UnsafeLink, got {other:?}"),
+    }
+    assert!(!dir.join("hard.txt").exists());
+}
+
+/// A hard link whose target escapes the root (absolute / `..`) is
+/// rejected with `UnsafeLink` rather than aliasing an outside file.
+#[test]
+fn tar_sink_hardlink_escaping_target_rejected() {
+    let dir = fresh_dir("tar_hardlink_escape");
+    let _g = CleanupOnDrop(dir.clone());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&build_link_header("hard.txt", "/etc/passwd", b'1'));
+    archive.extend_from_slice(&end_of_archive());
+
+    let mut sink = TarSink::new(&dir).expect("new");
+    match sink.write(&archive) {
+        Err(SinkError::UnsafeLink { reason, .. }) => {
+            assert_eq!(reason, "target escapes the extraction root");
+        }
+        other => panic!("expected UnsafeLink, got {other:?}"),
     }
 }
 
