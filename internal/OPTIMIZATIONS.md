@@ -873,12 +873,23 @@ match `tar`'s `--no-same-owner` default.
 
 ### O.25 Symbolic and hard link handling
 
+> **Status: shipped (2026-06-07).** `src/sink/tar.rs` now extracts
+> typeflag `2` (symlink) and `1` (hard link), including targets that
+> arrive via PAX `linkpath=` or a GNU `K` long-link extension
+> (checkpointed as the v16 `TarSinkState::pending_linkpath` field).
+> The path-safety surface was handled as described below: symlinks
+> are recreated verbatim, but the sink never follows one when placing
+> a later entry (`SinkError::SymlinkTraversal`), and hard-link targets
+> must resolve to an already-extracted regular file inside the root,
+> reached without crossing a symlink (`SinkError::UnsafeLink`).
+
 **What**: correctly recreate symlinks and hardlinks from tar.
 
-**Why deferred**: the MVP's tar parser will handle regular files only.
-Adding link handling is straightforward but expands the path-safety
-surface area significantly (symlink-target traversal is a classic
-attack vector).
+**Why it was deferred**: the MVP's tar parser handled regular files
+and directories only. Adding link handling is straightforward but
+expands the path-safety surface area significantly (symlink-target
+traversal is a classic attack vector) — which is why it waited for a
+deliberate design pass rather than landing with the MVP.
 
 ---
 

@@ -53,6 +53,17 @@ at offset 257) and emits each entry to its final path as the member
 header arrives. Hard links, symlinks, and long-name extensions are
 all supported.
 
+Symbolic links are recreated **verbatim** — including targets that
+point outside the extraction directory (e.g. `/usr/lib` or
+`../sibling`) — exactly as a faithful archiver would. The safety
+boundary `peel` enforces is that it never *writes through* a symlink:
+if a later entry's path would traverse a symlink (the classic
+`evil → /` then `evil/passwd` escape), `peel` refuses that entry
+rather than following the link out of the extraction directory. Hard
+links are stricter — their target must resolve to an already-extracted
+regular file inside the extraction directory, reached without crossing
+a symlink — so a hard link can never alias a file outside the tree.
+
 ### `.zst` / `.tar.zst`
 
 Streaming Zstandard. The decoder is hand-rolled in

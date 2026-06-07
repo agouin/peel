@@ -161,12 +161,12 @@ pub enum SinkError {
     },
 
     /// The tar entry uses a typeflag that the sink does not extract
-    /// under the MVP scope (symlinks, hard links, device nodes,
-    /// fifos).
+    /// (device nodes, fifos, PAX global headers). Regular files,
+    /// directories, symbolic links (`2`) and hard links (`1`) are
+    /// extracted; everything else lands here.
     ///
-    /// `internal/PLAN.md` §7 explicitly defers these; this variant lets
-    /// callers detect the condition without scanning a free-form
-    /// message.
+    /// This variant lets callers detect the condition without
+    /// scanning a free-form message.
     #[error("unsupported tar entry type {type_flag:?} for {entry:?}")]
     UnsupportedEntry {
         /// The raw `typeflag` byte from the header.
@@ -174,6 +174,53 @@ pub enum SinkError {
         /// The entry name (post PAX override) as a debug-printable
         /// string.
         entry: String,
+    },
+
+    /// An entry's resolved on-disk path would be written *through* a
+    /// symbolic link the sink will not follow.
+    ///
+    /// peel recreates symbolic links verbatim (faithful to the
+    /// archive) but never traverses one when placing a later entry:
+    /// once a path component on the way to an entry is a symlink, the
+    /// write is refused. This is the defense against the classic
+    /// symlink-traversal escape — an archive that creates a symlink
+    /// (`evil -> /`) and then writes `evil/passwd` to land outside
+    /// the extraction root. The lexical [`Self::PathEscape`] check
+    /// cannot catch this because the entry name itself
+    /// (`evil/passwd`) is root-relative and `..`-free; only the
+    /// on-disk state reveals the escape.
+    #[error(
+        "refusing to extract {entry:?}: path component {component:?} \
+         is a symbolic link"
+    )]
+    SymlinkTraversal {
+        /// The original entry name from the archive.
+        entry: String,
+        /// The path component (relative to the extraction root) that
+        /// resolved to a symbolic link.
+        component: String,
+    },
+
+    /// A hard-link entry named a target the sink refuses to link to.
+    ///
+    /// Hard links must point at an already-extracted regular file
+    /// inside the extraction root. This variant fires when the target
+    /// path is absolute or escapes the root, when reaching it would
+    /// traverse a symbolic link, when it does not exist, or when it
+    /// is not a regular file. Symbolic-link targets are *not* checked
+    /// here — peel recreates them verbatim (see
+    /// [`Self::SymlinkTraversal`] for the write-through defense).
+    #[error("refusing to hard-link {entry:?} to {target:?}: {reason}")]
+    UnsafeLink {
+        /// The hard-link entry name from the archive.
+        entry: String,
+        /// The link target the entry named.
+        target: String,
+        /// Short label of the rule that fired (e.g.
+        /// `"target does not exist"`,
+        /// `"target is not a regular file"`,
+        /// `"target reached through a symbolic link"`).
+        reason: &'static str,
     },
 
     /// A PAX 'x' extended header could not be parsed (length prefix
