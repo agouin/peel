@@ -119,7 +119,11 @@ default = ["zstd", "xz", "lz4", "gzip", "bzip2", "zip", "sevenz", "rar"]
 # Compression / stream codecs.
 zstd = ["dep:zstd"]
 xz = []
-lz4 = ["dep:lz4_flex"]
+# LZ4 block decompression is hand-rolled in `src/decode/lz4_native.rs`
+# (`internal/PLAN_lz4_block_decoder.md`), so this gate pulls no runtime
+# crate — it only switches the format module on. `lz4_flex` survives as
+# a dev-dependency: the differential reference for the native decoder.
+lz4 = []
 gzip = []
 bzip2 = []
 # Container formats. Each container's entry decoders rely on
@@ -166,13 +170,6 @@ webpki-roots = "0.26"
 # decoders, dictionary builder, etc.) are not needed and would expand
 # the audit surface for no gain.
 zstd = { version = "0.13", default-features = false, optional = true }
-# lz4 frame-format decompression backend (PLAN_v2.md §4 / internal/ENGINEERING_STANDARDS.md §2.2).
-# Pure Rust. We consume only the block-layer API (`block::decompress_into`)
-# and parse the LZ4 Frame Format ourselves to keep the wire-level surface
-# stable; the default `frame` feature pulls a `twox-hash` dep we don't
-# need at runtime, so it stays disabled. `safe-decode` keeps malformed
-# input from triggering panics inside the block decompressor.
-lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"], optional = true }
 # CLI argument parsing for the `peel` binary boundary; pre-approved per
 # internal/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
 clap = { version = "4", features = ["derive"] }
@@ -220,7 +217,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 # rejects the ring construction, so the dep being present does not by
 # itself force uring at runtime.
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.7", default-features = false }
+io-uring = { version = "0.6", default-features = false }
 
 # Win32 API bindings (PLAN_v3_windows.md §0.1 /
 # internal/ENGINEERING_STANDARDS.md §2.2). Microsoft-maintained, no
@@ -284,6 +281,17 @@ xz2 = "0.1"
 # implementation in the loop. `rust_backend` selects the pure-Rust
 # variant — no C dependency, no zlib link.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Dev-only: pure-Rust LZ4 codec kept as the differential reference for
+# the hand-rolled block decoder in `src/decode/lz4_native.rs`. Phase 3
+# of `internal/PLAN_lz4_block_decoder.md` swapped the production LZ4
+# block-decode path off this crate (dropping it from the runtime tree
+# so Fedora's rust2rpm spec resolves without a `rust-lz4_flex`
+# package); it stays here so `tests/test_lz4_native_diff.rs` and the
+# `lz4_native` unit tests keep a real reference encoder/decoder in the
+# loop. Same precedent as `flate2` for DEFLATE and `xz2` for xz.
+# `safe-decode` selects the bounds-checked reference decoder; `std`
+# enables the block compress/decompress helpers the corpus uses.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
 # Dev-only: enable hyper's `server` feature for an in-process H2
 # (h2c, plaintext prior-knowledge) test server in
 # `tests/support/h2c_server.rs`. The `[dependencies]` block already

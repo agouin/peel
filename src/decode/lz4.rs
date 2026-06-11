@@ -1,13 +1,13 @@
 //! lz4 streaming decoder for the [LZ4 Frame Format].
 //!
-//! Per `internal/PLAN_v2.md` §4 we drive the wire format ourselves and feed
-//! individual blocks through [`lz4_flex::block::decompress_into`] (the
-//! upstream block-layer API). The frame layer in `lz4_flex` is gated
-//! behind a `frame` feature that pulls a separate hash dependency and
-//! has historically been less stable than the block layer; parsing the
+//! Per `internal/PLAN_v2.md` §4 we drive the wire format ourselves and
+//! feed individual blocks through the hand-rolled
+//! [`crate::decode::lz4_native::decompress_block`]
+//! (`internal/PLAN_lz4_block_decoder.md`). Parsing the
 //! 11-or-so-byte header ourselves keeps the runtime tree small and
 //! exposes the exact frame and block boundaries we need for
-//! checkpointing.
+//! checkpointing; decoding the blocks ourselves drops the last
+//! external compression-codec dependency from the runtime tree.
 //!
 //! # Frame boundaries
 //!
@@ -646,17 +646,14 @@ impl StreamingDecoder for Lz4Decoder {
                     // Decompressed output cannot exceed the declared
                     // block-max-size for the frame; the buffer was
                     // sized to that bound when the header was parsed.
-                    let n = lz4_flex::block::decompress_into(
+                    let n = crate::decode::lz4_native::decompress_block(
                         &self.input_buf[..block_size],
                         &mut self.output_buf[..],
                     )
                     .map_err(|e| {
                         let consumed = self.bytes_consumed;
                         self.state = State::Done;
-                        DecodeError::Read {
-                            consumed,
-                            source: io::Error::other(format!("lz4: block decompress: {e}")),
-                        }
+                        e.into_decode_error(consumed)
                     })?;
                     sink.write_all(&self.output_buf[..n])
                         .map_err(DecodeError::Write)?;
@@ -915,7 +912,7 @@ pub fn resume_factory(
 ///
 /// Public surface is the streaming [`Xxh32`] state plus the one-shot
 /// [`xxh32`] free function. A standalone implementation is preferred
-/// to pulling in `twox-hash` (the dep `lz4_flex`'s frame feature uses);
+/// to pulling in `twox-hash` (the crate `lz4_flex`'s frame feature uses);
 /// per `internal/ENGINEERING_STANDARDS.md` §2.1 we hand-roll trivial
 /// primitives whose maintenance cost is dominated by the surrounding
 /// framing rather than the algorithm itself. The reference test
