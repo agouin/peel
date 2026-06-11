@@ -83,9 +83,9 @@ the bench grid in the project README). Resume is per LZMA2 chunk.
 
 ### `.lz4` / `.tar.lz4`
 
-Streaming LZ4 Frame Format. Frame parsing is hand-rolled; the inner
-block-layer decompression uses the `lz4_flex` crate's
-`block::decompress_into` API. Resume is per lz4 block.
+Streaming LZ4 Frame Format. Both the frame parsing and the inner
+block-layer decompression are hand-rolled (pure Rust, no external LZ4
+crate in the runtime tree). Resume is per lz4 block.
 
 ### `.gz` / `.tar.gz`
 

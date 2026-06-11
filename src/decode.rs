@@ -33,9 +33,12 @@
 //! - [`xz_native`] — implementation of the hand-rolled xz
 //!   decoder. The `xz` re-export is the public surface; only
 //!   tests reach into `xz_native::*` directly.
-//! - [`lz4`] — hand-rolls the LZ4 Frame Format around `lz4_flex`'s
-//!   block-layer API and exposes per-block frame boundaries
-//!   (round-one MVP per `internal/PLAN_v2.md` §4).
+//! - [`lz4`] — hand-rolls the LZ4 Frame Format, decodes each block
+//!   through [`lz4_native`], and exposes per-block frame boundaries
+//!   (`internal/PLAN_v2.md` §4 / `internal/PLAN_lz4_block_decoder.md`).
+//! - [`lz4_native`] — the hand-rolled LZ4 block decoder [`lz4`] feeds
+//!   each compressed block into; replaces the former `lz4_flex`
+//!   runtime dependency.
 //!
 //! Future formats (`gzip`, anything that fits the protocol) are added
 //! here following the same shape.
@@ -101,6 +104,12 @@ pub mod deflate_native;
 // Hand-rolled bzip2 decoder (`internal/PLAN_bz2_support.md`).
 #[cfg(feature = "bzip2")]
 pub mod bzip2_native;
+
+// Hand-rolled LZ4 block decoder (`internal/PLAN_lz4_block_decoder.md`).
+// `decode::lz4` drives the LZ4 Frame Format and feeds each block's
+// compressed payload here, replacing the former `lz4_flex` runtime dep.
+#[cfg(feature = "lz4")]
+pub mod lz4_native;
 
 // Hand-rolled RAR5 decoder (`internal/PLAN_rar5_decoder.md`). Gated
 // behind the `rar` Cargo feature alongside the rest of the RAR5
