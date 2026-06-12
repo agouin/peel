@@ -9,7 +9,7 @@
 # instead.
 
 pkgname=peel
-pkgver=0.7.7
+pkgver=0.7.8
 pkgrel=1
 pkgdesc='Streaming, resumable, space-efficient HTTP archive extractor'
 arch=('x86_64' 'aarch64')

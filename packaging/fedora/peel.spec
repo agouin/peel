@@ -1,7 +1,7 @@
 %bcond_without check
 
 Name:           peel
-Version:        0.7.7
+Version:        0.7.8
 Release:        1%{?dist}
 Summary:        Streaming, resumable, space-efficient HTTP archive extractor
 
@@ -104,5 +104,5 @@ install -D -m0644 target/man/peel.1   %{buildroot}%{_mandir}/man1/peel.1
 %{_mandir}/man1/peel.1*
 
 %changelog
-* Thu Jun 11 2026 Andrew Gouin <andrew@gouin.io> - 0.7.7-1
+* Fri Jun 12 2026 Andrew Gouin <andrew@gouin.io> - 0.7.8-1
 - Initial Fedora package.
