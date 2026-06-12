@@ -105,7 +105,4 @@ install -D -m0644 target/man/peel.1   %{buildroot}%{_mandir}/man1/peel.1
 
 %changelog
 * Fri Jun 12 2026 Andrew Gouin <andrew@gouin.io> - 0.7.8-1
-- Release v0.7.8.
-
-* Thu Jun 11 2026 Andrew Gouin <andrew@gouin.io> - 0.7.7-1
 - Initial Fedora package.
