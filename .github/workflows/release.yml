@@ -350,26 +350,16 @@ jobs:
               /github/home/rpmbuild/SPECS/peel.spec
 
       - name: Build RPMs
-        # Build the source RPM first, install its BuildRequires from
-        # Fedora's packaged rust crates with `dnf builddep`, then
-        # build the binary RPMs. The spec is rust2rpm-style: it lists
-        # every dependency as a `crate(...)` BuildRequires resolved
-        # against Fedora's `rust-*-devel` packages (no vendoring), so
-        # the deps must be installed before `rpmbuild -bb`.
-        #
-        # `--without check` flips the spec's `%bcond_without check`
-        # so %check (cargo test) is skipped — the main CI workflow
-        # already runs the suite on every push. Building the SRPM
-        # with `--without check` also evaluates the `%if %{with
-        # check}` crate BRs (sha2, blake2, xz2, …) out of the SRPM
-        # header, so `builddep` on the SRPM installs exactly the
-        # runtime dep closure and skips the heavy test-only crates.
+        # rust crates installed via `dnf builddep` need their README
+        # files present — many `include_str!("../README.md")` at
+        # compile time. `fedora:latest` sets `tsflags=nodocs` in
+        # dnf.conf to slim the image; override for the builddep call.
         shell: bash
         run: |
           export HOME=/github/home
-          rpmbuild -bs --without check ~/rpmbuild/SPECS/peel.spec
-          dnf -y builddep ~/rpmbuild/SRPMS/peel-*.src.rpm
-          rpmbuild -bb --without check ~/rpmbuild/SPECS/peel.spec
+          rpmbuild -bs ~/rpmbuild/SPECS/peel.spec
+          dnf -y builddep --setopt='tsflags=' ~/rpmbuild/SRPMS/peel-*.src.rpm
+          rpmbuild -bb ~/rpmbuild/SPECS/peel.spec
 
       - name: Stage outputs
         # The `.src.rpm` is arch-independent and gets rebuilt
