@@ -80,6 +80,10 @@ codecs.
 
 %prep
 %autosetup -n %{name}-%{version}
+# windows-sys is a Windows-only cfg-gated dep (rust-windows-sys is not
+# packaged in Fedora). Cargo's resolver inspects every target block
+# regardless of host target, so strip the block before %cargo_prep runs.
+sed -i "/^\[target\.'cfg(windows)'\.dependencies\]$/,/^] }$/d" Cargo.toml
 %cargo_prep
 
 %build
