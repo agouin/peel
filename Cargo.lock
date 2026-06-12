@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "peel-rs"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "aes",
  "anyhow",
