@@ -275,7 +275,6 @@ jobs:
   # `packaging/fedora/README.md` and `internal/PLAN_packaging.md` §1.
   package-fedora:
     name: Fedora .rpm (${{ matrix.arch }})
-    needs: vendor
     strategy:
       fail-fast: false
       matrix:
@@ -304,23 +303,20 @@ jobs:
         # `cargo-rpm-macros` pulls in `cargo` + `rust` (1.95+ on
         # Fedora 44, which clears the spec's `BuildRequires: rust >=
         # 1.85`) and provides %%cargo_prep / %%cargo_build that the
-        # spec relies on for hardening RUSTFLAGS. `gcc` is needed
-        # because a handful of vendored crates' build scripts
-        # compile C shims (notably ring). `git` + `tar` cover the
-        # source-staging step below.
+        # spec relies on for hardening RUSTFLAGS. `dnf5-plugins`
+        # provides the `dnf builddep` subcommand, which installs the
+        # spec's `crate(...)` BuildRequires from Fedora's packaged
+        # rust crates (see the Build RPMs step). `gcc` is needed
+        # because a handful of crate build scripts compile C shims
+        # (notably ring). `git` + `tar` cover the source-staging
+        # step below.
         run: |
-          dnf -y -q install rpm-build cargo-rpm-macros \
+          dnf -y -q install rpm-build cargo-rpm-macros dnf5-plugins \
               pkgconf-pkg-config libzstd-devel gcc git tar
-
-      - name: Download vendored crates
-        uses: actions/download-artifact@v4
-        with:
-          name: peel-vendor
-          path: vendor-artifact
 
       - name: Stage rpmbuild sources
         # Source0: github-style archive of the tagged tree. Source1:
-        # the vendored-deps tarball produced by the `vendor` job.
+        # `peel.rpmlintrc` (the rpmlint config the spec ships).
         shell: bash
         run: |
           set -euo pipefail
@@ -337,19 +333,11 @@ jobs:
               -C "$GITHUB_WORKSPACE" \
               --transform "s,^\./,peel-${ver}/," \
               --exclude='./.git' --exclude='./target' \
-              --exclude='./dist' --exclude='./vendor-artifact' \
+              --exclude='./dist' \
               .
-          # `find` rather than a fixed path: actions/upload-artifact@v4
-          # may strip the workspace-relative `dist/` prefix from the
-          # artifact, so the vendored tarball can end up at the top of
-          # `vendor-artifact/` or under `vendor-artifact/dist/`
-          # depending on action version. The find is robust to either.
-          vendored=$(find vendor-artifact -name 'peel-*-vendored.tar.gz' | head -1)
-          test -n "${vendored}" || { echo "vendored tarball not found"; exit 1; }
-          cp "${vendored}" "/github/home/rpmbuild/SOURCES/peel-${tag}-vendored.tar.gz"
-          # Source2 in the spec is `peel.rpmlintrc`, which rpmbuild
+          # Source1 in the spec is `peel.rpmlintrc`, which rpmbuild
           # resolves relative to `~/rpmbuild/SOURCES/`. Stage it
-          # alongside the tarballs.
+          # alongside the source tarball.
           cp packaging/fedora/peel.rpmlintrc \
               /github/home/rpmbuild/SOURCES/peel.rpmlintrc
           # Patch the spec's `Version:` to the tag's version. The
@@ -362,16 +350,25 @@ jobs:
               /github/home/rpmbuild/SPECS/peel.spec
 
       - name: Build RPMs
+        # Build the source RPM first, install its BuildRequires from
+        # Fedora's packaged rust crates with `dnf builddep`, then
+        # build the binary RPMs. The spec is rust2rpm-style: it lists
+        # every dependency as a `crate(...)` BuildRequires resolved
+        # against Fedora's `rust-*-devel` packages (no vendoring), so
+        # the deps must be installed before `rpmbuild -bb`.
+        #
         # `--without check` flips the spec's `%bcond_without check`
         # so %check (cargo test) is skipped — the main CI workflow
-        # already runs tests on every push, and %check would
-        # re-trigger the heavy xz2 → lzma-sys dev-dep build chain
-        # just to repeat what ci.yml already verified. The bcond
-        # also drops the `xz-devel` BR so dnf doesn't need it.
+        # already runs the suite on every push. Building the SRPM
+        # with `--without check` also evaluates the `%if %{with
+        # check}` crate BRs (sha2, blake2, xz2, …) out of the SRPM
+        # header, so `builddep` on the SRPM installs exactly the
+        # runtime dep closure and skips the heavy test-only crates.
         shell: bash
         run: |
           export HOME=/github/home
           rpmbuild -bs --without check ~/rpmbuild/SPECS/peel.spec
+          dnf -y builddep ~/rpmbuild/SRPMS/peel-*.src.rpm
           rpmbuild -bb --without check ~/rpmbuild/SPECS/peel.spec
 
       - name: Stage outputs
