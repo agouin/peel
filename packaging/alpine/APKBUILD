@@ -1,7 +1,7 @@
 # Contributor: Andrew Gouin <andrew@gouin.io>
 # Maintainer: Andrew Gouin <andrew@gouin.io>
 pkgname=peel
-pkgver=0.7.9
+pkgver=0.7.10
 pkgrel=0
 pkgdesc="Streaming, resumable, space-efficient HTTP archive extractor"
 url="https://github.com/agouin/peel"
