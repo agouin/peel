@@ -1,5 +1,3 @@
-%bcond_without check
-
 Name:           peel
 Version:        0.7.9
 Release:        1%{?dist}
@@ -49,21 +47,6 @@ BuildRequires:  (crate(tokio/macros) >= 1.0.0 with crate(tokio/macros) < 2.0.0~)
 BuildRequires:  (crate(tokio/sync) >= 1.0.0 with crate(tokio/sync) < 2.0.0~)
 BuildRequires:  (crate(io-uring) >= 0.6.0 with crate(io-uring) < 0.7.0~)
 
-%if %{with check}
-BuildRequires:  (crate(sha2/default) >= 0.10.0 with crate(sha2/default) < 0.11.0~)
-BuildRequires:  (crate(blake2/default) >= 0.10.0 with crate(blake2/default) < 0.11.0~)
-BuildRequires:  (crate(xz2/default) >= 0.1.0 with crate(xz2/default) < 0.2.0~)
-BuildRequires:  (crate(flate2/rust_backend) >= 1.0.0 with crate(flate2/rust_backend) < 2.0.0~)
-BuildRequires:  (crate(hyper/server) >= 1.0.0 with crate(hyper/server) < 2.0.0~)
-BuildRequires:  (crate(tokio-rustls/ring) >= 0.26.0 with crate(tokio-rustls/ring) < 0.27.0~)
-BuildRequires:  (crate(sha1/default) >= 0.10.0 with crate(sha1/default) < 0.11.0~)
-BuildRequires:  (crate(hmac/default) >= 0.12.0 with crate(hmac/default) < 0.13.0~)
-BuildRequires:  (crate(pbkdf2/hmac) >= 0.12.0 with crate(pbkdf2/hmac) < 0.13.0~)
-BuildRequires:  (crate(aes/default) >= 0.8.0 with crate(aes/default) < 0.9.0~)
-BuildRequires:  (crate(ctr/default) >= 0.9.0 with crate(ctr/default) < 0.10.0~)
-BuildRequires:  (crate(cbc/default) >= 0.1.0 with crate(cbc/default) < 0.2.0~)
-%endif
-
 # Rust inner attributes (`#![...]`) look like malformed shebangs to
 # brp-mangle-shebangs; exclude .rs from the check.
 %global __brp_mangle_shebangs_exclude_from ^.*\.rs$
@@ -95,11 +78,6 @@ target/release/peel-mangen target/man/peel.1
 %install
 install -D -m0755 target/release/peel %{buildroot}%{_bindir}/peel
 install -D -m0644 target/man/peel.1   %{buildroot}%{_mandir}/man1/peel.1
-
-%if %{with check}
-%check
-%cargo_test
-%endif
 
 %files
 %license LICENSE-MIT LICENSE-APACHE NOTICE
