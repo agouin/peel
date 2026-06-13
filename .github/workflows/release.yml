@@ -300,16 +300,13 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Install build deps
-        # `cargo-rpm-macros` pulls in `cargo` + `rust` (1.95+ on
-        # Fedora 44, which clears the spec's `BuildRequires: rust >=
-        # 1.85`) and provides %%cargo_prep / %%cargo_build that the
-        # spec relies on for hardening RUSTFLAGS. `dnf5-plugins`
-        # provides the `dnf builddep` subcommand, which installs the
-        # spec's `crate(...)` BuildRequires from Fedora's packaged
-        # rust crates (see the Build RPMs step). `gcc` is needed
-        # because a handful of crate build scripts compile C shims
-        # (notably ring). `git` + `tar` cover the source-staging
-        # step below.
+        # `cargo-rpm-macros` pulls in `cargo` + `rust` and provides the
+        # %%cargo_* macros the spec uses (RUSTFLAGS hardening, dynamic
+        # BuildRequires generation, license summary). `dnf5-plugins`
+        # provides `dnf builddep`, which installs the crate
+        # BuildRequires emitted by %%cargo_generate_buildrequires (see
+        # the Build RPMs step). `gcc` builds the C shims in a few crate
+        # build scripts (notably ring); `git` + `tar` stage the source.
         run: |
           dnf -y -q install rpm-build cargo-rpm-macros dnf5-plugins \
               pkgconf-pkg-config libzstd-devel gcc git tar
@@ -350,16 +347,34 @@ jobs:
               /github/home/rpmbuild/SPECS/peel.spec
 
       - name: Build RPMs
-        # rust crates installed via `dnf builddep` need their README
-        # files present — many `include_str!("../README.md")` at
-        # compile time. `fedora:latest` sets `tsflags=nodocs` in
-        # dnf.conf to slim the image; override for the builddep call.
+        # The crate BuildRequires are generated dynamically by
+        # %%cargo_generate_buildrequires, which only runs during the
+        # binary build (`-bb`) — not in the `-bs` source RPM. So resolve
+        # them in a loop: rpmbuild emits the unmet crate deps as a
+        # `.buildreqs.nosrc.rpm` and exits non-zero, we `builddep` that,
+        # and retry until the build runs (one round suffices for cargo).
+        # `--setopt=tsflags=` overrides `fedora:latest`'s `nodocs`, since
+        # several crates `include_str!("../README.md")` at compile time.
         shell: bash
         run: |
           export HOME=/github/home
-          rpmbuild -bs ~/rpmbuild/SPECS/peel.spec
-          dnf -y builddep --setopt='tsflags=' ~/rpmbuild/SRPMS/peel-*.src.rpm
-          rpmbuild -bb ~/rpmbuild/SPECS/peel.spec
+          spec=~/rpmbuild/SPECS/peel.spec
+          rpmbuild -bs "$spec"
+          dnf -y builddep --setopt='tsflags=' "$spec"
+          rounds=0
+          until rpmbuild -bb "$spec"; do
+            rounds=$((rounds + 1))
+            if [ "$rounds" -gt 5 ]; then
+              echo "BuildRequires did not converge after 5 rounds" >&2
+              exit 1
+            fi
+            nosrc=$(ls -t ~/rpmbuild/SRPMS/peel-*.buildreqs.nosrc.rpm 2>/dev/null | head -1)
+            if [ -z "$nosrc" ]; then
+              echo "rpmbuild failed without emitting dynamic BuildRequires" >&2
+              exit 1
+            fi
+            dnf -y builddep --setopt='tsflags=' "$nosrc"
+          done
 
       - name: Stage outputs
         # The `.src.rpm` is arch-independent and gets rebuilt
