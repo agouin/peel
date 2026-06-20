@@ -112,6 +112,17 @@ pub enum ClientError {
     #[error("invalid Range: {0}")]
     Range(#[from] super::range::RangeError),
 
+    /// A caller-supplied [`ClientConfig::extra_headers`] entry is not a
+    /// well-formed HTTP header — an invalid name or value (e.g. a
+    /// control character or a name with whitespace).
+    #[error("invalid request header {name:?}: {detail}")]
+    InvalidHeader {
+        /// The offending header name, as supplied by the caller.
+        name: String,
+        /// Why the name or value was rejected.
+        detail: String,
+    },
+
     /// Building the underlying TLS configuration failed.
     #[error("tls config error")]
     Tls(#[source] rustls::Error),
@@ -219,6 +230,7 @@ impl ClientError {
             Self::UnexpectedStatus { status, .. } => *status >= 500,
             Self::Url(_)
             | Self::Range(_)
+            | Self::InvalidHeader { .. }
             | Self::InvalidServerName { .. }
             | Self::MissingLocation { .. }
             | Self::TooManyRedirects { .. }
@@ -284,6 +296,18 @@ pub struct ClientConfig {
     /// Optional `User-Agent` override; if `None`, `peel/<version>`
     /// is sent.
     pub user_agent: Option<String>,
+    /// Extra request headers sent on every `HEAD`/`GET` (including
+    /// ranged GETs), in addition to the always-sent `User-Agent` and
+    /// `Accept`. Lets an embedder carry caller state the bare client
+    /// otherwise omits — e.g. `Cookie`, `Authorization`, `Referer` — so
+    /// a fetch can ride an existing session (cohort's browser-download
+    /// path). Each entry is a `(name, value)` pair, validated as a
+    /// well-formed HTTP header when the request is built; a malformed
+    /// entry surfaces as [`ClientError::InvalidHeader`]. Defaults to
+    /// empty. Caller-supplied entries are appended after the built-in
+    /// headers, so duplicating `User-Agent` here would send it twice —
+    /// use [`Self::user_agent`] to override the agent instead.
+    pub extra_headers: Vec<(String, String)>,
     /// Which HTTP version(s) to use. Defaults to
     /// [`HttpVersion::Auto`] (ALPN-negotiated H1 / H2).
     pub http_version: HttpVersion,
@@ -310,6 +334,7 @@ impl Default for ClientConfig {
             pool_capacity: DEFAULT_POOL_CAPACITY,
             read_buffer_bytes: DEFAULT_READ_BUFFER_BYTES,
             user_agent: None,
+            extra_headers: Vec::new(),
             http_version: HttpVersion::Auto,
             insecure: false,
         }
@@ -517,6 +542,15 @@ impl Client {
             .unwrap_or_else(|| format!("peel/{}", env!("CARGO_PKG_VERSION")));
         builder = builder.header(http::header::USER_AGENT, ua_value);
         builder = builder.header(http::header::ACCEPT, "*/*");
+
+        // Caller-supplied headers (Cookie / Authorization / Referer / …)
+        // so an embedder can ride an existing session. Validated up front
+        // (`validate_header`) so a malformed entry is a typed error rather
+        // than being silently dropped by the `http` builder at `.body()`.
+        for (name, value) in &self.inner.config.extra_headers {
+            let (header_name, header_value) = validate_header(name, value)?;
+            builder = builder.header(header_name, header_value);
+        }
 
         if let Some(r) = range {
             let value = format_range_header(r)?;
@@ -993,6 +1027,24 @@ impl ThroughputWatchdog {
     }
 }
 
+/// Validate one caller-supplied [`ClientConfig::extra_headers`] entry
+/// into an `http` name/value pair, mapping a malformed name or value to
+/// a typed [`ClientError::InvalidHeader`]. Done explicitly (rather than
+/// leaning on the `http` builder, which stashes the error until
+/// `.body()`) so a bad header is reported with the offending name.
+fn validate_header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), ClientError> {
+    let header_name =
+        HeaderName::from_bytes(name.as_bytes()).map_err(|e| ClientError::InvalidHeader {
+            name: name.to_string(),
+            detail: e.to_string(),
+        })?;
+    let header_value = HeaderValue::from_str(value).map_err(|e| ClientError::InvalidHeader {
+        name: name.to_string(),
+        detail: e.to_string(),
+    })?;
+    Ok((header_name, header_value))
+}
+
 fn translate_headers(map: &http::HeaderMap<HeaderValue>) -> Result<Headers, String> {
     let mut headers = Headers::default();
     for (name, value) in map.iter() {
@@ -1079,5 +1131,37 @@ mod tests {
             result.is_ok(),
             "insecure verifier must accept an untrusted certificate",
         );
+    }
+
+    #[test]
+    fn extra_headers_default_empty() {
+        assert!(ClientConfig::default().extra_headers.is_empty());
+    }
+
+    #[test]
+    fn validate_header_accepts_well_formed() {
+        let (name, value) = validate_header("Cookie", "session=abc123; theme=dark").expect("valid");
+        assert_eq!(name.as_str(), "cookie");
+        assert_eq!(value.to_str().expect("ascii"), "session=abc123; theme=dark");
+    }
+
+    #[test]
+    fn validate_header_rejects_bad_name() {
+        let err = validate_header("Bad Name", "x").expect_err("name with space is invalid");
+        assert!(
+            matches!(err, ClientError::InvalidHeader { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_header_rejects_bad_value() {
+        // A newline in the value would split the header — must be rejected.
+        let err = validate_header("X-Test", "line1\r\nline2").expect_err("CRLF is invalid");
+        if let ClientError::InvalidHeader { name, .. } = &err {
+            assert_eq!(name, "X-Test");
+        } else {
+            panic!("expected InvalidHeader, got {err:?}");
+        }
     }
 }

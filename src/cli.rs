@@ -235,6 +235,22 @@ pub struct Cli {
     )]
     pub insecure: bool,
 
+    /// Extra HTTP request header sent on every fetch. Repeatable.
+    ///
+    /// Format `Name: Value` (curl-style; the split is on the first
+    /// `:`, surrounding whitespace on the value is trimmed). Lets a
+    /// fetch carry caller state the bare client otherwise omits —
+    /// `Cookie`, `Authorization`, `Referer`, … — e.g. to ride an
+    /// existing browser session. HTTP(S) only; not applicable to local
+    /// extracts.
+    #[arg(
+        short = 'H',
+        long = "header",
+        value_name = "NAME: VALUE",
+        help_heading = "Advanced options"
+    )]
+    pub headers: Vec<String>,
+
     /// SHA-256 digest(s) the source must match. Repeatable.
     ///
     /// Single-URL runs: pass `--sha256 <hex>` once; the coordinator
@@ -569,6 +585,17 @@ pub enum CliError {
     /// a valid URL — so no default output path could be derived.
     #[error("URL is not valid; pass -o <PATH> explicitly")]
     InvalidUrl(#[source] UrlError),
+
+    /// A `-H/--header` argument was not in `Name: Value` form (no `:`)
+    /// or had an empty name. The header name/value is further validated
+    /// by the HTTP client when the request is built.
+    #[error("invalid --header {value:?}: {detail}")]
+    InvalidHeader {
+        /// The offending `-H` argument, as given.
+        value: String,
+        /// Why it was rejected.
+        detail: String,
+    },
 
     /// `-o/--output` was not given and the URL has no usable
     /// basename (e.g. it ends in `/`) so no default output path
@@ -1133,6 +1160,31 @@ enum SourceClassification {
     Local(PathBuf),
 }
 
+/// Parse `-H/--header` arguments (`Name: Value`, curl-style) into
+/// `(name, value)` pairs. The split is on the first `:`; surrounding
+/// whitespace on the value is trimmed (the conventional space after the
+/// colon is not part of the value). An entry with no `:` or an empty
+/// name is rejected here with a clear message; the header name/value is
+/// validated as a well-formed HTTP header later, by the client.
+fn parse_header_args(raw: &[String]) -> Result<Vec<(String, String)>, CliError> {
+    raw.iter()
+        .map(|h| {
+            let (name, value) = h.split_once(':').ok_or_else(|| CliError::InvalidHeader {
+                value: h.clone(),
+                detail: "expected `Name: Value`".to_string(),
+            })?;
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(CliError::InvalidHeader {
+                    value: h.clone(),
+                    detail: "empty header name".to_string(),
+                });
+            }
+            Ok((name.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 /// Classify one positional `<source>` argument
 /// (`internal/old/PLAN_local_file_extract.md` §1 step 1).
 ///
@@ -1501,6 +1553,9 @@ fn reject_http_only_flags(cli: &Cli) -> Result<(), CliError> {
     if cli.insecure {
         return Err(CliError::LocalFlagNotApplicable { flag: "--insecure" });
     }
+    if !cli.headers.is_empty() {
+        return Err(CliError::LocalFlagNotApplicable { flag: "--header" });
+    }
     if cli.no_extract {
         return Err(CliError::LocalFlagNotApplicable {
             flag: "--no-extract",
@@ -1772,9 +1827,11 @@ impl Cli {
                  the connection is not protected against man-in-the-middle attacks"
             );
         }
+        let extra_headers = parse_header_args(&self.headers)?;
         let client = Client::with_config(ClientConfig {
             http_version,
             insecure: self.insecure,
+            extra_headers,
             ..ClientConfig::default()
         })?;
 
@@ -2472,6 +2529,50 @@ mod tests {
         ])
         .expect("parse");
         assert!(cli.insecure);
+    }
+
+    #[test]
+    fn parses_repeated_header_flags() {
+        let cli = Cli::try_parse_from([
+            "peel",
+            "https://example.com/x.zst",
+            "-o",
+            "/tmp/o",
+            "-H",
+            "Cookie: a=b",
+            "--header",
+            "Authorization: Bearer t0ken",
+        ])
+        .expect("parse");
+        let parsed = parse_header_args(&cli.headers).expect("valid headers");
+        assert_eq!(
+            parsed,
+            vec![
+                ("Cookie".to_string(), "a=b".to_string()),
+                ("Authorization".to_string(), "Bearer t0ken".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_value_with_colons_keeps_them() {
+        // Only the first colon separates name from value (URLs, times).
+        let parsed =
+            parse_header_args(&["Referer: https://example.com/a:b".to_string()]).expect("valid");
+        assert_eq!(parsed[0].0, "Referer");
+        assert_eq!(parsed[0].1, "https://example.com/a:b");
+    }
+
+    #[test]
+    fn header_without_colon_is_rejected() {
+        let err = parse_header_args(&["NotAHeader".to_string()]).expect_err("no colon");
+        assert!(matches!(err, CliError::InvalidHeader { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn header_with_empty_name_is_rejected() {
+        let err = parse_header_args(&[": value".to_string()]).expect_err("empty name");
+        assert!(matches!(err, CliError::InvalidHeader { .. }), "got {err:?}");
     }
 
     #[test]
