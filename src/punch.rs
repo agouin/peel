@@ -286,14 +286,11 @@ mod linux {
     const FALLBACK_PAGE_SIZE: u64 = 4096;
 
     extern "C" {
-        // `int fallocate(int fd, int mode, off_t offset, off_t len);` —
-        // the Linux-specific syscall wrapper, exposed by both glibc and
-        // musl. We declare `off_t` as `i64` because every target we
-        // support is 64-bit Linux, where `off_t` is always 64-bit. (We
-        // can't use `fallocate64`: glibc exposes it as the explicit
-        // 64-bit-offset alias, but musl does not — under musl `off_t`
-        // is unconditionally 64-bit and only the bare `fallocate`
-        // symbol exists.)
+        // Use the 64-bit-offset entry point on 32-bit glibc.
+        #[cfg_attr(
+            all(target_env = "gnu", target_pointer_width = "32"),
+            link_name = "fallocate64"
+        )]
         fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
 
         // `int madvise(void *addr, size_t length, int advice);` —
